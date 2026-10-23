@@ -225,9 +225,10 @@ suite("Chat edit_file", () => {
     test(`run_command runs in allow mode (${place}) and reports output and exit code`, async function () {
       this.timeout(30000)
       const commands = terminalCommands(() => "allow", path.dirname(file), undefined, { place })
-      const ok = await commands.run("echo twinny-ran")
+      const ok = await commands.run("printf 'TWINNY_TEST_OK\\n'")
       assert.strictEqual(ok.ran, true)
-      assert.match(ok.output, /twinny-ran/)
+      assert.match(ok.output, /TWINNY_TEST_OK/)
+      assert.strictEqual(ok.timedOut, undefined)
       assert.strictEqual(ok.exitCode, 0)
       const failed = await commands.run("sh -c 'exit 3'")
       assert.strictEqual(failed.exitCode, 3)
@@ -235,6 +236,14 @@ suite("Chat edit_file", () => {
       await commands.run("cd /")
       const where = await commands.run("pwd")
       assert.match(where.output, new RegExp(`${fs.realpathSync(path.dirname(file))}|${path.dirname(file)}`))
+      // Relative writes must not follow a previous command into a child folder.
+      fs.mkdirSync(path.join(path.dirname(file), "nested"))
+      assert.strictEqual((await commands.run("cd nested")).exitCode, 0)
+      const written = await commands.run("printf 'root-only\\n' > todo.md")
+      assert.strictEqual(written.exitCode, 0)
+      assert.strictEqual(written.timedOut, undefined)
+      assert.strictEqual(fs.readFileSync(path.join(path.dirname(file), "todo.md"), "utf8"), "root-only\n")
+      assert.ok(!fs.existsSync(path.join(path.dirname(file), "nested", "todo.md")))
     })
   }
 

@@ -450,8 +450,8 @@ export interface CommandOutcome {
   output: string
   exitCode?: number
   /**
-   * The wait ran out before the command ended: `running` when it was left
-   * to carry on (a server in the terminal), `stopped` when it was ended.
+   * The wait ran out without confirmed completion: `running` when it was
+   * left alone (its actual state is unknown), `stopped` when it was ended.
    */
   timedOut?: "running" | "stopped"
   /** It was stopped by the user's stop on its step; the reply carries on. */
@@ -502,14 +502,14 @@ const runCommand = (sink: CommandSink): Tool => ({
     }
     const status =
       outcome.timedOut === "running"
-        ? "still running when the wait ran out; this is its output so far"
+        ? "completion unconfirmed when the wait ran out; the command may have finished or may still be running; do not retry automatically; this is its captured output so far"
         : outcome.timedOut === "stopped"
           ? "stopped: it ran longer than the wait allows; this is its output so far"
           : outcome.exitCode === undefined
             ? "finished; the shell did not report an exit code"
             : `exit code ${outcome.exitCode}`
     const outcomeWord = outcome.timedOut
-      ? outcome.timedOut === "running" ? "still running" : "timed out"
+      ? outcome.timedOut === "running" ? "completion unconfirmed" : "timed out"
       : outcome.exitCode === undefined ? "done" : `exit ${outcome.exitCode}`
     return {
       failed: outcome.timedOut === "stopped" || (!outcome.timedOut && !!outcome.exitCode),

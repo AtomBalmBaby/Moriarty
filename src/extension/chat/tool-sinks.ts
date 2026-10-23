@@ -473,14 +473,6 @@ const busy = new WeakSet<Terminal>()
 /** Terminals whose shell never reported integration; no need to wait to find that out again. */
 const withoutIntegration = new WeakSet<Terminal>()
 
-/** When a command of ours last ended in a terminal. */
-const lastEnded = new WeakMap<Terminal, number>()
-/**
- * A shell reports where it is with its next prompt, a moment after a
- * command ends. Sooner than this after one, what it last reported is not
- * taken as where it is now.
- */
-const CWD_SETTLE_MS = 2000
 
 /** A terminal to run in: ours, alive, and not in the middle of something; `fresh` when it was just opened at `cwd`. */
 const toolsTerminal = (cwd: string): { terminal: Terminal; fresh: boolean } => {
@@ -497,8 +489,8 @@ const toolsTerminal = (cwd: string): { terminal: Terminal; fresh: boolean } => {
 
 /** The terminal's shell integration, waiting briefly for a new terminal's shell to report it. */
 const integrationOf = (terminal: Terminal): Promise<TerminalShellIntegration | undefined> => {
-  if (terminal.shellIntegration) return Promise.resolve(terminal.shellIntegration)
   if (withoutIntegration.has(terminal)) return Promise.resolve(undefined)
+  if (terminal.shellIntegration) return Promise.resolve(terminal.shellIntegration)
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       listener.dispose()
@@ -524,15 +516,28 @@ const execute = (
   signal?: AbortSignal,
   onOutput?: (output: string) => void
 ) => {
-  const execution = run()
-  busy.add(terminal)
+  let execution: ReturnType<TerminalShellIntegration["executeCommand"]> | undefined
   let output = ""
-  const reading = (async () => {
-    for await (const chunk of execution.read()) {
-      output = (output + chunk).slice(-MAX_CAPTURE_CHARS)
-      onOutput?.(output)
-    }
-  })().catch((error) => logger.warn(`Chat command output: ${error}`))
+  let reading = Promise.resolve()
+  let started = false
+  let startEventReceived = false
+  // Read as soon as an execution is available: read() only captures future
+  // data. Do not depend on the host delivering a start event to capture it.
+  const startReading = (running: ReturnType<TerminalShellIntegration["executeCommand"]>) => {
+    if (started) return
+    started = true
+    reading = (async () => {
+      for await (const chunk of running.read()) {
+        output = (output + chunk).slice(-MAX_CAPTURE_CHARS)
+        onOutput?.(output)
+      }
+    })().catch((error) => logger.warn(`Chat command output: ${error}`))
+  }
+  const starting = window.onDidStartTerminalShellExecution((event) => {
+    if (event.terminal !== terminal || (execution && event.execution !== execution)) return
+    startEventReceived = true
+    startReading(event.execution)
+  })
 
   let settle: (ended: Ended) => void = () => undefined
   const ended = new Promise<Ended>((resolve) => {
@@ -541,10 +546,10 @@ const execute = (
   // These two listeners outlive the wait: a command left running frees
   // its terminal only when it really ends.
   const release = () => {
+    starting.dispose()
     finished.dispose()
     closed.dispose()
     busy.delete(terminal)
-    lastEnded.set(terminal, Date.now())
   }
   const finished = window.onDidEndTerminalShellExecution((event) => {
     if (event.execution !== execution) return
@@ -557,7 +562,19 @@ const execute = (
     release()
     settle({ exitCode: gone.exitStatus?.code })
   })
-  const timer = setTimeout(() => settle("timeout"), timeoutMs)
+  busy.add(terminal)
+  try {
+    execution = run()
+    startReading(execution)
+  } catch (error) {
+    release()
+    throw error
+  }
+  const timer = setTimeout(() => {
+    starting.dispose()
+    logger.warn(`Chat command tracking timed out: startEvent=${startEventReceived}, readerAttached=${started}, captured=${output.length}`)
+    settle("timeout")
+  }, timeoutMs)
   const stop = () => {
     // The user stopped the reply: the command is interrupted as Ctrl+C would.
     terminal.sendText("\x03", false)
@@ -569,7 +586,27 @@ const execute = (
     clearTimeout(timer)
     signal?.removeEventListener("abort", stop)
   })
-  return { ended, output: () => output, reading }
+  return { ended, output: () => output, get reading() { return reading } }
+}
+
+/** Presence of the API is not proof that the shell emits usable execution events. */
+const verifiedIntegration = new WeakSet<Terminal>()
+const verifyIntegration = async (terminal: Terminal, integration: TerminalShellIntegration, signal?: AbortSignal) => {
+  if (verifiedIntegration.has(terminal)) return true
+  if (signal?.aborted) return false
+  // This has no user side effects. Never retry a user's command after an
+  // ambiguous timeout: it may already have executed successfully.
+  const marker = "TWINNY_SHELL_INTEGRATION_OK"
+  const probe = execute(terminal, () => integration.executeCommand(`echo ${marker}`), INTEGRATION_WAIT_MS, signal)
+  const ended = await probe.ended
+  await Promise.race([probe.reading, new Promise((resolve) => setTimeout(resolve, 300))])
+  if (typeof ended === "object" && ended.exitCode === 0 && probe.output().includes(marker)) {
+    verifiedIntegration.add(terminal)
+    return true
+  }
+  withoutIntegration.add(terminal)
+  logger.warn(`Chat command: shell integration probe failed (${JSON.stringify(ended)}, captured=${probe.output().length}); using background execution`)
+  return false
 }
 
 /** In the tools terminal, so the user sees it and `@terminal` has it afterwards. */
@@ -582,13 +619,20 @@ const runInTerminal = async (
   signal?: AbortSignal,
   onOutput?: (output: string) => void
 ): Promise<CommandOutcome> => {
-  // Commands are promised the workspace root, and an earlier one may have
-  // left the shell elsewhere. Unless the shell is new, or has sat idle
-  // and says it is at the root, it is sent there first.
-  const idle = Date.now() - (lastEnded.get(terminal) ?? 0) > CWD_SETTLE_MS
-  if (!fresh && !(idle && integration.cwd?.fsPath === cwd)) {
-    await execute(terminal, () => integration.executeCommand("cd", [cwd]), 5000, signal).ended
+  // Commands are promised the workspace root. A previous command may have
+  // changed directories, and shell-integration cwd metadata can be stale.
+  // Require a successful reset for every reused terminal.
+  if (!fresh) {
+    const changed = await execute(terminal, () => integration.executeCommand("cd", [cwd]), 5000, signal).ended
+    if (signal?.aborted || changed === "stopped") return { ran: false, output: "" }
+    if (changed === "timeout" || changed.exitCode !== 0) {
+      withoutIntegration.add(terminal)
+      verifiedIntegration.delete(terminal)
+      logger.warn("Chat command: could not confirm terminal cwd; using background execution before dispatch")
+      return runInBackground(command, cwd, signal, onOutput)
+    }
   }
+  if (signal?.aborted) return { ran: false, output: "" }
   const run = execute(terminal, () => integration.executeCommand(command), COMMAND_TIMEOUT_MS, signal, onOutput)
   const ended = await run.ended
   // The last chunk can land just after the end event.
@@ -783,8 +827,11 @@ export const terminalCommands = (
         const { terminal, fresh } = toolsTerminal(cwd)
         terminal.show(true)
         const integration = await integrationOf(terminal)
-        if (integration) return runInTerminal(terminal, integration, command, cwd, fresh, own.signal, onOutput)
-        logger.info("Chat command: no shell integration in the tools terminal, running in the background")
+        if (integration && await verifyIntegration(terminal, integration, own.signal)) {
+          return runInTerminal(terminal, integration, command, cwd, fresh, own.signal, onOutput)
+        }
+        if (own.signal.aborted) return { ran: false, output: "" }
+        logger.info("Chat command: no verified shell integration in the tools terminal, running in the background")
         return runInBackground(command, cwd, own.signal, onOutput, options.timeoutMs)
       })()
       return stoppedByUser && outcome.timedOut === "stopped" ? { ...outcome, stoppedByUser: true } : outcome

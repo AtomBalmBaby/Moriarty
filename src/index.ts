@@ -159,6 +159,7 @@ const logStartup = (context: ExtensionContext, startedAt: number) => {
     `Twinny ${version} ready in ${formatMs(Date.now() - startedAt)} · ` +
       `VS Code ${vscode.version} · ${os.platform()} ${os.release()}`
   )
+  logger.info(`  extension:   ${context.extensionPath} · mode=${context.extensionMode} · entry=${context.extension.packageJSON.main}`)
   logger.info(`  completions: ${describeProvider(read(ACTIVE_FIM_PROVIDER_STORAGE_KEY))}`)
   logger.info(`  chat:        ${describeProvider(read(ACTIVE_CHAT_PROVIDER_STORAGE_KEY))}`)
   logger.info(`  embeddings:  ${describeProvider(read(ACTIVE_EMBEDDINGS_PROVIDER_STORAGE_KEY))}`)

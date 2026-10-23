@@ -13,9 +13,10 @@
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
 				"${workspaceFolder}/example"
+        "${workspaceFolder}"
       ],
       "outFiles": ["${workspaceFolder}/out/**/*.js"],
-      "preLaunchTask": "${defaultBuildTask}"
+      "preLaunchTask": "npm: build"
     },
     {
       "name": "Extension Tests",
