@@ -473,6 +473,15 @@ const busy = new WeakSet<Terminal>()
 /** Terminals whose shell never reported integration; no need to wait to find that out again. */
 const withoutIntegration = new WeakSet<Terminal>()
 
+/** When a command of ours last ended in a terminal. */
+const lastEnded = new WeakMap<Terminal, number>()
+/**
+ * A shell reports where it is with its next prompt, a moment after a
+ * command ends. Sooner than this after one, what it last reported is not
+ * taken as where it is now.
+ */
+const CWD_SETTLE_MS = 2000
+
 
 /** A terminal to run in: ours, alive, and not in the middle of something; `fresh` when it was just opened at `cwd`. */
 const toolsTerminal = (cwd: string): { terminal: Terminal; fresh: boolean } => {
@@ -536,6 +545,7 @@ const execute = (
     finished.dispose()
     closed.dispose()
     busy.delete(terminal)
+    lastEnded.set(terminal, Date.now())
   }
   const finished = window.onDidEndTerminalShellExecution((event) => {
     if (event.execution !== execution) return
@@ -593,20 +603,13 @@ const runInTerminal = async (
   signal?: AbortSignal,
   onOutput?: (output: string) => void
 ): Promise<CommandOutcome> => {
-  // Commands are promised the workspace root. A previous command may have
-  // changed directories, and shell-integration cwd metadata can be stale.
-  // Require a successful reset for every reused terminal.
-  if (!fresh) {
-    const changed = await execute(terminal, () => integration.executeCommand("cd", [cwd]), 5000, signal).ended
-    if (signal?.aborted || changed === "stopped") return { ran: false, output: "" }
-    if (changed === "timeout" || changed.exitCode !== 0) {
-      withoutIntegration.add(terminal)
-      verifiedIntegration.delete(terminal)
-      logger.warn("Chat command: could not confirm terminal cwd; using background execution before dispatch")
-      return runInBackground(command, cwd, signal, onOutput)
-    }
+  // Commands are promised the workspace root, and an earlier one may have
+  // left the shell elsewhere. Unless the shell is new, or has sat idle
+  // and says it is at the root, it is sent there first.
+  const idle = Date.now() - (lastEnded.get(terminal) ?? 0) > CWD_SETTLE_MS
+  if (!fresh && !(idle && integration.cwd?.fsPath === cwd)) {
+    await execute(terminal, () => integration.executeCommand("cd", [cwd]), 5000, signal).ended
   }
-  if (signal?.aborted) return { ran: false, output: "" }
   const run = execute(terminal, () => integration.executeCommand(command), COMMAND_TIMEOUT_MS, signal, onOutput)
   const ended = await run.ended
   // The last chunk can land just after the end event.
