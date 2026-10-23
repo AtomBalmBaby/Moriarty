@@ -804,7 +804,8 @@ export const terminalCommands = (
         const { terminal, fresh } = toolsTerminal(cwd)
         terminal.show(true)
         const integration = await integrationOf(terminal)
-        if (integration && await verifyIntegration(terminal, integration, own.signal)) {
+        // Experiment D negative control: trust API presence without the readiness probe.
+        if (integration) {
           return runInTerminal(terminal, integration, command, cwd, fresh, own.signal, onOutput)
         }
         if (own.signal.aborted) return { ran: false, output: "" }
