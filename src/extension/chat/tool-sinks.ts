@@ -516,28 +516,15 @@ const execute = (
   signal?: AbortSignal,
   onOutput?: (output: string) => void
 ) => {
-  let execution: ReturnType<TerminalShellIntegration["executeCommand"]> | undefined
+  const execution = run()
+  busy.add(terminal)
   let output = ""
-  let reading = Promise.resolve()
-  let started = false
-  let startEventReceived = false
-  // Read as soon as an execution is available: read() only captures future
-  // data. Do not depend on the host delivering a start event to capture it.
-  const startReading = (running: ReturnType<TerminalShellIntegration["executeCommand"]>) => {
-    if (started) return
-    started = true
-    reading = (async () => {
-      for await (const chunk of running.read()) {
-        output = (output + chunk).slice(-MAX_CAPTURE_CHARS)
-        onOutput?.(output)
-      }
-    })().catch((error) => logger.warn(`Chat command output: ${error}`))
-  }
-  const starting = window.onDidStartTerminalShellExecution((event) => {
-    if (event.terminal !== terminal || (execution && event.execution !== execution)) return
-    startEventReceived = true
-    startReading(event.execution)
-  })
+  const reading = (async () => {
+    for await (const chunk of execution.read()) {
+      output = (output + chunk).slice(-MAX_CAPTURE_CHARS)
+      onOutput?.(output)
+    }
+  })().catch((error) => logger.warn(`Chat command output: ${error}`))
 
   let settle: (ended: Ended) => void = () => undefined
   const ended = new Promise<Ended>((resolve) => {
@@ -546,7 +533,6 @@ const execute = (
   // These two listeners outlive the wait: a command left running frees
   // its terminal only when it really ends.
   const release = () => {
-    starting.dispose()
     finished.dispose()
     closed.dispose()
     busy.delete(terminal)
@@ -562,19 +548,7 @@ const execute = (
     release()
     settle({ exitCode: gone.exitStatus?.code })
   })
-  busy.add(terminal)
-  try {
-    execution = run()
-    startReading(execution)
-  } catch (error) {
-    release()
-    throw error
-  }
-  const timer = setTimeout(() => {
-    starting.dispose()
-    logger.warn(`Chat command tracking timed out: startEvent=${startEventReceived}, readerAttached=${started}, captured=${output.length}`)
-    settle("timeout")
-  }, timeoutMs)
+  const timer = setTimeout(() => settle("timeout"), timeoutMs)
   const stop = () => {
     // The user stopped the reply: the command is interrupted as Ctrl+C would.
     terminal.sendText("\x03", false)
@@ -586,7 +560,7 @@ const execute = (
     clearTimeout(timer)
     signal?.removeEventListener("abort", stop)
   })
-  return { ended, output: () => output, get reading() { return reading } }
+  return { ended, output: () => output, reading }
 }
 
 /** Presence of the API is not proof that the shell emits usable execution events. */
