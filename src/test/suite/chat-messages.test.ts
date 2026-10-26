@@ -31,7 +31,7 @@ suite("Chat messages", () => {
     assert.strictEqual(supportsStreaming(provider), true)
   })
 
-  test("the blocking request leaves the system prompt out", () => {
+  test("local OpenAI-compatible providers keep the system prompt while unrelated providers do not", () => {
     const messages: ChatCompletionMessage[] = [
       { role: "system", content: "s" },
       { role: "user", content: "u" }
@@ -40,6 +40,15 @@ suite("Chat messages", () => {
     const streaming = buildStreamingRequest(provider, messages)
     assert.strictEqual(streaming.messages.length, 2)
     assert.strictEqual(streaming.stream, true)
+
+    const llama = {
+      ...provider,
+      provider: API_PROVIDERS.LlamaCpp,
+      modelName: "gpt-oss-20b"
+    }
+    const userOnly = [{ role: "user", content: "only" }] as ChatCompletionMessage[]
+    assert.strictEqual(buildBlockingRequest(llama, userOnly).messages[0].role, "system")
+    assert.strictEqual(buildBlockingRequest(provider, userOnly).messages[0].role, "user")
   })
 
   test("text-only parts go to the provider as a plain string; images keep their parts", () => {

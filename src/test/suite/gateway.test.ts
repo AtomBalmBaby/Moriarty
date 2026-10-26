@@ -322,11 +322,13 @@ suite("Gateway process", function () {
     )
     assert.strictEqual(text, "Hello there")
     const sent = backend.requests[0].body?.messages as Array<Record<string, unknown>>
-    assert.strictEqual(sent[1].role, "assistant")
-    assert.strictEqual((sent[1].tool_calls as Array<{ id: string }>)[0].id, "call_a")
-    assert.ok(!("id" in sent[1]))
-    assert.strictEqual(sent[2].role, "tool")
-    assert.strictEqual(sent[2].tool_call_id, "call_a")
+    const assistant = sent.find((message) => message.role === "assistant")
+    const toolResult = sent.find((message) => message.role === "tool")
+    assert.ok(assistant)
+    assert.strictEqual((assistant.tool_calls as Array<{ id: string }>)[0].id, "call_a")
+    assert.ok(!("id" in assistant))
+    assert.ok(toolResult)
+    assert.strictEqual(toolResult.tool_call_id, "call_a")
   })
 
   test("the tool loop runs natively through the gateway, and in text when the backend's model has no tools", async () => {

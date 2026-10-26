@@ -575,6 +575,7 @@ const execute = (
 
 /** Presence of the API is not proof that the shell emits usable execution events. */
 const verifiedIntegration = new WeakSet<Terminal>()
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const verifyIntegration = async (terminal: Terminal, integration: TerminalShellIntegration, signal?: AbortSignal) => {
   if (verifiedIntegration.has(terminal)) return true
   if (signal?.aborted) return false
