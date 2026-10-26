@@ -312,6 +312,17 @@ export interface NewDocumentRequest {
   language?: string
 }
 
+export interface IntentCompilerResult {
+  objective: string
+  prompt: string
+  constraints?: string[]
+  exclusions?: string[]
+  strategy?: string
+  verification?: string[]
+  assumptions?: string[]
+  originalPrompt?: string
+}
+
 /* -------------------------------------------------------------------------- */
 /*  webview  ->  extension                                                    */
 /* -------------------------------------------------------------------------- */
@@ -320,6 +331,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>
   [EVENT_NAME.twinnyChatMessage]: Channel<ChatRequest>
+  [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string }, IntentCompilerResult | undefined>
   [EVENT_NAME.twinnyClickSuggestion]: Channel<string>
   /**
    * The rest of the message being typed, as the chat model guesses it from
@@ -467,6 +479,7 @@ export interface ClientEvents {
 
 export interface ServerEvents {
   [EVENT_NAME.twinnyAddMessage]: ChatCompletionMessage | undefined
+  [EVENT_NAME.twinnyConfigValueChanged]: ConfigValue
   [EVENT_NAME.twinnyGetConfigValue]: ConfigValue
   [EVENT_NAME.twinnyGetModels]: ModelCatalogue
   [EVENT_NAME.twinnyGetWorkspaceContext]: ContextValue

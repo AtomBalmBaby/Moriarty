@@ -37,7 +37,7 @@ import { EmptyChat } from "./empty-chat"
 import { GhostText } from "./ghost-text"
 import { createCustomImageExtension } from "./image-extension"
 import MessageItem from "./message-item"
-import { emit, useServerEvent } from "./messaging"
+import { bridge, emit, useServerEvent } from "./messaging"
 import { Shortcuts } from "./shortcuts"
 import { Suggestions } from "./suggestions"
 import { answerToolStep } from "./tool-steps"
@@ -72,6 +72,8 @@ interface QueuedMessage {
   html: string
   /** As sent: paragraphs joined with line breaks. */
   input: string
+  /** The original user wording, kept when a refined execution prompt is later used. */
+  originalPrompt?: string
   text: string
   mentions: MentionType[]
   images: ImageAttachment[]
@@ -80,6 +82,19 @@ interface QueuedMessage {
    * its next step; sent as a turn of its own if the reply ends first.
    */
   steer?: boolean
+}
+
+interface IntentCompilerReview {
+  objective: string
+  prompt: string
+  constraints: string[]
+  exclusions: string[]
+  strategy?: string
+  verification: string[]
+  assumptions: string[]
+  originalPrompt: string
+  waiting?: boolean
+  error?: string
 }
 
 /** A message's text with its line breaks, as the agent is handed it mid-reply. */
@@ -131,12 +146,54 @@ export const Chat = (props: ChatProps): JSX.Element => {
   agentModeRef.current = agentMode
   const { autoRun, autoRunAvailable, toggleAutoRun, setAutoRun } = useAutoRun(teamAgentRules)
   const [agentSettingsOpen, setAgentSettingsOpen] = useState(false)
+  const [intentCompilerEnabled, setIntentCompilerEnabled] = useState(false)
+  const [intentCompilerMode, setIntentCompilerMode] = useState("ask")
+  const syncIntentCompilerSettings = useCallback(async () => {
+    try {
+      const enabled = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
+        key: "chatToolsIntentCompilerEnabled"
+      })
+      const mode = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
+        key: "chatToolsIntentCompilerMode"
+      })
+      if (typeof enabled?.value === "boolean") setIntentCompilerEnabled(enabled.value)
+      if (typeof mode?.value === "string") setIntentCompilerMode(mode.value)
+    } catch {
+      // Keep the current UI state when the config cannot be read.
+    }
+  }, [])
+  useServerEvent(EVENT_NAME.twinnyConfigValueChanged, ({ key, value }) => {
+    if (key === "chatToolsIntentCompilerEnabled" && typeof value === "boolean") {
+      setIntentCompilerEnabled(value)
+    }
+    if (key === "chatToolsIntentCompilerMode" && typeof value === "string") {
+      setIntentCompilerMode(value)
+    }
+  })
+  const [intentCompilerReview, setIntentCompilerReview] = useState<{
+    originalPrompt: string
+    draft: string
+    review: IntentCompilerReview
+    message: QueuedMessage
+    rememberChoice: boolean
+    waiting?: boolean
+    error?: string
+  } | null>(null)
   const closeAgentSettings = useCallback(() => setAgentSettingsOpen(false), [])
+
+  useEffect(() => {
+    void syncIntentCompilerSettings()
+  }, [syncIntentCompilerSettings])
 
   const { conversation, saveLastConversation, setActiveConversation } =
     useConversationHistory()
 
+  useEffect(() => {
+    setIntentCompilerReview(null)
+  }, [conversation?.id])
+
   const chatRef = useRef<HTMLTextAreaElement>(null)
+  const intentReviewTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const editorWrapRef = useRef<HTMLDivElement>(null)
   const resizeRef = useRef<{ startY: number; startHeight: number } | null>(null)
   // Sent prompts, oldest first, recalled with the arrow keys. `recallIndex`
@@ -546,6 +603,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         {
           role: USER,
           content: message.input,
+          prompt: message.originalPrompt ?? message.input,
           images: message.images.length > 0 ? message.images : undefined
         }
       ]
@@ -573,7 +631,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   sendRef.current = sendMessage
 
   /** Sends the composer's message, or queues it while a reply is running. */
-  const handleSubmitForm = useCallback(() => {
+  const handleSubmitForm = useCallback(async () => {
     const html = editorRef.current?.getHTML() || ""
     const input = html
       .replace(/<p>/g, "")
@@ -608,8 +666,92 @@ export const Chat = (props: ChatProps): JSX.Element => {
       if (steer) emit(EVENT_NAME.twinnySteer, { id: message.id, text: steeringText(input) })
       return
     }
+
+    const currentIntentCompilerEnabled =
+      intentCompilerEnabled ||
+      (await bridge
+        .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerEnabled" })
+        .then((answer) => typeof answer?.value === "boolean" ? answer.value : false)
+        .catch(() => false))
+    const currentIntentCompilerMode =
+      intentCompilerMode ||
+      (await bridge
+        .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMode" })
+        .then((answer) => (typeof answer?.value === "string" ? answer.value : "ask"))
+        .catch(() => "ask"))
+
+    if (agentMode && currentIntentCompilerEnabled && currentIntentCompilerMode !== "always-original") {
+      setIntentCompilerReview({
+        originalPrompt: message.text,
+        draft: message.text,
+        review: {
+          objective: "Refining your request…",
+          prompt: message.text,
+          constraints: [],
+          exclusions: [],
+          verification: ["Waiting for the compiler to return a refined prompt."],
+          assumptions: ["Twinny is checking whether a clearer execution prompt is needed."],
+          originalPrompt: message.text
+        },
+        message: { ...message, originalPrompt: message.text },
+        rememberChoice: false,
+        waiting: true
+      })
+
+      const review = await bridge
+        .request(EVENT_NAME.twinnyCompileIntent, { prompt: message.text })
+        .catch(() => undefined)
+
+      if (review && review.prompt && review.prompt.trim() !== message.text.trim()) {
+        if (currentIntentCompilerMode === "always-refined") {
+          setIntentCompilerReview(null)
+          sendRef.current({
+            ...message,
+            originalPrompt: message.text,
+            input: review.prompt,
+            text: review.prompt,
+            html: review.prompt
+          })
+          return
+        }
+        setIntentCompilerReview({
+          originalPrompt: message.text,
+          draft: review.prompt,
+          review: {
+            ...review,
+            originalPrompt: review.originalPrompt ?? message.text,
+            constraints: review.constraints ?? [],
+            exclusions: review.exclusions ?? [],
+            verification: review.verification ?? [],
+            assumptions: review.assumptions ?? []
+          },
+          message: { ...message, originalPrompt: message.text },
+          rememberChoice: false
+        })
+        return
+      }
+
+      setIntentCompilerReview({
+        originalPrompt: message.text,
+        draft: message.text,
+        review: {
+          objective: review && review.prompt ? "The compiler kept the original request." : "The compiler did not return a usable refinement.",
+          prompt: message.text,
+          constraints: [],
+          exclusions: [],
+          verification: ["Run the original request, or edit the draft before executing."],
+          assumptions: [review ? "The model returned no material change to the request." : "The compiler timed out or failed to return valid JSON."],
+          originalPrompt: message.text
+        },
+        message: { ...message, originalPrompt: message.text },
+        rememberChoice: false,
+        error: review ? "The compiler kept the original wording, so Twinny is offering the original request instead." : "The compiler timed out or returned an invalid result. You can run the original request or edit the prompt before sending."
+      })
+      return
+    }
+
     sendRef.current(message)
-  }, [chatDisabled])
+  }, [agentMode, chatDisabled, intentCompilerEnabled, intentCompilerMode])
 
   /*
    * A stopped reply is picked up by asking for the rest. The transcript
@@ -1109,6 +1251,94 @@ export const Chat = (props: ChatProps): JSX.Element => {
           </div>
         )}
         <div className={styles.transcript}>
+          {!!intentCompilerReview && (
+            <div className={styles.intentReviewPanel}>
+              <div className={styles.intentReviewHead}>
+                {intentCompilerReview.waiting
+                  ? "Refining your request…"
+                  : "I refined your request. Does this capture your intent?"}
+              </div>
+              {!!intentCompilerReview.error && (
+                <div className={styles.intentReviewSummary}>
+                  <span className={styles.intentLabel}>Status</span>
+                  <div>{intentCompilerReview.error}</div>
+                </div>
+              )}
+              <div className={styles.intentReviewSummary}>
+                <span className={styles.intentLabel}>Objective</span>
+                <div>{intentCompilerReview.review.objective || "Refining the task."}</div>
+              </div>
+              <div className={styles.intentReviewSection}>
+                <span className={styles.intentLabel}>Proposed execution prompt</span>
+                <textarea
+                  ref={intentReviewTextareaRef}
+                  value={intentCompilerReview.draft}
+                  onChange={(event) =>
+                    setIntentCompilerReview((current) =>
+                      current ? { ...current, draft: event.target.value } : current
+                    )
+                  }
+                  className={styles.intentReviewTextarea}
+                  disabled={intentCompilerReview.waiting}
+                />
+              </div>
+              {!!intentCompilerReview.review.constraints?.length && (
+                <div className={styles.intentReviewSection}>
+                  <span className={styles.intentLabel}>Constraints</span>
+                  <ul>{intentCompilerReview.review.constraints.map((item) => <li key={item}>{item}</li>)}</ul>
+                </div>
+              )}
+              {!!intentCompilerReview.review.exclusions?.length && (
+                <div className={styles.intentReviewSection}>
+                  <span className={styles.intentLabel}>Exclusions</span>
+                  <ul>{intentCompilerReview.review.exclusions.map((item) => <li key={item}>{item}</li>)}</ul>
+                </div>
+              )}
+              {!!intentCompilerReview.review.verification?.length && (
+                <div className={styles.intentReviewSection}>
+                  <span className={styles.intentLabel}>Acceptance criteria</span>
+                  <ul>{intentCompilerReview.review.verification.map((item) => <li key={item}>{item}</li>)}</ul>
+                </div>
+              )}
+              {!!intentCompilerReview.review.assumptions?.length && (
+                <div className={styles.intentReviewSection}>
+                  <span className={styles.intentLabel}>Assumptions</span>
+                  <ul>{intentCompilerReview.review.assumptions.map((item) => <li key={item}>{item}</li>)}</ul>
+                </div>
+              )}
+              <div className={styles.intentReviewActions}>
+                <VSCodeButton disabled={intentCompilerReview.waiting} onClick={() => {
+                    const next = { ...intentCompilerReview.message, input: intentCompilerReview.draft, text: intentCompilerReview.draft, html: intentCompilerReview.draft, originalPrompt: intentCompilerReview.originalPrompt }
+                    setIntentCompilerReview(null)
+                    if (intentCompilerReview.rememberChoice) {
+                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerEnabled", value: true })
+                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerMode", value: "always-refined" })
+                    }
+                    sendRef.current(next)
+                }}>{intentCompilerReview.waiting ? "Waiting…" : "Run Refined"}</VSCodeButton>
+                <VSCodeButton appearance="secondary" onClick={() => {
+                    const next = { ...intentCompilerReview.message, input: intentCompilerReview.originalPrompt, text: intentCompilerReview.originalPrompt, html: intentCompilerReview.originalPrompt, originalPrompt: intentCompilerReview.originalPrompt }
+                    setIntentCompilerReview(null)
+                    if (intentCompilerReview.rememberChoice) {
+                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerEnabled", value: true })
+                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerMode", value: "always-original" })
+                    }
+                    sendRef.current(next)
+                }}>Run Original</VSCodeButton>
+                <VSCodeButton appearance="secondary" disabled={intentCompilerReview.waiting} onClick={() => intentReviewTextareaRef.current?.focus()}>
+                  Edit Refined
+                </VSCodeButton>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={intentCompilerReview.rememberChoice}
+                    onChange={(event) => setIntentCompilerReview((current) => current ? { ...current, rememberChoice: event.target.checked } : current)}
+                  />
+                  Always choose this option
+                </label>
+              </div>
+            </div>
+          )}
           {messages.length === 0 ? (
             <EmptyChat />
           ) : (

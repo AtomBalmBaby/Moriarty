@@ -6,7 +6,7 @@ import { AGENT_STEP_PRESETS, DEFAULT_AGENT_STEPS, EVENT_NAME, GLOBAL_STORAGE_KEY
 import type { TeamAgentPolicy } from "../common/team"
 
 import { StorageType, useStorageContext } from "./hooks/useStorageContext"
-import { bridge, emit } from "./messaging"
+import { bridge, emit, useServerEvent } from "./messaging"
 
 import styles from "./styles/agent-settings.module.css"
 
@@ -146,6 +146,8 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
   const [maxSteps, setMaxSteps] = useSetting<number>("chatToolsMaxSteps", DEFAULT_AGENT_STEPS)
   const [maxReadLines, setMaxReadLines] = useSetting<number>("chatToolsMaxReadLines", 1000)
   const [maxResultChars, setMaxResultChars] = useSetting<number>("chatToolsMaxResultChars", 100000)
+  const [intentCompilerEnabled, setIntentCompilerEnabled] = useSetting<boolean>("chatToolsIntentCompilerEnabled", false)
+  const [intentCompilerMode, setIntentCompilerMode] = useSetting<string>("chatToolsIntentCompilerMode", "ask")
   const { context: always, setContext: setAlways } = useStorageContext<string[]>(
     StorageType.Global,
     GLOBAL_STORAGE_KEY.alwaysRunCommands
@@ -158,6 +160,15 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
   const servers = Object.keys(mcpServers ?? {}).length
 
   // Escape or a click elsewhere puts it away.
+  useServerEvent(EVENT_NAME.twinnyConfigValueChanged, ({ key, value }) => {
+    if (key === "chatToolsIntentCompilerEnabled" && typeof value === "boolean") {
+      setIntentCompilerEnabled(value)
+    }
+    if (key === "chatToolsIntentCompilerMode" && typeof value === "string") {
+      setIntentCompilerMode(value)
+    }
+  })
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return
@@ -199,6 +210,28 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
         <button type="button" className={styles.close} onClick={onClose} aria-label={t("agent-settings-close")}>
           <span className="codicon codicon-close" aria-hidden="true" />
         </button>
+      </div>
+      <Choices
+        label="Intent compiler"
+        value={intentCompilerEnabled ? intentCompilerMode : "always-original"}
+        onChange={(value) => {
+          if (value === "always-original") {
+            setIntentCompilerEnabled(false)
+            setIntentCompilerMode("always-original")
+            return
+          }
+          setIntentCompilerEnabled(true)
+          setIntentCompilerMode(value)
+        }}
+        choices={[
+          { value: "always-original", label: "Always original", title: "Run the original request and skip the compiler." },
+          { value: "ask", label: "Ask each time", title: "Refine, then review and choose before execution." },
+          { value: "always-refined", label: "Always use refined", title: "Automatically execute the refined prompt when the proposal stays in scope." }
+        ]}
+      />
+      <div className={styles.row}>
+        <span className={styles.label}>Refine prompts before agent execution.</span>
+        <span className={styles.label}>Adds one side-effect-free inference call; individual requests can still choose Run Original.</span>
       </div>
       <Choices
         label={t("agent-settings-edits")}

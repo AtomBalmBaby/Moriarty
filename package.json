@@ -649,6 +649,28 @@
           "markdownDescription": "**Experimental.** Lets the chat model work in the workspace: find, read and search files (by regular expression, and by meaning through the embeddings index), read git history, ask the language servers for errors, references and definitions, edit, create, rename, move and delete files, and run commands. Edits are applied straight away unless `#twinny.chatToolsEdits#` asks for review; each applied edit comes back with any errors the editor then reports in the file, and the reply ends with the files it changed, each of which can be compared with what it was or undone. Commands ask first unless `#twinny.chatToolsCommands#` says otherwise. The project's `AGENTS.md` (or `CLAUDE.md`) is followed, and a folder's own `AGENTS.md` once the model works there. Files ignored by a `.gitignore` are off limits, and changes to `.vscode/`, a `.gitignore` or an `AGENTS.md` are always shown for review. Each step shows in the reply at the point it ran. Needs a capable coder model such as `qwen3-coder:30b` with a context of 8k tokens or more; small models tend to call tools badly. Set in your user settings; a workspace cannot turn it on.",
           "scope": "machine"
         },
+        "twinny.chatToolsIntentCompilerEnabled": {
+          "order": 20,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Before agent-mode execution, optionally refine the user's request into a clearer execution prompt. The original request remains authoritative and is kept for review or comparison. This adds one side-effect-free inference request per eligible agent turn."
+        },
+        "twinny.chatToolsIntentCompilerMode": {
+          "order": 20,
+          "type": "string",
+          "enum": [
+            "ask",
+            "always-refined",
+            "always-original"
+          ],
+          "enumDescriptions": [
+            "Ask for approval before executing the refined prompt.",
+            "Refine automatically when the proposal remains within scope.",
+            "Run the original request with no refinement inference."
+          ],
+          "default": "ask",
+          "markdownDescription": "How Twinny handles the intent compiler. `ask` shows a review panel; `always-refined` executes the refined prompt automatically; `always-original` disables the compiler for this request."
+        },
         "twinny.chatToolsEdits": {
           "order": 20,
           "type": "string",

@@ -88,6 +88,47 @@ const clampNumericSetting = (value: number | undefined, min: number, max: number
   return Math.min(max, Math.max(min, Math.round(value)))
 }
 
+const ensureStringList = (value: unknown): string[] => {
+  if (Array.isArray(value)) return value.map((entry) => String(entry).trim()).filter(Boolean)
+  if (typeof value === "string" && value.trim()) return [value.trim()]
+  return []
+}
+
+export const parseIntentCompilerResponse = (output: string | undefined) => {
+  if (!output?.trim()) return undefined
+  const text = stripThinking(output).trim()
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const candidate = match ? match[1] : text
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(candidate)
+  } catch {
+    const start = candidate.indexOf("{")
+    const end = candidate.lastIndexOf("}")
+    if (start === -1 || end === -1 || end <= start) return undefined
+    try {
+      parsed = JSON.parse(candidate.slice(start, end + 1))
+    } catch {
+      return undefined
+    }
+  }
+  if (!parsed || typeof parsed !== "object") return undefined
+  const details = parsed as Record<string, unknown>
+  const objective = String(details.objective ?? details.summary ?? "").trim()
+  const prompt = String(details.prompt ?? details.executionPrompt ?? "").trim()
+  if (!objective || !prompt) return undefined
+  return {
+    objective,
+    prompt,
+    constraints: ensureStringList(details.constraints),
+    exclusions: ensureStringList(details.exclusions),
+    strategy: String(details.strategy ?? "").trim() || undefined,
+    verification: ensureStringList(details.verification),
+    assumptions: ensureStringList(details.assumptions),
+    originalPrompt: String(details.originalPrompt ?? "").trim() || undefined
+  }
+}
+
 /**
  * The chat feature's front door.
  *
@@ -277,6 +318,48 @@ export class Chat extends Base {
     this._conversation = []
   }
 
+  /**
+   * Refine a prompt before the agent executes it, without changing the
+   * user's original intent.
+   */
+  public async compileIntent(prompt: string) {
+    const provider = this.getProvider()
+    if (!provider) return undefined
+    const settings = workspace.getConfiguration("twinny")
+    if (!settings.get<boolean>("chatToolsIntentCompilerEnabled", false)) return undefined
+    const mode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
+    if (mode === "always-original") return undefined
+    const trimmed = prompt.trim()
+    if (!trimmed) return undefined
+    const systemPrompt =
+      "You refine a user request for a coding agent without changing intent. Return only JSON in this shape: {\"objective\": string, \"prompt\": string, \"constraints\": string[], \"exclusions\": string[], \"strategy\": string, \"verification\": string[], \"assumptions\": string[]}. Keep it concise, grounded in the original request, and do not invent facts or permissions."
+    try {
+      const content = await readText(
+        resolveInferenceProvider(provider).chat(
+          {
+            model: provider.modelName,
+            messages: [
+              { role: SYSTEM, content: systemPrompt },
+              { role: USER, content: trimmed }
+            ]
+          },
+          { signal: undefined }
+        )
+      )
+      const result = parseIntentCompilerResponse(content)
+      if (!result) return undefined
+      return {
+        ...result,
+        originalPrompt: trimmed
+      }
+    } catch (error) {
+      if (!isCancelled(error)) {
+        logger.warn(`Chat compiler · ${describeProviderError(error, provider)}`)
+      }
+      return undefined
+    }
+  }
+
   /** A message typed in the chat, with whatever the user attached. */
   public async completion(
     messages: ChatCompletionMessage[],
@@ -307,6 +390,20 @@ export class Chat extends Base {
       })
     } finally {
       this._preparing = false
+    }
+    const mode = workspace.getConfiguration("twinny").get<string>("chatToolsIntentCompilerMode", "ask")
+    if (mode === "always-refined") {
+      const latest = this._conversation.at(-1)
+      const prompt = typeof latest?.content === "string" ? latest.content.trim() : ""
+      if (prompt) {
+        const refined = await this.compileIntent(prompt)
+        if (refined) {
+          if (latest?.role === USER) {
+            latest.prompt = prompt
+            latest.content = refined.prompt
+          }
+        }
+      }
     }
     return this.run(provider, "", view)
   }

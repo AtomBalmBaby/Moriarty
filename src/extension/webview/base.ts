@@ -190,6 +190,8 @@ export class BaseProvider {
         void vscode.commands.executeCommand(TWINNY_COMMAND_NAME.applyCode, code),
       [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions }) =>
         void this.chat?.completion(messages, mentions),
+      [EVENT_NAME.twinnyCompileIntent]: async ({ prompt }) =>
+        (await this.chat?.compileIntent(prompt)) ?? undefined,
       [EVENT_NAME.twinnyClickSuggestion]: (template) =>
         void vscode.commands.executeCommand(
           TWINNY_COMMAND_NAME.templateCompletion,
@@ -240,10 +242,12 @@ export class BaseProvider {
       [EVENT_NAME.twinnyInsertAtCursor]: (code) => this.insertAtCursor(code),
       [EVENT_NAME.twinnySendLanguage]: () => getLanguage(),
       [EVENT_NAME.twinnySendTheme]: () => getTheme(),
-      [EVENT_NAME.twinnySetConfigValue]: ({ key, value }) =>
-        void vscode.workspace
+      [EVENT_NAME.twinnySetConfigValue]: async ({ key, value }) => {
+        await vscode.workspace
           .getConfiguration("twinny")
-          .update(key, value, vscode.ConfigurationTarget.Global),
+          .update(key, value, vscode.ConfigurationTarget.Global)
+        this.bridge?.emit(EVENT_NAME.twinnyConfigValueChanged, { key, value })
+      },
       [EVENT_NAME.twinnySidebarReady]: () => this._sidebarReadyHandler?.(),
       [EVENT_NAME.twinnyStopGeneration]: () => this.destroyStream(),
       [EVENT_NAME.twinnyToolApproval]: ({ id, run, always }) => this.chat?.answerToolApproval(id, run, always),
