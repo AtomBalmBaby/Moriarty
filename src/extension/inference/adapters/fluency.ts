@@ -99,6 +99,15 @@ const maybeWithSystemMessage = (provider: TwinnyProvider, messages: ChatMessage[
   return [{ role: "system", content: DEFAULT_SYSTEM_MESSAGE } as ChatMessage, ...messages]
 }
 
+const ensureContentForCompatibility = (messages: ChatMessage[]): ChatMessage[] =>
+  messages.map((message) => {
+    const copy = { ...message } as ChatMessage
+    if (copy.content === null || copy.content === undefined) {
+      copy.content = ""
+    }
+    return copy
+  })
+
 const withReasoningHistory = (provider: TwinnyProvider, messages: ChatMessage[]): ChatMessage[] =>
   messages.map((message): ChatMessage => {
     if (message.role !== "assistant") return message
@@ -233,13 +242,18 @@ export const buildStreamingRequest = (
   messages: ChatMessage[],
   parameters: ChatParameters = {}
 ): CompletionStreaming<LLMProvider> => {
-  const flat = parsableToolArguments(flattenTextContent(messages))
-  const prepared = withReasoningHistory(provider, maybeWithSystemMessage(provider, flat))
+  const flat = ensureContentForCompatibility(
+    parsableToolArguments(flattenTextContent(messages))
+  )
+  const prepared = withReasoningHistory(
+    provider,
+    maybeWithSystemMessage(provider, flat)
+  )
   return {
     messages:
       provider.provider === API_PROVIDERS.Anthropic && usesTools(messages, parameters)
         ? withCacheBreakpoints(prepared)
-        : prepared,
+        : ensureContentForCompatibility(prepared),
     model: provider.modelName,
     stream: true,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -254,8 +268,18 @@ export const buildBlockingRequest = (
   messages: ChatMessage[],
   parameters: ChatParameters = {}
 ): CompletionNonStreaming<LLMProvider> => {
-  const prepared = withReasoningHistory(provider, maybeWithSystemMessage(provider, parsableToolArguments(flattenTextContent(messages))))
-  const filtered = requiresCompatibilitySystemMessage(provider) ? prepared : prepared.filter((message) => message.role !== "system")
+  const prepared = withReasoningHistory(
+    provider,
+    maybeWithSystemMessage(
+      provider,
+      ensureContentForCompatibility(
+        parsableToolArguments(flattenTextContent(messages))
+      )
+    )
+  )
+  const filtered = requiresCompatibilitySystemMessage(provider)
+    ? ensureContentForCompatibility(prepared)
+    : ensureContentForCompatibility(prepared).filter((message) => message.role !== "system")
   return {
     messages: filtered,
     model: provider.modelName,

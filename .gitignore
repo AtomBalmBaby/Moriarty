@@ -11,3 +11,4 @@ packages/twinny-server/*.tgz
 # local Claude Code settings and worktrees
 .claude/
 twinny.gateway.json
+src/test/twinny-providers.json

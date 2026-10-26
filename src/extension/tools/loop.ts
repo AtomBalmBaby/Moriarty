@@ -855,9 +855,9 @@ class ToolLoop {
     if (this._mode === "native") {
       const assistant: ChatMessage = {
         role: ASSISTANT,
-        // A reply that is only calls has no text: null, not "", since
-        // Anthropic refuses an empty text block.
-        content: text.trim() ? text : null,
+        // Some OpenAI-compatible servers reject `null` for assistant content
+        // when tool calls are present; use an empty string instead.
+        content: text.trim() ? text : "",
         tool_calls: calls.map(({ raw }) => ({
           id: raw!.id,
           type: "function" as const,

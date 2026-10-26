@@ -75,7 +75,7 @@ const mcpAllowed = (team: TeamAgentPolicy | undefined) => team?.commands !== "of
 const POLICY_REFRESH_WAIT_MS = 1500
 /** The steps an agent reply may take, as `twinny.chatToolsMaxSteps` may set them. */
 const MIN_STEPS_SETTING = 4
-const MAX_STEPS_SETTING = 40
+const MAX_STEPS_SETTING = 100
 const DEFAULT_READ_LINES = 1000
 const MIN_READ_LINES = 100
 const MAX_READ_LINES = 5000

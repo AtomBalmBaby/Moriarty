@@ -11,7 +11,7 @@
       "request": "launch",
       "runtimeExecutable": "${execPath}",
       "env": {
-        "TWINNY_DEV_PROVIDERS_FILE": "${workspaceFolder}/.vscode/twinny-debug-providers.json",
+        "TWINNY_DEV_PROVIDERS_FILE": "${workspaceFolder}/src/test/twinny-providers.json",
         "TWINNY_DEV_PROVIDERS_OVERRIDE": "1"
       },
       "args": [

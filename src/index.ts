@@ -45,11 +45,14 @@ import { GenerationTracker } from "./extension/generations"
 import { setChatGPTPlanAccessFactory } from "./extension/inference/adapters/chatgpt-plan"
 import { P2pRuntime } from "./extension/p2p/runtime"
 import { RemoteCredentials } from "./extension/providers/credentials"
+import {
+  applyDevelopmentProviders,
+  isDevelopmentHost
+} from "./extension/providers/dev-bootstrap"
 import { providerUrl } from "./extension/providers/errors"
 import { TwinnyProvider } from "./extension/providers/manager"
 import { TeamPolicyStore } from "./extension/providers/policy"
 import { setUpProvidersOnFirstRun } from "./extension/providers/setup"
-import { applyDevelopmentProviders } from "./extension/providers/dev-bootstrap"
 import { ProviderStore } from "./extension/providers/store"
 import { teamSession } from "./extension/providers/team"
 import { generateCommitMessage } from "./extension/review/commit-message"
@@ -171,6 +174,19 @@ export async function activate(context: ExtensionContext) {
   const store = new ProviderStore(context)
   try {
     await applyDevelopmentProviders(context, store)
+    if (isDevelopmentHost(context)) {
+      const activeChat = store.getActive("chat")
+      if (!activeChat) {
+        const message =
+          "Twinny development bootstrap did not select a chat provider. Check TWINNY_DEV_PROVIDERS_FILE and the provider JSON."
+        logger.error(message)
+        window.showErrorMessage(message)
+        throw new Error(message)
+      }
+      logger.info(
+        `Development bootstrap selected chat provider ${activeChat.label} (${activeChat.provider}) at ${activeChat.apiHostname}:${activeChat.apiPort ?? "?"}${activeChat.apiPath ?? ""}`
+      )
+    }
   } catch (error) {
     logger.error(
       `Twinny development provider bootstrap failed: ${messageOf(error)}`

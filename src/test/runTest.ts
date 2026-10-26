@@ -21,7 +21,8 @@ async function main() {
       ...process.env,
       TWINNY_DEV_PROVIDERS_FILE: path.resolve(
         extensionDevelopmentPath,
-        ".vscode-test",
+        "src",
+        "test",
         "twinny-providers.json"
       ),
       TWINNY_DEV_PROVIDERS_OVERRIDE: "1"
