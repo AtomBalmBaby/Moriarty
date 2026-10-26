@@ -723,7 +723,7 @@
           "type": "number",
           "default": 30,
           "minimum": 4,
-          "maximum": 40,
+          "maximum": 100,
           "markdownDescription": "How many tool steps one agent reply may take before the model is asked to answer with what it has (with `#twinny.chatTools#` on). More lets a capable model finish longer tasks in one reply; each step is another request to the model.",
           "scope": "machine"
         },
