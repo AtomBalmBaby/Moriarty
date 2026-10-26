@@ -21,6 +21,7 @@ const failed = (error: unknown): ProviderTestResult => ({
 export const useProviders = () => {
   const [providers, setProviders] = useState<Record<string, TwinnyProvider>>({})
   const [chatProvider, setChatProvider] = useState<TwinnyProvider | null>(null)
+  const [intentProvider, setIntentProvider] = useState<TwinnyProvider | null>(null)
   const [fimProvider, setFimProvider] = useState<TwinnyProvider | null>(null)
   const [embeddingProvider, setEmbeddingProvider] =
     useState<TwinnyProvider | null>(null)
@@ -34,6 +35,9 @@ export const useProviders = () => {
   useServerEvent(PROVIDER_EVENT_NAME.getActiveChatProvider, (provider) =>
     setChatProvider(provider || null)
   )
+  useServerEvent(PROVIDER_EVENT_NAME.getActiveIntentProvider, (provider) =>
+    setIntentProvider(provider || null)
+  )
   useServerEvent(PROVIDER_EVENT_NAME.getActiveFimProvider, (provider) =>
     setFimProvider(provider || null)
   )
@@ -44,6 +48,7 @@ export const useProviders = () => {
   useEffect(() => {
     emit(PROVIDER_EVENT_NAME.getAllProviders)
     emit(PROVIDER_EVENT_NAME.getActiveChatProvider)
+    emit(PROVIDER_EVENT_NAME.getActiveIntentProvider)
     emit(PROVIDER_EVENT_NAME.getActiveFimProvider)
     emit(PROVIDER_EVENT_NAME.getActiveEmbeddingsProvider)
   }, [])
@@ -56,6 +61,7 @@ export const useProviders = () => {
 
   const activeProviders: Record<ProviderType, TwinnyProvider | null> = {
     chat: chatProvider,
+    intent: intentProvider,
     fim: fimProvider,
     embedding: embeddingProvider
   }
@@ -64,6 +70,7 @@ export const useProviders = () => {
     (type: ProviderType, provider: TwinnyProvider) => {
       const channel = {
         chat: PROVIDER_EVENT_NAME.setActiveChatProvider,
+        intent: PROVIDER_EVENT_NAME.setActiveIntentProvider,
         fim: PROVIDER_EVENT_NAME.setActiveFimProvider,
         embedding: PROVIDER_EVENT_NAME.setActiveEmbeddingsProvider
       }[type]
@@ -75,6 +82,7 @@ export const useProviders = () => {
   return {
     activeProviders,
     chatProvider,
+    intentProvider,
     ready,
     embeddingProvider,
     fimProvider,
@@ -115,6 +123,8 @@ export const useProviders = () => {
         .catch(() => []),
     setActiveChatProvider: (p: TwinnyProvider) =>
       emit(PROVIDER_EVENT_NAME.setActiveChatProvider, p),
+    setActiveIntentProvider: (p: TwinnyProvider) =>
+      emit(PROVIDER_EVENT_NAME.setActiveIntentProvider, p),
     setActiveEmbeddingsProvider: (p: TwinnyProvider) =>
       emit(PROVIDER_EVENT_NAME.setActiveEmbeddingsProvider, p),
     setActiveFimProvider: (p: TwinnyProvider) =>

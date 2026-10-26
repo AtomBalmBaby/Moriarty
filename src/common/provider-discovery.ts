@@ -130,5 +130,5 @@ export const providersForServer = (
 
 const labelFor = (server: DiscoveredServer, type: ProviderType) => {
   const name = PROVIDER_DISPLAY_NAMES[server.provider] || server.provider
-  return type === "chat" ? name : `${name} ${type.toUpperCase()}`
+  return type === "chat" || type === "intent" ? name : `${name} ${type.toUpperCase()}`
 }

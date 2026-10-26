@@ -21,6 +21,7 @@ const STATE_ICONS: Record<P2pDeviceStatus["state"], string> = {
 
 const JOB_ICONS: Record<ProviderType, string> = {
   chat: "comment-discussion",
+  intent: "sparkle",
   fim: "file-code",
   embedding: "database"
 }

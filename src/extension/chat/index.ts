@@ -323,7 +323,7 @@ export class Chat extends Base {
    * user's original intent.
    */
   public async compileIntent(prompt: string) {
-    const provider = this.getProvider()
+    const provider = this.getIntentProvider() ?? this.getProvider()
     if (!provider) return undefined
     const settings = workspace.getConfiguration("twinny")
     if (!settings.get<boolean>("chatToolsIntentCompilerEnabled", false)) return undefined

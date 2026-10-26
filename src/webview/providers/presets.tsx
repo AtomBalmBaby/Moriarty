@@ -151,6 +151,50 @@ export const PRESETS: ProviderPreset[] = [
     <SvgPerplexity />,
     "llama-3.1-sonar-small-128k-online"
   ),
+  // intent
+  local(API_PROVIDERS.Ollama, "intent"),
+  local(API_PROVIDERS.LMStudio, "intent"),
+  local(API_PROVIDERS.LlamaCpp, "intent"),
+  local(API_PROVIDERS.OpenAICompatible, "intent"),
+  local(API_PROVIDERS.OpenWebUI, "intent"),
+  local(API_PROVIDERS.LiteLLM, "intent"),
+  local(API_PROVIDERS.Oobabooga, "intent"),
+  gateway("intent"),
+  hosted(
+    API_PROVIDERS.ChatGPTPlan,
+    "ChatGPT Plan",
+    <SvgOpenAI />,
+    "",
+    "intent"
+  ),
+  hosted(API_PROVIDERS.OpenAI, "OpenAI", <SvgOpenAI />, "gpt-4.1", "intent"),
+  hosted(
+    API_PROVIDERS.Anthropic,
+    "Anthropic",
+    <SvgAnthropic />,
+    "claude-sonnet-4-20250514",
+    "intent"
+  ),
+  hosted(API_PROVIDERS.Deepseek, "DeepSeek", <SvgDeepseek />, "deepseek-chat", "intent"),
+  hosted(API_PROVIDERS.Gemini, "Gemini", <SvgGemini />, "gemini-2.5-pro-preview-05-06", "intent"),
+  hosted(API_PROVIDERS.Groq, "Groq", <SvgGroq />, "llama-3.3-70b-versatile", "intent"),
+  hosted(API_PROVIDERS.Mistral, "Mistral", <SvgMistral />, "mistral-small-latest", "intent"),
+  hosted(API_PROVIDERS.OpenRouter, "OpenRouter", <SvgOpenRouter />, "openai/gpt-4.1", "intent"),
+  hosted(
+    API_PROVIDERS.DemonRoute,
+    "DemonRoute",
+    codicon("plug"),
+    "shoukewei/Qwen3.8-27B-OBLITERATED22-AGENT",
+    "intent"
+  ),
+  hosted(API_PROVIDERS.Cohere, "Cohere", <SvgCohere />, "command-r-plus", "intent"),
+  hosted(
+    API_PROVIDERS.Perplexity,
+    "Perplexity",
+    <SvgPerplexity />,
+    "llama-3.1-sonar-small-128k-online",
+    "intent"
+  ),
   // fim
   local(API_PROVIDERS.Ollama, "fim", "", FIM_TEMPLATE_FORMAT.automatic),
   local(API_PROVIDERS.LMStudio, "fim", "", FIM_TEMPLATE_FORMAT.automatic),

@@ -72,14 +72,15 @@ export const teamSession = async (
   return token ? { url: state.url, token } : undefined
 }
 
-const ROLES = ["chat", "fim", "embedding"] as const
+const ROLES = ["chat", "intent", "fim", "embedding"] as const
 /** Per feature. A cold model on a shared box can take this long to answer once. */
 const CAPABILITY = {
   chat: "chat",
+  intent: "chat",
   fim: "fim",
   embedding: "embeddings"
 } as const
-const LABELS = { chat: "Chat", fim: "Autocomplete", embedding: "Embeddings" }
+const LABELS = { chat: "Chat", intent: "Intent", fim: "Autocomplete", embedding: "Embeddings" }
 
 export const teamUrl = (input: string): URL => {
   let url: URL

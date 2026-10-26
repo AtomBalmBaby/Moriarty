@@ -507,7 +507,7 @@ export const ProviderForm = ({ initial, onClose, onSaved }: ProviderFormProps) =
               }
               onInput={(e) => update({ apiPath: valueOf(e) })}
             />,
-            draft.type === "chat" ? t("api-path-hint-chat") : undefined
+            draft.type === "chat" || draft.type === "intent" ? t("api-path-hint-chat") : undefined
           )}
         </>
       )}

@@ -52,6 +52,7 @@ type View =
 
 const SECTION_ICONS: Record<ProviderType, string> = {
   chat: "comment-discussion",
+  intent: "sparkle",
   fim: "file-code",
   embedding: "database"
 }

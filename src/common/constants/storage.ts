@@ -1,5 +1,6 @@
 export const ACTIVE_CONVERSATION_STORAGE_KEY = "twinny.active-conversation"
 export const ACTIVE_CHAT_PROVIDER_STORAGE_KEY = "twinny.active-chat-provider"
+export const ACTIVE_INTENT_PROVIDER_STORAGE_KEY = "twinny.active-intent-provider"
 export const ACTIVE_EMBEDDINGS_PROVIDER_STORAGE_KEY =
   "twinny.active-embeddings-provider"
 export const ACTIVE_FIM_PROVIDER_STORAGE_KEY = "twinny.active-fim-provider"

@@ -425,6 +425,7 @@ export interface ClientEvents {
   [PROVIDER_EVENT_NAME.getActiveChatProvider]: Channel
   [PROVIDER_EVENT_NAME.getActiveEmbeddingsProvider]: Channel
   [PROVIDER_EVENT_NAME.getActiveFimProvider]: Channel
+  [PROVIDER_EVENT_NAME.getActiveIntentProvider]: Channel
   [PROVIDER_EVENT_NAME.getAllProviders]: Channel
   [PROVIDER_EVENT_NAME.importProviders]: Channel
   [PROVIDER_EVENT_NAME.listProviderModels]: Channel<
@@ -436,6 +437,7 @@ export interface ClientEvents {
   [PROVIDER_EVENT_NAME.setActiveChatProvider]: Channel<TwinnyProvider>
   [PROVIDER_EVENT_NAME.setActiveEmbeddingsProvider]: Channel<TwinnyProvider>
   [PROVIDER_EVENT_NAME.setActiveFimProvider]: Channel<TwinnyProvider>
+  [PROVIDER_EVENT_NAME.setActiveIntentProvider]: Channel<TwinnyProvider>
   [PROVIDER_EVENT_NAME.testProvider]: Channel<TwinnyProvider, ProviderTestResult>
   [PROVIDER_EVENT_NAME.updateProvider]: Channel<
     TwinnyProvider,
@@ -513,6 +515,7 @@ export interface ServerEvents {
   [PROVIDER_EVENT_NAME.getActiveChatProvider]: TwinnyProvider | undefined
   [PROVIDER_EVENT_NAME.getActiveEmbeddingsProvider]: TwinnyProvider | undefined
   [PROVIDER_EVENT_NAME.getActiveFimProvider]: TwinnyProvider | undefined
+  [PROVIDER_EVENT_NAME.getActiveIntentProvider]: TwinnyProvider | undefined
   [PROVIDER_EVENT_NAME.getAllProviders]: Record<string, TwinnyProvider>
   [PROVIDER_EVENT_NAME.getTeamPolicy]: TeamStatus | null
   [PROVIDER_EVENT_NAME.openTeam]: TeamOpen

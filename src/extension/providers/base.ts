@@ -3,7 +3,8 @@ import * as vscode from "vscode"
 import {
   ACTIVE_CHAT_PROVIDER_STORAGE_KEY,
   ACTIVE_EMBEDDINGS_PROVIDER_STORAGE_KEY,
-  ACTIVE_FIM_PROVIDER_STORAGE_KEY
+  ACTIVE_FIM_PROVIDER_STORAGE_KEY,
+  ACTIVE_INTENT_PROVIDER_STORAGE_KEY
 } from "../../common/constants"
 
 import { resolveProviderEndpoint } from "./endpoint"
@@ -44,6 +45,13 @@ export class Base {
   public getProvider = () => {
     const provider = this.context?.globalState.get<TwinnyProvider>(
       ACTIVE_CHAT_PROVIDER_STORAGE_KEY
+    )
+    return resolveProviderEndpoint(provider)
+  }
+
+  public getIntentProvider = () => {
+    const provider = this.context?.globalState.get<TwinnyProvider>(
+      ACTIVE_INTENT_PROVIDER_STORAGE_KEY
     )
     return resolveProviderEndpoint(provider)
   }

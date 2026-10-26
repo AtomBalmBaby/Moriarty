@@ -100,6 +100,7 @@ export const PROVIDER_EVENT_NAME = {
   getActiveChatProvider: "twinny.get-active-provider",
   getActiveEmbeddingsProvider: "twinny.get-active-embeddings-provider",
   getActiveFimProvider: "twinny.get-active-fim-provider",
+  getActiveIntentProvider: "twinny.get-active-intent-provider",
   getAllProviders: "twinny.get-providers",
   importProviders: "twinny.import-providers",
   listProviderModels: "twinny.list-provider-models",
@@ -108,6 +109,7 @@ export const PROVIDER_EVENT_NAME = {
   setActiveChatProvider: "twinny.set-active-chat-provider",
   setActiveEmbeddingsProvider: "twinny.set-active-embeddings-provider",
   setActiveFimProvider: "twinny.set-active-fim-provider",
+  setActiveIntentProvider: "twinny.set-active-intent-provider",
   testProvider: "twinny.test-provider",
   updateProvider: "twinny.update-provider",
   useDiscoveredServer: "twinny.use-discovered-server"

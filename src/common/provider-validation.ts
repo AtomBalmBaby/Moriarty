@@ -14,9 +14,9 @@ import {
 } from "./constants"
 import { TwinnyProvider } from "./types"
 
-export type ProviderType = "chat" | "fim" | "embedding"
+export type ProviderType = "chat" | "intent" | "fim" | "embedding"
 
-export const PROVIDER_TYPES: ProviderType[] = ["chat", "fim", "embedding"]
+export const PROVIDER_TYPES: ProviderType[] = ["chat", "intent", "fim", "embedding"]
 
 /**
  * APIs twinny talks to through fluency.js. They have a fixed public endpoint,
@@ -81,7 +81,7 @@ export const isRemoteProvider = (provider: string) =>
  */
 export const usesEndpoint = (provider: string, type: string) =>
   !isChatGPTPlanProvider(provider) &&
-  (type !== "chat" || !isHostedProvider(provider))
+  ((type !== "chat" && type !== "intent") || !isHostedProvider(provider))
 
 /** Whether the person configures the hostname / port / path themselves. */
 export const hasConfigurableEndpoint = (provider: string, type: string) =>
@@ -92,8 +92,8 @@ export const expectsApiKey = (provider: string) =>
 
 export const supportsType = (provider: string, type: string) =>
   isChatGPTPlanProvider(provider)
-    ? type === "chat" || type === "fim"
-    : type === "chat" || !CHAT_ONLY_PROVIDERS.includes(provider)
+    ? type === "chat" || type === "intent" || type === "fim"
+    : type === "chat" || type === "intent" || !CHAT_ONLY_PROVIDERS.includes(provider)
 
 export interface EndpointDefaults {
   apiHostname?: string
@@ -259,7 +259,7 @@ export const normalizeProvider = (input: TwinnyProvider): TwinnyProvider => {
   if (!path && pasted.path) path = pasted.path
   // fluency.js adds the route itself; a user following older docs will
   // have included it, which then 404s.
-  if (type === "chat" && isOpenAICompatibleProvider(providerName)) {
+  if ((type === "chat" || type === "intent") && isOpenAICompatibleProvider(providerName)) {
     path = path.replace(/\/chat\/completions$/i, "")
   }
 
@@ -344,7 +344,7 @@ export const validateProvider = (
   if (!provider.modelName) errors.modelName = "Enter the model to use."
 
   if (!PROVIDER_TYPES.includes(type as ProviderType)) {
-    errors.type = "Type must be chat, fim or embedding."
+    errors.type = "Type must be chat, intent, fim or embedding."
   }
 
   if (!knownProviders.includes(providerName)) {
@@ -394,7 +394,7 @@ export const validateProvider = (
     }
 
     if (
-      type === "chat" &&
+      (type === "chat" || type === "intent") &&
       isOpenAICompatibleProvider(providerName) &&
       /\/chat\/completions$/i.test(path)
     ) {
@@ -403,7 +403,7 @@ export const validateProvider = (
       )
     }
 
-    if (type !== "chat" && !path && !isRemoteProvider(providerName)) {
+    if (!(type === "chat" || type === "intent") && !path && !isRemoteProvider(providerName)) {
       const suggested = getEndpointDefaults(providerName, type)?.apiPath
       warnings.push(
         suggested
@@ -413,7 +413,7 @@ export const validateProvider = (
     }
 
     if (
-      type === "chat" &&
+      (type === "chat" || type === "intent") &&
       providerName === API_PROVIDERS.Ollama &&
       /\/api\/(generate|chat)$/.test(path)
     ) {
@@ -463,8 +463,8 @@ export const describeProviderEndpoint = (provider: TwinnyProvider) => {
   if (!origin) return ""
   const path = provider.apiPath || ""
   const route = isRemoteProvider(provider.provider)
-    ? `${path}/twinny/v1/${provider.type === "embedding" ? "embeddings" : provider.type}`
-    : provider.type === "chat" && isOpenAICompatibleProvider(provider.provider)
+    ? `${path}/twinny/v1/${provider.type === "embedding" ? "embeddings" : provider.type === "intent" ? "chat" : provider.type}`
+    : (provider.type === "chat" || provider.type === "intent") && isOpenAICompatibleProvider(provider.provider)
       ? `${path}/chat/completions`
       : path
   return `${origin}${route}`

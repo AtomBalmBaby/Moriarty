@@ -9,6 +9,7 @@ import type { TwinnyProvider } from "./types"
 
 const JOB_LABEL: Record<ProviderType, string> = {
   chat: "chat",
+  intent: "intent",
   fim: "autocomplete",
   embedding: "embeddings"
 }
@@ -47,7 +48,7 @@ export const describeAgentPolicy = (agent: TeamAgentPolicy | undefined): string[
   return lines
 }
 
-const RECORDING_LABEL: Record<string, string> = { chat: "chat conversations", fim: "autocomplete requests", embeddings: "embedding inputs" }
+const RECORDING_LABEL: Record<string, string> = { chat: "chat conversations", intent: "intent refinement requests", fim: "autocomplete requests", embeddings: "embedding inputs" }
 
 /** "The gateway keeps …", for consent screens and the banner. */
 export const describeRecording = (routes: string[] | undefined): string | undefined =>
@@ -95,7 +96,7 @@ const leaveHint = "To use your own settings, leave the team from the Providers t
 
 /** A provider entry made by Connect to team: the gateway kind under the `team-<group>-<type>` id. */
 export const isTeamProvider = (provider: TwinnyProvider): boolean =>
-  provider.provider === API_PROVIDERS.TwinnyRemote && /^team-[0-9a-f]+-(chat|fim|embedding)$/.test(provider.id)
+  provider.provider === API_PROVIDERS.TwinnyRemote && /^team-[0-9a-f]+-(chat|intent|fim|embedding)$/.test(provider.id)
 
 /** The team's own entry for a job, by the id convention `team-<group>-<type>`. */
 export const teamProviderIdFor = (state: TeamPolicyState, type: ProviderType): string | undefined =>

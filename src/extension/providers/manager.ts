@@ -42,6 +42,7 @@ export type { TwinnyProvider }
 
 const ACTIVE_EVENTS = {
   chat: PROVIDER_EVENT_NAME.getActiveChatProvider,
+  intent: PROVIDER_EVENT_NAME.getActiveIntentProvider,
   fim: PROVIDER_EVENT_NAME.getActiveFimProvider,
   embedding: PROVIDER_EVENT_NAME.getActiveEmbeddingsProvider
 } as const
@@ -72,7 +73,7 @@ const chatGPTPlanRequestsFor = (context: ExtensionContext) => {
   return created
 }
 
-const TEAM_FEATURE_LABEL: Record<ProviderType, string> = { chat: "chat", fim: "autocomplete", embedding: "embeddings" }
+const TEAM_FEATURE_LABEL: Record<ProviderType, string> = { chat: "chat", intent: "intent", fim: "autocomplete", embedding: "embeddings" }
 
 export class ProviderManager {
   private readonly _store: ProviderStore
@@ -274,6 +275,8 @@ export class ProviderManager {
       [PROVIDER_EVENT_NAME.exportProviders]: () => this.exportProviders(),
       [PROVIDER_EVENT_NAME.getActiveChatProvider]: () =>
         void this.broadcastActive("chat"),
+      [PROVIDER_EVENT_NAME.getActiveIntentProvider]: () =>
+        void this.broadcastActive("intent"),
       [PROVIDER_EVENT_NAME.getActiveEmbeddingsProvider]: () =>
         void this.broadcastActive("embedding"),
       [PROVIDER_EVENT_NAME.getActiveFimProvider]: () =>
@@ -291,6 +294,8 @@ export class ProviderManager {
         this.resetProvidersToDefaults(),
       [PROVIDER_EVENT_NAME.setActiveChatProvider]: (p) =>
         this.setActiveProvider("chat", p),
+      [PROVIDER_EVENT_NAME.setActiveIntentProvider]: (p) =>
+        this.setActiveProvider("intent", p),
       [PROVIDER_EVENT_NAME.setActiveEmbeddingsProvider]: (p) =>
         this.setActiveProvider("embedding", p),
       [PROVIDER_EVENT_NAME.setActiveFimProvider]: (p) =>
@@ -344,6 +349,10 @@ export class ProviderManager {
 
   public getActiveFimProvider() {
     return this.getActiveProvider("fim")
+  }
+
+  public getActiveIntentProvider() {
+    return this.getActiveProvider("intent")
   }
 
   public getActiveEmbeddingsProvider() {

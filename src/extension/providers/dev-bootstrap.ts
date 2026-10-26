@@ -149,7 +149,7 @@ export const applyDevelopmentProviders = async (
   await store.saveProviders(all)
 
   const override = isDevProviderOverrideEnabled(env)
-  for (const type of ["chat", "fim", "embedding"] as const) {
+  for (const type of ["chat", "intent", "fim", "embedding"] as const) {
     const provider = providers.find((item) => item.type === type)
     if (!provider) continue
     const active = store.getActive(type)

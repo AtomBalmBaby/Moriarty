@@ -5,6 +5,7 @@ import {
   ACTIVE_CHAT_PROVIDER_STORAGE_KEY,
   ACTIVE_EMBEDDINGS_PROVIDER_STORAGE_KEY,
   ACTIVE_FIM_PROVIDER_STORAGE_KEY,
+  ACTIVE_INTENT_PROVIDER_STORAGE_KEY,
   EVENT_NAME,
   GLOBAL_STORAGE_KEY,
   INFERENCE_PROVIDERS_STORAGE_KEY,
@@ -18,6 +19,7 @@ export type Providers = Record<string, TwinnyProvider>
 
 const ACTIVE_KEYS: Record<ProviderType, string> = {
   chat: ACTIVE_CHAT_PROVIDER_STORAGE_KEY,
+  intent: ACTIVE_INTENT_PROVIDER_STORAGE_KEY,
   fim: ACTIVE_FIM_PROVIDER_STORAGE_KEY,
   embedding: ACTIVE_EMBEDDINGS_PROVIDER_STORAGE_KEY
 }
@@ -172,4 +174,4 @@ export class ProviderStore {
 }
 
 export const asType = (type: string): ProviderType =>
-  type === "fim" || type === "embedding" ? type : "chat"
+  type === "fim" || type === "embedding" || type === "intent" ? type : "chat"

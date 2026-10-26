@@ -1251,7 +1251,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
           </div>
         )}
         <div className={styles.transcript}>
-          {!!intentCompilerReview && (
+          {!!intentCompilerReview ? (
             <div className={styles.intentReviewPanel}>
               <div className={styles.intentReviewHead}>
                 {intentCompilerReview.waiting
@@ -1264,12 +1264,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
                   <div>{intentCompilerReview.error}</div>
                 </div>
               )}
-              <div className={styles.intentReviewSummary}>
-                <span className={styles.intentLabel}>Objective</span>
-                <div>{intentCompilerReview.review.objective || "Refining the task."}</div>
-              </div>
               <div className={styles.intentReviewSection}>
-                <span className={styles.intentLabel}>Proposed execution prompt</span>
                 <textarea
                   ref={intentReviewTextareaRef}
                   value={intentCompilerReview.draft}
@@ -1282,30 +1277,6 @@ export const Chat = (props: ChatProps): JSX.Element => {
                   disabled={intentCompilerReview.waiting}
                 />
               </div>
-              {!!intentCompilerReview.review.constraints?.length && (
-                <div className={styles.intentReviewSection}>
-                  <span className={styles.intentLabel}>Constraints</span>
-                  <ul>{intentCompilerReview.review.constraints.map((item) => <li key={item}>{item}</li>)}</ul>
-                </div>
-              )}
-              {!!intentCompilerReview.review.exclusions?.length && (
-                <div className={styles.intentReviewSection}>
-                  <span className={styles.intentLabel}>Exclusions</span>
-                  <ul>{intentCompilerReview.review.exclusions.map((item) => <li key={item}>{item}</li>)}</ul>
-                </div>
-              )}
-              {!!intentCompilerReview.review.verification?.length && (
-                <div className={styles.intentReviewSection}>
-                  <span className={styles.intentLabel}>Acceptance criteria</span>
-                  <ul>{intentCompilerReview.review.verification.map((item) => <li key={item}>{item}</li>)}</ul>
-                </div>
-              )}
-              {!!intentCompilerReview.review.assumptions?.length && (
-                <div className={styles.intentReviewSection}>
-                  <span className={styles.intentLabel}>Assumptions</span>
-                  <ul>{intentCompilerReview.review.assumptions.map((item) => <li key={item}>{item}</li>)}</ul>
-                </div>
-              )}
               <div className={styles.intentReviewActions}>
                 <VSCodeButton disabled={intentCompilerReview.waiting} onClick={() => {
                     const next = { ...intentCompilerReview.message, input: intentCompilerReview.draft, text: intentCompilerReview.draft, html: intentCompilerReview.draft, originalPrompt: intentCompilerReview.originalPrompt }
@@ -1338,8 +1309,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
                 </label>
               </div>
             </div>
-          )}
-          {messages.length === 0 ? (
+          ) : messages.length === 0 ? (
             <EmptyChat />
           ) : (
             <Virtuoso
