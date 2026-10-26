@@ -10,9 +10,13 @@
       "type": "extensionHost",
       "request": "launch",
       "runtimeExecutable": "${execPath}",
+      "env": {
+        "TWINNY_DEV_PROVIDERS_FILE": "${workspaceFolder}/.vscode/twinny-debug-providers.json",
+        "TWINNY_DEV_PROVIDERS_OVERRIDE": "1"
+      },
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
-				"${workspaceFolder}/example"
+        "${workspaceFolder}/example",
         "${workspaceFolder}"
       ],
       "outFiles": ["${workspaceFolder}/out/**/*.js"],

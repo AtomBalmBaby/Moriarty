@@ -1,0 +1,39 @@
+{
+  "5fdffd53-dcff-4ca5-ad7c-ba02cc79090a": {
+    "id": "5fdffd53-dcff-4ca5-ad7c-ba02cc79090a",
+    "label": "llama.cpp FIM",
+    "modelName": "/mnt/models/gpt-oss-20b-Q5_K_M.gguf",
+    "provider": "llamacpp",
+    "type": "fim",
+    "apiHostname": "mycroft",
+    "apiPort": 8081,
+    "apiProtocol": "http",
+    "apiPath": "/completion",
+    "apiKey": "",
+    "fimTemplate": "automatic"
+  },
+  "03635671-c399-45e0-a87b-03507b625ed5": {
+    "id": "03635671-c399-45e0-a87b-03507b625ed5",
+    "label": "llama.cpp",
+    "modelName": "/mnt/models/gpt-oss-20b-Q5_K_M.gguf",
+    "provider": "llamacpp",
+    "type": "chat",
+    "apiHostname": "mycroft",
+    "apiPort": 8081,
+    "apiProtocol": "http",
+    "apiPath": "",
+    "apiKey": ""
+  },
+  "f3d94bfd-1f9f-4021-9c6d-9278b73d9ffe": {
+    "id": "f3d94bfd-1f9f-4021-9c6d-9278b73d9ffe",
+    "label": "llama.cpp EMBEDDING",
+    "modelName": "/mnt/models/gpt-oss-20b-Q5_K_M.gguf",
+    "provider": "llamacpp",
+    "type": "embedding",
+    "apiHostname": "mycroft",
+    "apiPort": 8081,
+    "apiProtocol": "http",
+    "apiPath": "/embedding",
+    "apiKey": ""
+  }
+}

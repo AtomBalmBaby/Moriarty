@@ -49,6 +49,7 @@ import { providerUrl } from "./extension/providers/errors"
 import { TwinnyProvider } from "./extension/providers/manager"
 import { TeamPolicyStore } from "./extension/providers/policy"
 import { setUpProvidersOnFirstRun } from "./extension/providers/setup"
+import { applyDevelopmentProviders } from "./extension/providers/dev-bootstrap"
 import { ProviderStore } from "./extension/providers/store"
 import { teamSession } from "./extension/providers/team"
 import { generateCommitMessage } from "./extension/review/commit-message"
@@ -167,6 +168,18 @@ const logStartup = (context: ExtensionContext, startedAt: number) => {
 
 export async function activate(context: ExtensionContext) {
   setContext(context)
+  const store = new ProviderStore(context)
+  try {
+    await applyDevelopmentProviders(context, store)
+  } catch (error) {
+    logger.error(
+      `Twinny development provider bootstrap failed: ${messageOf(error)}`
+    )
+    window.showErrorMessage(
+      `Twinny development provider bootstrap failed: ${messageOf(error)}`
+    )
+    throw error
+  }
   const chatGPTPlan = ChatGPTPlanSession.shared(context)
   setChatGPTPlanAccessFactory(() => chatGPTPlan)
   context.subscriptions.push({
@@ -203,15 +216,12 @@ export async function activate(context: ExtensionContext) {
 
   // Gateway tokens live in secret storage; requests read them from memory.
   const credentials = new RemoteCredentials(context)
-  await credentials.load(Object.values(await new ProviderStore(context).getProviders()))
+  await credentials.load(Object.values(await store.getProviders()))
   context.subscriptions.push(credentials)
 
   // Nothing configured yet: use whichever local server is running, or say
   // so. Runs in the background; the sidebar waits on it before listing.
-  const providerSetup = setUpProvidersOnFirstRun(
-    context,
-    new ProviderStore(context)
-  )
+  const providerSetup = setUpProvidersOnFirstRun(context, store)
 
   // This computer as part of the team's pool, when the developer switched
   // it on. Resumes after the team connection's key is loaded.

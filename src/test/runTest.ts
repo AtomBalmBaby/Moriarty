@@ -17,8 +17,19 @@ async function main() {
 
     console.log(`Running tests with command: ${cliPath} ${args.join(" ")}`)
 
+    const env = {
+      ...process.env,
+      TWINNY_DEV_PROVIDERS_FILE: path.resolve(
+        extensionDevelopmentPath,
+        ".vscode-test",
+        "twinny-providers.json"
+      ),
+      TWINNY_DEV_PROVIDERS_OVERRIDE: "1"
+    }
+
     const proc = cp.spawn(cliPath, args, {
-      stdio: "inherit"
+      stdio: "inherit",
+      env
     })
 
     proc.on("exit", (code) => {

@@ -2,8 +2,13 @@
 
 The AI coding assistant for Visual Studio Code that stays inside your network. Code completion, inline edits, chat, code review and more, on a model server you choose: on your machine, on another of your devices, on a hosted API, or on one gateway your whole team shares. Free, open source, MIT licensed, no telemetry, no sign-in.
 
-[Install from the Marketplace](https://marketplace.visualstudio.com/items?itemName=rjmacarthy.twinny) · [Documentation](https://docs.twinny.dev/) · [What's new](https://docs.twinny.dev/reference/whats-new/) · [Changelog](CHANGELOG.md) · [Teams](https://docs.twinny.dev/teams/overview/) · [中文](README.zh-CN.md) · [Português (BR)](README.pt-BR.md)
+## Development provider bootstrap
 
+For local Extension Development Host debugging, Twinny can auto-load a provider fixture from a JSON export that matches the normal `twinny-providers.json` format. Set `TWINNY_DEV_PROVIDERS_FILE` to a file such as `.vscode/twinny-debug-providers.json`, and either launch the extension with `TWINNY_DEV_PROVIDERS_OVERRIDE=1` for a persistent F5 default or set `TWINNY_LIVE=1`/`TWINNY_DEV_PROVIDERS_OVERRIDE=1` for automated live-model tests. The provider file is only consumed in VS Code Development/Test mode; production builds ignore it entirely.
+
+`TWINNY_DEV_PROVIDERS_FILE` is read before provider discovery and inference begin, and the active chat provider is set from the configured file if no manual provider selection is already active or override mode is requested. Missing files, invalid JSON, and unreachable servers fail loudly in development/test hosts rather than silently passing.
+
+[Install from the Marketplace](https://marketplace.visualstudio.com/items?itemName=rjmacarthy.twinny) · [Documentation](https://docs.twinny.dev/) · [What's new](https://docs.twinny.dev/reference/whats-new/) · [Changelog](CHANGELOG.md) · [Teams](https://docs.twinny.dev/teams/overview/) · [中文](README.zh-CN.md) · [Português (BR)](README.pt-BR.md)
 **For teams:** one gateway on your network serves every developer's VS Code, with a key per person, usage, policy and an admin page. `npx twinny-server quickstart` sets it up. Free for five developers, $15 a seat a month after that, and a [30-day trial](https://twinny.dev/#trial) with no card. Details, prices and a live admin page at [twinny.dev](https://twinny.dev/#teams).
 
 ## Getting started
