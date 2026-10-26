@@ -124,6 +124,8 @@ export interface ToolLoopUsage {
 export interface ToolLoopOptions {
   mode?: ToolMode
   maxSteps?: number
+  /** Upper ceiling for one tool result kept in the model's context, after scaling by the context window. */
+  maxResultChars?: number
   /**
    * Tokens the model's context holds, asked before each request: a local
    * server knows only once the model is loaded. Unknown leaves the
@@ -468,7 +470,7 @@ class ToolLoop {
       if (outer?.aborted) forward()
       else outer?.addEventListener("abort", forward, { once: true })
 
-      const reply = { text: "", shown: 0, toolCalls: undefined as ChatToolCall[] | undefined }
+      const reply = { text: "", shown: 0, toolCalls: undefined as ChatToolCall[] | undefined, reasoning: "" }
       let found: FoundCall | undefined
       let finishReason: ChatFinishReason | undefined
       let promptTokens: number | undefined
@@ -485,6 +487,7 @@ class ToolLoop {
         )
         for await (const chunk of chunks) {
           reply.text += chunk.content
+          if (typeof chunk.reasoning === "string" && chunk.reasoning) reply.reasoning += chunk.reasoning
           if (chunk.toolCalls) reply.toolCalls = [...(reply.toolCalls ?? []), ...chunk.toolCalls]
           if (chunk.usage?.promptTokens) promptTokens = chunk.usage.promptTokens
           if (chunk.usage?.completionTokens) completionTokens = chunk.usage.completionTokens
@@ -653,7 +656,7 @@ class ToolLoop {
           yield this.show(`${gapAfter(this._shown)}${stepLine(result.summary)}`)
         }
       }
-      const slots = this.remember(calls, results, reply.text, found, step)
+      const slots = this.remember(calls, results, reply.text, found, step, reply.reasoning || undefined)
       keys.forEach((key, i) => {
         if (key) this._answered.set(key, { summary: results[i].summary, slot: slots[i] })
       })
@@ -738,7 +741,7 @@ class ToolLoop {
     } catch {
       window = undefined
     }
-    this._plan = window && window > 0 ? planContext(window) : undefined
+    this._plan = window && window > 0 ? planContext(window, this._options.maxResultChars) : undefined
     const plan = this._plan
     if (!plan) return
     const estimate = () => this._estimator.tokens(charsOf(this._messages) + extraChars)
@@ -838,7 +841,8 @@ class ToolLoop {
     results: ToolResult[],
     text: string,
     found: FoundCall | undefined,
-    step: number
+    step: number,
+    reasoning?: string
   ): ResultSlot[] {
     const slot = (name: string, preface?: string): ResultSlot => ({
       message: this._messages.length,
@@ -849,7 +853,7 @@ class ToolLoop {
     })
     const slots: ResultSlot[] = []
     if (this._mode === "native") {
-      this._messages.push({
+      const assistant: ChatMessage = {
         role: ASSISTANT,
         // A reply that is only calls has no text: null, not "", since
         // Anthropic refuses an empty text block.
@@ -859,7 +863,9 @@ class ToolLoop {
           type: "function" as const,
           function: { name: raw!.name, arguments: raw!.arguments }
         }))
-      } as ChatMessage)
+      }
+      if (reasoning) assistant.reasoning = reasoning
+      this._messages.push(assistant)
       calls.forEach(({ raw }, i) => {
         slots.push(slot(raw!.name, results[i].preface))
         this._messages.push({ role: "tool", tool_call_id: raw!.id, content: results[i].output } as ChatMessage)

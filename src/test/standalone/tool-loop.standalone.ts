@@ -81,8 +81,12 @@ test("a context is shared out by its size", () => {
   const hosted = planContext(200_000)
   assert.deepStrictEqual([small.limit, small.target, small.resultChars, small.notesChars], [2867, 1863, 2703, 1200])
   assert.deepStrictEqual([local.limit, local.resultChars, local.notesChars], [27_443, 21_626, 6000])
-  assert.deepStrictEqual([hosted.resultChars, hosted.notesChars], [30_000, 6000], "one result never runs past its cap")
+  assert.deepStrictEqual([hosted.resultChars, hosted.notesChars], [100_000, 6000], "the default cap is large enough to keep a whole result in context")
   assert.ok(small.window < SMALL_CONTEXT_TOKENS && local.window > SMALL_CONTEXT_TOKENS)
+
+  assert.strictEqual(planContext(200_000, 10_000).resultChars, 10_000, "a tiny cap clamps the tool result ceiling")
+  assert.strictEqual(planContext(200_000, Number.NaN).resultChars, 100_000, "invalid caps fall back to the default while keeping the context scaling")
+  assert.strictEqual(planContext(200_000, 0).resultChars, 2000, "non-positive caps clamp to the minimum room")
 
   const estimator = new TokenEstimator()
   assert.strictEqual(estimator.tokens(3300), 1000)

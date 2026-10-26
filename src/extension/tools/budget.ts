@@ -33,15 +33,16 @@ export interface ContextPlan {
 }
 
 /** How a context of `window` tokens is shared out. */
-export const planContext = (window: number): ContextPlan => {
+export const planContext = (window: number, maxResultChars = 100_000): ContextPlan => {
   // Room for the reply itself: the answer, or the next call's arguments.
   const reply = Math.min(2048, Math.floor(window * 0.2))
   const limit = Math.max(512, Math.floor(window * 0.9) - reply)
+  const ceiling = Number.isFinite(maxResultChars) ? Math.max(2000, Math.min(200_000, Math.round(maxResultChars))) : 100_000
   return {
     window,
     limit,
     target: Math.floor(limit * 0.65),
-    resultChars: clamp(Math.floor(window * DEFAULT_CHARS_PER_TOKEN * 0.2), 2000, 30_000),
+    resultChars: clamp(Math.floor(window * DEFAULT_CHARS_PER_TOKEN * 0.2), 2000, ceiling),
     notesChars: clamp(Math.floor(window * DEFAULT_CHARS_PER_TOKEN * 0.08), 1200, 6000)
   }
 }

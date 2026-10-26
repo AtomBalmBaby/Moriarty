@@ -76,6 +76,17 @@ const POLICY_REFRESH_WAIT_MS = 1500
 /** The steps an agent reply may take, as `twinny.chatToolsMaxSteps` may set them. */
 const MIN_STEPS_SETTING = 4
 const MAX_STEPS_SETTING = 40
+const DEFAULT_READ_LINES = 1000
+const MIN_READ_LINES = 100
+const MAX_READ_LINES = 5000
+const DEFAULT_RESULT_CHARS = 100_000
+const MIN_RESULT_CHARS = 10_000
+const MAX_RESULT_CHARS = 200_000
+
+const clampNumericSetting = (value: number | undefined, min: number, max: number, fallback: number) => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback
+  return Math.min(max, Math.max(min, Math.round(value)))
+}
 
 /**
  * The chat feature's front door.
@@ -609,9 +620,22 @@ export class Chat extends Base {
     const approveChange = (detail: string, approval: "command" | "change") =>
       this._steps.approve(detail, approval)
     const search = this._search
+    const maxReadLines = clampNumericSetting(
+      this.config.get<number>("chatToolsMaxReadLines", DEFAULT_READ_LINES),
+      MIN_READ_LINES,
+      MAX_READ_LINES,
+      DEFAULT_READ_LINES
+    )
+    const maxResultChars = clampNumericSetting(
+      this.config.get<number>("chatToolsMaxResultChars", DEFAULT_RESULT_CHARS),
+      MIN_RESULT_CHARS,
+      MAX_RESULT_CHARS,
+      DEFAULT_RESULT_CHARS
+    )
     const available = workspaceTools(view, [], {
       edits: editorEdits(view, editMode, approveChange, changes),
       editor: editorKnowledge(view, editMode, approveChange, changes),
+      readFileMaxLines: maxReadLines,
       commands:
         commandMode === "off"
           ? undefined
@@ -645,6 +669,7 @@ export class Chat extends Base {
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
+      maxResultChars,
       // OpenAI's reasoning models think silently on the chat route; at their
       // default effort one tool step can take minutes.
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,

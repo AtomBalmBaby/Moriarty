@@ -727,6 +727,24 @@
           "markdownDescription": "How many tool steps one agent reply may take before the model is asked to answer with what it has (with `#twinny.chatTools#` on). More lets a capable model finish longer tasks in one reply; each step is another request to the model.",
           "scope": "machine"
         },
+        "twinny.chatToolsMaxReadLines": {
+          "order": 20,
+          "type": "number",
+          "default": 1000,
+          "minimum": 100,
+          "maximum": 5000,
+          "markdownDescription": "The maximum number of lines any single `read_file` call may return. Lower values keep tool results smaller; higher values let the agent read wider ranges in one pass.",
+          "scope": "machine"
+        },
+        "twinny.chatToolsMaxResultChars": {
+          "order": 20,
+          "type": "number",
+          "default": 100000,
+          "minimum": 10000,
+          "maximum": 200000,
+          "markdownDescription": "The largest tool-result payload kept in a model's context before the agent trims older results. This scales with the model's context window while never exceeding the cap.",
+          "scope": "machine"
+        },
         "twinny.chatToolsCommandsRunIn": {
           "order": 20,
           "type": "string",

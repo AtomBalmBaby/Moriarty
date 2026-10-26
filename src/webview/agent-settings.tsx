@@ -50,6 +50,46 @@ interface Choice<T> {
   locked?: string
 }
 
+const clampNumber = (value: number, min: number, max: number) => Math.min(max, Math.max(min, Math.round(value)))
+
+const NumberSetting = ({
+  label,
+  value,
+  min,
+  max,
+  step,
+  unit,
+  title,
+  onChange
+}: {
+  label: string
+  value: number
+  min: number
+  max: number
+  step?: number
+  unit: string
+  title: string
+  onChange: (value: number) => void
+}) => (
+  <label className={styles.row} aria-label={label}>
+    <span className={styles.label} title={title}>{label}</span>
+    <span className={styles.numberWrap}>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        step={step ?? 1}
+        value={value}
+        aria-label={label}
+        title={title}
+        className={styles.numberInput}
+        onChange={(event) => onChange(clampNumber(Number(event.target.value || 0), min, max))}
+      />
+      <span className={styles.unit}>{unit}</span>
+    </span>
+  </label>
+)
+
 const Choices = <T extends string | number>({
   label,
   value,
@@ -104,6 +144,8 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
   const [commands, setCommands] = useSetting<string>("chatToolsCommands", "ask")
   const [runIn, setRunIn] = useSetting<string>("chatToolsCommandsRunIn", "background")
   const [maxSteps, setMaxSteps] = useSetting<number>("chatToolsMaxSteps", DEFAULT_AGENT_STEPS)
+  const [maxReadLines, setMaxReadLines] = useSetting<number>("chatToolsMaxReadLines", 1000)
+  const [maxResultChars, setMaxResultChars] = useSetting<number>("chatToolsMaxResultChars", 100000)
   const { context: always, setContext: setAlways } = useStorageContext<string[]>(
     StorageType.Global,
     GLOBAL_STORAGE_KEY.alwaysRunCommands
@@ -212,6 +254,26 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
           label: String(steps),
           title: t("agent-settings-steps-title", { count: steps })
         }))}
+      />
+      <NumberSetting
+        label={t("agent-settings-read-lines")}
+        value={maxReadLines}
+        min={100}
+        max={5000}
+        step={50}
+        unit={t("agent-settings-lines-unit")}
+        title={t("agent-settings-read-lines-title")}
+        onChange={setMaxReadLines}
+      />
+      <NumberSetting
+        label={t("agent-settings-result-chars")}
+        value={maxResultChars}
+        min={10000}
+        max={200000}
+        step={1000}
+        unit={t("agent-settings-characters-unit")}
+        title={t("agent-settings-result-chars-title")}
+        onChange={setMaxResultChars}
       />
       {team?.commands !== "off" && team?.mcp !== "off" && (
         <div className={styles.row}>

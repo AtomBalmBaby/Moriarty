@@ -114,6 +114,18 @@ test("editor tools, rename, delete and move are offered only when there is an ed
   ])
 })
 
+test("read_file obeys the configured line cap and advertises it", async () => {
+  const root = repo()
+  const file = path.join(root, "src", "many-lines.ts")
+  fs.writeFileSync(file, Array.from({ length: 250 }, (_, i) => `line ${i + 1}`).join("\n") + "\n")
+  const tools = workspaceTools(root, [], { readFileMaxLines: 120 })
+  const read = await tools.run({ name: "read_file", args: { path: "src/many-lines.ts" } })
+  assert.match(read.output, /lines 1–120 of 250/)
+  assert.strictEqual(read.summary, "read `src/many-lines.ts:1–120`")
+  const desc = tools.tools.find((tool) => tool.name === "read_file")?.description
+  assert.match(desc ?? "", /at most 120 at a time/)
+})
+
 test("grep tries the pattern as plain text when it matches nothing as a regex", async () => {
   const root = repo()
   fs.writeFileSync(path.join(root, "keys.json"), "{ \"key\": \"ctrl+i\", \"call\": \"f(x)\" }\n")

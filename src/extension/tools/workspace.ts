@@ -57,7 +57,9 @@ export interface Tool extends ToolSpec {
   run(args: Record<string, string>, context?: ToolContext): Promise<ToolResult>
 }
 
-const MAX_READ_LINES = 150
+const MIN_READ_LINES = 100
+const DEFAULT_READ_LINES = 1000
+const MAX_READ_LINES = 5000
 const MAX_GREP_MATCHES = 40
 /** Matches shown per file, so one noisy file does not hide the others. */
 const MAX_GREP_PER_FILE = 10
@@ -150,42 +152,50 @@ const listDir = (view: WorkspaceView): Tool => ({
   }
 })
 
-const readFile = (view: WorkspaceView): Tool => ({
-  name: "read_file",
-  readOnly: true,
-  description: `A file's lines, numbered; at most ${MAX_READ_LINES} at a time, so ask for a range in long files.`,
-  parameters: [
-    { name: "path", description: "The file." },
-    { name: "start_line", description: "First line to read, from 1.", optional: true, type: "integer" },
-    { name: "end_line", description: "Last line to read.", optional: true, type: "integer" }
-  ],
-  async run({ path: file, start_line, end_line }) {
-    if (!file) throw new ToolInputError("read_file needs a path.")
-    const absolute = view.resolve(file, "file")
-    const rel = view.relative(absolute)
-    const text = await view.text(absolute)
-    if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
-    const lines = linesOf(text)
-    if (!lines.length) return { output: `${rel} is empty.`, summary: `read \`${rel}\` · empty` }
-    const start = Math.max(1, Number.parseInt(start_line ?? "", 10) || 1)
-    if (start > lines.length) {
-      throw new ToolInputError(`${rel} has only ${plural(lines.length, "line")}.`)
-    }
-    const asked = Math.max(start, Number.parseInt(end_line ?? "", 10) || lines.length)
-    const end = Math.min(lines.length, asked, start + MAX_READ_LINES - 1)
-    const body = lines
-      .slice(start - 1, end)
-      .map((line, i) => `${start + i}: ${clip(line)}`)
-      .join("\n")
-    const cut = end < Math.min(asked, lines.length)
-      ? `\n… stopped at line ${end} of ${lines.length}; read on with start_line ${end + 1}`
-      : ""
-    return {
-      output: `${rel} (lines ${start}–${end} of ${lines.length})\n${body}${cut}`,
-      summary: `read \`${rel}:${start}–${end}\``
+const clampReadLines = (limit: number | undefined) => {
+  const value = Number.isFinite(limit) ? Math.round(limit as number) : DEFAULT_READ_LINES
+  return Math.min(MAX_READ_LINES, Math.max(MIN_READ_LINES, value))
+}
+
+const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES): Tool => {
+  const limit = clampReadLines(maxLines)
+  return {
+    name: "read_file",
+    readOnly: true,
+    description: `A file's lines, numbered; at most ${limit} at a time, so ask for a range in long files.`,
+    parameters: [
+      { name: "path", description: "The file." },
+      { name: "start_line", description: "First line to read, from 1.", optional: true, type: "integer" },
+      { name: "end_line", description: "Last line to read.", optional: true, type: "integer" }
+    ],
+    async run({ path: file, start_line, end_line }) {
+      if (!file) throw new ToolInputError("read_file needs a path.")
+      const absolute = view.resolve(file, "file")
+      const rel = view.relative(absolute)
+      const text = await view.text(absolute)
+      if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
+      const lines = linesOf(text)
+      if (!lines.length) return { output: `${rel} is empty.`, summary: `read \`${rel}\` · empty` }
+      const start = Math.max(1, Number.parseInt(start_line ?? "", 10) || 1)
+      if (start > lines.length) {
+        throw new ToolInputError(`${rel} has only ${plural(lines.length, "line")}.`)
+      }
+      const asked = Math.max(start, Number.parseInt(end_line ?? "", 10) || lines.length)
+      const end = Math.min(lines.length, asked, start + limit - 1)
+      const body = lines
+        .slice(start - 1, end)
+        .map((line, i) => `${start + i}: ${clip(line)}`)
+        .join("\n")
+      const cut = end < Math.min(asked, lines.length)
+        ? `\n… stopped at line ${end} of ${lines.length}; read on with start_line ${end + 1}`
+        : ""
+      return {
+        output: `${rel} (lines ${start}–${end} of ${lines.length})\n${body}${cut}`,
+        summary: `read \`${rel}:${start}–${end}\``
+      }
     }
   }
-})
+}
 
 const grep = (view: WorkspaceView): Tool => ({
   name: "grep",
@@ -561,6 +571,8 @@ export interface ToolExtras {
   codeSearch?: CodeSearch
   /** The editor's language servers and open files. */
   editor?: EditorSink
+  /** The maximum number of lines a single `read_file` result may show. */
+  readFileMaxLines?: number
   /** Whether `git` is offered when the root is in a repository; on by default. */
   git?: boolean
   /** Whether the project's `AGENTS.md` files are read; on by default. */
@@ -598,7 +610,7 @@ export const workspaceTools = (
   ignoredGlobs: string[] = [],
   extras: ToolExtras = {}
 ): WorkspaceTools => {
-  const { edits, commands, codeSearch, editor } = extras
+  const { edits, commands, codeSearch, editor, readFileMaxLines } = extras
   const view =
     typeof root === "string" ? new WorkspaceView(root, ignoredGlobs, edits?.read?.bind(edits)) : root
   const tools = [
@@ -606,7 +618,7 @@ export const workspaceTools = (
     ...(editor ? [editorContext(view, editor)] : []),
     listDir(view),
     findFiles(view),
-    readFile(view),
+    readFile(view, readFileMaxLines),
     grep(view),
     findSymbol(view),
     ...(editor ? [goToDefinition(view, editor), findReferences(view, editor), diagnostics(view, editor)] : []),

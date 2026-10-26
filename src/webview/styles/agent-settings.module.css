@@ -59,6 +59,33 @@
   color: var(--tw-fg-faint);
 }
 
+.numberWrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.numberInput {
+  width: 6em;
+  padding: 1px 4px;
+  border: 1px solid var(--tw-rule);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--tw-fg) 6%, var(--tw-bg));
+  color: var(--tw-fg);
+  font: inherit;
+}
+
+.numberInput:focus-visible {
+  outline: 1px solid var(--tw-fg-faint);
+  outline-offset: 1px;
+}
+
+.unit {
+  color: var(--tw-fg-faint);
+  font-size: var(--tw-fs-xs);
+}
+
 .choices,
 .link {
   flex-shrink: 0;
