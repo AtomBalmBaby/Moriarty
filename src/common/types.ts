@@ -49,6 +49,17 @@ export interface ImageAttachment {
 
 export type ChatCompletionMessage = ChatCompletionMessageParam & {
   id?: string
+  /** Hidden reasoning a backend streams alongside the answer; kept for the next request only. */
+  reasoning?: string
+  /** OpenAI-compatible reasoning field used when a local backend expects it. */
+  reasoning_content?: string
+  /** Native tool calls returned by the model, before they are turned into the workspace's call shape. */
+  tool_calls?: Array<{
+    id: string
+    type: "function"
+    function: { name: string; arguments: string }
+  }>
+  tool_call_id?: string
   images?: ImageAttachment[] | string[]
   /**
    * The workspace chunks that were searched out for this reply, kept with

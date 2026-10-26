@@ -88,6 +88,27 @@ export const parsableToolArguments = (messages: ChatMessage[]): ChatMessage[] =>
 
 type ChatParameters = Pick<ChatRequest, "maxTokens" | "temperature" | "think" | "tools" | "reasoningEffort">
 
+const DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
+
+const requiresCompatibilitySystemMessage = (provider: TwinnyProvider) =>
+  [API_PROVIDERS.LlamaCpp, API_PROVIDERS.OpenAICompatible].includes(provider.provider)
+
+const maybeWithSystemMessage = (provider: TwinnyProvider, messages: ChatMessage[]): ChatMessage[] => {
+  if (!requiresCompatibilitySystemMessage(provider)) return messages
+  if (messages.some((message) => message.role === "system")) return messages
+  return [{ role: "system", content: DEFAULT_SYSTEM_MESSAGE } as ChatMessage, ...messages]
+}
+
+const withReasoningHistory = (provider: TwinnyProvider, messages: ChatMessage[]): ChatMessage[] =>
+  messages.map((message): ChatMessage => {
+    if (message.role !== "assistant") return message
+    const reasoning = (message as { reasoning?: unknown }).reasoning
+    if (typeof reasoning !== "string" || !reasoning || !requiresCompatibilitySystemMessage(provider)) return message
+    const rest = { ...message } as ChatMessage & { reasoning?: string }
+    delete rest.reasoning
+    return { ...rest, reasoning_content: reasoning } as ChatMessage
+  })
+
 /**
  * Only real API parameters: OpenAI rejects unknown ones such as an `id`.
  * `think: false` is sent as OpenAI's own `reasoning_effort: "none"`, which
@@ -213,11 +234,12 @@ export const buildStreamingRequest = (
   parameters: ChatParameters = {}
 ): CompletionStreaming<LLMProvider> => {
   const flat = parsableToolArguments(flattenTextContent(messages))
+  const prepared = withReasoningHistory(provider, maybeWithSystemMessage(provider, flat))
   return {
     messages:
       provider.provider === API_PROVIDERS.Anthropic && usesTools(messages, parameters)
-        ? withCacheBreakpoints(flat)
-        : flat,
+        ? withCacheBreakpoints(prepared)
+        : prepared,
     model: provider.modelName,
     stream: true,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -231,13 +253,17 @@ export const buildBlockingRequest = (
   provider: TwinnyProvider,
   messages: ChatMessage[],
   parameters: ChatParameters = {}
-): CompletionNonStreaming<LLMProvider> => ({
-  messages: parsableToolArguments(flattenTextContent(messages.filter((m) => m.role !== "system"))),
-  model: provider.modelName,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  provider: getFluencyProvider(provider) as any,
-  ...requestParameters(provider, parameters)
-})
+): CompletionNonStreaming<LLMProvider> => {
+  const prepared = withReasoningHistory(provider, maybeWithSystemMessage(provider, parsableToolArguments(flattenTextContent(messages))))
+  const filtered = requiresCompatibilitySystemMessage(provider) ? prepared : prepared.filter((message) => message.role !== "system")
+  return {
+    messages: filtered,
+    model: provider.modelName,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    provider: getFluencyProvider(provider) as any,
+    ...requestParameters(provider, parameters)
+  }
+}
 
 /**
  * Whether fluency.js passes tools to this kind of hosted provider: it
@@ -304,7 +330,9 @@ export async function* fluencyChat(
   const body = buildBlockingRequest(config, messages, request)
   logRequest(`${config.provider}/chat.completions`, body)
   const result = await client.chat.completions.create(body)
-  const content = result.choices[0]?.message?.content
+  const message = result.choices[0]?.message
+  const content = message?.content
+  const reasoning = reasoningOf(message)
   const usage = usageFromResponse(result as unknown as { usage?: StreamResponse["usage"] })
   const finishReason = finishReasonOf(result.choices[0]?.finish_reason)
   const toolCalls = toolCallCollector()
@@ -313,9 +341,13 @@ export async function* fluencyChat(
       .map((call, index) => ({ ...call, index }))
   )
   const calls = toolCalls.take()
-  const extras = { ...(finishReason ? { finishReason } : {}), ...(calls ? { toolCalls: calls } : {}) }
+  const extras = {
+    ...(reasoning ? { reasoning } : {}),
+    ...(finishReason ? { finishReason } : {}),
+    ...(calls ? { toolCalls: calls } : {})
+  }
   if (usage) yield { content: content || "", usage, ...extras }
-  else if (content || finishReason || calls) yield { content: content || "", ...extras }
+  else if (content || reasoning || finishReason || calls) yield { content: content || "", ...extras }
 }
 
 /** What fluency.js knows a hosted API serves, for the model dropdown. */

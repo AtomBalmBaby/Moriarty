@@ -25,6 +25,7 @@ import {
   ChatChunk,
   ChatRequest,
   InferenceCapability,
+  InferenceClient,
   InferenceError,
   InferenceProvider,
   isInferenceError,
@@ -34,10 +35,13 @@ import {
   resolveInferenceProvider,
   toInferenceError
 } from "../../extension/inference"
+import { buildBlockingRequest, buildStreamingRequest } from "../../extension/inference/adapters/fluency"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
 import { describeProviderError } from "../../extension/providers/errors"
 import { listProviderModels, testProvider } from "../../extension/providers/probe"
 import { TemplateProvider } from "../../extension/templates/provider"
+import { withTools } from "../../extension/tools/loop"
+import { WorkspaceTools } from "../../extension/tools/workspace"
 
 /* -------------------------------------------------------------------------- */
 /*  Fake servers                                                              */
@@ -950,6 +954,133 @@ suite("Inference layer", function () {
         provider: API_PROVIDERS.Anthropic
       })
       assert.ok(hosted.models.length > 0 && !hosted.error)
+    })
+  })
+
+  suite("llama.cpp compatibility and native reasoning", () => {
+    test("local OpenAI-compatible requests include a fallback system message only when needed", () => {
+      const config = normalizeProvider({
+        ...fakeChatConfig,
+        provider: API_PROVIDERS.LlamaCpp,
+        modelName: "gpt-oss-20b",
+        apiHostname: "127.0.0.1",
+        apiPort: 8080,
+        apiPath: "/v1"
+      })
+      const userOnly = [{ role: "user", content: "hello" }] as ChatCompletionMessage[]
+      const stream = buildStreamingRequest(config, userOnly)
+      assert.deepStrictEqual(stream.messages[0], { role: "system", content: "You are a helpful assistant." })
+      assert.strictEqual(stream.messages[1].role, "user")
+      assert.deepStrictEqual(buildBlockingRequest(config, userOnly).messages[0], { role: "system", content: "You are a helpful assistant." })
+
+      const withExisting = [
+        { role: "system", content: "Be brief." },
+        { role: "user", content: "hello" }
+      ] as ChatCompletionMessage[]
+      assert.strictEqual(buildStreamingRequest(config, withExisting).messages[0].content, "Be brief.")
+
+      const hosted = normalizeProvider({
+        ...fakeChatConfig,
+        provider: API_PROVIDERS.OpenAI,
+        apiHostname: "api.openai.com",
+        apiProtocol: "https",
+        apiPath: "/v1"
+      })
+      assert.strictEqual(buildStreamingRequest(hosted, userOnly).messages[0].role, "user")
+    })
+
+    test("non-streaming reasoning is kept hidden and serialized as reasoning_content", () => {
+      const config = normalizeProvider({
+        ...fakeChatConfig,
+        provider: API_PROVIDERS.LlamaCpp,
+        modelName: "gpt-oss-20b",
+        apiHostname: "127.0.0.1",
+        apiPort: 8080,
+        apiPath: "/v1"
+      })
+      const messages = [{ role: "assistant", content: "Final answer", reasoning: "I checked the file." }] as ChatCompletionMessage[]
+      const serialized = buildBlockingRequest(config, messages)
+      const assistant = serialized.messages.find((message) => message.role === "assistant") as ChatCompletionMessage & {
+        reasoning_content?: string
+        reasoning?: string
+      }
+      assert.strictEqual(assistant.reasoning_content, "I checked the file.")
+      assert.strictEqual(assistant.reasoning, undefined)
+    })
+
+    test("native tool-calling keeps GPT-OSS reasoning through a full multi-step exchange", async () => {
+      const seen: ChatRequest[] = []
+      const workspace = {
+        orientation: "workspace",
+        tools: [
+          {
+            name: "read_file",
+            description: "Read a workspace file.",
+            parameters: [{ name: "path", description: "The file to read.", type: "string" }],
+            run: async ({ path }: { path: string }) => ({
+              output: `Contents of ${path}`,
+              summary: `read ${path}`
+            })
+          }
+        ],
+        run: async (call: { args: Record<string, string> }) => ({
+          output: `Contents of ${call.args.path}`,
+          summary: `read ${call.args.path}`
+        })
+      } as unknown as WorkspaceTools
+
+      const client = {
+        id: "fake",
+        capabilities: () => ["chat"] as InferenceCapability[],
+        models: async () => [],
+        fim: async () => { throw new Error("unused") },
+        embeddings: async () => { throw new Error("unused") },
+        chat: async function* (request: ChatRequest) {
+          seen.push({ ...request, messages: [...request.messages] })
+          if (seen.length === 1) {
+            yield {
+              content: "",
+              reasoning: "I should inspect the file first.",
+              toolCalls: [{ id: "call_1", name: "read_file", arguments: "{\"path\":\"src/index.ts\"}" }]
+            }
+            return
+          }
+          yield { content: "I found the file content.", finishReason: "stop" }
+        }
+      } as unknown as InferenceClient
+
+      const wrapped = withTools(client, workspace, { mode: "native" })
+      const chunks: ChatChunk[] = []
+      for await (const chunk of wrapped.chat({
+        model: "gpt-oss-20b",
+        messages: [{ role: "user", content: "Inspect src/index.ts" } as ChatCompletionMessage]
+      }, {})) {
+        chunks.push(chunk)
+      }
+
+      assert.ok(seen.length >= 2)
+      const nextRequest = seen[1]
+      const assistantMessage = nextRequest.messages.find((message) => message.role === "assistant") as ChatCompletionMessage
+      assert.ok(assistantMessage)
+      assert.strictEqual(assistantMessage.reasoning, "I should inspect the file first.")
+      assert.strictEqual(assistantMessage.tool_calls?.[0]?.function.name, "read_file")
+
+      const serialized = buildStreamingRequest(
+        normalizeProvider({
+          ...fakeChatConfig,
+          provider: API_PROVIDERS.LlamaCpp,
+          modelName: "gpt-oss-20b",
+          apiHostname: "127.0.0.1",
+          apiPort: 8080,
+          apiPath: "/v1"
+        }),
+        nextRequest.messages
+      )
+      const serializedAssistant = serialized.messages.find((message) => message.role === "assistant") as ChatCompletionMessage
+      assert.strictEqual(serializedAssistant.reasoning_content, "I should inspect the file first.")
+      assert.strictEqual(serializedAssistant.reasoning, undefined)
+      assert.ok((serializedAssistant.tool_calls?.length ?? 0) > 0)
+      assert.ok(chunks.some((chunk) => chunk.content.includes("I found the file content.")))
     })
   })
 })
