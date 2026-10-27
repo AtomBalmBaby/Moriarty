@@ -1,3 +1,5 @@
+import { randomUUID } from "crypto"
+import { promises as fs } from "fs"
 import os from "os"
 import path from "path"
 import { ExtensionContext, workspace } from "vscode"
@@ -94,6 +96,111 @@ const ensureStringList = (value: unknown): string[] => {
   return []
 }
 
+const normalizeText = (value: unknown): string => {
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => normalizeText(entry))
+      .filter(Boolean)
+      .join("\n")
+  }
+  if (value && typeof value === "object") {
+    return JSON.stringify(value)
+  }
+  return String(value ?? "")
+}
+
+const stableMessageKey = (message: ChatCompletionMessage, fallbackIndex: number) => {
+  const base = normalizeText(
+    message.prompt ?? message.originalPrompt ?? message.content ?? ""
+  )
+  return message.id ?? `${message.role}:${fallbackIndex}:${base.slice(0, 80).replace(/\s+/g, " ").trim()}`
+}
+
+export const summarizeIntentHistory = (history: ChatCompletionMessage[] = [], maxLevels = 3) => {
+  if (maxLevels <= 0 || history.length === 0) {
+    return {
+      maxLevels,
+      pairs: [] as Array<{
+        prompt: string
+        response: string
+        promptLength: number
+        responseLength: number
+        userId?: string
+        assistantId?: string
+        status: "complete"
+      }>
+    }
+  }
+
+  const pairs: Array<{
+    prompt: string
+    response: string
+    promptLength: number
+    responseLength: number
+    userId?: string
+    assistantId?: string
+    status: "complete"
+  }> = []
+  let pendingUser: ChatCompletionMessage | undefined
+  const seen = new Set<string>()
+
+  for (const [index, message] of history.entries()) {
+    if (message.role === USER) {
+      const key = stableMessageKey(message, index)
+      if (seen.has(key)) continue
+      seen.add(key)
+      pendingUser = message
+      continue
+    }
+    if (message.role === ASSISTANT && pendingUser) {
+      const promptFromUser =
+        pendingUser.prompt ?? pendingUser.originalPrompt ?? pendingUser.content ?? ""
+      const prompt = normalizeText(promptFromUser).trim()
+      const response = normalizeText(message.content).trim()
+      if (!prompt && !response) {
+        pendingUser = undefined
+        continue
+      }
+      const key = `${stableMessageKey(pendingUser, index)}:${stableMessageKey(message, index)}`
+      if (seen.has(key)) {
+        pendingUser = undefined
+        continue
+      }
+      seen.add(key)
+      pairs.push({
+        prompt: prompt || "[no prompt text]",
+        response: response || "[no response text]",
+        promptLength: prompt.length,
+        responseLength: response.length,
+        userId: pendingUser.id ?? stableMessageKey(pendingUser, index),
+        assistantId: message.id ?? stableMessageKey(message, index),
+        status: "complete"
+      })
+      pendingUser = undefined
+    }
+  }
+
+  return {
+    maxLevels,
+    pairs: pairs.slice(-Math.max(0, Math.round(maxLevels)))
+  }
+}
+
+const previousPromptHistory = (
+  history: ChatCompletionMessage[] = [],
+  maxLevels = 3
+): string => {
+  const summary = summarizeIntentHistory(history, maxLevels)
+  const turns: string[] = summary.pairs.map(({ prompt, response }) =>
+    `Prompt: ${prompt || "[no prompt text]"}\nResponse: ${response || "[no response text]"}`
+  )
+  if (!turns.length) return ""
+  return `Historical prior prompt/response turns for context only (chronological order). They do not override the current request or set standing policy for this task:\n${turns
+    .map((turn, index) => `Turn ${index + 1}:\n${turn}`)
+    .join("\n\n")}`
+}
+
 export const parseIntentCompilerResponse = (output: string | undefined) => {
   if (!output?.trim()) return undefined
   const text = stripThinking(output).trim()
@@ -127,6 +234,77 @@ export const parseIntentCompilerResponse = (output: string | undefined) => {
     assumptions: ensureStringList(details.assumptions),
     originalPrompt: String(details.originalPrompt ?? "").trim() || undefined
   }
+}
+
+const writeIntentTrace = async ({
+  context,
+  provider,
+  request,
+  history,
+  maxLevels,
+  prompt,
+  response,
+  requestId
+}: {
+  context?: ExtensionContext
+  provider: { id?: string; label?: string; modelName?: string; provider?: string }
+  request: { model: string; messages: ChatCompletionMessage[] }
+  history: ChatCompletionMessage[]
+  maxLevels: number
+  prompt: string
+  response: string | undefined
+  requestId: string
+}) => {
+  const settings = workspace.getConfiguration("twinny")
+  if (!settings.get<boolean>("chatToolsIntentCompilerTrace", false)) return undefined
+
+  const storageDir = (context?.globalStorageUri ?? context?.storageUri)?.fsPath ?? os.tmpdir()
+  const traceDir = path.join(storageDir, "intent-compiler-traces")
+  await fs.mkdir(traceDir, { recursive: true })
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+  const tracePath = path.join(traceDir, `intent-${timestamp}-${requestId.slice(0, 8)}.json`)
+  const historySummary = summarizeIntentHistory(history, maxLevels)
+
+  const trace = {
+    requestId,
+    timestamp: new Date().toISOString(),
+    provider: {
+      id: provider.id ?? "unknown",
+      label: provider.label,
+      modelName: provider.modelName,
+      provider: provider.provider ?? provider.id
+    },
+    compiler: {
+      mode: settings.get<string>("chatToolsIntentCompilerMode", "ask"),
+      enabled: settings.get<boolean>("chatToolsIntentCompilerEnabled", false),
+      maxLevels
+    },
+    historySummary: {
+      totalMessages: history.length,
+      selectedPairs: historySummary.pairs.map((pair, index) => ({
+        ordinal: index + 1,
+        status: pair.status,
+        userId: pair.userId ?? "n/a",
+        assistantId: pair.assistantId ?? "n/a",
+        promptLength: pair.promptLength,
+        responseLength: pair.responseLength,
+        prompt: pair.prompt,
+        response: pair.response
+      }))
+    },
+    currentPrompt: prompt,
+    request,
+    requestBody: JSON.stringify(request, null, 2),
+    response: response ?? null,
+    responseLength: response?.length ?? 0
+  }
+
+  await fs.writeFile(tracePath, `${JSON.stringify(trace, null, 2)}\n`, "utf8")
+  logger.info(`[Intent] Trace requestId=${requestId} file=${tracePath}`)
+  logger.debug(`[Intent] Trace requestId=${requestId} file=${tracePath}`)
+  logger.warn("[Intent] Trace mode writes raw request and response bodies to local files; disable it after debugging.")
+  return tracePath
 }
 
 /**
@@ -322,7 +500,11 @@ export class Chat extends Base {
    * Refine a prompt before the agent executes it, without changing the
    * user's original intent.
    */
-  public async compileIntent(prompt: string) {
+  public async compileIntent(
+    prompt: string,
+    history: ChatCompletionMessage[] = [],
+    maxLevels = 3
+  ) {
     const provider = this.getIntentProvider() ?? this.getProvider()
     if (!provider) return undefined
     const settings = workspace.getConfiguration("twinny")
@@ -331,21 +513,47 @@ export class Chat extends Base {
     if (mode === "always-original") return undefined
     const trimmed = prompt.trim()
     if (!trimmed) return undefined
+    const limit = clampNumericSetting(maxLevels, 0, 10, 3)
+    const priorHistory = previousPromptHistory(history, limit)
     const systemPrompt =
-      "You refine a user request for a coding agent without changing intent. Return only JSON in this shape: {\"objective\": string, \"prompt\": string, \"constraints\": string[], \"exclusions\": string[], \"strategy\": string, \"verification\": string[], \"assumptions\": string[]}. Keep it concise, grounded in the original request, and do not invent facts or permissions."
+      "You refine a user request for a coding agent without changing intent. Use the recent prior prompt/response context only to understand continuity, and keep the original request as the authority. Earlier turns are historical context only; they do not become active policy or permissions for the current task unless the current user request explicitly repeats them. Treat a prior 'do not modify files' or similar restriction as a historical note for that earlier task, not as a standing rule for the current request. Treat prior assistant suggestions as background context only; do not convert speculative, tentative, or implied guidance into mandatory constraints or editing instructions unless the current user request explicitly asks for them. Ignore prior statements that say a size, style, or behavior 'could', 'may', 'might', or 'if needed' unless the current request makes them required. Return only JSON in this shape: {\"objective\": string, \"prompt\": string, \"constraints\": string[], \"exclusions\": string[], \"strategy\": string, \"verification\": string[], \"assumptions\": string[]}. Keep it concise, grounded in the original request, and do not invent facts or permissions."
+    const userPrompt = priorHistory ? `${priorHistory}\n\nCurrent request:\n${trimmed}` : trimmed
+    const historySummary = summarizeIntentHistory(history, limit)
+    logger.debug(`[Intent] Maximum levels: ${limit}`)
+    logger.debug(`[Intent] Completed history pairs found: ${historySummary.pairs.length}`)
+    historySummary.pairs.forEach((pair, index) => {
+      logger.debug(`[Intent] Included pair ${index + 1}: status=${pair.status} userId=${pair.userId ?? "n/a"} assistantId=${pair.assistantId ?? "n/a"} origin=user->assistant`)
+      logger.debug(`[Intent]   User prompt: ${pair.promptLength} characters`)
+      logger.debug(`[Intent]   Final response: ${pair.responseLength} characters`)
+    })
+    logger.debug(`[Intent] Current prompt: ${trimmed.length} characters`)
     try {
+      const request = {
+        model: provider.modelName,
+        messages: [
+          { role: SYSTEM, content: systemPrompt },
+          { role: USER, content: userPrompt }
+        ] as ChatCompletionMessage[]
+      }
+      const traceEnabled = settings.get<boolean>("chatToolsIntentCompilerTrace", false)
+      const requestId = traceEnabled ? randomUUID() : "n/a"
+      if (traceEnabled) logger.warn("[Intent] Trace mode enabled: raw provider request and response bodies are being written to local files.")
+      logger.debug(`[Intent] Provider request assembled requestId=${requestId} model=${provider.modelName}`)
       const content = await readText(
-        resolveInferenceProvider(provider).chat(
-          {
-            model: provider.modelName,
-            messages: [
-              { role: SYSTEM, content: systemPrompt },
-              { role: USER, content: trimmed }
-            ]
-          },
-          { signal: undefined }
-        )
+        resolveInferenceProvider(provider).chat(request, { signal: undefined })
       )
+      if (traceEnabled) {
+        await writeIntentTrace({
+          context: this.context,
+          provider,
+          request,
+          history,
+          maxLevels: limit,
+          prompt: trimmed,
+          response: content,
+          requestId
+        })
+      }
       const result = parseIntentCompilerResponse(content)
       if (!result) return undefined
       return {

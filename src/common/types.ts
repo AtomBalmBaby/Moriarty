@@ -49,6 +49,8 @@ export interface ImageAttachment {
 
 export type ChatCompletionMessage = ChatCompletionMessageParam & {
   id?: string
+  /** The user's original wording, kept distinct from the executed prompt when refinement is accepted. */
+  originalPrompt?: string
   /** Hidden reasoning a backend streams alongside the answer; kept for the next request only. */
   reasoning?: string
   /** OpenAI-compatible reasoning field used when a local backend expects it. */

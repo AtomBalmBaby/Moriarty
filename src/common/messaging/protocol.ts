@@ -331,7 +331,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>
   [EVENT_NAME.twinnyChatMessage]: Channel<ChatRequest>
-  [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string }, IntentCompilerResult | undefined>
+  [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string; history?: ChatCompletionMessage[]; maxLevels?: number }, IntentCompilerResult | undefined>
   [EVENT_NAME.twinnyClickSuggestion]: Channel<string>
   /**
    * The rest of the message being typed, as the chat model guesses it from

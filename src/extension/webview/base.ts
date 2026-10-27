@@ -190,8 +190,8 @@ export class BaseProvider {
         void vscode.commands.executeCommand(TWINNY_COMMAND_NAME.applyCode, code),
       [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions }) =>
         void this.chat?.completion(messages, mentions),
-      [EVENT_NAME.twinnyCompileIntent]: async ({ prompt }) =>
-        (await this.chat?.compileIntent(prompt)) ?? undefined,
+      [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels }) =>
+        (await this.chat?.compileIntent(prompt, history, maxLevels)) ?? undefined,
       [EVENT_NAME.twinnyClickSuggestion]: (template) =>
         void vscode.commands.executeCommand(
           TWINNY_COMMAND_NAME.templateCompletion,

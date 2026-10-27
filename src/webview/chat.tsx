@@ -72,6 +72,8 @@ interface QueuedMessage {
   html: string
   /** As sent: paragraphs joined with line breaks. */
   input: string
+  /** The actual execution prompt the agent should receive. */
+  prompt?: string
   /** The original user wording, kept when a refined execution prompt is later used. */
   originalPrompt?: string
   text: string
@@ -148,6 +150,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const [agentSettingsOpen, setAgentSettingsOpen] = useState(false)
   const [intentCompilerEnabled, setIntentCompilerEnabled] = useState(false)
   const [intentCompilerMode, setIntentCompilerMode] = useState("ask")
+  const [intentCompilerMaxLevels, setIntentCompilerMaxLevels] = useState(3)
   const syncIntentCompilerSettings = useCallback(async () => {
     try {
       const enabled = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
@@ -156,8 +159,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
       const mode = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
         key: "chatToolsIntentCompilerMode"
       })
+      const maxLevels = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
+        key: "chatToolsIntentCompilerMaxLevels"
+      })
       if (typeof enabled?.value === "boolean") setIntentCompilerEnabled(enabled.value)
       if (typeof mode?.value === "string") setIntentCompilerMode(mode.value)
+      if (typeof maxLevels?.value === "number") setIntentCompilerMaxLevels(Math.max(0, Math.min(10, Math.round(maxLevels.value))))
     } catch {
       // Keep the current UI state when the config cannot be read.
     }
@@ -168,6 +175,9 @@ export const Chat = (props: ChatProps): JSX.Element => {
     }
     if (key === "chatToolsIntentCompilerMode" && typeof value === "string") {
       setIntentCompilerMode(value)
+    }
+    if (key === "chatToolsIntentCompilerMaxLevels" && typeof value === "number") {
+      setIntentCompilerMaxLevels(Math.max(0, Math.min(10, Math.round(value))))
     }
   })
   const [intentCompilerReview, setIntentCompilerReview] = useState<{
@@ -598,12 +608,14 @@ export const Chat = (props: ChatProps): JSX.Element => {
     const conversationId = conversation?.id || uuidv4()
 
     setMessages((prevMessages) => {
+      const executedPrompt = message.prompt ?? message.input
       const updatedMessages: ChatCompletionMessage[] = [
         ...(prevMessages || []),
         {
           role: USER,
           content: message.input,
-          prompt: message.originalPrompt ?? message.input,
+          prompt: executedPrompt,
+          originalPrompt: message.originalPrompt ?? message.input,
           images: message.images.length > 0 ? message.images : undefined
         }
       ]
@@ -629,6 +641,62 @@ export const Chat = (props: ChatProps): JSX.Element => {
   // The queue sends from an event handler; it always reaches this render's.
   const sendRef = useRef(sendMessage)
   sendRef.current = sendMessage
+
+  const resolveCompilerHistory = useCallback(() => {
+    const asText = (value: unknown): string => {
+      if (typeof value === "string") return value
+      if (Array.isArray(value)) return value.map((item) => asText(item)).join(" ")
+      if (value && typeof value === "object") return JSON.stringify(value)
+      return String(value ?? "")
+    }
+
+    const stableKey = (message: ChatCompletionMessage, fallbackIndex: number) => {
+      const text = asText(message.prompt ?? message.originalPrompt ?? message.content ?? "")
+      return message.id ?? `${message.role}:${fallbackIndex}:${text.slice(0, 80).replace(/\s+/g, " ").trim()}`
+    }
+
+    const merged = [...(conversation?.messages ?? []), ...messages]
+    const completed: ChatCompletionMessage[] = []
+    let pendingUser: ChatCompletionMessage | undefined
+    const seen = new Set<string>()
+
+    for (const [index, message] of merged.entries()) {
+      if (message.role === "user") {
+        const key = stableKey(message, index)
+        if (!seen.has(key)) {
+          seen.add(key)
+          pendingUser = message
+        }
+        continue
+      }
+      if (message.role === "assistant" && pendingUser) {
+        const promptText = asText(pendingUser.prompt ?? pendingUser.originalPrompt ?? pendingUser.content)
+        const responseText = asText(message.content)
+        if (promptText.trim() || responseText.trim()) {
+          const pairKey = `${stableKey(pendingUser, index)}:${stableKey(message, index)}`
+          if (!seen.has(pairKey)) {
+            seen.add(pairKey)
+            completed.push({
+              ...pendingUser,
+              content: promptText,
+              prompt: promptText,
+              originalPrompt: pendingUser.originalPrompt ?? promptText,
+              id: pendingUser.id ?? stableKey(pendingUser, index)
+            })
+            completed.push({
+              ...message,
+              content: responseText,
+              prompt: responseText,
+              id: message.id ?? stableKey(message, index)
+            })
+          }
+        }
+        pendingUser = undefined
+      }
+    }
+
+    return completed.slice(-Math.max(0, Math.round(intentCompilerMaxLevels)) * 2)
+  }, [conversation?.messages, messages, intentCompilerMaxLevels])
 
   /** Sends the composer's message, or queues it while a reply is running. */
   const handleSubmitForm = useCallback(async () => {
@@ -679,6 +747,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
         .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMode" })
         .then((answer) => (typeof answer?.value === "string" ? answer.value : "ask"))
         .catch(() => "ask"))
+    const currentIntentCompilerMaxLevels =
+      intentCompilerMaxLevels ||
+      (await bridge
+        .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMaxLevels" })
+        .then((answer) => (typeof answer?.value === "number" ? answer.value : 3))
+        .catch(() => 3))
 
     if (agentMode && currentIntentCompilerEnabled && currentIntentCompilerMode !== "always-original") {
       setIntentCompilerReview({
@@ -699,7 +773,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
       })
 
       const review = await bridge
-        .request(EVENT_NAME.twinnyCompileIntent, { prompt: message.text })
+        .request(EVENT_NAME.twinnyCompileIntent, {
+          prompt: message.text,
+          history: resolveCompilerHistory(),
+          maxLevels: Math.max(0, Math.round(currentIntentCompilerMaxLevels))
+        })
         .catch(() => undefined)
 
       if (review && review.prompt && review.prompt.trim() !== message.text.trim()) {
@@ -709,6 +787,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
             ...message,
             originalPrompt: message.text,
             input: review.prompt,
+            prompt: review.prompt,
             text: review.prompt,
             html: review.prompt
           })
@@ -1251,7 +1330,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
           </div>
         )}
         <div className={styles.transcript}>
-          {!!intentCompilerReview ? (
+          {intentCompilerReview ? (
             <div className={styles.intentReviewPanel}>
               <div className={styles.intentReviewHead}>
                 {intentCompilerReview.waiting
@@ -1279,7 +1358,14 @@ export const Chat = (props: ChatProps): JSX.Element => {
               </div>
               <div className={styles.intentReviewActions}>
                 <VSCodeButton disabled={intentCompilerReview.waiting} onClick={() => {
-                    const next = { ...intentCompilerReview.message, input: intentCompilerReview.draft, text: intentCompilerReview.draft, html: intentCompilerReview.draft, originalPrompt: intentCompilerReview.originalPrompt }
+                    const next = {
+                      ...intentCompilerReview.message,
+                      input: intentCompilerReview.draft,
+                      prompt: intentCompilerReview.draft,
+                      text: intentCompilerReview.draft,
+                      html: intentCompilerReview.draft,
+                      originalPrompt: intentCompilerReview.originalPrompt
+                    }
                     setIntentCompilerReview(null)
                     if (intentCompilerReview.rememberChoice) {
                       emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerEnabled", value: true })
@@ -1288,7 +1374,14 @@ export const Chat = (props: ChatProps): JSX.Element => {
                     sendRef.current(next)
                 }}>{intentCompilerReview.waiting ? "Waiting…" : "Run Refined"}</VSCodeButton>
                 <VSCodeButton appearance="secondary" onClick={() => {
-                    const next = { ...intentCompilerReview.message, input: intentCompilerReview.originalPrompt, text: intentCompilerReview.originalPrompt, html: intentCompilerReview.originalPrompt, originalPrompt: intentCompilerReview.originalPrompt }
+                    const next = {
+                      ...intentCompilerReview.message,
+                      input: intentCompilerReview.originalPrompt,
+                      prompt: intentCompilerReview.originalPrompt,
+                      text: intentCompilerReview.originalPrompt,
+                      html: intentCompilerReview.originalPrompt,
+                      originalPrompt: intentCompilerReview.originalPrompt
+                    }
                     setIntentCompilerReview(null)
                     if (intentCompilerReview.rememberChoice) {
                       emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerEnabled", value: true })

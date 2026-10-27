@@ -671,6 +671,20 @@
           "default": "ask",
           "markdownDescription": "How Twinny handles the intent compiler. `ask` shows a review panel; `always-refined` executes the refined prompt automatically; `always-original` disables the compiler for this request."
         },
+        "twinny.chatToolsIntentCompilerMaxLevels": {
+          "order": 20,
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 3,
+          "markdownDescription": "How many previous prompt/response turns Twinny may use as context when refining a new agent request. Set to `0` to ignore prior turns and refine only from the current prompt."
+        },
+        "twinny.chatToolsIntentCompilerTrace": {
+          "order": 20,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Write the exact raw outbound Intent Compiler request and provider response to a local trace file under the extension storage folder for debugging. Disabled by default; the file may contain workspace or conversation content."
+        },
         "twinny.chatToolsEdits": {
           "order": 20,
           "type": "string",
