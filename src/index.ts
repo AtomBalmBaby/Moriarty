@@ -180,21 +180,16 @@ export async function activate(context: ExtensionContext) {
         const message =
           "Twinny development bootstrap did not select a chat provider. Check TWINNY_DEV_PROVIDERS_FILE and the provider JSON."
         logger.error(message)
-        window.showErrorMessage(message)
-        throw new Error(message)
+      } else {
+        logger.info(
+          `Development bootstrap selected chat provider ${activeChat.label} (${activeChat.provider}) at ${activeChat.apiHostname}:${activeChat.apiPort ?? "?"}${activeChat.apiPath ?? ""}`
+        )
       }
-      logger.info(
-        `Development bootstrap selected chat provider ${activeChat.label} (${activeChat.provider}) at ${activeChat.apiHostname}:${activeChat.apiPort ?? "?"}${activeChat.apiPath ?? ""}`
-      )
     }
   } catch (error) {
     logger.error(
       `Twinny development provider bootstrap failed: ${messageOf(error)}`
     )
-    window.showErrorMessage(
-      `Twinny development provider bootstrap failed: ${messageOf(error)}`
-    )
-    throw error
   }
   const chatGPTPlan = ChatGPTPlanSession.shared(context)
   setChatGPTPlanAccessFactory(() => chatGPTPlan)
