@@ -151,7 +151,8 @@ Required behavior:
 
 ### Compiler result
 
-- Valid refinement: send the **refined execution prompt** to the independently selected Chat/Execution provider.
+- Valid refinement: send the **original request as authoritative input** together with the refinement as explicitly supplementary execution guidance to the independently selected Chat/Execution provider. The refinement may clarify the approach but must not replace, narrow, or omit the original objective, scope, constraints, or requested deliverables. If they conflict, the original request takes precedence.
+- This handoff is an explicit contract, not a claim that a text comparison can reliably detect every semantic change in a compiler response.
 - Skipped/disabled/always-original, missing Intent selection, invalid compiler output, compiler provider error, or compilation timeout: do not invent a replacement. Follow existing cancellation/error semantics and, when safe to proceed, use the **original request**.
 - Prior user restrictions can be quoted as history for understanding but cannot become new standing task rules merely because the compiler saw them.
 - Do not accidentally append a second assistant turn, rewrite the original history, or double-send the current prompt when moving from compiler to execution.

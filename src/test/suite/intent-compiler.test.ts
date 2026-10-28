@@ -9,7 +9,12 @@ import {
   ACTIVE_INTENT_PROVIDER_STORAGE_KEY
 } from "../../common/constants"
 import { ChatCompletionMessage } from "../../common/types"
-import { Chat, parseIntentCompilerResponse, summarizeIntentHistory } from "../../extension/chat/index"
+import {
+  buildIntentExecutionPrompt,
+  Chat,
+  parseIntentCompilerResponse,
+  summarizeIntentHistory
+} from "../../extension/chat/index"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
@@ -66,6 +71,42 @@ suite("Intent compiler", () => {
 
   test("rejects malformed compiler output", () => {
     assert.strictEqual(parseIntentCompilerResponse("not valid json"), undefined)
+  })
+
+  test("keeps multi-file Home Assistant YAML retrieval authoritative over a single-file script rewrite", () => {
+    const original =
+      "Retrieve all the YAML files that relate to or are used in the LCARS Operations dashboard and add them to this project."
+    const refined =
+      "Create a script (or function) that connects to Home Assistant and downloads a specified file."
+    const executionPrompt = buildIntentExecutionPrompt(original, refined)
+
+    assert.ok(executionPrompt.includes(original))
+    assert.ok(executionPrompt.includes(refined))
+    assert.match(executionPrompt, /must not replace, narrow, or omit the original objective, scope, constraints, or requested deliverables/i)
+    assert.match(executionPrompt, /follow the original request/i)
+  })
+
+  test("preserves a legitimate script-writing request when adding compiler guidance", () => {
+    const original =
+      "Create a script that connects to Home Assistant and downloads the specified YAML file into this project."
+    const refined = "Write a small Python script that downloads the requested YAML file."
+    const executionPrompt = buildIntentExecutionPrompt(original, refined)
+
+    assert.ok(executionPrompt.includes(original))
+    assert.ok(executionPrompt.includes(refined))
+    assert.match(executionPrompt, /Original user request:/)
+    assert.match(executionPrompt, /Supplementary Intent refinement:/)
+  })
+
+  test("preserves the LCARS typography audit scope, read-only constraint, and report deliverable", () => {
+    const original =
+      "Audit the typography on the LCARS Operations dashboard and report all findings without modifying any files."
+    const refined = "Implement consistent typography across the dashboard components."
+    const executionPrompt = buildIntentExecutionPrompt(original, refined)
+
+    assert.ok(executionPrompt.includes(original))
+    assert.ok(executionPrompt.includes(refined))
+    assert.match(executionPrompt, /follow the original request/i)
   })
 
   test("skips compile when the setting is disabled or set to always original", async () => {

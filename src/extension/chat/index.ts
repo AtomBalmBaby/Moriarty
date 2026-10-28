@@ -250,6 +250,13 @@ export const parseIntentCompilerResponse = (output: string | undefined) => {
   }
 }
 
+export const buildIntentExecutionPrompt = (originalPrompt: string, refinedPrompt: string) =>
+  [
+    "Execute the original user request in full. The Intent compiler refinement is supplementary execution guidance only; it must not replace, narrow, or omit the original objective, scope, constraints, or requested deliverables. If guidance conflicts with the original request, follow the original request.",
+    `Original user request:\n${originalPrompt.trim()}`,
+    `Supplementary Intent refinement:\n${refinedPrompt.trim()}`
+  ].join("\n\n")
+
 const writeIntentTrace = async ({
   context,
   provider,
@@ -627,7 +634,8 @@ export class Chat extends Base {
         if (refined) {
           if (latest?.role === USER) {
             latest.prompt = prompt
-            latest.content = refined.prompt
+            latest.originalPrompt = prompt
+            latest.content = buildIntentExecutionPrompt(prompt, refined.prompt)
           }
         }
       }
