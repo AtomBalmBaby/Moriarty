@@ -150,7 +150,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const [agentSettingsOpen, setAgentSettingsOpen] = useState(false)
   const [intentCompilerEnabled, setIntentCompilerEnabled] = useState(false)
   const [intentCompilerMode, setIntentCompilerMode] = useState("ask")
-  const [intentCompilerMaxLevels, setIntentCompilerMaxLevels] = useState(3)
+  const [intentCompilerMaxTurns, setIntentCompilerMaxTurns] = useState(3)
   const syncIntentCompilerSettings = useCallback(async () => {
     try {
       const enabled = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
@@ -159,12 +159,20 @@ export const Chat = (props: ChatProps): JSX.Element => {
       const mode = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
         key: "chatToolsIntentCompilerMode"
       })
-      const maxLevels = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
-        key: "chatToolsIntentCompilerMaxLevels"
+      const maxTurns = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
+        key: "chatToolsIntentCompilerMaxTurns"
       })
       if (typeof enabled?.value === "boolean") setIntentCompilerEnabled(enabled.value)
       if (typeof mode?.value === "string") setIntentCompilerMode(mode.value)
-      if (typeof maxLevels?.value === "number") setIntentCompilerMaxLevels(Math.max(0, Math.min(10, Math.round(maxLevels.value))))
+      if (typeof maxTurns?.value === "number") setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(maxTurns.value))))
+      else {
+        const legacyMaxTurns = await bridge
+          .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMaxLevels" })
+          .catch(() => undefined)
+        if (typeof legacyMaxTurns?.value === "number") {
+          setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(legacyMaxTurns.value))))
+        }
+      }
     } catch {
       // Keep the current UI state when the config cannot be read.
     }
@@ -176,8 +184,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
     if (key === "chatToolsIntentCompilerMode" && typeof value === "string") {
       setIntentCompilerMode(value)
     }
+    if (key === "chatToolsIntentCompilerMaxTurns" && typeof value === "number") {
+      setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(value))))
+    }
     if (key === "chatToolsIntentCompilerMaxLevels" && typeof value === "number") {
-      setIntentCompilerMaxLevels(Math.max(0, Math.min(10, Math.round(value))))
+      setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(value))))
     }
   })
   const [intentCompilerReview, setIntentCompilerReview] = useState<{
@@ -695,8 +706,8 @@ export const Chat = (props: ChatProps): JSX.Element => {
       }
     }
 
-    return completed.slice(-Math.max(0, Math.round(intentCompilerMaxLevels)) * 2)
-  }, [conversation?.messages, messages, intentCompilerMaxLevels])
+    return completed.slice(-Math.max(0, Math.round(intentCompilerMaxTurns)) * 2)
+  }, [conversation?.messages, messages, intentCompilerMaxTurns])
 
   /** Sends the composer's message, or queues it while a reply is running. */
   const handleSubmitForm = useCallback(async () => {
@@ -747,12 +758,13 @@ export const Chat = (props: ChatProps): JSX.Element => {
         .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMode" })
         .then((answer) => (typeof answer?.value === "string" ? answer.value : "ask"))
         .catch(() => "ask"))
-    const currentIntentCompilerMaxLevels =
-      intentCompilerMaxLevels ||
-      (await bridge
-        .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMaxLevels" })
-        .then((answer) => (typeof answer?.value === "number" ? answer.value : 3))
-        .catch(() => 3))
+    const currentIntentCompilerMaxTurns =
+      typeof intentCompilerMaxTurns === "number"
+        ? intentCompilerMaxTurns
+        : await bridge
+            .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMaxTurns" })
+            .then((answer) => (typeof answer?.value === "number" ? answer.value : 3))
+            .catch(() => 3)
 
     if (agentMode && currentIntentCompilerEnabled && currentIntentCompilerMode !== "always-original") {
       setIntentCompilerReview({
@@ -776,7 +788,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         .request(EVENT_NAME.twinnyCompileIntent, {
           prompt: message.text,
           history: resolveCompilerHistory(),
-          maxLevels: Math.max(0, Math.round(currentIntentCompilerMaxLevels))
+          maxLevels: Math.max(0, Math.round(currentIntentCompilerMaxTurns))
         })
         .catch(() => undefined)
 

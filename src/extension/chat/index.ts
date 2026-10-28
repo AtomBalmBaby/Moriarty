@@ -84,10 +84,24 @@ const MAX_READ_LINES = 5000
 const DEFAULT_RESULT_CHARS = 100_000
 const MIN_RESULT_CHARS = 10_000
 const MAX_RESULT_CHARS = 200_000
+const INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxTurns"
+const LEGACY_INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxLevels"
 
 const clampNumericSetting = (value: number | undefined, min: number, max: number, fallback: number) => {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback
   return Math.min(max, Math.max(min, Math.round(value)))
+}
+
+const getIntentCompilerMaxTurns = (settings: ReturnType<typeof workspace.getConfiguration>, fallback = 3) => {
+  const configuredValue = settings.get<number>(INTENT_COMPILER_MAX_TURNS_KEY)
+  if (typeof configuredValue === "number" && Number.isFinite(configuredValue)) {
+    return clampNumericSetting(configuredValue, 0, 10, fallback)
+  }
+  const legacyValue = settings.get<number>(LEGACY_INTENT_COMPILER_MAX_TURNS_KEY)
+  if (typeof legacyValue === "number" && Number.isFinite(legacyValue)) {
+    return clampNumericSetting(legacyValue, 0, 10, fallback)
+  }
+  return fallback
 }
 
 const ensureStringList = (value: unknown): string[] => {
@@ -503,7 +517,7 @@ export class Chat extends Base {
   public async compileIntent(
     prompt: string,
     history: ChatCompletionMessage[] = [],
-    maxLevels = 3
+    maxTurns?: number
   ) {
     const provider = this.getIntentProvider()
     if (!provider) return undefined
@@ -513,7 +527,12 @@ export class Chat extends Base {
     if (mode === "always-original") return undefined
     const trimmed = prompt.trim()
     if (!trimmed) return undefined
-    const limit = clampNumericSetting(maxLevels, 0, 10, 3)
+    const limit = clampNumericSetting(
+      typeof maxTurns === "number" ? maxTurns : getIntentCompilerMaxTurns(settings, 3),
+      0,
+      10,
+      3
+    )
     const priorHistory = previousPromptHistory(history, limit)
     const systemPrompt =
       "You refine a user request for a coding agent without changing intent. Use the recent prior prompt/response context only to understand continuity, and keep the original request as the authority. Earlier turns are historical context only; they do not become active policy or permissions for the current task unless the current user request explicitly repeats them. Treat a prior 'do not modify files' or similar restriction as a historical note for that earlier task, not as a standing rule for the current request. Treat prior assistant suggestions as background context only; do not convert speculative, tentative, or implied guidance into mandatory constraints or editing instructions unless the current user request explicitly asks for them. Ignore prior statements that say a size, style, or behavior 'could', 'may', 'might', or 'if needed' unless the current request makes them required. Return only JSON in this shape: {\"objective\": string, \"prompt\": string, \"constraints\": string[], \"exclusions\": string[], \"strategy\": string, \"verification\": string[], \"assumptions\": string[]}. Keep it concise, grounded in the original request, and do not invent facts or permissions."

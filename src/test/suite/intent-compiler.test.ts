@@ -181,7 +181,7 @@ suite("Intent compiler", () => {
     const settings = vscode.workspace.getConfiguration("twinny")
     await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMaxLevels", 2, vscode.ConfigurationTarget.Global)
+    await settings.update("chatToolsIntentCompilerMaxTurns", 2, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerTrace", false, vscode.ConfigurationTarget.Global)
 
     const provider = {

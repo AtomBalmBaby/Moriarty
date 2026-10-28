@@ -713,7 +713,7 @@
           "default": "ask",
           "markdownDescription": "How Twinny handles the intent compiler. `ask` shows a review panel; `always-refined` executes the refined prompt automatically; `always-original` disables the compiler for this request."
         },
-        "twinny.chatToolsIntentCompilerMaxLevels": {
+        "twinny.chatToolsIntentCompilerMaxTurns": {
           "order": 20,
           "type": "integer",
           "minimum": 0,

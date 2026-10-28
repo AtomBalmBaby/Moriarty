@@ -148,7 +148,7 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
   const [maxResultChars, setMaxResultChars] = useSetting<number>("chatToolsMaxResultChars", 100000)
   const [intentCompilerEnabled, setIntentCompilerEnabled] = useSetting<boolean>("chatToolsIntentCompilerEnabled", false)
   const [intentCompilerMode, setIntentCompilerMode] = useSetting<string>("chatToolsIntentCompilerMode", "ask")
-  const [intentCompilerMaxLevels, setIntentCompilerMaxLevels] = useSetting<number>("chatToolsIntentCompilerMaxLevels", 3)
+  const [intentCompilerMaxTurns, setIntentCompilerMaxTurns] = useSetting<number>("chatToolsIntentCompilerMaxTurns", 3)
   const [intentCompilerTrace, setIntentCompilerTrace] = useSetting<boolean>("chatToolsIntentCompilerTrace", false)
   const { context: always, setContext: setAlways } = useStorageContext<string[]>(
     StorageType.Global,
@@ -239,14 +239,14 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
         <span className={styles.label}>Adds one side-effect-free inference call; individual requests can still choose Run Original.</span>
       </div>
       <NumberSetting
-        label="Max intent levels"
-        value={intentCompilerMaxLevels}
+        label="Max intent turns"
+        value={intentCompilerMaxTurns}
         min={0}
         max={10}
         step={1}
         unit="turns"
         title="How many previous prompt/response turns to include as context when refining a new request."
-        onChange={setIntentCompilerMaxLevels}
+        onChange={setIntentCompilerMaxTurns}
       />
       <label className={styles.row} aria-label="Trace intent compiler requests">
         <span className={styles.label}>Trace intent compiler requests</span>
