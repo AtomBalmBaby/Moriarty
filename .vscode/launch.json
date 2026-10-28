@@ -1,7 +1,4 @@
-// A launch configuration that compiles the extension and then opens it inside a new window
-// Use IntelliSense to learn about possible attributes.
-// Hover to view descriptions of existing attributes.
-// For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+
 {
   "version": "0.2.0",
   "configurations": [
@@ -19,19 +16,31 @@
         "${workspaceFolder}/example",
         "${workspaceFolder}"
       ],
-      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
       "preLaunchTask": "npm: build"
     },
     {
-      "name": "Extension Tests",
+      "name": "Twinny Tests",
       "type": "extensionHost",
       "request": "launch",
       "runtimeExecutable": "${execPath}",
+      "env": {
+        "TWINNY_DEV_PROVIDERS_FILE": "${workspaceFolder}/src/test/twinny-providers.json",
+        "TWINNY_DEV_PROVIDERS_OVERRIDE": "1"
+      },
       "args": [
+        "--disable-extensions",
         "--extensionDevelopmentPath=${workspaceFolder}",
-        "--extensionTestsPath=${workspaceFolder}/out/test/suite/index"
+        "--extensionTestsPath=${workspaceFolder}/out/test/suite/index",
+        "${workspaceFolder}/example",
+        "${workspaceFolder}"
       ],
-      "outFiles": ["${workspaceFolder}/out/test/**/*.js"]
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
+      "preLaunchTask": "build-extension-and-tests"
     }
   ]
 }

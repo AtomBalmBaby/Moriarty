@@ -57,8 +57,91 @@ class ChatIn extends Chat {
 const call = (name: string, args: Record<string, string>) =>
   "```tool\n" + JSON.stringify({ name, arguments: args }) + "\n```"
 
+const fakeWebview = () => {
+  let listener: ((message: unknown) => void) | undefined
+  const sent: unknown[] = []
+  return {
+    sent,
+    onDidReceiveMessage: (handler: (message: unknown) => void) => {
+      listener = handler
+      return { dispose() {} }
+    },
+    postMessage: (payload: unknown) => {
+      sent.push(payload)
+    },
+    dispatch: (message: unknown) => {
+      listener?.(message)
+    }
+  }
+}
+
 suite("Agent reply, end to end", function () {
   this.timeout(60000)
+
+  test("the webview message channel drives the same Chat completion and tool loop as a user prompt", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-webview-message-"))
+    const file = path.join(root, "a.ts")
+    fs.writeFileSync(file, "export const a = 1\n")
+
+    const model = new ScriptedModel([
+      call("read_file", { path: "a.ts" }),
+      call("edit_file", { path: "a.ts", find: "export const a = 1", replace: "export const a = 2" }),
+      "Done."
+    ])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
+
+    const stored: Record<string, unknown> = {
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider,
+      [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
+    }
+    const context = {
+      globalState: {
+        get: (key: string) => stored[key],
+        update: async (key: string, value: unknown) => {
+          if (value === undefined) delete stored[key]
+          else stored[key] = value
+        }
+      },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(root)
+    } as unknown as vscode.ExtensionContext
+
+    const webview = fakeWebview()
+    const bridge = new ExtensionBridge(webview as unknown as vscode.Webview)
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
+    chat.root = root
+    bridge.handleAll({
+      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions }) => void chat.completion(messages, mentions)
+    })
+
+    try {
+      await (bridge as unknown as {
+        _dispatch: (message: { type: string; data: unknown }) => Promise<void>
+      })._dispatch({
+        type: EVENT_NAME.twinnyChatMessage,
+        data: {
+          messages: [{ role: "user", content: "Update the constant in a.ts to 2." }],
+          mentions: []
+        }
+      })
+
+      assert.strictEqual(model.requests[0].messages[0].content, "Update the constant in a.ts to 2.")
+      assert.ok(fs.readFileSync(file, "utf8").includes("export const a = 2"))
+      assert.ok(
+        (webview.sent as unknown[]).some(
+          (payload) =>
+            typeof payload === "object" &&
+            payload !== null &&
+            "type" in payload &&
+            payload.type === EVENT_NAME.twinnyAddMessage
+        )
+      )
+    } finally {
+      chat.dispose()
+      bridge.dispose()
+    }
+  })
 
   test("an MCP server's tool is asked for first, and Always run keeps the tool, not the call", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-agent-mcp-"))

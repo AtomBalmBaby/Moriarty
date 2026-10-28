@@ -35,7 +35,7 @@ export const REMOTE_PROTOCOL_VERSION = 1
 /** Every route lives under this path, after whatever base the gateway has. */
 export const REMOTE_PROTOCOL_BASE = "/twinny/v1"
 
-export type TeamDefaults = Partial<Record<InferenceCapability, string>>
+export type TeamDefaults = Partial<Record<InferenceCapability | "intent", string>>
 
 /**
  * What a team's admin asks connected extensions to enforce. Sent on the

@@ -72,15 +72,24 @@ export const teamSession = async (
   return token ? { url: state.url, token } : undefined
 }
 
-const ROLES = ["chat", "intent", "fim", "embedding"] as const
+const DEFAULT_ROLES = ["chat", "fim", "embedding"] as const
+const ROLES = [...DEFAULT_ROLES, "intent"] as const
 /** Per feature. A cold model on a shared box can take this long to answer once. */
 const CAPABILITY = {
   chat: "chat",
-  intent: "chat",
+  intent: "intent",
   fim: "fim",
   embedding: "embeddings"
 } as const
 const LABELS = { chat: "Chat", intent: "Intent", fim: "Autocomplete", embedding: "Embeddings" }
+
+const roleSet = (team: { defaults?: Partial<Record<string, string>> }) => {
+  const roles = [...DEFAULT_ROLES] as ProviderType[]
+  if (team.defaults && Object.prototype.hasOwnProperty.call(team.defaults, "intent")) {
+    roles.splice(1, 0, "intent")
+  }
+  return roles
+}
 
 export const teamUrl = (input: string): URL => {
   let url: URL
@@ -223,7 +232,7 @@ export class TeamConnection {
       // as given, so connecting is one round trip and never waits on a cold
       // model, a rate limit or a busy gateway. Each provider can be tested
       // from the Providers tab afterwards.
-      for (const type of ROLES) {
+      for (const type of roleSet(team)) {
         const alias = team.defaults[CAPABILITY[type]]
         const current = this.store.getActive(type)
         active[type] = activeSignature(current)

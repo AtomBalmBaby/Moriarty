@@ -436,11 +436,18 @@ export const parseRequest = (
 /* -------------------------------------------------------------------------- */
 
 const CAPABILITIES: InferenceCapability[] = ["fim", "chat", "embeddings"]
+const TEAM_DEFAULT_CAPABILITIES = ["chat", "intent", "fim", "embeddings"] as const
 
 export const isInferenceCapability = (
   value: unknown
 ): value is InferenceCapability =>
   typeof value === "string" && (CAPABILITIES as string[]).includes(value)
+
+const isTeamDefaultCapability = (
+  value: unknown
+): value is InferenceCapability | "intent" =>
+  typeof value === "string" &&
+  (TEAM_DEFAULT_CAPABILITIES as readonly string[]).includes(value)
 
 export const parseIdentity = (input: unknown): RemoteIdentity => {
   if (!isRecord(input) || typeof input.key !== "string") {
@@ -574,12 +581,25 @@ export const parseTeam = (input: unknown): RemoteTeam => {
   const models = parseModels(input)
   const defaults: RemoteTeam["defaults"] = {}
   for (const [capability, alias] of Object.entries(input.defaults)) {
+    const validCapability =
+      capability === "intent"
+        ? (value: string) =>
+            models.some(
+              (model) =>
+                model.id === value && model.capabilities.includes("chat")
+            )
+        : isInferenceCapability(capability)
+          ? (value: string) =>
+              models.some(
+                (model) =>
+                  model.id === value &&
+                  model.capabilities.includes(capability)
+              )
+          : undefined
     if (
-      !isInferenceCapability(capability) ||
+      !isTeamDefaultCapability(capability) ||
       typeof alias !== "string" ||
-      !models.some(
-        (model) => model.id === alias && model.capabilities.includes(capability)
-      )
+      !validCapability?.(alias)
     ) {
       throw new InferenceError(
         "inference-failure",

@@ -505,7 +505,7 @@ export class Chat extends Base {
     history: ChatCompletionMessage[] = [],
     maxLevels = 3
   ) {
-    const provider = this.getIntentProvider() ?? this.getProvider()
+    const provider = this.getIntentProvider()
     if (!provider) return undefined
     const settings = workspace.getConfiguration("twinny")
     if (!settings.get<boolean>("chatToolsIntentCompilerEnabled", false)) return undefined

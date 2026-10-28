@@ -4,7 +4,10 @@ import os from "os"
 import path from "path"
 import * as vscode from "vscode"
 
-import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY } from "../../common/constants"
+import {
+  ACTIVE_CHAT_PROVIDER_STORAGE_KEY,
+  ACTIVE_INTENT_PROVIDER_STORAGE_KEY
+} from "../../common/constants"
 import { ChatCompletionMessage } from "../../common/types"
 import { Chat, parseIntentCompilerResponse, summarizeIntentHistory } from "../../extension/chat/index"
 import { GenerationTracker } from "../../extension/generations"
@@ -92,7 +95,7 @@ suite("Intent compiler", () => {
       label: "Scripted compiler",
       modelName: "scripted-intent-model",
       provider: "scripted-intent-compiler",
-      type: "chat"
+      type: "intent" as const
     }
     const model = new ScriptedCompilerModel()
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
@@ -100,7 +103,7 @@ suite("Intent compiler", () => {
     const context = {
       globalState: {
         get: (key: string) => {
-          if (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY) return provider
+          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
           return undefined
         },
         update: async () => undefined
@@ -118,18 +121,75 @@ suite("Intent compiler", () => {
     chat.dispose()
   })
 
+  test("uses the selected intent provider for compilation and keeps chat execution independent", async () => {
+    const settings = vscode.workspace.getConfiguration("twinny")
+    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
+    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
+
+    const intentProvider = {
+      id: "intent-provider-a",
+      label: "Intent Provider A",
+      modelName: "intent-model-a",
+      provider: "scripted-intent-compiler",
+      type: "intent" as const,
+      apiHostname: "intent.example.test",
+      apiPort: 8080,
+      apiProtocol: "https",
+      apiPath: "/v1"
+    }
+    const chatProvider = {
+      id: "chat-provider-b",
+      label: "Chat Provider B",
+      modelName: "chat-model-b",
+      provider: "scripted-chat-executor",
+      type: "chat" as const,
+      apiHostname: "chat.example.test",
+      apiPort: 9090,
+      apiProtocol: "https",
+      apiPath: "/v1"
+    }
+    const intentModel = new ScriptedCompilerModel()
+    const chatModel = new ScriptedCompilerModel()
+    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => intentModel })
+    providerRegistry.register("scripted-chat-executor", { id: "scripted-chat-executor", create: () => chatModel })
+
+    const context = {
+      globalState: {
+        get: (key: string) => {
+          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return intentProvider
+          if (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY) return chatProvider
+          return undefined
+        },
+        update: async () => undefined
+      },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
+    assert.strictEqual(chat.getIntentProvider()?.modelName, "intent-model-a")
+    assert.strictEqual(chat.getProvider()?.modelName, "chat-model-b")
+
+    const result = await chat.compileIntent("Fix the parser.")
+    assert.ok(result)
+    assert.deepStrictEqual(intentModel.requests.map((request) => request.model), ["intent-model-a"])
+    assert.deepStrictEqual(chatModel.requests, [])
+    chat.dispose()
+  })
+
   test("includes prior prompt/response history in the compiler request", async () => {
     const settings = vscode.workspace.getConfiguration("twinny")
     await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerMaxLevels", 2, vscode.ConfigurationTarget.Global)
+    await settings.update("chatToolsIntentCompilerTrace", false, vscode.ConfigurationTarget.Global)
 
     const provider = {
       id: "scripted-intent-provider",
       label: "Scripted compiler",
       modelName: "scripted-intent-model",
       provider: "scripted-intent-compiler",
-      type: "chat"
+      type: "intent" as const
     }
     const model = new ScriptedCompilerModel()
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
@@ -137,7 +197,7 @@ suite("Intent compiler", () => {
     const context = {
       globalState: {
         get: (key: string) => {
-          if (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY) return provider
+          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
           return undefined
         },
         update: async () => undefined
@@ -156,7 +216,7 @@ suite("Intent compiler", () => {
 
     await chat.compileIntent("Fix the bug in the parser.", history, 2)
     assert.ok(model.requests.length > 0)
-    assert.match(String(model.requests[0].messages[1]?.content ?? ""), /Recent prior prompt\/response turns/)
+    assert.match(String(model.requests[0].messages[1]?.content ?? ""), /Historical prior prompt\/response turns/)
     assert.match(String(model.requests[0].messages[1]?.content ?? ""), /Second task prompt/)
     chat.dispose()
   })
@@ -188,7 +248,7 @@ suite("Intent compiler", () => {
       label: "Scripted compiler",
       modelName: "scripted-intent-model",
       provider: "scripted-intent-compiler",
-      type: "chat"
+      type: "intent" as const
     }
     const model = new ScriptedCompilerModel()
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
@@ -196,7 +256,7 @@ suite("Intent compiler", () => {
     const context = {
       globalState: {
         get: (key: string) => {
-          if (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY) return provider
+          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
           return undefined
         },
         update: async () => undefined
@@ -254,7 +314,7 @@ suite("Intent compiler", () => {
       label: "Scripted compiler",
       modelName: "scripted-intent-model",
       provider: "scripted-intent-compiler",
-      type: "chat"
+      type: "intent" as const
     }
     const model = new ScriptedCompilerModel()
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
@@ -262,7 +322,7 @@ suite("Intent compiler", () => {
     const context = {
       globalState: {
         get: (key: string) => {
-          if (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY) return provider
+          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
           return undefined
         },
         update: async () => undefined
@@ -312,7 +372,7 @@ suite("Intent compiler", () => {
       label: "Scripted compiler",
       modelName: "scripted-intent-model",
       provider: "scripted-intent-compiler",
-      type: "chat"
+      type: "intent" as const
     }
     const model = new ScriptedCompilerModel()
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
@@ -320,7 +380,7 @@ suite("Intent compiler", () => {
     const context = {
       globalState: {
         get: (key: string) => {
-          if (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY) return provider
+          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
           return undefined
         },
         update: async () => undefined

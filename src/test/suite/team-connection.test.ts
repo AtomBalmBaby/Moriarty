@@ -190,6 +190,22 @@ suite("Connect to team", function () {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 
+  test("legacy defaults without intent do not silently assign chat to intent", async () => {
+    const preview = await service.preview(input())
+    assert.deepStrictEqual(preview.roles.map((role) => role.type), ["chat", "fim", "embedding"])
+    assert.deepStrictEqual(preview.roles.map((role) => role.alias), ["coder", "coder", "embed"])
+    assert.strictEqual(preview.roles.some((role) => role.type === "intent"), false)
+    assert.strictEqual(active.intent, undefined)
+  })
+
+  test("an explicit intent default is preserved and stays separate from chat", async () => {
+    team.defaults = { chat: "coder", intent: "coder", fim: "coder", embeddings: "embed" }
+    const preview = await service.preview(input())
+    assert.deepStrictEqual(preview.roles.map((role) => role.type), ["chat", "intent", "fim", "embedding"])
+    assert.deepStrictEqual(preview.roles.map((role) => role.alias), ["coder", "coder", "coder", "embed"])
+    team.defaults = { chat: "coder", fim: "coder", embeddings: "embed" }
+  })
+
   test("previews the team defaults without touching the models, then saves them with keys only in secret storage", async () => {
     const preview = await service.preview(input())
     assert.strictEqual(preview.identity, "alice")

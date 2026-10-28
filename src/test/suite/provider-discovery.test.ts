@@ -85,6 +85,7 @@ suite("Provider discovery", () => {
         providers.map((p) => [p.type, p.modelName]),
         [
           ["chat", "llama3:latest"],
+          ["intent", "llama3:latest"],
           ["fim", "qwen2.5-coder:7b"],
           ["embedding", "nomic-embed-text:latest"]
         ]
@@ -123,7 +124,7 @@ suite("Provider discovery", () => {
       )
       assert.deepStrictEqual(
         providers.map((p) => p.type),
-        ["chat"]
+        ["chat", "intent"]
       )
     })
 

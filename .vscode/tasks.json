@@ -42,6 +42,22 @@
 			"problemMatcher": [],
 			"label": "npm: build",
 			"detail": "node scripts/build.mjs"
+		},
+		{
+			"type": "npm",
+			"script": "build-tests",
+			"group": "build",
+			"problemMatcher": "$tsc",
+			"label": "npm: build-tests",
+			"detail": "tsc -p . --outDir out"
+		},
+		{
+			"label": "build-extension-and-tests",
+			"dependsOn": [
+				"npm: build",
+				"npm: build-tests"
+			],
+			"problemMatcher": []
 		}
 	]
 }
