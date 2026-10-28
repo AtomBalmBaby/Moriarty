@@ -765,35 +765,76 @@
           "default": {},
           "additionalProperties": {
             "type": "object",
-            "required": [
-              "command"
-            ],
-            "properties": {
-              "command": {
-                "type": "string",
-                "description": "The program that runs the server, e.g. npx or uvx."
+            "oneOf": [
+              {
+                "required": [
+                  "command"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "stdio"
+                    ],
+                    "description": "Transport type for a local stdio server. Omit it for the legacy config format."
+                  },
+                  "command": {
+                    "type": "string",
+                    "description": "The program that runs the server, e.g. npx or uvx."
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Its arguments."
+                  },
+                  "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Environment variables for it, on top of VS Code's."
+                  },
+                  "cwd": {
+                    "type": "string",
+                    "description": "The folder it runs in; the workspace root by default."
+                  }
+                }
               },
-              "args": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Its arguments."
-              },
-              "env": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "description": "Environment variables for it, on top of VS Code's."
-              },
-              "cwd": {
-                "type": "string",
-                "description": "The folder it runs in; the workspace root by default."
+              {
+                "required": [
+                  "type",
+                  "url"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "http",
+                    "description": "HTTP streamable MCP server transport."
+                  },
+                  "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "The streamable MCP HTTP endpoint, e.g. http://localhost:3000/mcp or https://example.com/mcp."
+                  },
+                  "headers": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "HTTP headers for the server request, such as Authorization: Bearer ... or custom headers."
+                  },
+                  "timeoutMs": {
+                    "type": "number",
+                    "minimum": 1000,
+                    "description": "How long Twinny waits for an HTTP response before failing the request."
+                  }
+                }
               }
-            }
+            ]
           },
-          "markdownDescription": "Model Context Protocol servers whose tools agent mode can use (with `#twinny.chatTools#` on), by name: `{ \"github\": { \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": { \"GITHUB_TOKEN\": \"…\" } } }`. Servers run on this machine over standard input and output, start with the first agent reply and stop with the chat. Each call is shown with Run and Skip first, unless you chose Always run for that tool. Every tool goes into every agent request, so a server with many tools makes small models pick worse. Set in your user settings; a workspace cannot add one.",
+          "markdownDescription": "Model Context Protocol servers whose tools agent mode can use (with `#twinny.chatTools#` on), by name: `{ \"github\": { \"type\": \"http\", \"url\": \"http://localhost:3000/mcp\", \"headers\": { \"Authorization\": \"Bearer …\" } } }`. Legacy stdio servers still work with `{ \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": { \"GITHUB_TOKEN\": \"…\" } }`. Each call is shown with Run and Skip first, unless you chose Always run for that tool. Every tool goes into every agent request, so a server with many tools makes small models pick worse. Set in your user settings; a workspace cannot add one.",
           "scope": "machine"
         },
         "twinny.chatToolsMaxSteps": {
@@ -913,6 +954,7 @@
   },
   "dependencies": {
     "@lancedb/lancedb": "^0.19.1",
+    "@modelcontextprotocol/sdk": "^1.20.0",
     "@tiptap/extension-image": "^2.11.7",
     "@tiptap/extension-mention": "^2.5.9",
     "@tiptap/extension-placeholder": "^2.5.9",

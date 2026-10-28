@@ -24,6 +24,46 @@ interface Running {
 const serverConfig = (value: unknown): McpServerConfig | string => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return "it is not an object"
   const entry = value as Record<string, unknown>
+  const type = entry.type === undefined ? "stdio" : entry.type
+  if (type !== "stdio" && type !== "http") return "type is not stdio or http"
+
+  if (type === "http") {
+    const url = typeof entry.url === "string" ? entry.url.trim() : ""
+    if (!url) return "it has no url"
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "url is not an http or https URL"
+    } catch {
+      return "url is not a valid URL"
+    }
+    if (entry.command !== undefined) return "http servers do not use command"
+    if (entry.args !== undefined && (!Array.isArray(entry.args) || !entry.args.every((a) => typeof a === "string"))) {
+      return "args is not a list of strings"
+    }
+    if (
+      entry.env !== undefined &&
+      (!entry.env || typeof entry.env !== "object" || !Object.values(entry.env).every((v) => typeof v === "string"))
+    ) {
+      return "env is not an object of strings"
+    }
+    if (entry.cwd !== undefined && typeof entry.cwd !== "string") return "cwd is not a string"
+    if (
+      entry.headers !== undefined &&
+      (!entry.headers || typeof entry.headers !== "object" || !Object.values(entry.headers).every((v) => typeof v === "string"))
+    ) {
+      return "headers is not an object of strings"
+    }
+    if (entry.timeoutMs !== undefined && (typeof entry.timeoutMs !== "number" || !Number.isFinite(entry.timeoutMs))) {
+      return "timeoutMs is not a number"
+    }
+    return {
+      type: "http",
+      url,
+      ...(entry.headers ? { headers: entry.headers as Record<string, string> } : {}),
+      ...(entry.timeoutMs !== undefined ? { timeoutMs: entry.timeoutMs as number } : {})
+    }
+  }
+
   if (typeof entry.command !== "string" || !entry.command.trim()) return "it has no command"
   if (entry.args !== undefined && (!Array.isArray(entry.args) || !entry.args.every((a) => typeof a === "string"))) {
     return "args is not a list of strings"
@@ -36,6 +76,7 @@ const serverConfig = (value: unknown): McpServerConfig | string => {
   }
   if (entry.cwd !== undefined && typeof entry.cwd !== "string") return "cwd is not a string"
   return {
+    type: "stdio",
     command: entry.command,
     ...(entry.args ? { args: entry.args as string[] } : {}),
     ...(entry.env ? { env: entry.env as Record<string, string> } : {}),

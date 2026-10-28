@@ -5,11 +5,16 @@
  * answers and one that dies, and the tools going through the agent loop
  * in both calling modes with their own schemas.
  */
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
 import * as assert from "node:assert"
+import { randomUUID } from "node:crypto"
 import * as fs from "node:fs"
+import * as http from "node:http"
 import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
+import { z } from "zod"
 
 import { McpHost } from "../../extension/chat/mcp-host"
 import { ChatChunk, ChatRequest, InferenceClient } from "../../extension/inference"
@@ -165,5 +170,86 @@ test("servers follow the settings: a changed entry is restarted, a removed one s
     assert.ok(!host.configured)
   } finally {
     host.dispose()
+  }
+})
+
+
+const startHttpTestServer = async () => {
+  const server = new McpServer({ name: "http-test", version: "1.0.0" })
+  server.registerTool(
+    "echo",
+    {
+      description: "Echoes a string",
+      inputSchema: { text: z.string() }
+    },
+    async ({ text }) => ({
+      content: [{ type: "text", text: `echo:${text}` }]
+    })
+  )
+  server.registerTool(
+    "slow_echo",
+    {
+      description: "Echoes after a small SSE-backed delay",
+      inputSchema: { text: z.string() }
+    },
+    async ({ text }) => {
+      await new Promise((resolve) => setTimeout(resolve, 75))
+      return { content: [{ type: "text", text: `slow:${text}` }] }
+    }
+  )
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() })
+  await server.connect(transport)
+  const httpServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1")
+    if (url.pathname !== "/mcp") {
+      res.writeHead(404)
+      res.end("not found")
+      return
+    }
+    await transport.handleRequest(req, res)
+  })
+  await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve))
+  const address = httpServer.address()
+  if (!address || typeof address === "string") throw new Error("HTTP test server did not bind to a port")
+  return {
+    url: `http://127.0.0.1:${address.port}/mcp`,
+    close: async () => {
+      await transport.close()
+      await new Promise<void>((resolve, reject) => httpServer.close((error) => (error ? reject(error) : resolve())))
+    }
+  }
+}
+
+test("an explicit HTTP MCP server config works for list and call operations", async () => {
+  const endpoint = await startHttpTestServer()
+  try {
+    const client = new McpClient("http", { type: "http", url: endpoint.url }, { cwd })
+    const tools = await client.listTools()
+    assert.ok(tools.some((tool) => tool.name === "echo"))
+    assert.strictEqual((await client.callTool("echo", { text: "hello" })).text, "echo:hello")
+    assert.strictEqual((await client.callTool("slow_echo", { text: "later" })).text, "slow:later")
+    client.close()
+  } finally {
+    await endpoint.close()
+  }
+})
+
+test("unknown or invalid MCP server types are rejected and valid HTTP config passes through the host", async () => {
+  const endpoint = await startHttpTestServer()
+  try {
+    const host = new McpHost(
+      () => ({
+        valid: { type: "http", url: endpoint.url },
+        invalidType: { type: "ssh", url: "ssh://example.com" },
+        invalidUrl: { type: "http", url: "not a URL" }
+      }),
+      () => cwd
+    )
+    const tools = await host.ready()
+    assert.ok(tools.some((tool) => tool.name === "valid__echo"))
+    assert.ok(!tools.some((tool) => tool.name === "invalidType__"))
+    host.dispose()
+  } finally {
+    await endpoint.close()
   }
 })
