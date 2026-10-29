@@ -1,9 +1,9 @@
 /**
  * The MCP servers the user set up in `twinny.chatToolsMcpServers`, kept
  * running for the chat: started on the first agent reply that wants them,
- * restarted when their configuration changes, closed with the chat. Each
- * server's tools join agent mode; each call is put to the user first
- * unless they chose Always run for that tool, since nothing undoes what a
+ * restarted when their configuration changes, closed with the chat. Disabled
+ * entries never start or expose tools. Each call is put to the user first
+ * unless global approval or Always run permits it, since nothing undoes what a
  * server did.
  */
 import { logger } from "../../common/logger"
@@ -12,6 +12,9 @@ import type { McpSink, ToolResult } from "../tools/workspace"
 
 /** How long a reply waits for its servers to start and list their tools. */
 const READY_WAIT_MS = 15_000
+
+const isServerEnabled = (value: unknown): boolean =>
+  value !== null && typeof value === "object" && !Array.isArray(value) && Reflect.get(value, "enabled") !== false
 
 interface Running {
   client: McpClient
@@ -100,12 +103,13 @@ export class McpHost {
 
   /** Whether the user set up any server. */
   get configured(): boolean {
-    return Object.keys(this._servers() ?? {}).length > 0
+    return Object.values(this._servers() ?? {}).some(isServerEnabled)
   }
 
   /** The tools of every server that is up, in the settings' order, so the prompt reads the same each reply. */
   get tools(): McpToolSpec[] {
-    return Object.keys(this._servers() ?? {}).flatMap((name) => this._running.get(name)?.tools ?? [])
+    const servers = this._servers() ?? {}
+    return Object.keys(servers).flatMap((name) => (isServerEnabled(servers[name]) ? this._running.get(name)?.tools ?? [] : []))
   }
 
   /**
@@ -114,7 +118,7 @@ export class McpHost {
    * that fails is logged and left out; the reply goes on without it.
    */
   async ready(): Promise<McpToolSpec[]> {
-    const wanted = this._servers() ?? {}
+    const wanted = Object.fromEntries(Object.entries(this._servers() ?? {}).filter(([, value]) => isServerEnabled(value)))
     for (const [name, running] of this._running) {
       if (!(name in wanted) || running.key !== JSON.stringify(wanted[name])) {
         running.client.close()
@@ -138,6 +142,10 @@ export class McpHost {
         })
         try {
           const tools = await client.listTools()
+          if (!isServerEnabled(this._servers()?.[name])) {
+            client.close()
+            return
+          }
           if (tools.length > MANY_MCP_TOOLS) {
             logger.warn(
               `MCP server ${name} offers ${tools.length} tools; small models pick worse from long lists. Fewer servers, or a server set to fewer tools, helps.`
@@ -161,12 +169,22 @@ export class McpHost {
   }
 
   /** The tools for one reply; `approve` says whether a call may run. */
-  sink(approve: (detail: string, tool: McpToolSpec) => Promise<boolean>): McpSink {
+  sink(
+    approve: (detail: string, tool: McpToolSpec) => Promise<boolean>,
+    autoApprove: () => boolean = () => false
+  ): McpSink {
     return {
       tools: this.tools,
       call: async (tool, args, context): Promise<ToolResult> => {
         const label = `${tool.server}/${tool.tool}`
-        if (!(await approve(`${label} ${JSON.stringify(args)}`, tool))) {
+        if (!isServerEnabled(this._servers()?.[tool.server])) {
+          return {
+            output: `The MCP server ${tool.server} is disabled or not configured.`,
+            summary: `\`${label}\` failed · server disabled`,
+            failed: true
+          }
+        }
+        if (!autoApprove() && !(await approve(`${label} ${JSON.stringify(args)}`, tool))) {
           return {
             output: "The user chose not to run this tool. Carry on without it, or ask the user.",
             summary: `\`${label}\` skipped`

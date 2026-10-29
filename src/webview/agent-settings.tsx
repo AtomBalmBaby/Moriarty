@@ -150,6 +150,7 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
   const [intentCompilerMode, setIntentCompilerMode] = useSetting<string>("chatToolsIntentCompilerMode", "ask")
   const [intentCompilerMaxTurns, setIntentCompilerMaxTurns] = useSetting<number>("chatToolsIntentCompilerMaxTurns", 3)
   const [intentCompilerTrace, setIntentCompilerTrace] = useSetting<boolean>("chatToolsIntentCompilerTrace", false)
+  const [mcpNeverAskAgain, setMcpNeverAskAgain] = useSetting<boolean>("mcpNeverAskAgain", false)
   const { context: always, setContext: setAlways } = useStorageContext<string[]>(
     StorageType.Global,
     GLOBAL_STORAGE_KEY.alwaysRunCommands
@@ -171,6 +172,9 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
     }
     if (key === "chatToolsIntentCompilerTrace" && typeof value === "boolean") {
       setIntentCompilerTrace(value)
+    }
+    if (key === "mcpNeverAskAgain" && typeof value === "boolean") {
+      setMcpNeverAskAgain(value)
     }
   })
 
@@ -332,6 +336,20 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
         title={t("agent-settings-result-chars-title")}
         onChange={setMaxResultChars}
       />
+      <label className={styles.row} aria-label="MCP: Never ask me. EVER.">
+        <span
+          className={styles.label}
+          title="Automatically approve every tool call from enabled MCP servers. Applies across conversations and restarts. Does not enable disabled servers or override external system permissions. This includes destructive actions offered by enabled servers."
+        >
+          MCP: Never ask me. EVER.
+        </span>
+        <input
+          type="checkbox"
+          checked={mcpNeverAskAgain}
+          title="Automatically approve every tool call from enabled MCP servers. Applies across conversations and restarts. Does not enable disabled servers or override external system permissions. This includes destructive actions offered by enabled servers."
+          onChange={(event) => setMcpNeverAskAgain(event.target.checked)}
+        />
+      </label>
       {team?.commands !== "off" && team?.mcp !== "off" && (
         <div className={styles.row}>
           <span className={styles.label} title={t("agent-settings-mcp-title")}>

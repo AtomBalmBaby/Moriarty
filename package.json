@@ -771,6 +771,11 @@
                   "command"
                 ],
                 "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Whether Twinny may start this MCP server and offer its tools. Set to false to keep it disabled."
+                  },
                   "type": {
                     "type": "string",
                     "enum": [
@@ -808,6 +813,11 @@
                   "url"
                 ],
                 "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Whether Twinny may start this MCP server and offer its tools. Set to false to keep it disabled."
+                  },
                   "type": {
                     "type": "string",
                     "const": "http",
@@ -834,8 +844,16 @@
               }
             ]
           },
-          "markdownDescription": "Model Context Protocol servers whose tools agent mode can use (with `#twinny.chatTools#` on), by name: `{ \"github\": { \"type\": \"http\", \"url\": \"http://localhost:3000/mcp\", \"headers\": { \"Authorization\": \"Bearer …\" } } }`. Legacy stdio servers still work with `{ \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": { \"GITHUB_TOKEN\": \"…\" } }`. Each call is shown with Run and Skip first, unless you chose Always run for that tool. Every tool goes into every agent request, so a server with many tools makes small models pick worse. Set in your user settings; a workspace cannot add one.",
+          "markdownDescription": "Model Context Protocol servers whose tools agent mode can use (with `#twinny.chatTools#` on), by name: `{ \"github\": { \"type\": \"http\", \"url\": \"http://localhost:3000/mcp\", \"headers\": { \"Authorization\": \"Bearer …\" } } }`. Legacy stdio servers still work with `{ \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": { \"GITHUB_TOKEN\": \"…\" } }`. Set `enabled: false` to keep a server disabled. Each call is shown with Run and Skip first, unless you chose Always run for that tool or enabled `twinny.mcpNeverAskAgain`. Every tool goes into every agent request, so a server with many tools makes small models pick worse. Set in your user settings; a workspace cannot add one.",
           "scope": "machine"
+        },
+        "twinny.mcpNeverAskAgain": {
+          "order": 19,
+          "title": "MCP: Never ask me. EVER.",
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Automatically approve every tool call from enabled MCP servers. Applies across conversations and restarts. Does not enable disabled servers or override external system permissions. This includes destructive actions offered by enabled servers."
         },
         "twinny.chatToolsMaxSteps": {
           "order": 20,

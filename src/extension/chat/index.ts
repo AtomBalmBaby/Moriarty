@@ -604,7 +604,7 @@ export class Chat extends Base {
       if (this.ownAgentMode()) await this.freshTeamPolicy()
       view = this.toolsView()
       // The user's MCP servers, started (or restarted) for an agent reply.
-      if (view && this._mcp.configured && mcpAllowed(currentTeamPolicy()?.agent)) await this._mcp.ready()
+      if (view && mcpAllowed(currentTeamPolicy()?.agent)) await this._mcp.ready()
       this._conversation = await buildChatTurn(messages, {
         systemPrompt: () => this._context.systemPrompt(),
         additionalContext: async (question, sources, history) => {
@@ -986,7 +986,13 @@ export class Chat extends Base {
           )
         : undefined,
       // A team that takes commands away takes MCP servers too: neither can be undone.
-      mcp: !mcpAllowed(team) || !this._mcp.tools.length ? undefined : this._mcp.sink((detail, tool) => this.approveMcp(detail, tool))
+      mcp:
+        !mcpAllowed(team) || !this._mcp.tools.length
+          ? undefined
+          : this._mcp.sink(
+              (detail, tool) => this.approveMcp(detail, tool),
+              () => this.config.get<boolean>("mcpNeverAskAgain", false) && !currentTeamPolicy()?.agent?.commands
+            )
     })
     hooks.onTools(available)
     let warned = false

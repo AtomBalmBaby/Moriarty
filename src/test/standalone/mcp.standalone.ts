@@ -26,6 +26,16 @@ import { workspaceTools } from "../../extension/tools/workspace"
 const fakeServer = { command: process.execPath, args: [path.join(__dirname, "..", "suite", "support", "fake-mcp-server.js")] }
 const cwd = os.tmpdir()
 
+const callMcpTool = async (root: string, sink: ReturnType<McpHost["sink"]>, name: string, args: Record<string, unknown>) => {
+  const run = scripted([{ calls: [{ id: "1", name, arguments: JSON.stringify(args) }] }, "done"])
+  for await (const chunk of withTools(run.client, workspaceTools(root, [], { mcp: sink }), { mode: "native" }).chat({
+    model: "m",
+    messages: [{ role: "user", content: "run" }]
+  }))
+    void chunk
+  return run.requests
+}
+
 test("a server is started, shaken hands with, and its tools listed page by page", async () => {
   const stderr: string[] = []
   const client = new McpClient("fake", fakeServer, { cwd, onStderr: (text) => stderr.push(text) })
@@ -152,6 +162,92 @@ test("an MCP tool goes through the agent loop in both calling modes, asked first
     assert.match(String(text.requests[1].messages.at(-1)?.content), /The user chose not to run this tool/)
   } finally {
     host.dispose()
+  }
+})
+
+test("global MCP approval persists across recreated hosts, skips prompts, and can be turned off", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-mcp-global-"))
+  const persistedSetting = { enabled: true }
+  const servers = { fake: { ...fakeServer, enabled: true } }
+  const asked: string[] = []
+  const approval = async (detail: string) => {
+    asked.push(detail)
+    return false
+  }
+  let host = new McpHost(() => servers, () => root)
+  try {
+    assert.ok((await host.ready()).some((tool) => tool.name === "fake__echo"))
+    let sink = host.sink(approval, () => persistedSetting.enabled)
+    const first = await callMcpTool(root, sink, "fake__add", { a: 2, b: 3 })
+    assert.match(String(first[1].messages.at(-1)?.content), /^5 \(a:number,b:number\)$/)
+    assert.deepStrictEqual(asked, [], "the enabled global setting bypasses the pending approval callback")
+
+    host.dispose()
+    host = new McpHost(() => servers, () => root)
+    await host.ready()
+    sink = host.sink(approval, () => persistedSetting.enabled)
+    const afterRestart = await callMcpTool(root, sink, "fake__fail", {})
+    assert.match(String(afterRestart[1].messages.at(-1)?.content), /The tool reported an error:\s*no such issue/)
+    assert.deepStrictEqual(asked, [], "a recreated MCP host still reads the persisted global choice")
+
+    persistedSetting.enabled = false
+    const afterDisable = await callMcpTool(root, sink, "fake__echo", { text: "not run" })
+    assert.match(String(afterDisable[1].messages.at(-1)?.content), /The user chose not to run this tool/)
+    assert.deepStrictEqual(asked, ["fake/echo {\"text\":\"not run\"}"], "turning it off restores normal per-call approval")
+  } finally {
+    host.dispose()
+  }
+})
+
+test("disabled MCP servers stay unavailable and newly enabled tools are auto-approved", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-mcp-enabled-"))
+  let servers: Record<string, unknown> = { fake: { ...fakeServer, enabled: false } }
+  let approvals = 0
+  const host = new McpHost(() => servers, () => root)
+  try {
+    assert.deepStrictEqual(await host.ready(), [])
+    assert.strictEqual(host.configured, false)
+    assert.deepStrictEqual(host.tools, [])
+
+    servers = { fake: { ...fakeServer, enabled: true } }
+    assert.ok((await host.ready()).some((tool) => tool.name === "fake__echo"))
+    const sink = host.sink(async () => {
+      approvals++
+      return false
+    }, () => true)
+    const newlyEnabled = await callMcpTool(root, sink, "fake__echo", { text: "enabled" })
+    assert.match(String(newlyEnabled[1].messages.at(-1)?.content), /enabled/)
+    assert.strictEqual(approvals, 0)
+
+    servers = { fake: { ...fakeServer, enabled: false } }
+    assert.deepStrictEqual(host.tools, [], "disabling a server removes its discovered tools immediately")
+    const staleToolCall = await callMcpTool(root, sink, "fake__echo", { text: "disabled" })
+    assert.match(String(staleToolCall[1].messages.at(-1)?.content), /server .* disabled or not configured/i)
+    assert.strictEqual(approvals, 0, "disabled servers are rejected before approval or transport")
+    await host.ready()
+    assert.deepStrictEqual(host.tools, [])
+  } finally {
+    host.dispose()
+  }
+})
+
+test("HTTP MCP calls use global auto-approval at the execution boundary", async () => {
+  const endpoint = await startHttpTestServer()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-mcp-http-auto-"))
+  let approvals = 0
+  const host = new McpHost(() => ({ http: { type: "http", enabled: true, url: endpoint.url } }), () => root)
+  try {
+    assert.ok((await host.ready()).some((tool) => tool.name === "http__echo"))
+    const sink = host.sink(async () => {
+      approvals++
+      return false
+    }, () => true)
+    const request = await callMcpTool(root, sink, "http__echo", { text: "unattended" })
+    assert.match(String(request[1].messages.at(-1)?.content), /echo:unattended/)
+    assert.strictEqual(approvals, 0)
+  } finally {
+    host.dispose()
+    await endpoint.close()
   }
 })
 

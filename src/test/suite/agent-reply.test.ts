@@ -202,6 +202,111 @@ suite("Agent reply, end to end", function () {
     }
   })
 
+  test("global MCP approval survives a new chat and can be changed without a new chat", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-agent-mcp-global-"))
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousApproval = settings.inspect<boolean>("mcpNeverAskAgain")?.globalValue
+    const previousCommands = settings.inspect<string>("chatToolsCommands")?.globalValue
+    const previousServers = settings.inspect<Record<string, unknown>>("chatToolsMcpServers")?.globalValue
+    const fakeServer = {
+      command: process.execPath,
+      args: [path.join(__dirname, "support", "fake-mcp-server.js")],
+      env: { ELECTRON_RUN_AS_NODE: "1" }
+    }
+    await settings.update("chatToolsMcpServers", { fake: fakeServer }, vscode.ConfigurationTarget.Global)
+    await settings.update("mcpNeverAskAgain", true, vscode.ConfigurationTarget.Global)
+
+    const stored: Record<string, unknown> = {
+      [EVENT_NAME.twinnyGlobalContext + "-" + GLOBAL_STORAGE_KEY.agentMode]: true,
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider
+    }
+    const context = {
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const asked: string[] = []
+    let model = new ScriptedModel([call("fake__add", { a: "1", b: "2" }), "first done"])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
+    const firstRef: { current?: ChatIn } = {}
+    const firstBridge = {
+      emit: (type: string, data: unknown) => {
+        if (type !== EVENT_NAME.twinnyToolSteps) return
+        const waiting = (data as ToolStepView[]).find((step) => step.status === "waiting")
+        if (!waiting) return
+        asked.push(waiting.mcpTool ?? "")
+        setTimeout(() => firstRef.current?.answerToolApproval(waiting.id, true), 10)
+      }
+    } as unknown as ExtensionBridge
+    const firstChat = new ChatIn(new GenerationTracker(), undefined, context, firstBridge, undefined)
+    firstRef.current = firstChat
+    firstChat.root = root
+    let secondChat: ChatIn | undefined
+    let ordinaryChat: ChatIn | undefined
+    try {
+      assert.strictEqual(await firstChat.completion([{ role: "user", content: "Add." } as ChatCompletionMessage]), "first done")
+      assert.match(JSON.stringify(model.requests[1].messages.at(-1)?.content), /3 \(a:number,b:number\)/)
+      assert.strictEqual(asked.length, 0, "the global setting bypasses the real Chat approval callback")
+      firstChat.dispose()
+
+      model = new ScriptedModel([
+        call("fake__add", { a: "4", b: "5" }),
+        "second done",
+        call("fake__fail", {}),
+        "error returned"
+      ])
+      const secondRef: { current?: ChatIn } = {}
+      const secondBridge = {
+        emit: (type: string, data: unknown) => {
+          if (type !== EVENT_NAME.twinnyToolSteps) return
+          const waiting = (data as ToolStepView[]).find((step) => step.status === "waiting")
+          if (!waiting) return
+          asked.push(waiting.mcpTool ?? "")
+          setTimeout(() => secondRef.current?.answerToolApproval(waiting.id, true), 10)
+        }
+      } as unknown as ExtensionBridge
+      secondChat = new ChatIn(new GenerationTracker(), undefined, context, secondBridge, undefined)
+      secondRef.current = secondChat
+      secondChat.root = root
+      assert.strictEqual(await secondChat.completion([{ role: "user", content: "Add again." } as ChatCompletionMessage]), "second done")
+      assert.strictEqual(asked.length, 0, "a newly created conversation keeps the user's global choice")
+
+      await settings.update("mcpNeverAskAgain", false, vscode.ConfigurationTarget.Global)
+      assert.strictEqual(await secondChat.completion([{ role: "user", content: "Fail." } as ChatCompletionMessage]), "error returned")
+      assert.deepStrictEqual(asked, ["fake/fail"], "turning the setting off restores the interactive approval path")
+      assert.match(JSON.stringify(model.requests[3].messages.at(-1)?.content), /no such issue/)
+
+      await settings.update("mcpNeverAskAgain", true, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsCommands", "ask", vscode.ConfigurationTarget.Global)
+      const ordinaryModel = new ScriptedModel([call("run_command", { command: "echo twinny-ordinary-tool" }), "command complete"])
+      model = ordinaryModel
+      const ordinaryRef: { current?: ChatIn } = {}
+      const ordinaryBridge = {
+        emit: (type: string, data: unknown) => {
+          if (type !== EVENT_NAME.twinnyToolSteps) return
+          const waiting = (data as ToolStepView[]).find((step) => step.status === "waiting")
+          if (!waiting) return
+          asked.push(waiting.mcpTool ?? "ordinary")
+          setTimeout(() => ordinaryRef.current?.answerToolApproval(waiting.id, true), 10)
+        }
+      } as unknown as ExtensionBridge
+      ordinaryChat = new ChatIn(new GenerationTracker(), undefined, context, ordinaryBridge, undefined)
+      ordinaryRef.current = ordinaryChat
+      ordinaryChat.root = root
+      assert.strictEqual(await ordinaryChat.completion([{ role: "user", content: "Run the harmless command." } as ChatCompletionMessage]), "command complete")
+      assert.deepStrictEqual(asked, ["fake/fail", "ordinary"], "global MCP approval does not auto-approve ordinary tools")
+      assert.match(JSON.stringify(ordinaryModel.requests[1].messages.at(-1)?.content), /twinny-ordinary-tool/)
+    } finally {
+      firstChat.dispose()
+      secondChat?.dispose()
+      ordinaryChat?.dispose()
+      providerRegistry.unregister("scripted-agent")
+      await settings.update("mcpNeverAskAgain", previousApproval, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsCommands", previousCommands, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsMcpServers", previousServers, vscode.ConfigurationTarget.Global)
+    }
+  })
+
   teardown(async () => {
     providerRegistry.unregister("scripted-agent")
     await vscode.commands.executeCommand("workbench.action.closeAllEditors")
