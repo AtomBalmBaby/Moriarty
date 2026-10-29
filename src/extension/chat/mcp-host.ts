@@ -117,14 +117,17 @@ export class McpHost {
    * what they no longer name, and read the new servers' tools. A server
    * that fails is logged and left out; the reply goes on without it.
    */
-  async ready(): Promise<McpToolSpec[]> {
-    const wanted = Object.fromEntries(Object.entries(this._servers() ?? {}).filter(([, value]) => isServerEnabled(value)))
+  async ready(names?: string[]): Promise<McpToolSpec[]> {
+    const configured = this._servers() ?? {}
     for (const [name, running] of this._running) {
-      if (!(name in wanted) || running.key !== JSON.stringify(wanted[name])) {
+      if (!isServerEnabled(configured[name]) || running.key !== JSON.stringify(configured[name])) {
         running.client.close()
         this._running.delete(name)
       }
     }
+    const wanted = Object.fromEntries(Object.entries(configured).filter(([name, value]) =>
+      isServerEnabled(value) && (names === undefined || names.includes(name))
+    ))
     const taken = new Set(this.tools.map((tool) => tool.name))
     const starting = Object.entries(wanted)
       .filter(([name]) => !this._running.has(name))
@@ -165,18 +168,27 @@ export class McpHost {
       new Promise((resolve) => (timer = setTimeout(resolve, READY_WAIT_MS)))
     ])
     clearTimeout(timer)
-    return this.tools
+    return this.toolsFor(names)
+  }
+
+  toolsFor(names?: string[]): McpToolSpec[] {
+    return names === undefined ? this.tools : this.tools.filter((tool) => names.includes(tool.server))
   }
 
   /** The tools for one reply; `approve` says whether a call may run. */
   sink(
     approve: (detail: string, tool: McpToolSpec) => Promise<boolean>,
-    autoApprove: () => boolean = () => false
+    autoApprove: () => boolean = () => false,
+    permitted: McpToolSpec[] = this.tools
   ): McpSink {
+    const allowed = new Set(permitted.map((tool) => `${tool.server}/${tool.tool}`))
     return {
-      tools: this.tools,
+      tools: permitted,
       call: async (tool, args, context): Promise<ToolResult> => {
         const label = `${tool.server}/${tool.tool}`
+        if (!allowed.has(label)) {
+          return { output: `The MCP capability ${label} is not permitted for this agent.`, summary: `\`${label}\` failed · not permitted`, failed: true }
+        }
         if (!isServerEnabled(this._servers()?.[tool.server])) {
           return {
             output: `The MCP server ${tool.server} is disabled or not configured.`,

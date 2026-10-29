@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.3.17 · 2026-10-28
+
+Extension release: dependable mouse access to custom agents and agent settings in VSCodium.
+
+- **Open the picker with the mouse.** Replace the platform-native select with a visible, keyboard-accessible menu; selection and Manage Agents are actionable from Agent off.
+- **Restore agent settings access.** An always-visible gear beside the picker opens the same management GUI as + Manage Agents.
+- **Keep the packaged release discoverable.** Bump the extension and gateway version so VSCodium installs this webview instead of retaining the older registered extension.
+
+## 4.3.16 · 2026-10-28
+
+Extension release: selectable custom agents and a corrected, always-available agent picker.
+
+- **Select an agent from the chat composer.** Choose Agent off, Default Agent or an enabled `.agent.md` profile in one dropdown; **+ Manage Agents…** opens profile registration and discovery settings. Shift+Tab switches between Off and the last valid enabled agent.
+- **Manage Copilot-compatible profiles.** Discover `.github/agents/*.agent.md`, register files, create and open profiles, enable or remove registrations, and review validation and MCP-reference status.
+- **Keep webviews and settings in sync.** Webview assets receive per-document cache keys; selection writes are idempotent and traced, and settings changes update the management panel. `vscode-userdata:` profile paths resolve correctly.
+
 What changed in each release of the twinny extension and `twinny-server`. The gateway is built from the same tree and carries the extension's version number. Newest first. A shorter, feature-by-feature version with links to the documentation is at [What's new](https://docs.twinny.dev/reference/whats-new/).
 
 ## 4.3.15 · 2026-10-16

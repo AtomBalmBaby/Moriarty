@@ -1,9 +1,11 @@
-import { randomUUID } from "crypto"
+import { createHash, randomUUID } from "crypto"
 import { promises as fs } from "fs"
 import os from "os"
 import path from "path"
-import { ExtensionContext, workspace } from "vscode"
+import { ExtensionContext, RelativePattern, Uri, workspace } from "vscode"
 
+import type { AgentSelection } from "../../common/agents"
+import { AGENT_SELECTION_STORAGE_KEY, isAgentSelectionEnabled, normalizeAgentSelection, resolveAgentSelection, selectionFromLegacyAgentMode } from "../../common/agents"
 import { cleanModelSuggestion, composerSuggestionMessages } from "../../common/composer-predict"
 import {
   API_PROVIDERS,
@@ -26,6 +28,9 @@ import {
   ReplyChangesView,
   TwinnyProvider
 } from "../../common/types"
+import { composeAgentPrompt } from "../agents/prompt"
+import type { LoadedAgent } from "../agents/registry"
+import { AgentRegistry } from "../agents/registry"
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
@@ -338,6 +343,11 @@ export class Chat extends Base {
   private readonly _context: ChatContextBuilder
   private readonly _generation: ChatGeneration
   private readonly _search: WorkspaceSearch | undefined
+  private readonly _agents: AgentRegistry
+  private _requestAgentSelection: AgentSelection = "off"
+  private _activeAgent?: LoadedAgent
+  private _activeMcpTools: McpToolSpec[] = []
+  private _missingMcpCapabilities: string[] = []
   private readonly _steps: ToolSteps
   private readonly _stopSubscription: { dispose(): void }
   /** What agent replies changed, kept so each can be compared or undone from the chat. */
@@ -365,12 +375,14 @@ export class Chat extends Base {
     templateDir: string | undefined,
     extensionContext: ExtensionContext,
     bridge: ExtensionBridge,
-    search: WorkspaceSearch | undefined
+    search: WorkspaceSearch | undefined,
+    agents: AgentRegistry = new AgentRegistry(extensionContext)
   ) {
     super(extensionContext)
     this._generations = generations
     this._bridge = bridge
     this._search = search
+    this._agents = agents
     this._steps = new ToolSteps((steps) => bridge.emit(EVENT_NAME.twinnyToolSteps, steps))
     // Stopping the reply skips a command still waiting for Run or Skip.
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
@@ -590,7 +602,8 @@ export class Chat extends Base {
   /** A message typed in the chat, with whatever the user attached. */
   public async completion(
     messages: ChatCompletionMessage[],
-    mentions?: MentionType[]
+    mentions?: MentionType[],
+    requestedSelection?: AgentSelection
   ): Promise<string | undefined> {
     const provider = this.start()
     if (!provider) return undefined
@@ -599,14 +612,90 @@ export class Chat extends Base {
     this._preparing = true
     let view: WorkspaceView | undefined
     try {
-      // Asked on the developer's own switch, so a team that turns agent mode
-      // back on is heard from too.
-      if (this.ownAgentMode()) await this.freshTeamPolicy()
+      this._requestAgentSelection = await this.currentAgentSelection(requestedSelection)
+      this._activeAgent = undefined
+      this._activeMcpTools = []
+      this._missingMcpCapabilities = []
+      if (this._requestAgentSelection !== "off" && this._requestAgentSelection !== "default") {
+        try {
+          this._activeAgent = await this._agents.load(this._requestAgentSelection)
+          if (this._activeAgent) {
+            const hash = createHash("sha256").update(JSON.stringify({ frontmatter: this._activeAgent.profile.frontmatter, instructions: this._activeAgent.profile.instructions })).digest("hex")
+            logger.debug(`[Agent] profile id=${this._activeAgent.summary.id} path=${this._activeAgent.summary.path} sha256=${hash}`)
+          }
+        } catch (error) {
+          logger.warn(`Agent '${this._requestAgentSelection}' could not be loaded: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        if (!this._activeAgent) {
+          await this.setAgentSelection("off")
+          this._requestAgentSelection = "off"
+          this._bridge.emit(EVENT_NAME.twinnyNotification, "The selected agent is missing, disabled, or invalid. Agent selection was reset to Agent off.")
+        }
+      }
+      // Asked on the developer's own selection, so team policy is current before tools are exposed.
+      if (this._requestAgentSelection !== "off") await this.freshTeamPolicy()
       view = this.toolsView()
-      // The user's MCP servers, started (or restarted) for an agent reply.
-      if (view && mcpAllowed(currentTeamPolicy()?.agent)) await this._mcp.ready()
+      const team = currentTeamPolicy()?.agent
+      if (view && mcpAllowed(team)) {
+        const profile = this._activeAgent?.profile
+        const toolMcpNames = profile?.tools?.flatMap((tool) => {
+          const separator = tool.indexOf("/")
+          return separator > 0 ? [tool.slice(0, separator)] : []
+        }) ?? []
+        const explicitNames = [...new Set([...(profile?.mcpServers ?? []), ...toolMcpNames])]
+        const serverNames = profile ? explicitNames : undefined
+        const serverSettings = this.config.get<Record<string, unknown>>("chatToolsMcpServers", {}) ?? {}
+        if (serverNames) {
+          for (const name of serverNames) {
+            const configured = serverSettings[name]
+            if (!configured) this._missingMcpCapabilities.push(`${name} (not configured)`)
+            else if (typeof configured === "object" && configured !== null && Reflect.get(configured, "enabled") === false) {
+              this._missingMcpCapabilities.push(`${name} (disabled)`)
+            }
+          }
+        }
+        await this._mcp.ready(serverNames)
+        const availableMcpTools = this._mcp.toolsFor(serverNames)
+        if (serverNames) {
+          for (const name of serverNames) {
+            const configured = serverSettings[name]
+            if (configured && typeof configured === "object" && Reflect.get(configured, "enabled") !== false && !availableMcpTools.some((tool) => tool.server === name)) {
+              this._missingMcpCapabilities.push(`${name} (unavailable or exposes no tools)`)
+            }
+          }
+        }
+        this._activeMcpTools = availableMcpTools
+        if (profile?.tools !== undefined) {
+          const requested = profile.tools
+          this._activeMcpTools = this._activeMcpTools.filter((tool) =>
+            requested.some((entry) => entry === `${tool.server}/${tool.tool}` || entry === `${tool.server}/*` || entry === tool.tool)
+          )
+          for (const entry of requested.filter((name) => name.includes("/"))) {
+            const [server, toolName] = entry.split("/", 2)
+            const found = availableMcpTools.some((tool) => tool.server === server && (toolName === "*" || tool.tool === toolName))
+            if (!found) this._missingMcpCapabilities.push(`${entry} (not exposed by the configured server)`)
+          }
+        }
+      } else if (this._activeAgent) {
+        const referenced = new Set([
+          ...this._activeAgent.profile.mcpServers,
+          ...(this._activeAgent.profile.tools ?? []).flatMap((tool) => {
+            const separator = tool.indexOf("/")
+            return separator > 0 ? [tool.slice(0, separator)] : []
+          })
+        ])
+        this._missingMcpCapabilities = [...referenced].map((name) => `${name} (blocked by team policy or no workspace tools are available)`)
+      }
+      if (this._missingMcpCapabilities.length) {
+        this._bridge.emit(EVENT_NAME.twinnyNotification, `Agent MCP capabilities unavailable: ${this._missingMcpCapabilities.join(", ")}`)
+      }
       this._conversation = await buildChatTurn(messages, {
-        systemPrompt: () => this._context.systemPrompt(),
+        systemPrompt: async () => {
+          const base = await this._context.systemPrompt()
+          if (this._requestAgentSelection === "off") return base
+          const context = await this.agentWorkspaceContext(view)
+          return composeAgentPrompt(base, this._activeAgent?.profile.instructions ?? "", context, this._missingMcpCapabilities)
+        },
         additionalContext: async (question, sources, history) => {
           const context = await this._context.additionalContext(question, sources, mentions, history)
           // With tools, where the user is in the editor comes with the
@@ -795,21 +884,71 @@ export class Chat extends Base {
   }
 
   /**
-   * Agent mode, as the composer's switch left it (stored the way the webview
+   * Agent selection, as the composer's picker left it (stored the way the webview
    * stores global values). Until it is first switched, `twinny.chatTools`.
    */
   private agentMode(): boolean {
-    return !currentTeamPolicy()?.agent?.off && this.ownAgentMode()
+    return !currentTeamPolicy()?.agent?.off && isAgentSelectionEnabled(this._requestAgentSelection)
   }
 
-  /** The developer's own switch, whatever their team's rules say. */
-  private ownAgentMode(): boolean {
-    const stored = this.context?.globalState.get<boolean>(
-      `${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`
+  private async currentAgentSelection(requested?: AgentSelection): Promise<AgentSelection> {
+    const state = this.context?.globalState
+    const key = `${EVENT_NAME.twinnyGlobalContext}-${AGENT_SELECTION_STORAGE_KEY}`
+    const stored = state?.get<unknown>(key)
+    const legacy = selectionFromLegacyAgentMode(
+      state?.get<unknown>(`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`)
     )
-    return stored ?? this.config.get<boolean>("chatTools", false)
+    const defaultSelection = this.config.get<{ defaultSelection?: "off" | "default" }>("agents", {})?.defaultSelection
+    const selection = resolveAgentSelection(
+      requested,
+      stored,
+      legacy,
+      this.config.get<boolean>("chatTools", false),
+      defaultSelection
+    )
+    if (normalizeAgentSelection(stored) !== selection) {
+      await state?.update(key, selection)
+      this._bridge.emit(EVENT_NAME.twinnyGlobalContext, { key: AGENT_SELECTION_STORAGE_KEY, value: selection })
+    }
+    return selection
   }
 
+  private async setAgentSelection(selection: AgentSelection): Promise<void> {
+    const key = `${EVENT_NAME.twinnyGlobalContext}-${AGENT_SELECTION_STORAGE_KEY}`
+    await this.context?.globalState.update(key, selection)
+    this._bridge.emit(EVENT_NAME.twinnyGlobalContext, { key: AGENT_SELECTION_STORAGE_KEY, value: selection })
+  }
+
+  private async agentWorkspaceContext(view?: WorkspaceView): Promise<string> {
+    const folders = workspace.workspaceFolders?.slice(0, 1) ?? []
+    if (!folders.length) return "No workspace folder is open."
+    let filesByRoot: Uri[][]
+    try {
+      filesByRoot = await Promise.all(folders.map((folder) => workspace.findFiles(
+        new RelativePattern(folder, "**/*"),
+        "**/{.git,node_modules,.venv,dist,build}/**,**/.env*,**/*.{pem,key,p12,pfx}",
+        101
+      )))
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      logger.warn(`Agent workspace inventory could not be generated: ${detail}`)
+      return `Runtime workspace context (generated for this request): inventory unavailable: ${detail}`
+    }
+    const entries = folders.map((folder, index) => {
+      const base = folder.uri.path.replace(/\/$/, "")
+      const files = filesByRoot[index] ?? []
+      const relative = files
+        .filter((file) => file.path.startsWith(`${base}/`))
+        .map((file) => file.path.slice(base.length + 1))
+        .filter((name) => !/(^|\/)(\.git|node_modules|\.venv|secrets?)(\/|$)|(^|\/)\.env|\.(pem|key|p12|pfx)$/i.test(name))
+        .filter((name) => index !== 0 || !view || view.visible(path.join(view.root, name)))
+      return `Workspace root: ${folder.uri.toString()}\nPaths are relative to this root on the workspace extension host (including Remote/SSH workspaces). Current bounded file inventory:\n${relative.slice(0, 100).map((name) => `- ${name}`).join("\n")}${relative.length > 100 || files.length > 100 ? "\n- (inventory truncated; inspect with permitted tools)" : ""}`
+    })
+    const toolRootNote = folders.length > 1
+      ? `Twinny's existing workspace tools operate on the first root (${folders[0].uri.toString()}); additional roots are listed for context only.`
+      : "Use the listed workspace root for every relative path."
+    return `Runtime workspace context (generated for this request):\n${entries.join("\n\n")}\n\n${toolRootNote}`
+  }
   /**
    * Whether a command asks first: not when the composer's auto-run switch
    * is on (until it is first switched, `twinny.chatToolsCommands`), nor
@@ -956,7 +1095,7 @@ export class Chat extends Base {
       MAX_RESULT_CHARS,
       DEFAULT_RESULT_CHARS
     )
-    const available = workspaceTools(view, [], {
+    let available = workspaceTools(view, [], {
       edits: editorEdits(view, editMode, approveChange, changes),
       editor: editorKnowledge(view, editMode, approveChange, changes),
       readFileMaxLines: maxReadLines,
@@ -987,13 +1126,29 @@ export class Chat extends Base {
         : undefined,
       // A team that takes commands away takes MCP servers too: neither can be undone.
       mcp:
-        !mcpAllowed(team) || !this._mcp.tools.length
+        !mcpAllowed(team) || !this._activeMcpTools.length
           ? undefined
           : this._mcp.sink(
               (detail, tool) => this.approveMcp(detail, tool),
-              () => this.config.get<boolean>("mcpNeverAskAgain", false) && !currentTeamPolicy()?.agent?.commands
+              () => this.config.get<boolean>("mcpNeverAskAgain", false) && !currentTeamPolicy()?.agent?.commands,
+              this._activeMcpTools
             )
     })
+    const requestedTools = this._activeAgent?.profile.tools
+    if (requestedTools !== undefined) {
+      const groups: Record<string, string[]> = {
+        read: ["list_dir", "find_files", "read_file", "grep", "find_symbol", "editor_context", "find_references", "go_to_definition", "diagnostics"],
+        search: ["search_code", "grep", "find_files", "find_symbol", "find_references"],
+        edit: ["edit_file", "create_file", "rename_symbol", "move_file", "delete_file"],
+        execute: ["run_command"]
+      }
+      const permitted = new Set(requestedTools.flatMap((name) => groups[name] ?? [name]))
+      if (permitted.has("*")) {
+        // A wildcard is still limited to tools already created under Twinny policy.
+      } else {
+        available = { ...available, tools: available.tools.filter((tool) => permitted.has(tool.name)) }
+      }
+    }
     hooks.onTools(available)
     let warned = false
     return withTools(resolveInferenceProvider(provider), available, {

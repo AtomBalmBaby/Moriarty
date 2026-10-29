@@ -1,0 +1,45 @@
+# Custom agent profiles
+
+Twinny's chat composer has one agent dropdown: **Agent off**, **Default Agent**, enabled `.agent.md` profiles, and **+ Manage Agents…**. Agent off is the fresh-install default. Existing `agentMode` preferences are migrated once to Off or Default Agent. Shift+Tab toggles between Off and the last enabled selection. Auto-run remains a separate command-approval preference.
+
+## Add a profile
+
+The management panel lets you register an explicit file path, choose a file, create a starter profile, open a profile, enable or disable it, remove its registration, and refresh discovery. By default Twinny discovers `.github/agents/*.agent.md` in open workspaces and `agents/` under the extension's VS Code global storage directory. `AGENTS.md` remains project instructions, not a selectable profile.
+
+Example `review.agent.md`:
+
+```markdown
+---
+name: Review Agent
+description: Review changes for correctness and regressions
+tools:
+  - read
+  - search
+  - ha-mcp/*
+mcp-servers:
+  - ha-mcp
+model: coder-model
+user-invocable: true
+disable-model-invocation: false
+---
+
+Review the requested changes. Prioritize correctness, security, and focused tests.
+```
+
+Twinny parses the YAML frontmatter and adds the Markdown body once to the selected agent's request. `name`, `description`, `tools`, `model`, `user-invocable`, `disable-model-invocation`, and `mcp-servers` are recognized. Non-user-invocable profiles are not shown in the picker. `model` is recognized and reported, but Twinny keeps the active provider/model. `disable-model-invocation` is parsed; Twinny does not implement subagent/model invocation. Other fields are preserved in the file and reported as unsupported.
+
+`tools` restricts the workspace and MCP tools already permitted by Twinny. MCP server names in `mcp-servers` (or qualified tool names such as `ha-mcp/search`) refer only to entries already configured in `twinny.chatToolsMcpServers`. Twinny starts only those enabled configured servers, discovers their real tools, and keeps normal Twinny approval rules. Command definitions or credentials placed in frontmatter are never executed or used to configure servers. Missing, disabled, invalid, or unavailable references are reported and do not create tools.
+
+## Settings
+
+The chat dropdown’s **+ Manage Agents…** panel exposes the new-chat default, automatic discovery, additional search directories, and registration controls. The extension also contributes `twinny.agents` to VS Code Settings:
+
+- `defaultSelection`: `off` (default) or `default`; legacy agent-on preference migration takes precedence.
+- `autoDiscover`: whether automatic discovery is enabled (default `true`).
+- `searchPaths`: additional directory paths. Workspace-relative paths can use `${workspaceFolder}/`; user storage can use `${extensionGlobalStorage}/`.
+- `definitions`: explicit registrations with `path`, optional `id`/`name`, `enabled`, and `scope`.
+- `excludedPaths`: discovered profile paths to exclude.
+
+User-created files are stored under `ExtensionContext.globalStorageUri/agents`, not a hardcoded home-directory location. Settings are persisted through VS Code configuration; existing MCP connections remain configured in `twinny.chatToolsMcpServers`.
+
+Twinny generates the active workspace root, relative-path guidance, and a bounded live inventory at request time for enabled agents. Inventory excludes common private/build paths and files hidden by Twinny's workspace visibility rules. In multi-root workspaces, the existing tool executor operates on the first root, so that is the root inventoried for tool use.

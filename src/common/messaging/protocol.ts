@@ -1,3 +1,4 @@
+import type { AgentProfileSummary } from "../agents"
 import {
   CONVERSATION_EVENT_NAME,
   EMBEDDING_EVENT_NAME,
@@ -71,6 +72,7 @@ export interface ComposerTurn {
 
 export interface ChatRequest {
   messages: ChatCompletionMessage[]
+  agentSelection?: import("../agents").AgentSelection
   /** Files/symbols the user @-mentioned in the composer. */
   mentions: MentionType[]
   conversationId?: string
@@ -80,6 +82,13 @@ export interface ConfigValue<T = unknown> {
   key: string
   value: T
 }
+
+export type AgentRegistryRequest =
+  | { action: "list" | "refresh" | "pick" }
+  | { action: "add"; path: string; name?: string }
+  | { action: "create"; name: string }
+  | { action: "open" | "remove"; id: string }
+  | { action: "enable"; id: string; enabled: boolean }
 
 /** The outcome of one live request against a provider. */
 export interface ProviderTestResult {
@@ -330,6 +339,7 @@ export interface IntentCompilerResult {
 export interface ClientEvents {
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>
+  [EVENT_NAME.twinnyAgentRegistry]: Channel<AgentRegistryRequest, AgentProfileSummary[]>
   [EVENT_NAME.twinnyChatMessage]: Channel<ChatRequest>
   [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string; history?: ChatCompletionMessage[]; maxLevels?: number }, IntentCompilerResult | undefined>
   [EVENT_NAME.twinnyClickSuggestion]: Channel<string>
@@ -359,7 +369,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinnySendLanguage]: Channel<void, LanguageType>
   [EVENT_NAME.twinnySendTheme]: Channel<void, ThemeType>
   [EVENT_NAME.twinnySessionContext]: Channel<{ key: string }, ContextValue>
-  [EVENT_NAME.twinnySetConfigValue]: Channel<ConfigValue>
+  [EVENT_NAME.twinnySetConfigValue]: Channel<ConfigValue, void>
   [EVENT_NAME.twinnySetGlobalContext]: Channel<ContextValue>
   [EVENT_NAME.twinnySetSessionContext]: Channel<ContextValue>
   [EVENT_NAME.twinnySetWorkspaceContext]: Channel<ContextValue>
@@ -481,6 +491,7 @@ export interface ClientEvents {
 
 export interface ServerEvents {
   [EVENT_NAME.twinnyAddMessage]: ChatCompletionMessage | undefined
+  [EVENT_NAME.twinnyAgentRegistry]: AgentProfileSummary[]
   [EVENT_NAME.twinnyConfigValueChanged]: ConfigValue
   [EVENT_NAME.twinnyGetConfigValue]: ConfigValue
   [EVENT_NAME.twinnyGetModels]: ModelCatalogue
@@ -504,6 +515,7 @@ export interface ServerEvents {
   [EVENT_NAME.twinnyWorkspaceSearch]: WorkspaceSearchReport
   /** The tool steps of the reply being written, whole, each time one changes. */
   [EVENT_NAME.twinnyToolSteps]: ToolStepView[]
+  [EVENT_NAME.twinnyNotification]: string
 
   [CONVERSATION_EVENT_NAME.getConversations]: Record<string, Conversation>
   [CONVERSATION_EVENT_NAME.setActiveConversation]: Conversation | undefined

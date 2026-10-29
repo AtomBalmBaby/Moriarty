@@ -8,6 +8,7 @@
 export const EVENT_NAME = {
   twinntGetLocale: "twinnt-get-locale",
   twinnyAcceptSolution: "twinny-accept-solution",
+  twinnyAgentRegistry: "twinny-agent-registry",
   twinnyAddMessage: "twinny-add-message",
   twinnyChatMessage: "twinny-chat-message",
   twinnyCompileIntent: "twinny-compile-intent",

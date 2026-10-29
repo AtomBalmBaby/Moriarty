@@ -181,6 +181,7 @@ export interface ReplyMeta {
 export interface Conversation {
   id?: string
   title?: string
+  agentSelection?: import("./agents").AgentSelection
   messages: ChatCompletionMessage[]
   /** Set by features that name the conversation themselves (reviews). */
   pinnedTitle?: boolean

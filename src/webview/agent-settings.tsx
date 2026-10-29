@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import cx from "classnames"
 
+import type { AgentProfileSummary } from "../common/agents"
 import { AGENT_STEP_PRESETS, DEFAULT_AGENT_STEPS, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../common/constants"
+import type { AgentRegistryRequest } from "../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../common/team"
 
 import { StorageType, useStorageContext } from "./hooks/useStorageContext"
@@ -122,6 +124,190 @@ const Choices = <T extends string | number>({
   </div>
 )
 
+interface AgentSettingsConfig extends Record<string, unknown> {
+  defaultSelection: "off" | "default"
+  autoDiscover: boolean
+  searchPaths: string[]
+  excludedPaths: string[]
+}
+
+const isSettingsRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+
+const AgentRegistryPanel = () => {
+  const [options, setOptions] = useState<AgentSettingsConfig>({ defaultSelection: "off", autoDiscover: true, searchPaths: [], excludedPaths: [] })
+  const [searchPathsDraft, setSearchPathsDraft] = useState("")
+  const [excludedPathsDraft, setExcludedPathsDraft] = useState("")
+  const [settingsBusy, setSettingsBusy] = useState(false)
+  const [agents, setAgents] = useState<AgentProfileSummary[]>([])
+  const [path, setPath] = useState("")
+  const [name, setName] = useState("")
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
+  const configUpdateObserved = useRef(false)
+
+  const applyConfig = useCallback((value: unknown) => {
+    const settings = isSettingsRecord(value) ? value : {}
+    const searchPaths = Array.isArray(settings.searchPaths)
+      ? settings.searchPaths.filter((entry): entry is string => typeof entry === "string")
+      : []
+    const excludedPaths = Array.isArray(settings.excludedPaths)
+      ? settings.excludedPaths.filter((entry): entry is string => typeof entry === "string")
+      : []
+    setOptions({
+      defaultSelection: settings.defaultSelection === "default" ? "default" : "off",
+      autoDiscover: settings.autoDiscover !== false,
+      searchPaths,
+      excludedPaths
+    })
+    setSearchPathsDraft(searchPaths.join("\n"))
+    setExcludedPathsDraft(excludedPaths.join("\n"))
+  }, [])
+
+  useServerEvent(EVENT_NAME.twinnyConfigValueChanged, ({ key, value }) => {
+    if (key !== "agents") return
+    configUpdateObserved.current = true
+    applyConfig(value)
+  })
+
+  const perform = useCallback(async (request: AgentRegistryRequest) => {
+    setBusy(true)
+    setError("")
+    try {
+      setAgents(await bridge.request(EVENT_NAME.twinnyAgentRegistry, request))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  useEffect(() => { void perform({ action: "list" }) }, [perform])
+
+  useEffect(() => {
+    let cancelled = false
+    bridge.request(EVENT_NAME.twinnyGetConfigValue, { key: "agents" })
+      .then(({ value }) => {
+        if (cancelled || configUpdateObserved.current) return
+        applyConfig(value)
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(`Could not load agent settings: ${reason instanceof Error ? reason.message : String(reason)}`)
+      })
+    return () => { cancelled = true }
+  }, [applyConfig])
+
+  const updateOptions = useCallback(async (patch: Partial<AgentSettingsConfig>) => {
+    setSettingsBusy(true)
+    setError("")
+    try {
+      const { value } = await bridge.request(EVENT_NAME.twinnyGetConfigValue, { key: "agents" })
+      const settings = isSettingsRecord(value) ? value : {}
+      const next = { ...settings, ...patch }
+      await bridge.request(EVENT_NAME.twinnySetConfigValue, { key: "agents", value: next })
+      setOptions((current) => ({ ...current, ...patch }))
+      try {
+        setAgents(await bridge.request(EVENT_NAME.twinnyAgentRegistry, { action: "refresh" }))
+      } catch (reason) {
+        setError(`Settings saved, but profiles could not be refreshed: ${reason instanceof Error ? reason.message : String(reason)}`)
+      }
+    } catch (reason) {
+      setError(`Could not save agent settings: ${reason instanceof Error ? reason.message : String(reason)}`)
+    } finally {
+      setSettingsBusy(false)
+    }
+  }, [])
+
+  return (
+    <section className={styles.agentsSection} aria-label="Selectable agents">
+      <div className={styles.agentsHeading}>
+        <strong>Agents</strong>
+        <button type="button" className={styles.choice} disabled={busy} onClick={() => void perform({ action: "refresh" })}>Refresh</button>
+      </div>
+      <label className={styles.agentSettingRow}>
+        <span>New chat default</span>
+        <select
+          value={options.defaultSelection}
+          disabled={settingsBusy}
+          onChange={(event) => void updateOptions({ defaultSelection: event.target.value === "default" ? "default" : "off" })}
+        >
+          <option value="off">Agent off</option>
+          <option value="default">Default Agent</option>
+        </select>
+      </label>
+      <label className={styles.agentSettingRow}>
+        <span>Discover profiles automatically</span>
+        <input
+          type="checkbox"
+          checked={options.autoDiscover}
+          disabled={settingsBusy}
+          onChange={(event) => void updateOptions({ autoDiscover: event.target.checked })}
+        />
+      </label>
+      <div className={styles.agentSettingColumn}>
+        <span>Additional discovery directories (one path per line)</span>
+        <textarea
+          className={styles.agentInput}
+          aria-label="Additional agent discovery directories"
+          placeholder="${workspaceFolder}/.agents\n${extensionGlobalStorage}/agents"
+          value={searchPathsDraft}
+          disabled={settingsBusy}
+          onChange={(event) => setSearchPathsDraft(event.target.value)}
+        />
+        <button
+          type="button"
+          className={styles.choice}
+          disabled={settingsBusy}
+          onClick={() => void updateOptions({ searchPaths: [...new Set(searchPathsDraft.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean))] })}
+        >Save discovery paths</button>
+      </div>
+      <div className={styles.agentSettingColumn}>
+        <span>Excluded profile files (one path per line)</span>
+        <textarea
+          className={styles.agentInput}
+          aria-label="Excluded agent profile files"
+          value={excludedPathsDraft}
+          disabled={settingsBusy}
+          onChange={(event) => setExcludedPathsDraft(event.target.value)}
+        />
+        <button
+          type="button"
+          className={styles.choice}
+          disabled={settingsBusy}
+          onClick={() => void updateOptions({ excludedPaths: [...new Set(excludedPathsDraft.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean))] })}
+        >Save exclusions</button>
+      </div>
+      <div className={styles.agentAddForm}>
+        <input className={styles.agentInput} aria-label="Agent file path" placeholder="path/to/profile.agent.md" value={path} onChange={(event) => setPath(event.target.value)} />
+        <button type="button" className={styles.choice} disabled={busy || !path.trim()} onClick={() => { void perform({ action: "add", path: path.trim(), ...(name.trim() ? { name: name.trim() } : {}) }); setPath("") }}>Register path</button>
+        <button type="button" className={styles.choice} disabled={busy} onClick={() => void perform({ action: "pick" })}>Choose file…</button>
+        <input className={styles.agentInput} aria-label="Agent display name" placeholder="Agent name" value={name} onChange={(event) => setName(event.target.value)} />
+        <button type="button" className={styles.choice} disabled={busy || !name.trim()} onClick={() => { void perform({ action: "create", name: name.trim() }); setName("") }}>Create new</button>
+      </div>
+      {error && <div className={styles.agentError} role="alert">{error}</div>}
+      {!agents.length && !busy && <div className={styles.agentStatus}>No registered or discovered agent profiles.</div>}
+      {agents.map((agent) => (
+        <div key={agent.id} className={styles.agentEntry}>
+          <div className={styles.agentEntryMain}>
+            <label className={styles.agentEnabled}>
+              <input type="checkbox" checked={agent.enabled} disabled={busy || !agent.valid} onChange={(event) => void perform({ action: "enable", id: agent.id, enabled: event.target.checked })} />
+              <span>{agent.name}</span>
+            </label>
+            <span className={styles.agentStatus}>{agent.valid ? agent.userInvocable ? "Valid" : "Not user-invocable" : "Invalid: " + (agent.validation ?? "unknown error")}</span>
+          </div>
+          <code className={styles.agentPath} title={agent.path}>{agent.path}</code>
+          <div className={styles.agentStatus}>Source: {agent.source}{agent.mcpServers.length ? " · MCP: " + agent.mcpServers.join(", ") : " · MCP: none"}</div>
+          {agent.warnings.map((warning) => <div key={warning} className={styles.agentWarning}>{warning}</div>)}
+          <div className={styles.agentActions}>
+            <button type="button" className={styles.choice} disabled={busy} onClick={() => void perform({ action: "open", id: agent.id })}>Open</button>
+            <button type="button" className={styles.choice} disabled={busy} onClick={() => void perform({ action: "remove", id: agent.id })}>Remove registration</button>
+          </div>
+        </div>
+      ))}
+    </section>
+  )
+}
+
 interface AgentSettingsProps {
   /** What the connected team's policy allows, if it sets agent rules. */
   team?: TeamAgentPolicy
@@ -186,7 +372,7 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
     }
     const onPointer = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null
-      if (!panel.current?.contains(target) && !target?.closest("[data-agent-settings-toggle]")) onClose()
+      if (!panel.current?.contains(target) && !target?.closest("[data-agent-picker]")) onClose()
     }
     window.addEventListener("keydown", onKey, true)
     window.addEventListener("mousedown", onPointer)
@@ -220,6 +406,7 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
           <span className="codicon codicon-close" aria-hidden="true" />
         </button>
       </div>
+      <AgentRegistryPanel />
       <Choices
         label="Intent compiler"
         value={intentCompilerEnabled ? intentCompilerMode : "always-original"}

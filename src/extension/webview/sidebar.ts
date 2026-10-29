@@ -71,9 +71,10 @@ export class SidebarProvider extends BaseProvider {
   }
 
   private getHtmlForWebview(webview: vscode.Webview) {
+    const nonce = getNonce()
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, "out", "sidebar.js")
-    )
+    ).with({ query: `v=${nonce}` })
 
     const codiconCssUri = vscode.Uri.joinPath(
       this.context.extensionUri,
@@ -83,11 +84,9 @@ export class SidebarProvider extends BaseProvider {
 
     const css = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, "out", "sidebar.css")
-    )
+    ).with({ query: `v=${nonce}` })
 
     const codiconCssWebviewUri = webview.asWebviewUri(codiconCssUri)
-
-    const nonce = getNonce()
 
     return `<!DOCTYPE html>
     <html lang="en">

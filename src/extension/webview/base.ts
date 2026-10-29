@@ -17,6 +17,7 @@ import {
   ModelCatalogue,
   TwinnyProvider
 } from "../../common/types"
+import { AgentRegistry } from "../agents/registry"
 import { Chat } from "../chat"
 import { ConversationHistory } from "../chat/conversation-history"
 import { searchSymbols } from "../chat/symbols"
@@ -47,6 +48,7 @@ export class BaseProvider {
   private _workspaceIndex: WorkspaceIndex | undefined
   private _embeddingService: EmbeddingService | undefined
   private _fileTreeProvider: FileTreeProvider
+  private readonly _agentRegistry: AgentRegistry
   private _p2p: P2pRuntime | undefined
   private _p2pBridge: P2pBridge | undefined
   private _teamShare: TeamShare | undefined
@@ -83,6 +85,7 @@ export class BaseProvider {
     teamPlugins?: TeamPlugins
   ) {
     this.context = context
+    this._agentRegistry = new AgentRegistry(context)
     this._fileTreeProvider = new FileTreeProvider()
     this._workspaceIndex = index
     this._p2p = p2p
@@ -127,7 +130,8 @@ export class BaseProvider {
       this._templateDir,
       this.context,
       bridge,
-      this._workspaceIndex?.search
+      this._workspaceIndex?.search,
+      this._agentRegistry
     )
 
     this.conversationHistory = new ConversationHistory(
@@ -188,8 +192,38 @@ export class BaseProvider {
       [EVENT_NAME.twinntGetLocale]: () => this.getLocale(),
       [EVENT_NAME.twinnyAcceptSolution]: (code) =>
         void vscode.commands.executeCommand(TWINNY_COMMAND_NAME.applyCode, code),
-      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions }) =>
-        void this.chat?.completion(messages, mentions),
+      [EVENT_NAME.twinnyAgentRegistry]: async (request) => {
+        let profiles
+        switch (request.action) {
+          case "list":
+          case "refresh":
+            profiles = await this._agentRegistry.list()
+            break
+          case "pick":
+            profiles = await this._agentRegistry.pick()
+            break
+          case "add":
+            profiles = await this._agentRegistry.add(request.path, request.name)
+            break
+          case "create":
+            profiles = await this._agentRegistry.create(request.name)
+            break
+          case "open":
+            await this._agentRegistry.open(request.id)
+            profiles = await this._agentRegistry.list()
+            break
+          case "enable":
+            profiles = await this._agentRegistry.setEnabled(request.id, request.enabled)
+            break
+          case "remove":
+            profiles = await this._agentRegistry.remove(request.id)
+            break
+        }
+        bridge.emit(EVENT_NAME.twinnyAgentRegistry, profiles)
+        return profiles
+      },
+      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection }) =>
+        void this.chat?.completion(messages, mentions, agentSelection),
       [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels }) =>
         (await this.chat?.compileIntent(prompt, history, maxLevels)) ?? undefined,
       [EVENT_NAME.twinnyClickSuggestion]: (template) =>
@@ -243,9 +277,14 @@ export class BaseProvider {
       [EVENT_NAME.twinnySendLanguage]: () => getLanguage(),
       [EVENT_NAME.twinnySendTheme]: () => getTheme(),
       [EVENT_NAME.twinnySetConfigValue]: async ({ key, value }) => {
-        await vscode.workspace
-          .getConfiguration("twinny")
-          .update(key, value, vscode.ConfigurationTarget.Global)
+        const configuration = vscode.workspace.getConfiguration("twinny")
+        const scope = key === "agents" ? configuration.inspect("agents") : undefined
+        const target = scope?.workspaceFolderValue !== undefined
+          ? vscode.ConfigurationTarget.WorkspaceFolder
+          : scope?.workspaceValue !== undefined
+            ? vscode.ConfigurationTarget.Workspace
+            : vscode.ConfigurationTarget.Global
+        await configuration.update(key, value, target)
         this.bridge?.emit(EVENT_NAME.twinnyConfigValueChanged, { key, value })
       },
       [EVENT_NAME.twinnySidebarReady]: () => this._sidebarReadyHandler?.(),
@@ -255,7 +294,7 @@ export class BaseProvider {
       [EVENT_NAME.twinnySteer]: ({ id, text }) => this.chat?.steer(id, text),
       [EVENT_NAME.twinnyOpenChange]: ({ id, path }) => void this.chat?.openChange(id, path),
       [EVENT_NAME.twinnyOpenAgentSettings]: () =>
-        void vscode.commands.executeCommand("workbench.action.openSettings", "twinny.chatTools"),
+        void vscode.commands.executeCommand("workbench.action.openSettings", "twinny.agents"),
       [EVENT_NAME.twinnyUndoChanges]: async ({ id, paths }) =>
         (await this.chat?.undoChanges(id, paths)) ?? { error: "The chat is not ready." },
       [EVENT_NAME.twinnySymbolSearch]: ({ query }) => searchSymbols(query),

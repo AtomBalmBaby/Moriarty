@@ -10,6 +10,8 @@ import * as cheerio from "cheerio"
 import cx from "classnames"
 import { v4 as uuidv4 } from "uuid"
 
+import type { AgentProfileSummary, AgentSelection } from "../common/agents"
+import { nextAgentSelection, withAgentSelection } from "../common/agents"
 import { ASSISTANT, EVENT_NAME, USER } from "../common/constants"
 import {
   AnyContextItem,
@@ -143,7 +145,18 @@ export const Chat = (props: ChatProps): JSX.Element => {
     () => getThinkingMessage(String(completionRef.current?.content ?? "")).message
   )
   const [isBottom, setIsBottom] = useState(false)
-  const { agentMode, toggleAgentMode, agentModeTeamOff, teamAgentRules } = useAgentMode()
+  const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([])
+  const { conversation, saveLastConversation, setActiveConversation } = useConversationHistory()
+  const { agentMode, teamAgentRules, agentSelection, storedAgentSelection, lastAgentSelection, setAgentSelection, resetAgentSelectionForNewChat, agentPreferenceError } = useAgentMode(
+    agentProfiles.filter((profile) => profile.enabled && profile.valid && profile.userInvocable).map((profile) => profile.id)
+  )
+  const [agentProfilesLoaded, setAgentProfilesLoaded] = useState(false)
+  const lastSyncedConversationId = useRef<string | undefined>(undefined)
+  const [agentPickerError, setAgentPickerError] = useState("")
+  const [agentMenuOpen, setAgentMenuOpen] = useState(false)
+  const agentPickerRef = useRef<HTMLDivElement>(null)
+  const agentPickerButtonRef = useRef<HTMLButtonElement>(null)
+  const agentMenuItemsRef = useRef<Array<HTMLButtonElement | null>>([])
   const agentModeRef = useRef(agentMode)
   agentModeRef.current = agentMode
   const { autoRun, autoRunAvailable, toggleAutoRun, setAutoRun } = useAutoRun(teamAgentRules)
@@ -201,13 +214,114 @@ export const Chat = (props: ChatProps): JSX.Element => {
     error?: string
   } | null>(null)
   const closeAgentSettings = useCallback(() => setAgentSettingsOpen(false), [])
+  const agentMenuOptions = useMemo(() => [
+    { value: "off" as AgentSelection, label: "Agent off" },
+    { value: "default" as AgentSelection, label: "Default Agent" },
+    ...agentProfiles
+      .filter((profile) => profile.valid && profile.enabled && profile.userInvocable)
+      .map((profile) => ({ value: profile.id as AgentSelection, label: profile.name }))
+  ], [agentProfiles])
+  const selectedAgentLabel = agentMenuOptions.find((option) => option.value === agentSelection)?.label ?? "Agent off"
+  const focusAgentMenuItem = useCallback((index: number) => {
+    const count = agentMenuOptions.length + 1
+    const next = (index + count) % count
+    agentMenuItemsRef.current[next]?.focus()
+  }, [agentMenuOptions.length])
+  useEffect(() => {
+    if (!agentMenuOpen) return
+    const selectedIndex = agentMenuOptions.findIndex((option) => option.value === agentSelection)
+    agentMenuItemsRef.current[selectedIndex >= 0 ? selectedIndex : 0]?.focus()
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!agentPickerRef.current?.contains(event.target as Node)) setAgentMenuOpen(false)
+    }
+    document.addEventListener("pointerdown", closeOnOutsidePointer)
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer)
+  }, [agentMenuOpen, agentMenuOptions, agentSelection])
+  const handleAgentMenuKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const currentIndex = Number(event.currentTarget.dataset.menuIndex)
+    if (event.key === "ArrowDown") {
+      event.preventDefault()
+      focusAgentMenuItem(currentIndex + 1)
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault()
+      focusAgentMenuItem(currentIndex - 1)
+    } else if (event.key === "Home") {
+      event.preventDefault()
+      focusAgentMenuItem(0)
+    } else if (event.key === "End") {
+      event.preventDefault()
+      focusAgentMenuItem(agentMenuOptions.length)
+    } else if (event.key === "Escape") {
+      event.preventDefault()
+      setAgentMenuOpen(false)
+      agentPickerButtonRef.current?.focus()
+    } else if (event.key === "Tab") {
+      setAgentMenuOpen(false)
+    }
+  }, [agentMenuOptions.length, focusAgentMenuItem])
+  const chooseAgentSelection = useCallback((next: import("../common/agents").AgentSelection, source = "dropdown") => {
+    if (!setAgentSelection(next, source)) return
+    if (conversation?.id) {
+      const updated = { ...conversation, agentSelection: next }
+      saveLastConversation(updated)
+      setActiveConversation(updated)
+    }
+  }, [conversation, saveLastConversation, setActiveConversation, setAgentSelection])
+  const toggleAgentForChat = useCallback(() => {
+    const available = new Set(agentProfiles.filter((profile) => profile.enabled && profile.valid && profile.userInvocable).map((profile) => profile.id))
+    const next = nextAgentSelection(agentSelection, lastAgentSelection, available)
+    chooseAgentSelection(next, "shift-tab")
+    return true
+  }, [agentSelection, agentProfiles, chooseAgentSelection, lastAgentSelection])
+  const toggleAgentForChatRef = useRef(toggleAgentForChat)
+  toggleAgentForChatRef.current = toggleAgentForChat
+  const toggleAgentForEditor = useCallback(() => toggleAgentForChatRef.current(), [])
+
+  useEffect(() => {
+    let cancelled = false
+    bridge.request(EVENT_NAME.twinnyAgentRegistry, { action: "list" })
+      .then((profiles) => {
+        if (cancelled) return
+        setAgentProfiles(profiles)
+        setAgentProfilesLoaded(true)
+        setAgentPickerError("")
+      })
+      .catch((error) => {
+        if (cancelled) return
+        setAgentPickerError(error instanceof Error ? error.message : String(error))
+        setAgentProfilesLoaded(false)
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  useServerEvent(EVENT_NAME.twinnyNotification, (message) => setAgentPickerError(message))
+
+  useEffect(() => {
+    const conversationId = conversation?.id
+    if (!conversationId || lastSyncedConversationId.current === conversationId) return
+    lastSyncedConversationId.current = conversationId
+    if (conversation.agentSelection) setAgentSelection(conversation.agentSelection, "history-restore")
+  }, [conversation?.agentSelection, conversation?.id, setAgentSelection])
+
+  useServerEvent(EVENT_NAME.twinnyNewConversation, resetAgentSelectionForNewChat)
+
+  useServerEvent(EVENT_NAME.twinnyAgentRegistry, (profiles) => {
+    setAgentProfiles(profiles)
+    setAgentProfilesLoaded(true)
+    setAgentPickerError("")
+  })
+
+  useEffect(() => {
+    if (!agentProfilesLoaded || storedAgentSelection === "off" || storedAgentSelection === "default") return
+    const selected = agentProfiles.find((profile) => profile.id === storedAgentSelection)
+    if (selected?.valid && selected.enabled && selected.userInvocable) return
+    setAgentSelection("off")
+    emit(EVENT_NAME.twinnyNotification, "The selected agent is unavailable or disabled. Agent selection was reset to Agent off.")
+  }, [agentProfiles, agentProfilesLoaded, setAgentSelection, storedAgentSelection])
 
   useEffect(() => {
     void syncIntentCompilerSettings()
   }, [syncIntentCompilerSettings])
-
-  const { conversation, saveLastConversation, setActiveConversation } =
-    useConversationHistory()
 
   useEffect(() => {
     setIntentCompilerReview(null)
@@ -388,11 +502,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
       if (!prev) return prev
       const updatedMessages = prev.slice(0, index)
 
-      emit(EVENT_NAME.twinnyChatMessage, {
+      emit(EVENT_NAME.twinnyChatMessage, withAgentSelection({
         messages: updatedMessages,
         mentions: mentions || [],
-        conversationId: conversation?.id
-      })
+        conversationId: conversation?.id,
+      }, storedAgentSelection))
 
       return updatedMessages
     })
@@ -457,11 +571,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
         }
       ]
 
-      emit(EVENT_NAME.twinnyChatMessage, {
+      emit(EVENT_NAME.twinnyChatMessage, withAgentSelection({
         messages: updatedMessages,
         mentions: mentions || [],
-        conversationId: conversation?.id
-      })
+        conversationId: conversation?.id,
+      }, storedAgentSelection))
 
       return updatedMessages
     })
@@ -634,17 +748,18 @@ export const Chat = (props: ChatProps): JSX.Element => {
       const currentConversation = {
         id: conversationId,
         messages: updatedMessages,
-        title: conversation?.title || t("chat-new-conversation-title")
+        title: conversation?.title || t("chat-new-conversation-title"),
+        agentSelection: storedAgentSelection
       }
 
       saveLastConversation(currentConversation)
       setActiveConversation(currentConversation)
 
-      emit(EVENT_NAME.twinnyChatMessage, {
+      emit(EVENT_NAME.twinnyChatMessage, withAgentSelection({
         messages: updatedMessages,
         mentions: message.mentions,
-        conversationId
-      })
+        conversationId,
+      }, storedAgentSelection))
 
       return updatedMessages
     })
@@ -872,11 +987,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
         }
       ]
       saveLastConversation({ ...conversation, messages: updatedMessages })
-      emit(EVENT_NAME.twinnyChatMessage, {
+      emit(EVENT_NAME.twinnyChatMessage, withAgentSelection({
         messages: updatedMessages,
         mentions: [],
-        conversationId: conversation?.id
-      })
+        conversationId: conversation?.id,
+      }, storedAgentSelection))
       return updatedMessages
     })
   }, [conversation, chatDisabled, clearSearchReport, clearToolSteps, t])
@@ -1029,7 +1144,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
           interrupt: handleInterrupt,
           newConversation: startNewConversation,
           toggleShortcuts,
-          toggleAgentMode,
+          toggleAgentMode: toggleAgentForEditor,
           scrollTranscript
         }),
         GhostText,
@@ -1459,7 +1574,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         </div>
         <div className={cx(styles.composer, { [styles.agentBusy]: agentMode && (isLoading || generatingRef.current) })}>
           {showShortcuts && <Shortcuts />}
-          {agentMode && agentSettingsOpen && (
+          {agentSettingsOpen && (
             <AgentSettings team={teamAgentRules} autoRun={autoRun} setAutoRun={setAutoRun} onClose={closeAgentSettings} />
           )}
           {!!queued.length && (
@@ -1539,27 +1654,88 @@ export const Chat = (props: ChatProps): JSX.Element => {
                 />
               </div>
               <div className={styles.modeSwitches}>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={agentMode}
-                  disabled={chatDisabled || agentModeTeamOff}
-                  className={cx(styles.agentToggle, { [styles.agentToggleOn]: agentMode })}
-                  onClick={toggleAgentMode}
-                  title={t(
-                    agentModeTeamOff ? "agent-mode-team-off-title" : agentMode ? "agent-mode-on-title" : "agent-mode-off-title"
+                <div className={styles.agentPicker} ref={agentPickerRef} data-agent-picker>
+                  <span className="codicon codicon-hubot" aria-hidden="true" />
+                  <button
+                    ref={agentPickerButtonRef}
+                    type="button"
+                    className={cx(styles.agentSelect, { [styles.agentToggleOn]: agentSelection !== "off" })}
+                    aria-label="Select chat agent"
+                    aria-haspopup="menu"
+                    aria-expanded={agentMenuOpen}
+                    aria-controls="twinny-agent-menu"
+                    title={agentPickerError || agentPreferenceError || selectedAgentLabel}
+                    aria-describedby={agentPickerError || agentPreferenceError ? "agent-picker-status" : undefined}
+                    onClick={() => setAgentMenuOpen((open) => !open)}
+                    onKeyDown={(event) => {
+                      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                        event.preventDefault()
+                        setAgentMenuOpen(true)
+                      }
+                    }}
+                  >
+                    <span>{selectedAgentLabel}</span>
+                    <span className="codicon codicon-chevron-down" aria-hidden="true" />
+                  </button>
+                  {agentMenuOpen && (
+                    <div className={styles.agentMenu} id="twinny-agent-menu" role="menu" aria-label="Chat agent">
+                      {agentMenuOptions.map((option, index) => (
+                        <button
+                          key={option.value}
+                          ref={(element) => { agentMenuItemsRef.current[index] = element }}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={agentSelection === option.value}
+                          data-menu-index={index}
+                          className={styles.agentMenuOption}
+                          onKeyDown={handleAgentMenuKeyDown}
+                          onClick={() => {
+                            chooseAgentSelection(option.value)
+                            setAgentMenuOpen(false)
+                            setAgentSettingsOpen(false)
+                          }}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                      <div className={styles.agentMenuSeparator} role="separator" />
+                      <button
+                        ref={(element) => { agentMenuItemsRef.current[agentMenuOptions.length] = element }}
+                        type="button"
+                        role="menuitem"
+                        data-menu-index={agentMenuOptions.length}
+                        className={styles.agentMenuOption}
+                        onKeyDown={handleAgentMenuKeyDown}
+                        onClick={() => {
+                          setAgentMenuOpen(false)
+                          setAgentSettingsOpen(true)
+                        }}
+                      >
+                        + Manage Agents…
+                      </button>
+                    </div>
                   )}
-                >
-                  <span className={styles.agentDot} aria-hidden="true" />
-                  {t(agentMode ? "agent-mode-on" : "agent-mode")}
+                  <button
+                    type="button"
+                    className={styles.agentSettingsButton}
+                    aria-label="Agent settings"
+                    title="Agent settings"
+                    onClick={() => {
+                      setAgentMenuOpen(false)
+                      setAgentSettingsOpen(true)
+                    }}
+                  >
+                    <span className="codicon codicon-gear" aria-hidden="true" />
+                  </button>
                   <span className={styles.switchKey}>{t("agent-mode-key")}</span>
-                </button>
-                {agentMode && autoRunAvailable && (
+                </div>
+                {(agentPickerError || agentPreferenceError) && <span id="agent-picker-status" className={styles.agentPickerError} role="status" title={agentPickerError || agentPreferenceError}>{agentPickerError || agentPreferenceError}</span>}
+                {autoRunAvailable && (
                   <button
                     type="button"
                     role="switch"
                     aria-checked={autoRun}
-                    disabled={chatDisabled}
+                    disabled={chatDisabled || !agentMode}
                     className={cx(styles.agentToggle, { [styles.agentToggleOn]: autoRun })}
                     onClick={toggleAutoRun}
                     title={t(autoRun ? "auto-run-on-title" : "auto-run-off-title")}
@@ -1568,19 +1744,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
                     <span className={styles.switchLabel}>{t("auto-run")}</span>
                   </button>
                 )}
-                {agentMode && (
-                  <button
-                    type="button"
-                    data-agent-settings-toggle
-                    aria-expanded={agentSettingsOpen}
-                    className={cx(styles.agentToggle, { [styles.agentToggleOn]: agentSettingsOpen })}
-                    onClick={() => setAgentSettingsOpen((open) => !open)}
-                    title={t("agent-settings-title")}
-                    aria-label={t("agent-settings-title")}
-                  >
-                    <span className="codicon codicon-settings-gear" aria-hidden="true" />
-                  </button>
-                )}
+
               </div>
               <div className={styles.chatButtons}>
                 <VSCodeButton

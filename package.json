@@ -2,7 +2,7 @@
   "name": "twinny",
   "displayName": "twinny - AI Code Completion and Chat",
   "description": "AI code completion, chat, inline edit and code review on models you run. Private, open source, one gateway for the whole team.",
-  "version": "4.3.15",
+  "version": "4.3.17",
   "icon": "assets/icon.png",
   "keywords": [
     "code-inference",
@@ -684,6 +684,40 @@
           "default": true,
           "markdownDescription": "Shows grey text ahead of the cursor in the chat composer; `Tab` accepts it and `Ctrl+→` accepts a word of it. It finishes words from what you have typed before, as a phone keyboard does, and once a conversation has an exchange, a pause after a word asks the chat model for the rest of the message given the last few turns. No requests are made while a reply is coming."
         },
+        "twinny.agents": {
+          "order": 20,
+          "type": "object",
+          "default": {
+            "defaultSelection": "off",
+            "autoDiscover": true,
+            "searchPaths": [],
+            "definitions": [],
+            "excludedPaths": []
+          },
+          "scope": "resource",
+          "markdownDescription": "Selectable Copilot-compatible .agent.md profiles. Twinny discovers .github/agents in each workspace and its extension global storage agents directory. MCP entries are references to servers already configured in twinny.chatToolsMcpServers; definitions in agent files are never executed.",
+          "properties": {
+            "defaultSelection": { "type": "string", "enum": ["off", "default"], "default": "off", "description": "Selection to migrate into new chat sessions when no legacy preference exists." },
+            "autoDiscover": { "type": "boolean", "default": true, "description": "Discover .agent.md profiles in workspace .github/agents and extension global storage." },
+            "searchPaths": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Additional directories containing .agent.md files. Supports ${workspaceFolder}/ and ${extensionGlobalStorage}/ prefixes." },
+            "definitions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "name": { "type": "string" },
+                  "path": { "type": "string" },
+                  "enabled": { "type": "boolean", "default": true },
+                  "scope": { "type": "string", "enum": ["workspace", "user"] }
+                }
+              },
+              "default": []
+            },
+            "excludedPaths": { "type": "array", "items": { "type": "string" }, "default": [] }
+          }
+        },
         "twinny.chatTools": {
           "order": 20,
           "type": "boolean",
@@ -996,6 +1030,7 @@
     "i18next": "^23.16.5",
     "i18next-http-backend": "^2.6.2",
     "ignore": "^6.0.2",
+    "js-yaml": "^4.1.0",
     "lucide-react": "^0.473.0",
     "node-polyfill-webpack-plugin": "^3.0.0",
     "onnxruntime-web": "^1.18.0",

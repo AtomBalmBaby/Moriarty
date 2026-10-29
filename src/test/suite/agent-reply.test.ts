@@ -57,6 +57,22 @@ class ChatIn extends Chat {
 const call = (name: string, args: Record<string, string>) =>
   "```tool\n" + JSON.stringify({ name, arguments: args }) + "\n```"
 
+const openWorkspace = async (root: string): Promise<() => Promise<void>> => {
+  const index = vscode.workspace.workspaceFolders?.length ?? 0
+  const update = (deleteCount: number, folder?: vscode.WorkspaceFolder) => new Promise<void>((resolve, reject) => {
+    const subscription = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      subscription.dispose()
+      resolve()
+    })
+    if (!vscode.workspace.updateWorkspaceFolders(index, deleteCount, ...(folder ? [folder] : []))) {
+      subscription.dispose()
+      reject(new Error("Could not update VS Code test workspace folders."))
+    }
+  })
+  await update(0, { uri: vscode.Uri.file(root), name: "agent-reply-test" } as vscode.WorkspaceFolder)
+  return async () => update(1)
+}
+
 const fakeWebview = () => {
   let listener: ((message: unknown) => void) | undefined
   const sent: unknown[] = []
@@ -82,6 +98,7 @@ suite("Agent reply, end to end", function () {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-webview-message-"))
     const file = path.join(root, "a.ts")
     fs.writeFileSync(file, "export const a = 1\n")
+    const closeWorkspace = await openWorkspace(root)
 
     const model = new ScriptedModel([
       call("read_file", { path: "a.ts" }),
@@ -112,7 +129,9 @@ suite("Agent reply, end to end", function () {
     const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
     chat.root = root
     bridge.handleAll({
-      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions }) => void chat.completion(messages, mentions)
+      [EVENT_NAME.twinnyChatMessage]: async ({ messages, mentions, agentSelection }) => {
+        await chat.completion(messages, mentions, agentSelection)
+      }
     })
 
     try {
@@ -126,7 +145,12 @@ suite("Agent reply, end to end", function () {
         }
       })
 
-      assert.strictEqual(model.requests[0].messages[0].content, "Update the constant in a.ts to 2.")
+      const finalContent = model.requests[0].messages.at(-1)?.content
+      assert.ok(
+        typeof finalContent === "string"
+          ? finalContent === "Update the constant in a.ts to 2."
+          : Array.isArray(finalContent) && finalContent.some((part) => "text" in part && part.text === "Update the constant in a.ts to 2.")
+      )
       assert.ok(fs.readFileSync(file, "utf8").includes("export const a = 2"))
       assert.ok(
         (webview.sent as unknown[]).some(
@@ -140,6 +164,8 @@ suite("Agent reply, end to end", function () {
     } finally {
       chat.dispose()
       bridge.dispose()
+      await closeWorkspace()
+      fs.rmSync(root, { recursive: true, force: true })
     }
   })
 
@@ -323,6 +349,7 @@ suite("Agent reply, end to end", function () {
     fs.writeFileSync(path.join(root, "src", "a.ts"), "export const a = 1\n")
     git("add", ".")
     git("commit", "-qm", "first")
+    const closeWorkspace = await openWorkspace(root)
 
     const model = new ScriptedModel([
       call("read_file", { path: "src/a.ts" }),
@@ -397,6 +424,8 @@ suite("Agent reply, end to end", function () {
       assert.ok(undone.view?.files.every((f) => f.undone))
     } finally {
       chat.dispose()
+      await closeWorkspace()
+      fs.rmSync(root, { recursive: true, force: true })
     }
   })
 
