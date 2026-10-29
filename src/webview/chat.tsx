@@ -1575,7 +1575,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         <div className={cx(styles.composer, { [styles.agentBusy]: agentMode && (isLoading || generatingRef.current) })}>
           {showShortcuts && <Shortcuts />}
           {agentSettingsOpen && (
-            <AgentSettings team={teamAgentRules} autoRun={autoRun} setAutoRun={setAutoRun} onClose={closeAgentSettings} />
+            <AgentSettings team={teamAgentRules} autoRun={autoRun} setAutoRun={setAutoRun} onClose={closeAgentSettings} agentSelection={agentSelection} />
           )}
           {!!queued.length && (
             <ol className={styles.queue} aria-label={t("queued-title")}>

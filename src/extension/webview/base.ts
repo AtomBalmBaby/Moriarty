@@ -10,7 +10,9 @@ import {
 import { logger } from "../../common/logger"
 import {
   ContextValue,
-  NewDocumentRequest
+  NewDocumentRequest,
+  PromptInstructionsRequest,
+  PromptInstructionsResponse
 } from "../../common/messaging/protocol"
 import {
   AnyContextItem,
@@ -27,6 +29,7 @@ import { GenerationTracker } from "../generations"
 import { ExtensionBridge } from "../messaging/bridge"
 import { P2pBridge } from "../p2p/bridge"
 import { P2pRuntime } from "../p2p/runtime"
+import { promptInstructionConfigKeys } from "../prompts/instructions"
 import { resolveProviderEndpoint } from "../providers/endpoint"
 import { ProviderManager } from "../providers/manager"
 import { ReviewService } from "../review/service"
@@ -187,6 +190,29 @@ export class BaseProvider {
    * bridge routes it back to whoever asked (or broadcasts it if nobody is
    * waiting on a specific reply). Nothing here mentions `postMessage`.
    */
+  private async promptInstructions(request: PromptInstructionsRequest): Promise<PromptInstructionsResponse> {
+    if (request.action === "inspect") {
+      if (!this.chat) throw new Error("Chat is not initialized; prompt preview is unavailable.")
+      return this.chat.previewPromptInstructions(request.agentSelection)
+    }
+    if (request.action === "pick") {
+      const files = await vscode.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectFolders: false,
+        canSelectMany: false,
+        openLabel: "Select Markdown file",
+        filters: { Markdown: ["md"] }
+      })
+      return { selectedFile: files?.[0]?.fsPath }
+    }
+    const key = request.route === "chat" ? promptInstructionConfigKeys.chatFile : promptInstructionConfigKeys.intentFile
+    const file = vscode.workspace.getConfiguration("twinny").get<string>(key)
+    if (!file) throw new Error("No custom Markdown file is selected for " + request.route + " base instructions.")
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    await vscode.window.showTextDocument(document)
+    return {}
+  }
+
   private registerHandlers(bridge: ExtensionBridge) {
     bridge.handleAll({
       [EVENT_NAME.twinntGetLocale]: () => this.getLocale(),
@@ -222,6 +248,7 @@ export class BaseProvider {
         bridge.emit(EVENT_NAME.twinnyAgentRegistry, profiles)
         return profiles
       },
+      [EVENT_NAME.twinnyPromptInstructions]: (request) => this.promptInstructions(request),
       [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection }) =>
         void this.chat?.completion(messages, mentions, agentSelection),
       [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels }) =>
@@ -278,7 +305,8 @@ export class BaseProvider {
       [EVENT_NAME.twinnySendTheme]: () => getTheme(),
       [EVENT_NAME.twinnySetConfigValue]: async ({ key, value }) => {
         const configuration = vscode.workspace.getConfiguration("twinny")
-        const scope = key === "agents" ? configuration.inspect("agents") : undefined
+        const instructionSetting = key.startsWith("chatBaseInstructions") || key.startsWith("intentBaseInstructions")
+        const scope = key === "agents" || instructionSetting ? configuration.inspect(key) : undefined
         const target = scope?.workspaceFolderValue !== undefined
           ? vscode.ConfigurationTarget.WorkspaceFolder
           : scope?.workspaceValue !== undefined

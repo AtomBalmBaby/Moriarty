@@ -68,12 +68,20 @@ suite("Intent compiler", () => {
     assert.strictEqual(parseIntentCompilerResponse("not valid json"), undefined)
   })
 
+  test("rejects compiler JSON that violates the required protocol shape", () => {
+    assert.strictEqual(parseIntentCompilerResponse(JSON.stringify({ objective: "Goal", prompt: "Do it" })), undefined)
+    assert.strictEqual(parseIntentCompilerResponse(JSON.stringify({
+      objective: "Goal", prompt: "Do it", constraints: [], exclusions: [], strategy: "", verification: [], assumptions: [], extra: true
+    })), undefined)
+  })
+
   test("skips compile when the setting is disabled or set to always original", async () => {
     const settings = vscode.workspace.getConfiguration("twinny")
     await settings.update("chatToolsIntentCompilerEnabled", false, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerMode", "always-original", vscode.ConfigurationTarget.Global)
 
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: { get: () => undefined, update: async () => undefined },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -85,10 +93,13 @@ suite("Intent compiler", () => {
     chat.dispose()
   })
 
-  test("builds a refined execution prompt from the provider response", async () => {
+  test("compilation independently resolves default, custom, and None instructions while enforcing JSON", async () => {
     const settings = vscode.workspace.getConfiguration("twinny")
     await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
+    await settings.update("intentBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
+    await settings.update("intentBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
+    await settings.update("chatBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
 
     const provider = {
       id: "scripted-intent-provider",
@@ -101,6 +112,7 @@ suite("Intent compiler", () => {
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
 
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: {
         get: (key: string) => {
           if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
@@ -113,12 +125,79 @@ suite("Intent compiler", () => {
     } as unknown as vscode.ExtensionContext
 
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
-    const result = await chat.compileIntent("Fix the bug in the parser.")
-    assert.ok(result)
-    assert.strictEqual(result?.objective.includes("Refine the request"), true)
-    assert.match(result?.prompt ?? "", /smallest safe implementation change/)
-    assert.ok(model.requests.length > 0)
-    chat.dispose()
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-intent-instructions-"))
+    const customFile = path.join(root, "compiler.md")
+    try {
+      const result = await chat.compileIntent("Fix the bug in the parser.")
+      assert.ok(result)
+      assert.strictEqual(result?.objective.includes("Refine the request"), true)
+      assert.match(result?.prompt ?? "", /smallest safe implementation change/)
+      let system = String(model.requests[0].messages[0]?.content ?? "")
+      assert.match(system, /Refine a user request for a coding agent without changing its intent/)
+      assert.match(system, /Return exactly one valid JSON object/)
+      assert.doesNotMatch(system, /You are a helpful, respectful and honest coding assistant/)
+
+      await fs.writeFile(customFile, "Compiler-only custom instructions")
+      await settings.update("intentBaseInstructionsFile", customFile, vscode.ConfigurationTarget.Global)
+      await settings.update("intentBaseInstructionsMode", "custom", vscode.ConfigurationTarget.Global)
+      await chat.compileIntent("Use the custom compiler profile.")
+      system = String(model.requests[1].messages[0]?.content ?? "")
+      assert.match(system, /Compiler-only custom instructions/)
+      assert.doesNotMatch(system, /Refine a user request for a coding agent/)
+      assert.match(system, /Return exactly one valid JSON object/)
+
+      await settings.update("intentBaseInstructionsMode", "none", vscode.ConfigurationTarget.Global)
+      await chat.compileIntent("Run with no optional compiler instructions.")
+      system = String(model.requests[2].messages[0]?.content ?? "")
+      assert.doesNotMatch(system, /Compiler-only custom instructions/)
+      assert.match(system, /Return exactly one valid JSON object/)
+    } finally {
+      await settings.update("intentBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
+      await settings.update("intentBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
+      await settings.update("chatBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
+      await fs.rm(root, { recursive: true, force: true })
+      chat.dispose()
+    }
+  })
+
+  test("chat effective prompt preview uses only chat instructions", async () => {
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-chat-instructions-"))
+    const chatFile = path.join(root, "chat.md")
+    const intentFile = path.join(root, "intent.md")
+    await fs.writeFile(chatFile, "Chat-only base instructions")
+    await fs.writeFile(intentFile, "Compiler-only base instructions")
+    await settings.update("chatBaseInstructionsFile", chatFile, vscode.ConfigurationTarget.Global)
+    await settings.update("chatBaseInstructionsMode", "custom", vscode.ConfigurationTarget.Global)
+    await settings.update("intentBaseInstructionsFile", intentFile, vscode.ConfigurationTarget.Global)
+    await settings.update("intentBaseInstructionsMode", "custom", vscode.ConfigurationTarget.Global)
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalState: { get: () => undefined, update: async () => undefined },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
+    try {
+      const preview = await chat.previewPromptInstructions("off")
+      assert.match(preview.chatEffective, /Chat-only base instructions/)
+      assert.doesNotMatch(preview.chatEffective, /Compiler-only base instructions/)
+      assert.match(preview.intentEffective, /Compiler-only base instructions/)
+      assert.doesNotMatch(preview.intentEffective, /Chat-only base instructions/)
+
+      await settings.update("chatBaseInstructionsMode", "none", vscode.ConfigurationTarget.Global)
+      const nonePreview = await chat.previewPromptInstructions("off")
+      assert.equal(nonePreview.chat.mode, "none")
+      assert.doesNotMatch(nonePreview.chatEffective, /Chat-only base instructions/)
+      assert.match(nonePreview.intentEffective, /Compiler-only base instructions/)
+    } finally {
+      await settings.update("chatBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
+      await settings.update("chatBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
+      await settings.update("intentBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
+      await settings.update("intentBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
+      await fs.rm(root, { recursive: true, force: true })
+      chat.dispose()
+    }
   })
 
   test("uses the selected intent provider for compilation and keeps chat execution independent", async () => {
@@ -154,6 +233,7 @@ suite("Intent compiler", () => {
     providerRegistry.register("scripted-chat-executor", { id: "scripted-chat-executor", create: () => chatModel })
 
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: {
         get: (key: string) => {
           if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return intentProvider
@@ -195,6 +275,7 @@ suite("Intent compiler", () => {
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
 
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: {
         get: (key: string) => {
           if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
@@ -254,6 +335,7 @@ suite("Intent compiler", () => {
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
 
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: {
         get: (key: string) => {
           if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
@@ -320,6 +402,7 @@ suite("Intent compiler", () => {
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
 
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: {
         get: (key: string) => {
           if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
@@ -378,6 +461,7 @@ suite("Intent compiler", () => {
     providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
 
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: {
         get: (key: string) => {
           if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider

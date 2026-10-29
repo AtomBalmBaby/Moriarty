@@ -85,13 +85,13 @@ export class TemplateProvider {
     }
   }
 
-  /** The system message for a template: its own, the shared one, or none. */
+  /** A template-specific system message, when one exists. */
   public async readSystemMessageTemplate(templateName?: string): Promise<string> {
     const own =
       templateName && !isSystemTemplate(templateName)
         ? await this.readSource(`${templateName}-${SYSTEM}`)
         : undefined
-    return own ?? (await this.readSource(SYSTEM)) ?? ""
+    return own ?? ""
   }
 
   /**

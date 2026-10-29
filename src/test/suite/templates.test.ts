@@ -6,9 +6,6 @@ import * as path from "path"
 import { defaultTemplates } from "../../extension/templates/defaults"
 import { TemplateProvider } from "../../extension/templates/provider"
 
-const builtIn = (name: string) =>
-  defaultTemplates.find((template) => template.name === name)?.template as string
-
 suite("Templates", () => {
   let dir: string
   let templates: TemplateProvider
@@ -94,11 +91,10 @@ suite("Templates", () => {
       assert.strictEqual(await templates.readTemplate("../secret", {}), "")
     })
 
-    test("still renders when system.hbs has been deleted", async () => {
-      remove("system")
+    test("renders without an optional shared system message", async () => {
       write("custom", "[{{systemMessage}}] {{{code}}}")
       const prompt = await templates.readTemplate("custom", { code: "x" })
-      assert.strictEqual(prompt, `[${builtIn("system")}] x`)
+      assert.strictEqual(prompt, "[] x")
     })
 
     test("renders a template the developer added", async () => {
@@ -125,10 +121,10 @@ suite("Templates", () => {
   })
 
   suite("system messages", () => {
-    test("a template's own system message beats the shared one", async () => {
-      write("system", "shared")
+    test("a template-specific system message is used without a shared base message", async () => {
+      write("system", "legacy shared")
       write("custom", "{{systemMessage}}")
-      assert.strictEqual(await templates.readTemplate("custom", {}), "shared")
+      assert.strictEqual(await templates.readTemplate("custom", {}), "")
       write("custom-system", "own")
       assert.strictEqual(await templates.readTemplate("custom", {}), "own")
     })
@@ -145,10 +141,10 @@ suite("Templates", () => {
       assert.strictEqual(await templates.readSystemMessageTemplate("fim"), "")
     })
 
-    test("without a folder, the built-in system prompt", async () => {
+    test("without a folder, there is no shared optional system prompt", async () => {
       assert.strictEqual(
         await new TemplateProvider(undefined).readSystemMessageTemplate("explain"),
-        builtIn("system")
+        ""
       )
     })
   })

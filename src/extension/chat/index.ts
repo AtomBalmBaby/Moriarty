@@ -41,6 +41,7 @@ import {
   knownContextWindow
 } from "../inference/context-window"
 import { ExtensionBridge } from "../messaging/bridge"
+import { PromptInstructionResolver } from "../prompts/instructions"
 import { Base } from "../providers/base"
 import { describeProviderError, stripThinking } from "../providers/errors"
 import { TemplateProvider } from "../templates/provider"
@@ -91,6 +92,7 @@ const MIN_RESULT_CHARS = 10_000
 const MAX_RESULT_CHARS = 200_000
 const INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxTurns"
 const LEGACY_INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxLevels"
+const INTENT_COMPILER_PROTOCOL = "Return exactly one valid JSON object, with no prose or Markdown fences, using this required shape: {\"objective\": string, \"prompt\": string, \"constraints\": string[], \"exclusions\": string[], \"strategy\": string, \"verification\": string[], \"assumptions\": string[]}. Every key is required. Do not add keys. The compiler validates this structure before accepting a result."
 
 const clampNumericSetting = (value: number | undefined, min: number, max: number, fallback: number) => {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback
@@ -240,18 +242,22 @@ export const parseIntentCompilerResponse = (output: string | undefined) => {
   }
   if (!parsed || typeof parsed !== "object") return undefined
   const details = parsed as Record<string, unknown>
-  const objective = String(details.objective ?? details.summary ?? "").trim()
-  const prompt = String(details.prompt ?? details.executionPrompt ?? "").trim()
+  const expectedKeys = ["objective", "prompt", "constraints", "exclusions", "strategy", "verification", "assumptions"]
+  if (Object.keys(details).length !== expectedKeys.length || expectedKeys.some((key) => !Object.prototype.hasOwnProperty.call(details, key))) return undefined
+  if (typeof details.objective !== "string" || typeof details.prompt !== "string" || typeof details.strategy !== "string") return undefined
+  const lists = [details.constraints, details.exclusions, details.verification, details.assumptions]
+  if (!lists.every((value) => Array.isArray(value) && value.every((entry) => typeof entry === "string"))) return undefined
+  const objective = details.objective.trim()
+  const prompt = details.prompt.trim()
   if (!objective || !prompt) return undefined
   return {
     objective,
     prompt,
     constraints: ensureStringList(details.constraints),
     exclusions: ensureStringList(details.exclusions),
-    strategy: String(details.strategy ?? "").trim() || undefined,
+    strategy: details.strategy.trim(),
     verification: ensureStringList(details.verification),
-    assumptions: ensureStringList(details.assumptions),
-    originalPrompt: String(details.originalPrompt ?? "").trim() || undefined
+    assumptions: ensureStringList(details.assumptions)
   }
 }
 
@@ -261,6 +267,7 @@ const writeIntentTrace = async ({
   request,
   history,
   maxLevels,
+  instructions,
   prompt,
   response,
   requestId
@@ -270,6 +277,7 @@ const writeIntentTrace = async ({
   request: { model: string; messages: ChatCompletionMessage[] }
   history: ChatCompletionMessage[]
   maxLevels: number
+  instructions: { mode: string; source?: string; hash: string }
   prompt: string
   response: string | undefined
   requestId: string
@@ -297,7 +305,8 @@ const writeIntentTrace = async ({
     compiler: {
       mode: settings.get<string>("chatToolsIntentCompilerMode", "ask"),
       enabled: settings.get<boolean>("chatToolsIntentCompilerEnabled", false),
-      maxLevels
+      maxLevels,
+      baseInstructions: instructions
     },
     historySummary: {
       totalMessages: history.length,
@@ -369,6 +378,8 @@ export class Chat extends Base {
   /** Aborted when this chat goes: the commands it started end with it. */
   private readonly _lifetime = new AbortController()
   private readonly _generations: GenerationTracker
+  private readonly _extensionContext: ExtensionContext
+  private readonly _promptInstructions: PromptInstructionResolver
 
   constructor(
     generations: GenerationTracker,
@@ -380,6 +391,8 @@ export class Chat extends Base {
   ) {
     super(extensionContext)
     this._generations = generations
+    this._extensionContext = extensionContext
+    this._promptInstructions = new PromptInstructionResolver(extensionContext)
     this._bridge = bridge
     this._search = search
     this._agents = agents
@@ -546,8 +559,9 @@ export class Chat extends Base {
       3
     )
     const priorHistory = previousPromptHistory(history, limit)
-    const systemPrompt =
-      "You refine a user request for a coding agent without changing intent. Use the recent prior prompt/response context only to understand continuity, and keep the original request as the authority. Earlier turns are historical context only; they do not become active policy or permissions for the current task unless the current user request explicitly repeats them. Treat a prior 'do not modify files' or similar restriction as a historical note for that earlier task, not as a standing rule for the current request. Treat prior assistant suggestions as background context only; do not convert speculative, tentative, or implied guidance into mandatory constraints or editing instructions unless the current user request explicitly asks for them. Ignore prior statements that say a size, style, or behavior 'could', 'may', 'might', or 'if needed' unless the current request makes them required. Return only JSON in this shape: {\"objective\": string, \"prompt\": string, \"constraints\": string[], \"exclusions\": string[], \"strategy\": string, \"verification\": string[], \"assumptions\": string[]}. Keep it concise, grounded in the original request, and do not invent facts or permissions."
+    const resolvedInstructions = await this._promptInstructions.resolve("intent")
+    const systemPrompt = [resolvedInstructions.content.trim(), INTENT_COMPILER_PROTOCOL].filter(Boolean).join("\n\n")
+    logger.debug("[Prompt] intent mode=" + resolvedInstructions.mode + " agent=none order=" + [resolvedInstructions.content.trim() ? "intent-base" : "", "compiler-input", "compiler-protocol"].filter(Boolean).join(","))
     const userPrompt = priorHistory ? `${priorHistory}\n\nCurrent request:\n${trimmed}` : trimmed
     const historySummary = summarizeIntentHistory(history, limit)
     logger.debug(`[Intent] Maximum levels: ${limit}`)
@@ -580,6 +594,7 @@ export class Chat extends Base {
           request,
           history,
           maxLevels: limit,
+          instructions: { mode: resolvedInstructions.mode, source: resolvedInstructions.source, hash: resolvedInstructions.hash },
           prompt: trimmed,
           response: content,
           requestId
@@ -596,6 +611,33 @@ export class Chat extends Base {
         logger.warn(`Chat compiler · ${describeProviderError(error, provider)}`)
       }
       return undefined
+    }
+  }
+
+  public async previewPromptInstructions(agentSelection: AgentSelection = "off") {
+    const [chatSnapshot, intent] = await Promise.all([this._context.systemPromptSnapshot(), this._promptInstructions.resolve("intent")])
+    const chat = chatSnapshot.instructions
+    const chatBase = chatSnapshot.prompt
+    let agent: LoadedAgent | undefined
+    if (agentSelection !== "off" && agentSelection !== "default") {
+      agent = await this._agents.load(agentSelection)
+    }
+    const enabled = agentSelection !== "off"
+    const workspaceContext = enabled ? await this.agentWorkspaceContext(this.toolsView()) : ""
+    const chatEffective = enabled
+      ? composeAgentPrompt(chatBase, agent?.profile.instructions ?? "", workspaceContext)
+      : chatBase
+    return {
+      chat,
+      intent,
+      chatEffective,
+      intentEffective: [intent.content.trim(), INTENT_COMPILER_PROTOCOL].filter(Boolean).join("\n\n"),
+      agentId: agent?.summary.id ?? (agentSelection === "default" ? "default" : undefined),
+      agentWarning: agentSelection !== "off" && agentSelection !== "default" && !agent
+        ? "The selected agent profile " + agentSelection + " is unavailable."
+        : undefined,
+      chatRuntimeContext: workspaceContext || "Request-specific workspace, editor, and attachment context is assembled at send time and is not included in this preview.",
+      toolGuidance: "Provider tool declarations and Twinny's approval, authorization, workspace-boundary, and credential-protection policies are applied at request time; they are not user-editable Markdown."
     }
   }
 
@@ -691,9 +733,22 @@ export class Chat extends Base {
       }
       this._conversation = await buildChatTurn(messages, {
         systemPrompt: async () => {
-          const base = await this._context.systemPrompt()
-          if (this._requestAgentSelection === "off") return base
+          const snapshot = await this._context.systemPromptSnapshot()
+          const base = snapshot.prompt
+          const baseLayers = [snapshot.hasTeamPolicy ? "team-policy" : "", snapshot.instructions.content.trim() ? "chat-base" : ""].filter(Boolean)
+          const agentId = this._activeAgent?.summary.id ?? this._requestAgentSelection
+          if (this._requestAgentSelection === "off") {
+            logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=off order=" + [...baseLayers, "runtime-user-context", ...(view ? ["provider-tool-definitions"] : [])].join(","))
+            return base
+          }
           const context = await this.agentWorkspaceContext(view)
+          const layers = [...baseLayers]
+          if (this._activeAgent?.profile.instructions.trim()) layers.push("agent-profile")
+          if (context.trim()) layers.push("workspace-context")
+          if (this._missingMcpCapabilities.length) layers.push("mcp-capability-notes")
+          layers.push("runtime-user-context")
+          if (view) layers.push("provider-tool-definitions")
+          logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=" + agentId + " order=" + layers.join(","))
           return composeAgentPrompt(base, this._activeAgent?.profile.instructions ?? "", context, this._missingMcpCapabilities)
         },
         additionalContext: async (question, sources, history) => {

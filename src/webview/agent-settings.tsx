@@ -2,9 +2,9 @@ import React, { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import cx from "classnames"
 
-import type { AgentProfileSummary } from "../common/agents"
+import type { AgentProfileSummary, AgentSelection } from "../common/agents"
 import { AGENT_STEP_PRESETS, DEFAULT_AGENT_STEPS, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../common/constants"
-import type { AgentRegistryRequest } from "../common/messaging/protocol"
+import type { AgentRegistryRequest, PromptInstructionSnapshot, PromptInstructionsResponse } from "../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../common/team"
 
 import { StorageType, useStorageContext } from "./hooks/useStorageContext"
@@ -308,12 +308,149 @@ const AgentRegistryPanel = () => {
   )
 }
 
+type PromptRoute = "chat" | "intent"
+
+const promptConfigKeys = {
+  chat: { mode: "chatBaseInstructionsMode", file: "chatBaseInstructionsFile" },
+  intent: { mode: "intentBaseInstructionsMode", file: "intentBaseInstructionsFile" }
+} as const
+
+const PromptInstructionsPanel = ({ agentSelection }: { agentSelection: AgentSelection }) => {
+  const [inspection, setInspection] = useState<PromptInstructionsResponse>()
+  const [previewRoute, setPreviewRoute] = useState<PromptRoute>()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+  const reloadSequence = useRef(0)
+
+  const reload = useCallback(async () => {
+    const sequence = ++reloadSequence.current
+    setBusy(true)
+    setError("")
+    try {
+      const result = await bridge.request(EVENT_NAME.twinnyPromptInstructions, { action: "inspect", agentSelection })
+      if (sequence === reloadSequence.current) setInspection(result)
+    } catch (reason) {
+      if (sequence === reloadSequence.current) setError("Could not load prompt instructions: " + (reason instanceof Error ? reason.message : String(reason)))
+    } finally {
+      if (sequence === reloadSequence.current) setBusy(false)
+    }
+  }, [agentSelection])
+
+  useEffect(() => { void reload() }, [reload])
+  useServerEvent(EVENT_NAME.twinnyConfigValueChanged, ({ key }) => {
+    if (Object.values(promptConfigKeys).some((route) => key === route.mode || key === route.file)) void reload()
+  })
+
+  const save = useCallback(async (key: string, value: unknown) => {
+    setBusy(true)
+    setError("")
+    try {
+      await bridge.request(EVENT_NAME.twinnySetConfigValue, { key, value })
+      await reload()
+    } catch (reason) {
+      setError("Could not save prompt settings: " + (reason instanceof Error ? reason.message : String(reason)))
+      setBusy(false)
+    }
+  }, [reload])
+
+  const pick = useCallback(async (route: PromptRoute) => {
+    setBusy(true)
+    setError("")
+    try {
+      const result = await bridge.request(EVENT_NAME.twinnyPromptInstructions, { action: "pick", route })
+      if (result.selectedFile) {
+        await bridge.request(EVENT_NAME.twinnySetConfigValue, { key: promptConfigKeys[route].file, value: result.selectedFile })
+        await bridge.request(EVENT_NAME.twinnySetConfigValue, { key: promptConfigKeys[route].mode, value: "custom" })
+      }
+      await reload()
+    } catch (reason) {
+      setError("Could not select the Markdown file: " + (reason instanceof Error ? reason.message : String(reason)))
+      setBusy(false)
+    }
+  }, [reload])
+
+  const open = useCallback(async (route: PromptRoute) => {
+    setBusy(true)
+    setError("")
+    try {
+      await bridge.request(EVENT_NAME.twinnyPromptInstructions, { action: "open", route })
+    } catch (reason) {
+      setError("Could not open the Markdown file: " + (reason instanceof Error ? reason.message : String(reason)))
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  const routePanel = (route: PromptRoute, title: string, snapshot: PromptInstructionSnapshot | undefined) => (
+    <section className={styles.promptRoute} aria-label={title}>
+      <strong>{title}</strong>
+      <label className={styles.promptSettingRow}>
+        <span>Mode</span>
+        <select
+          className={styles.agentInput}
+          aria-label={title + " mode"}
+          value={snapshot?.mode ?? "default"}
+          disabled={busy}
+          onChange={(event) => void save(promptConfigKeys[route].mode, event.currentTarget.value)}
+        >
+          <option value="default">Built-in Default</option>
+          <option value="custom">Custom Markdown File</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+      {snapshot?.mode === "custom" && (
+        <>
+          <div className={styles.promptPath} title={snapshot.file}>{snapshot.file || "No Markdown file selected"}</div>
+          <div className={styles.promptActions}>
+            <button type="button" className={styles.choice} disabled={busy} onClick={() => void pick(route)}>Choose Markdown File…</button>
+            <button type="button" className={styles.choice} disabled={busy || !snapshot.file} onClick={() => void open(route)}>Open for Editing</button>
+          </div>
+        </>
+      )}
+      {snapshot?.warning && <div className={styles.promptWarning} role="status">{snapshot.warning}</div>}
+      {snapshot?.mode === "custom" && !snapshot.warning && !snapshot.content.trim() && <div className={styles.promptSource}>The selected Markdown file is empty; no optional base instructions are added.</div>}
+      {snapshot?.mode === "none" && <div className={styles.promptSource}>No optional base instructions are added in None mode.</div>}
+      {snapshot && <div className={styles.promptSource}>Resolved from: {snapshot.source ?? "None"} · SHA-256 {snapshot.hash.slice(0, 12)}</div>}
+      <label className={styles.promptPreview}>
+        <span>Selected preamble (read-only)</span>
+        <textarea readOnly rows={4} value={snapshot?.content ?? ""} aria-label={title + " selected preamble preview"} />
+      </label>
+      <div className={styles.promptActions}>
+        <button type="button" className={styles.choice} disabled={busy} onClick={() => void reload()}>Refresh Preview</button>
+        <button type="button" className={styles.choice} disabled={busy} onClick={() => { setPreviewRoute(route); void reload() }}>Preview Effective Prompt</button>
+        <button type="button" className={styles.choice} disabled={busy || snapshot?.mode === "default"} onClick={() => void save(promptConfigKeys[route].mode, "default")}>Restore Default</button>
+      </div>
+      {previewRoute === route && inspection && (
+        <div className={styles.promptEffective}>
+          <strong>{title} effective prompt</strong>
+          {route === "chat" && inspection.agentWarning && <div className={styles.promptWarning}>{inspection.agentWarning}</div>}
+          {route === "chat" && inspection.agentId && <div className={styles.promptSource}>Selected agent profile: {inspection.agentId}</div>}
+          <textarea readOnly rows={8} value={route === "chat" ? inspection.chatEffective ?? "" : inspection.intentEffective ?? ""} aria-label={title + " effective prompt preview"} />
+          <strong>Dynamically generated runtime content (not editable Markdown)</strong>
+          <pre>{route === "chat" ? [inspection.chatRuntimeContext, inspection.toolGuidance].filter(Boolean).join("\n\n") : "Compiler input contains the current user request and bounded conversation history. The required JSON protocol is enforced by Twinny."}</pre>
+          <button type="button" className={styles.choice} onClick={() => setPreviewRoute(undefined)}>Close Preview</button>
+        </div>
+      )}
+    </section>
+  )
+
+  return (
+    <section className={styles.promptInstructions} aria-label="Base instructions">
+      <div className={styles.agentsHeading}><strong>Base Instructions</strong></div>
+      {routePanel("chat", "Chat Base Instructions", inspection?.chat)}
+      {routePanel("intent", "Intent Compiler Base Instructions", inspection?.intent)}
+      {error && <div className={styles.agentError} role="alert">{error}</div>}
+    </section>
+  )
+}
+
 interface AgentSettingsProps {
   /** What the connected team's policy allows, if it sets agent rules. */
   team?: TeamAgentPolicy
   autoRun: boolean
   setAutoRun: (on: boolean) => void
   onClose: () => void
+  agentSelection: AgentSelection
 }
 
 /**
@@ -323,7 +460,7 @@ interface AgentSettingsProps {
  * back to their settings; a rule the team sets shows, and cannot be
  * loosened here.
  */
-export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSettingsProps) => {
+export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelection }: AgentSettingsProps) => {
   const { t } = useTranslation()
   const panel = useRef<HTMLDivElement>(null)
   const [edits, setEdits] = useSetting<string>("chatToolsEdits", "apply")
@@ -406,6 +543,7 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose }: AgentSetti
           <span className="codicon codicon-close" aria-hidden="true" />
         </button>
       </div>
+      <PromptInstructionsPanel agentSelection={agentSelection} />
       <AgentRegistryPanel />
       <Choices
         label="Intent compiler"

@@ -112,6 +112,7 @@ suite("Agent reply, end to end", function () {
       [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
     }
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: {
         get: (key: string) => stored[key],
         update: async (key: string, value: unknown) => {
@@ -120,8 +121,7 @@ suite("Agent reply, end to end", function () {
         }
       },
       workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: [],
-      extensionUri: vscode.Uri.file(root)
+      subscriptions: []
     } as unknown as vscode.ExtensionContext
 
     const webview = fakeWebview()
@@ -194,6 +194,7 @@ suite("Agent reply, end to end", function () {
       [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
     }
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -247,6 +248,7 @@ suite("Agent reply, end to end", function () {
       [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider
     }
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -367,6 +369,7 @@ suite("Agent reply, end to end", function () {
       [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.autoRunCommands}`]: true
     }
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: { get: (key: string) => stored[key], update: async () => undefined },
       workspaceState: { get: () => undefined, update: async () => undefined },
       storageUri: vscode.Uri.file(path.join(root, ".git", "twinny-storage")),
@@ -448,6 +451,7 @@ suite("Agent reply, end to end", function () {
       [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
     }
     const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalState: { get: (key: string) => stored[key], update: async () => undefined },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []

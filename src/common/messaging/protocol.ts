@@ -83,6 +83,32 @@ export interface ConfigValue<T = unknown> {
   value: T
 }
 
+export type PromptInstructionsRequest =
+  | { action: "inspect"; agentSelection?: import("../agents").AgentSelection }
+  | { action: "pick" | "open"; route: "chat" | "intent" }
+
+export interface PromptInstructionSnapshot {
+  route: "chat" | "intent"
+  mode: "default" | "custom" | "none"
+  file?: string
+  source?: string
+  content: string
+  hash: string
+  warning?: string
+}
+
+export interface PromptInstructionsResponse {
+  selectedFile?: string
+  chat?: PromptInstructionSnapshot
+  intent?: PromptInstructionSnapshot
+  chatEffective?: string
+  intentEffective?: string
+  agentId?: string
+  agentWarning?: string
+  chatRuntimeContext?: string
+  toolGuidance?: string
+}
+
 export type AgentRegistryRequest =
   | { action: "list" | "refresh" | "pick" }
   | { action: "add"; path: string; name?: string }
@@ -324,11 +350,11 @@ export interface NewDocumentRequest {
 export interface IntentCompilerResult {
   objective: string
   prompt: string
-  constraints?: string[]
-  exclusions?: string[]
-  strategy?: string
-  verification?: string[]
-  assumptions?: string[]
+  constraints: string[]
+  exclusions: string[]
+  strategy: string
+  verification: string[]
+  assumptions: string[]
   originalPrompt?: string
 }
 
@@ -340,6 +366,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>
   [EVENT_NAME.twinnyAgentRegistry]: Channel<AgentRegistryRequest, AgentProfileSummary[]>
+  [EVENT_NAME.twinnyPromptInstructions]: Channel<PromptInstructionsRequest, PromptInstructionsResponse>
   [EVENT_NAME.twinnyChatMessage]: Channel<ChatRequest>
   [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string; history?: ChatCompletionMessage[]; maxLevels?: number }, IntentCompilerResult | undefined>
   [EVENT_NAME.twinnyClickSuggestion]: Channel<string>
@@ -492,6 +519,7 @@ export interface ClientEvents {
 export interface ServerEvents {
   [EVENT_NAME.twinnyAddMessage]: ChatCompletionMessage | undefined
   [EVENT_NAME.twinnyAgentRegistry]: AgentProfileSummary[]
+  [EVENT_NAME.twinnyPromptInstructions]: PromptInstructionsResponse
   [EVENT_NAME.twinnyConfigValueChanged]: ConfigValue
   [EVENT_NAME.twinnyGetConfigValue]: ConfigValue
   [EVENT_NAME.twinnyGetModels]: ModelCatalogue

@@ -5,6 +5,7 @@
 import * as assert from "assert"
 import * as http from "http"
 import { AddressInfo } from "net"
+import * as path from "path"
 import * as vscode from "vscode"
 
 import {
@@ -200,6 +201,7 @@ const stubBridge = () => {
 
 const contextWith = (active: Record<string, TwinnyProvider>) =>
   ({
+    extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
     globalState: {
       get: (key: string) => active[key],
       update: async () => undefined
@@ -210,6 +212,7 @@ const contextWith = (active: Record<string, TwinnyProvider>) =>
 /** Enough of an extension context for the chat to build prompts. */
 const chatContext = () =>
   ({
+    extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
     globalState: {
       get: (key: string) => (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY ? fakeChatConfig : undefined),
       update: async () => undefined

@@ -223,3 +223,74 @@
   align-self: flex-start;
   margin-top: 2px;
 }
+
+.promptInstructions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 5px 0;
+  border-top: 1px solid var(--tw-rule);
+  border-bottom: 1px solid var(--tw-rule);
+}
+
+.promptRoute {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 5px 0;
+  border-top: 1px solid color-mix(in srgb, var(--tw-rule) 55%, transparent);
+}
+
+.promptSettingRow,
+.promptPreview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--tw-fg-faint);
+}
+
+.promptActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.promptPath,
+.promptSource {
+  overflow-wrap: anywhere;
+  color: var(--tw-fg-faint);
+  font-size: var(--tw-fs-xs);
+}
+
+.promptWarning {
+  color: var(--vscode-editorWarning-foreground, var(--tw-fg-dim));
+  overflow-wrap: anywhere;
+}
+
+.promptPreview textarea,
+.promptEffective textarea {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  padding: 4px;
+  border: 1px solid var(--tw-rule);
+  background: color-mix(in srgb, var(--tw-fg) 4%, var(--tw-bg));
+  color: var(--tw-fg);
+  font: inherit;
+  white-space: pre-wrap;
+}
+
+.promptEffective {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 5px;
+  border: 1px solid var(--tw-rule);
+}
+
+.promptEffective pre {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  color: var(--tw-fg-faint);
+}

@@ -725,6 +725,32 @@
           "markdownDescription": "**Experimental.** Lets the chat model work in the workspace: find, read and search files (by regular expression, and by meaning through the embeddings index), read git history, ask the language servers for errors, references and definitions, edit, create, rename, move and delete files, and run commands. Edits are applied straight away unless `#twinny.chatToolsEdits#` asks for review; each applied edit comes back with any errors the editor then reports in the file, and the reply ends with the files it changed, each of which can be compared with what it was or undone. Commands ask first unless `#twinny.chatToolsCommands#` says otherwise. The project's `AGENTS.md` (or `CLAUDE.md`) is followed, and a folder's own `AGENTS.md` once the model works there. Files ignored by a `.gitignore` are off limits, and changes to `.vscode/`, a `.gitignore` or an `AGENTS.md` are always shown for review. Each step shows in the reply at the point it ran. Needs a capable coder model such as `qwen3-coder:30b` with a context of 8k tokens or more; small models tend to call tools badly. Set in your user settings; a workspace cannot turn it on.",
           "scope": "machine"
         },
+        "twinny.chatBaseInstructionsMode": {
+          "order": 20,
+          "type": "string",
+          "enum": ["default", "custom", "none"],
+          "default": "default",
+          "markdownDescription": "Select the optional conversational chat base instructions. Custom Markdown is read on each new request; None omits this layer without disabling runtime context, tools, or application policies."
+        },
+        "twinny.chatBaseInstructionsFile": {
+          "order": 20,
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the custom Markdown file used when Chat Base Instructions is set to Custom Markdown File."
+        },
+        "twinny.intentBaseInstructionsMode": {
+          "order": 20,
+          "type": "string",
+          "enum": ["default", "custom", "none"],
+          "default": "default",
+          "markdownDescription": "Select the optional Intent Compiler base instructions independently of chat instructions. The compiler's JSON protocol remains enforced by Twinny when this is None or customized."
+        },
+        "twinny.intentBaseInstructionsFile": {
+          "order": 20,
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the custom Markdown file used when Intent Compiler Base Instructions is set to Custom Markdown File."
+        },
         "twinny.chatToolsIntentCompilerEnabled": {
           "order": 20,
           "type": "boolean",

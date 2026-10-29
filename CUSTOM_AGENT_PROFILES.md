@@ -43,3 +43,8 @@ The chat dropdown’s **+ Manage Agents…** panel exposes the new-chat default,
 User-created files are stored under `ExtensionContext.globalStorageUri/agents`, not a hardcoded home-directory location. Settings are persisted through VS Code configuration; existing MCP connections remain configured in `twinny.chatToolsMcpServers`.
 
 Twinny generates the active workspace root, relative-path guidance, and a bounded live inventory at request time for enabled agents. Inventory excludes common private/build paths and files hidden by Twinny's workspace visibility rules. In multi-root workspaces, the existing tool executor operates on the first root, so that is the root inventoried for tool use.
+
+
+## Base instructions
+
+The agent settings panel also offers independent **Chat Base Instructions** and **Intent Compiler Base Instructions** selectors. Each can use the bundled default, a user-owned Markdown file, or None. Custom files are read for each new request; missing or unreadable files show a warning and fall back to that route's bundled default. None removes only that optional behavioral layer; agent profiles, compiler JSON protocol, runtime context, tool approvals, and application-enforced workspace/security boundaries remain separate. Use **Preview Effective Prompt** in the panel to inspect the resolved layers without making an inference request.
