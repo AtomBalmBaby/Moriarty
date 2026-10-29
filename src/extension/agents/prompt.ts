@@ -10,7 +10,7 @@ export const composeAgentPrompt = (
   }
   if (workspaceContext.trim()) sections.push(workspaceContext.trim())
   if (unavailable.length) {
-    sections.push("Unavailable MCP capabilities (not connected and not available to call): " + unavailable.join(", "))
+    sections.push("Agent capability diagnostics (not available to call unless listed as resolved tools): " + unavailable.join("\n"))
   }
   return sections.filter(Boolean).join("\n\n")
 }

@@ -31,6 +31,7 @@ import {
 import { composeAgentPrompt } from "../agents/prompt"
 import type { LoadedAgent } from "../agents/registry"
 import { AgentRegistry } from "../agents/registry"
+import { agentToolSelectionDiagnostic, resolveAgentToolSelection } from "../agents/tool-selection"
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
@@ -357,6 +358,7 @@ export class Chat extends Base {
   private _activeAgent?: LoadedAgent
   private _activeMcpTools: McpToolSpec[] = []
   private _missingMcpCapabilities: string[] = []
+  private _agentToolDiagnostic?: string
   private readonly _steps: ToolSteps
   private readonly _stopSubscription: { dispose(): void }
   /** What agent replies changed, kept so each can be compared or undone from the chat. */
@@ -658,6 +660,7 @@ export class Chat extends Base {
       this._activeAgent = undefined
       this._activeMcpTools = []
       this._missingMcpCapabilities = []
+      this._agentToolDiagnostic = undefined
       if (this._requestAgentSelection !== "off" && this._requestAgentSelection !== "default") {
         try {
           this._activeAgent = await this._agents.load(this._requestAgentSelection)
@@ -682,10 +685,15 @@ export class Chat extends Base {
         const profile = this._activeAgent?.profile
         const toolMcpNames = profile?.tools?.flatMap((tool) => {
           const separator = tool.indexOf("/")
-          return separator > 0 ? [tool.slice(0, separator)] : []
+          const namespace = separator > 0 ? tool.slice(0, separator).toLowerCase() : ""
+          return separator > 0 && !["twinny", "vscode", "workspace", "builtin"].includes(namespace)
+            ? [tool.slice(0, separator)]
+            : []
         }) ?? []
         const explicitNames = [...new Set([...(profile?.mcpServers ?? []), ...toolMcpNames])]
-        const serverNames = profile ? explicitNames : undefined
+        const hasToolRestriction = profile?.tools !== undefined
+        const includesWildcard = profile?.tools?.includes("*") ?? false
+        const serverNames = profile && (profile.mcpServers.length > 0 || (hasToolRestriction && !includesWildcard)) ? explicitNames : undefined
         const serverSettings = this.config.get<Record<string, unknown>>("chatToolsMcpServers", {}) ?? {}
         if (serverNames) {
           for (const name of serverNames) {
@@ -707,23 +715,15 @@ export class Chat extends Base {
           }
         }
         this._activeMcpTools = availableMcpTools
-        if (profile?.tools !== undefined) {
-          const requested = profile.tools
-          this._activeMcpTools = this._activeMcpTools.filter((tool) =>
-            requested.some((entry) => entry === `${tool.server}/${tool.tool}` || entry === `${tool.server}/*` || entry === tool.tool)
-          )
-          for (const entry of requested.filter((name) => name.includes("/"))) {
-            const [server, toolName] = entry.split("/", 2)
-            const found = availableMcpTools.some((tool) => tool.server === server && (toolName === "*" || tool.tool === toolName))
-            if (!found) this._missingMcpCapabilities.push(`${entry} (not exposed by the configured server)`)
-          }
-        }
       } else if (this._activeAgent) {
         const referenced = new Set([
           ...this._activeAgent.profile.mcpServers,
           ...(this._activeAgent.profile.tools ?? []).flatMap((tool) => {
             const separator = tool.indexOf("/")
-            return separator > 0 ? [tool.slice(0, separator)] : []
+            const namespace = separator > 0 ? tool.slice(0, separator).toLowerCase() : ""
+            return separator > 0 && !["twinny", "vscode", "workspace", "builtin"].includes(namespace)
+              ? [tool.slice(0, separator)]
+              : []
           })
         ])
         this._missingMcpCapabilities = [...referenced].map((name) => `${name} (blocked by team policy or no workspace tools are available)`)
@@ -749,7 +749,7 @@ export class Chat extends Base {
           layers.push("runtime-user-context")
           if (view) layers.push("provider-tool-definitions")
           logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=" + agentId + " order=" + layers.join(","))
-          return composeAgentPrompt(base, this._activeAgent?.profile.instructions ?? "", context, this._missingMcpCapabilities)
+          return composeAgentPrompt(base, this._activeAgent?.profile.instructions ?? "", context, [...this._missingMcpCapabilities, ...(this._agentToolDiagnostic ? [this._agentToolDiagnostic] : [])])
         },
         additionalContext: async (question, sources, history) => {
           const context = await this._context.additionalContext(question, sources, mentions, history)
@@ -1190,19 +1190,18 @@ export class Chat extends Base {
             )
     })
     const requestedTools = this._activeAgent?.profile.tools
-    if (requestedTools !== undefined) {
-      const groups: Record<string, string[]> = {
-        read: ["list_dir", "find_files", "read_file", "grep", "find_symbol", "editor_context", "find_references", "go_to_definition", "diagnostics"],
-        search: ["search_code", "grep", "find_files", "find_symbol", "find_references"],
-        edit: ["edit_file", "create_file", "rename_symbol", "move_file", "delete_file"],
-        execute: ["run_command"]
-      }
-      const permitted = new Set(requestedTools.flatMap((name) => groups[name] ?? [name]))
-      if (permitted.has("*")) {
-        // A wildcard is still limited to tools already created under Twinny policy.
-      } else {
-        available = { ...available, tools: available.tools.filter((tool) => permitted.has(tool.name)) }
-      }
+    const mcpNames = new Set(this._activeMcpTools.map((tool) => tool.name))
+    const nativeTools = available.tools.filter((tool) => !mcpNames.has(tool.name))
+    const allAvailableNames = [...nativeTools.map((tool) => tool.name), ...this._activeMcpTools.map((tool) => `${tool.server}/${tool.tool}`)]
+    const selection = resolveAgentToolSelection(requestedTools, nativeTools, this._activeMcpTools)
+    const nativeNames = new Set(selection.native.map((tool) => tool.name))
+    const selectedMcpNames = new Set(selection.mcp.map((tool) => tool.name))
+    available = { ...available, tools: available.tools.filter((tool) => nativeNames.has(tool.name) || selectedMcpNames.has(tool.name)) }
+    this._activeMcpTools = selection.mcp
+    if (selection.explicit && (selection.unmatched.length || (!selection.native.length && !selection.mcp.length))) {
+      this._agentToolDiagnostic = agentToolSelectionDiagnostic(requestedTools, selection.unmatched, allAvailableNames, selection.native.length + selection.mcp.length)
+      logger.warn(this._agentToolDiagnostic)
+      this._bridge.emit(EVENT_NAME.twinnyNotification, this._agentToolDiagnostic)
     }
     hooks.onTools(available)
     let warned = false

@@ -15,6 +15,7 @@ import * as vscode from "vscode"
 
 import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../../common/constants"
 import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
+import { AgentRegistry } from "../../extension/agents/registry"
 import { Chat } from "../../extension/chat/index"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
@@ -509,4 +510,85 @@ suite("Agent reply, end to end", function () {
       await settings.update("chatToolsMaxSteps", undefined, vscode.ConfigurationTarget.Global)
     }
   })
+  test("Chat Base Instructions=None leaves eligible agent tools intact and profile restrictions resolve safely", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-agent-tool-resolution-"))
+    const profilePath = path.join(root, ".github", "agents", "plan.agent.md")
+    fs.mkdirSync(path.dirname(profilePath), { recursive: true })
+    const closeWorkspace = await openWorkspace(root)
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousAgents = settings.inspect("agents")?.globalValue
+    const previousBaseMode = settings.inspect("chatBaseInstructionsMode")?.globalValue
+    const previousMcpServers = settings.inspect("chatToolsMcpServers")?.globalValue
+    const model = new ScriptedModel(["Done.", "Done.", "Done.", "Done."])
+    const providerKind = "llamacpp"
+    const previousAdapter = providerRegistry.get(providerKind)
+    const configuredProvider: TwinnyProvider = { ...provider, provider: providerKind }
+    providerRegistry.register(providerKind, { id: "scripted-llamacpp", create: () => model })
+    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: configuredProvider }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-storage")),
+      globalState: {
+        get: (key: string) => stored[key],
+        update: async (key: string, value: unknown) => { stored[key] = value }
+      },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const registry = new AgentRegistry(context)
+    const bridgeMessages: Array<{ type: string; data: unknown }> = []
+    const bridge = { emit: (type: string, data?: unknown) => bridgeMessages.push({ type, data }) } as unknown as ExtensionBridge
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
+    chat.root = root
+
+    const runWithProfile = async (frontmatter: string, prompt: string) => {
+      fs.writeFileSync(profilePath, `---\nname: Plan\n${frontmatter}---\n\nPlan the requested audit.`)
+      const registered = await registry.list()
+      const profile = registered.find((item) => item.path === vscode.Uri.file(profilePath).toString())
+      assert.ok(profile?.valid, "temporary agent profile should parse and register")
+      await chat.completion([{ role: "user", content: prompt }], [], profile.id)
+      return model.requests.at(-1)
+    }
+
+    try {
+      await settings.update("agents", {
+        autoDiscover: false,
+        definitions: [{ id: "test-plan-profile", path: profilePath, enabled: true }],
+        searchPaths: [],
+        excludedPaths: []
+      }, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsMcpServers", {}, vscode.ConfigurationTarget.Global)
+
+      await settings.update("chatBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
+      const defaultInstructions = await runWithProfile("", "Audit the project with normal tools under the built-in base.")
+      const defaultTools = defaultInstructions?.tools?.map((tool) => tool.name) ?? []
+      assert.ok(defaultTools.includes("read_file"), "an undeclared tools field must retain eligible tools")
+      assert.ok(defaultTools.length > 1, "the agent should retain multiple normally eligible tools")
+
+      await settings.update("chatBaseInstructionsMode", "none", vscode.ConfigurationTarget.Global)
+      const unrestricted = await runWithProfile("", "Audit the project with normal tools and no base instructions.")
+      const normalTools = unrestricted?.tools?.map((tool) => tool.name) ?? []
+      assert.deepStrictEqual(normalTools, defaultTools, "None mode must not change the resolved tool set")
+      assert.doesNotMatch(String(unrestricted?.messages[0]?.content), /You are a helpful, respectful and honest coding assistant/)
+
+      const restricted = await runWithProfile("tools:\n  - vscode/readFile\n", "Audit with the declared read tool only.")
+      assert.deepStrictEqual(restricted?.tools?.map((tool) => tool.name), ["read_file"])
+
+      const unresolved = await runWithProfile("tools:\n  - vscode/webSearch\n", "Audit with the unavailable web search tool.")
+      assert.ok(!unresolved?.tools?.some((tool) => tool.name === "read_file"), "unmatched restrictions must not grant alternatives")
+      const notice = bridgeMessages.map(({ data }) => String(data ?? "")).find((message) => message.includes("Unmatched names: vscode/webSearch"))
+      assert.ok(notice, "unmatched tool names and alternatives should be reported")
+      assert.match(notice ?? "", /Available alternatives: .*read_file/)
+    } finally {
+      chat.dispose()
+      await settings.update("agents", previousAgents, vscode.ConfigurationTarget.Global)
+      await settings.update("chatBaseInstructionsMode", previousBaseMode, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsMcpServers", previousMcpServers, vscode.ConfigurationTarget.Global)
+      if (previousAdapter) providerRegistry.register(providerKind, previousAdapter)
+      else providerRegistry.unregister(providerKind)
+      await closeWorkspace()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
 })

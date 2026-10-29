@@ -107,6 +107,10 @@ export class ChatGeneration {
     const run = this._generations.start("chat")
     this._run = run
     let text = prefix
+    let streamChunks = 0
+    let streamedContentChars = 0
+    let reasoningChars = 0
+    let finishReason: string | undefined
     const elapsed = this.logRequest(request.messages, provider)
     const started = Date.now()
     const meta: ReplyMeta = { model: provider.modelName, provider: provider.label }
@@ -130,6 +134,10 @@ export class ChatGeneration {
       })
       try {
         for await (const chunk of chunks) {
+          streamChunks++
+          streamedContentChars += chunk.content.length
+          reasoningChars += chunk.reasoning?.length ?? 0
+          if (chunk.finishReason) finishReason = chunk.finishReason
           if (chunk.usage?.completionTokens) {
             meta.completionTokens = chunk.usage.completionTokens
           }
@@ -153,6 +161,15 @@ export class ChatGeneration {
           (run.signal.aborted ? " · stopped by the user" : "")
       )
       logger.block("Chat reply", reply)
+      if (!run.signal.aborted && !text.slice(prefix.length).trim() && !extras.keepEmpty?.()) {
+        const streamState = streamChunks === 0
+          ? "the provider emitted no response chunks"
+          : streamedContentChars === 0
+            ? "the stream contained no visible text"
+            : "Twinny received content but no usable text or completed tool call remained after response parsing"
+        const reasoning = reasoningChars ? `; ${reasoningChars} reasoning characters were received without visible content` : ""
+        throw new Error(`The provider completed without usable chat content or a completed tool call (${streamState}; finish reason: ${finishReason ?? "not provided"}${reasoning}). Check the model/server response and tool-call support, then retry.`)
+      }
       await extras.settle?.()
       // A discarded reply is nobody's: not shown, and not part of the conversation.
       if (this._discarded.has(run)) return ""

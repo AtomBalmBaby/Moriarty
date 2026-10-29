@@ -10,6 +10,7 @@ import { GenerationState, GenerationTracker } from "../../extension/generations"
 import { InferenceClient, InferenceError } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
 import { TemplateProvider } from "../../extension/templates/provider"
+import { withTools } from "../../extension/tools/loop"
 
 const provider = {
   id: "fake",
@@ -122,6 +123,74 @@ suite("Generation tracker", () => {
       // A later part does not start until the next request resets it.
       assert.strictEqual(await generation.generate(client, request, provider), "")
       assert.strictEqual(tracker.state.busy, false)
+    } finally {
+      generation.dispose()
+    }
+  })
+
+  test("an empty provider completion is reported instead of silently succeeding", async () => {
+    const tracker = new GenerationTracker()
+    const messages: Array<{ type: string; data: unknown }> = []
+    const bridge = { emit: (type: string, data?: unknown) => messages.push({ type, data }) } as unknown as ExtensionBridge
+    const generation = new ChatGeneration(bridge, tracker)
+    const client = {
+      async *chat() {
+        yield { content: "", finishReason: "stop" as const }
+      }
+    } as unknown as InferenceClient
+    try {
+      assert.strictEqual(await generation.generate(client, request, provider), "")
+      const failure = messages.find(({ type }) => type === EVENT_NAME.twinnyAddMessage)?.data as { content?: string } | undefined
+      assert.match(failure?.content ?? "", /without usable chat content or a completed tool call/i)
+      assert.match(failure?.content ?? "", /finish reason: stop/i)
+    } finally {
+      generation.dispose()
+    }
+  })
+
+  test("whitespace-only parsed output is distinguished from a provider stream with no text", async () => {
+    const tracker = new GenerationTracker()
+    const messages: Array<{ type: string; data: unknown }> = []
+    const bridge = { emit: (type: string, data?: unknown) => messages.push({ type, data }) } as unknown as ExtensionBridge
+    const generation = new ChatGeneration(bridge, tracker)
+    const client = {
+      async *chat() {
+        yield { content: "  ", reasoning: "thinking", finishReason: "stop" as const }
+      }
+    } as unknown as InferenceClient
+    try {
+      await generation.generate(client, request, provider)
+      const failure = messages.find(({ type }) => type === EVENT_NAME.twinnyAddMessage)?.data as { content?: string } | undefined
+      assert.match(failure?.content ?? "", /Twinny received content but no usable text/i)
+      assert.match(failure?.content ?? "", /8 reasoning characters were received/i)
+    } finally {
+      generation.dispose()
+    }
+  })
+
+  test("a reasoning-only tool-loop response reaches empty-response diagnostics", async () => {
+    const tracker = new GenerationTracker()
+    const messages: Array<{ type: string; data: unknown }> = []
+    const bridge = { emit: (type: string, data?: unknown) => messages.push({ type, data }) } as unknown as ExtensionBridge
+    const generation = new ChatGeneration(bridge, tracker)
+    const client = {
+      id: "fake",
+      capabilities: () => ["chat" as const],
+      async *chat() {
+        yield { content: "", reasoning: "thinking", finishReason: "stop" as const }
+      }
+    } as unknown as InferenceClient
+    const tools = {
+      tools: [],
+      orientation: "",
+      run: async () => ({ output: "", summary: "" })
+    }
+    try {
+      const wrapped = withTools(client, tools, { mode: "native" })
+      await generation.generate(wrapped, request, provider)
+      const failure = messages.find(({ type }) => type === EVENT_NAME.twinnyAddMessage)?.data as { content?: string } | undefined
+      assert.match(failure?.content ?? "", /8 reasoning characters were received/i)
+      assert.match(failure?.content ?? "", /finish reason: stop/i)
     } finally {
       generation.dispose()
     }

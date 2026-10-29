@@ -575,8 +575,8 @@ class ToolLoop {
         }
         if (last && !settled && !this._stuck && step >= maxSteps) this._options.onOutOfSteps?.()
         const usage = this._usage.promptTokens || this._usage.completionTokens ? { ...this._usage } : undefined
-        if (usage || finishReason) {
-          yield { content: "", ...(usage ? { usage } : {}), ...(finishReason ? { finishReason } : {}) }
+        if (usage || finishReason || reply.reasoning) {
+          yield { content: "", ...(reply.reasoning ? { reasoning: reply.reasoning } : {}), ...(usage ? { usage } : {}), ...(finishReason ? { finishReason } : {}) }
         }
         return
       }
