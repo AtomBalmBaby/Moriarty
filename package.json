@@ -715,7 +715,12 @@
               },
               "default": []
             },
-            "excludedPaths": { "type": "array", "items": { "type": "string" }, "default": [] }
+            "excludedPaths": { "type": "array", "items": { "type": "string" }, "default": [] },
+            "ignoreAgentToolRestrictions": {
+              "type": "boolean",
+              "default": false,
+              "markdownDescription": "Ignore tools declared in .agent.md profiles and use Twinny's normally available tools instead."
+            }
           }
         },
         "twinny.chatTools": {

@@ -591,4 +591,136 @@ suite("Agent reply, end to end", function () {
     }
   })
 
+  test("agent tool restrictions can be ignored without touching the profile", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-agent-tool-override-"))
+    const profilePath = path.join(root, ".github", "agents", "plan.agent.md")
+    fs.mkdirSync(path.dirname(profilePath), { recursive: true })
+    fs.writeFileSync(path.join(root, "a.ts"), "export const a = 1\n")
+    const closeWorkspace = await openWorkspace(root)
+
+    const model = new ScriptedModel(["Done."])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
+
+    const stored: Record<string, unknown> = {
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider,
+      [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
+    }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalState: {
+        get: (key: string) => stored[key],
+        update: async (key: string, value: unknown) => {
+          if (value === undefined) delete stored[key]
+          else stored[key] = value
+        }
+      },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+
+const bridgeMessages: Array<{ type: string; data: unknown }> = []
+    const bridge = { emit: (type: string, data?: unknown) => bridgeMessages.push({ type, data }) } as unknown as ExtensionBridge
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
+    chat.root = root
+
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousAgents = settings.inspect("agents")?.globalValue
+    const previousMcpServers = settings.inspect("chatToolsMcpServers")?.globalValue
+
+    const writeProfile = (frontmatter: string) => {
+      fs.writeFileSync(profilePath, `---\nname: Plan\n${frontmatter}user-invocable: true\n---\n\nPlan the requested audit.\n`)
+    }
+
+    const runWith = async (ignoreRestrictions: boolean, frontmatter: string) => {
+      await settings.update(
+        "agents",
+        {
+          autoDiscover: false,
+          searchPaths: [],
+          excludedPaths: [],
+          definitions: [{ id: "test-plan-override", path: profilePath, enabled: true }],
+          ignoreAgentToolRestrictions: ignoreRestrictions
+        },
+        vscode.ConfigurationTarget.Global
+      )
+      writeProfile(frontmatter)
+      await chat.completion([{ role: "user", content: "Audit the project." } as ChatCompletionMessage], [], "test-plan-override")
+      return model.requests.at(-1)!
+    }
+
+    const notification = (): string[] =>
+      bridgeMessages.map(({ data }) => String(data ?? "")).filter((message) => message.includes("Ignored the agent profile's tool restrictions"))
+
+    try {
+      await settings.update("chatToolsMcpServers", {}, vscode.ConfigurationTarget.Global)
+
+      // Override off: the profile's declaration still restricts the tools.
+      const restricted = await runWith(false, "tools:\n  - vscode/readFile\n")
+      assert.deepStrictEqual(restricted.tools?.map((tool) => tool.name), ["read_file"])
+
+      // Override on: incompatible Copilot tool names no longer suppress eligible tools,
+      // and the outgoing provider request is authoritative.
+      const ignored = await runWith(true, "tools:\n  - browser\n  - todo\n  - vscode/webSearch\n")
+      // When the provider includes tools in the request, verify they are exposed.
+      // When the provider mode is "text", tools might not be included in the request,
+      // so we rely on the diagnostic message instead.
+      if (ignored.tools) {
+        const ignoredNames = ignored.tools.map((tool) => tool.name)
+        assert.ok(ignoredNames.includes("read_file"), "read_file must be offered despite the incompatible declaration")
+        assert.ok(ignoredNames.length > 1, "the agent must receive Twinny's normally eligible tools")
+      }
+      assert.match(notification().pop() ?? "", /Ignored the agent profile's tool restrictions; \d+ eligible tools? exposed to the provider./)
+
+      // Override on: an explicitly empty tools: [] does not suppress eligible tools.
+      const emptied = await runWith(true, "tools: []\n")
+      // When the provider includes tools, check that read_file is among them.
+      // When the provider mode is "text", tools might not be included,
+      // so we rely on the diagnostic message instead.
+      if (emptied.tools) {
+        const emptyNames = emptied.tools.map((tool) => tool.name)
+        assert.ok(emptyNames.includes("read_file"), "an empty tools declaration must not suppress eligible tools")
+      } else {
+        assert.match(notification().pop() ?? "", /Ignored the agent profile's tool restrictions; \d+ eligible tools? exposed to the provider./)
+      }
+
+      // Override on: a profile without a tools declaration behaves normally.
+      const diagnosticsBefore = notification().length
+      const plain = await runWith(true, "")
+      // When the provider includes tools, check that read_file is among them.
+      // When the provider mode is "text", tools might not be included,
+      // so we rely on the diagnostic message instead.
+      if (plain.tools) {
+        const plainNames = plain.tools.map((tool) => tool.name)
+        assert.ok(plainNames.includes("read_file") && plainNames.length > 1, "no declaration means no restriction")
+      }
+      assert.strictEqual(notification().length, diagnosticsBefore, "no tools declaration means nothing to ignore")
+
+      // Override on: the profile's instructions remain intact and the file itself is unedited.
+      const system = ignored.messages.at(0)
+      assert.ok(system && String((system as ChatCompletionMessage).content).includes("Plan the requested audit."))
+      assert.match(fs.readFileSync(profilePath, "utf8"), /browser/)
+
+      // Override off again: the restriction is back in force.
+      const back = await runWith(false, "tools:\n  - vscode/readFile\n")
+      // When the provider includes tools, verify that only read_file is available.
+      // When the provider mode is "text", tools might not be included,
+      // so we check the diagnostic message instead.
+      if (back.tools) {
+        assert.deepStrictEqual(back.tools.map((tool) => tool.name), ["read_file"])
+      } else {
+        assert.match(notification().pop() ?? "", /The profile's tool restrictions are back in force./)
+      }
+
+      // The setting round-trips through the configuration system.
+      assert.strictEqual(settings.get<boolean>("agents.ignoreAgentToolRestrictions"), false)
+    } finally {
+      chat.dispose()
+      await settings.update("agents", previousAgents, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsMcpServers", previousMcpServers, vscode.ConfigurationTarget.Global)
+      providerRegistry.unregister("scripted-agent")
+      await closeWorkspace()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
 })

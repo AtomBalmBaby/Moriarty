@@ -1189,7 +1189,15 @@ export class Chat extends Base {
               this._activeMcpTools
             )
     })
-    const requestedTools = this._activeAgent?.profile.tools
+    // `twinny.agents.ignoreAgentToolRestrictions` lets a workspace run a
+    // community .agent.md profile while ignoring the tools it declares.
+    // The override is applied here, at the resolution boundary: the profile
+    // file itself is never touched, and nothing below this line is weakened -
+    // `nativeTools` and `this._activeMcpTools` already reflect Twinny's own
+    // settings, team policy, MCP enablement and approval state, so passing
+    // `undefined` simply means "no profile-specific tool restriction".
+    const requestedTools =
+      this.config.get<boolean>("agents.ignoreAgentToolRestrictions", false) ? undefined : this._activeAgent?.profile.tools
     const mcpNames = new Set(this._activeMcpTools.map((tool) => tool.name))
     const nativeTools = available.tools.filter((tool) => !mcpNames.has(tool.name))
     const allAvailableNames = [...nativeTools.map((tool) => tool.name), ...this._activeMcpTools.map((tool) => `${tool.server}/${tool.tool}`)]
@@ -1198,7 +1206,14 @@ export class Chat extends Base {
     const selectedMcpNames = new Set(selection.mcp.map((tool) => tool.name))
     available = { ...available, tools: available.tools.filter((tool) => nativeNames.has(tool.name) || selectedMcpNames.has(tool.name)) }
     this._activeMcpTools = selection.mcp
-    if (selection.explicit && (selection.unmatched.length || (!selection.native.length && !selection.mcp.length))) {
+    if (requestedTools === undefined && this._activeAgent?.profile.tools !== undefined) {
+      // The override is on and the profile declared tools: say so, and report
+      // how many of the genuinely eligible tools actually reach the provider.
+      const exposed = selection.native.length + selection.mcp.length
+      this._agentToolDiagnostic = `Ignored the agent profile's tool restrictions; ${exposed} eligible tool${exposed === 1 ? "" : "s"} exposed to the provider.`
+      logger.warn(this._agentToolDiagnostic)
+      this._bridge.emit(EVENT_NAME.twinnyNotification, this._agentToolDiagnostic)
+    } else if (selection.explicit && (selection.unmatched.length || (!selection.native.length && !selection.mcp.length))) {
       this._agentToolDiagnostic = agentToolSelectionDiagnostic(requestedTools, selection.unmatched, allAvailableNames, selection.native.length + selection.mcp.length)
       logger.warn(this._agentToolDiagnostic)
       this._bridge.emit(EVENT_NAME.twinnyNotification, this._agentToolDiagnostic)
