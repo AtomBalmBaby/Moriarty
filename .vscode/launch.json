@@ -14,7 +14,8 @@
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
         "${workspaceFolder}/example",
-        "${workspaceFolder}"
+        "${workspaceFolder}",
+        "--disable-extensions"
       ],
       "outFiles": [
         "${workspaceFolder}/out/**/*.js"

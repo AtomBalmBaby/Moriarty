@@ -566,10 +566,6 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
           { value: "always-refined", label: "Always use refined", title: "Automatically execute the refined prompt when the proposal stays in scope." }
         ]}
       />
-      <div className={styles.row}>
-        <span className={styles.label}>Refine prompts before agent execution.</span>
-        <span className={styles.label}>Adds one side-effect-free inference call; individual requests can still choose Run Original.</span>
-      </div>
       <NumberSetting
         label="Max intent turns"
         value={intentCompilerMaxTurns}
