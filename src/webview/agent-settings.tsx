@@ -544,7 +544,10 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
         </button>
       </div>
       <PromptInstructionsPanel agentSelection={agentSelection} />
-      <AgentRegistryPanel />
+      <details>
+        <summary>Agents</summary>
+        <AgentRegistryPanel />
+      </details>
       <Choices
         label="Intent compiler"
         value={intentCompilerEnabled ? intentCompilerMode : "always-original"}

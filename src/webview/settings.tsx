@@ -27,6 +27,12 @@ export const Settings = () => {
       WORKSPACE_STORAGE_KEY.selectedTemplates
     ) || []
 
+  // New: storage for ignoreAgentToolRestrictions
+  const {
+    context: ignoreAgentToolRestrictions,
+    setContext: setIgnoreAgentToolRestrictions
+  } = useStorageContext<boolean>(StorageType.Global, "agents.ignoreAgentToolRestrictions")
+
   const handleTemplateClick = (
     e: React.MouseEvent<HTMLInputElement, MouseEvent>
   ) => {
@@ -99,6 +105,19 @@ export const Settings = () => {
         <VSCodeButton appearance="secondary" onClick={handleClearSelection}>
           {t("clear")}
         </VSCodeButton>
+      </div>
+
+      {/* Ignore Agent Tool Restrictions */}
+      <div className={styles.checkboxGroup}>
+        <label htmlFor="ignoreAgentToolRestrictions" className={styles.checkboxItem}>
+          <VSCodeCheckbox
+            id="ignoreAgentToolRestrictions"
+            name="ignoreAgentToolRestrictions"
+            checked={ignoreAgentToolRestrictions ?? false}
+            onClick={() => setIgnoreAgentToolRestrictions(!(ignoreAgentToolRestrictions ?? false))}
+          />
+          <span>Ignore Agent Tool Restrictions</span>
+        </label>
       </div>
     </div>
   )
