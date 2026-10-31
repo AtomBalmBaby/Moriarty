@@ -400,32 +400,47 @@ export class Chat extends Base {
     this._agents = agents
     this._steps = new ToolSteps((steps) => bridge.emit(EVENT_NAME.twinnyToolSteps, steps))
 
-    // Expose tool inventory to the webview
-    this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
-  // Ensure MCP servers are ready and tools are loaded
-  await this._mcp.ready();
-  return this._mcp.tools.map((tool) => ({
-    name: tool.tool,
-    description: tool.description,
-    server: tool.server,
-    tool: tool.tool,
-  }));
-})
-    // Stopping the reply skips a command still waiting for Run or Skip.
-    this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
+    // Initialize generation and context
     this._generation = new ChatGeneration(bridge, generations)
-    this._context = new ChatContextBuilder(
-      extensionContext,
-      bridge,
-      new TemplateProvider(templateDir),
-      search
-    )
+    this._context = new ChatContextBuilder(extensionContext, bridge, new TemplateProvider(templateDir), search)
+    this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
+
+this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
+  try {
+    logger.info('twinny-tool-inventory requested');
+    const root = workspace.workspaceFolders?.[0]?.uri.fsPath;
+    let nativeList: any[] = [];
+    if (root) {
+      const nativeTools = workspaceTools(root, [], {});
+      nativeList = nativeTools.tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        server: 'Native Tools',
+        tool: t.name,
+      }));
+      logger.info(`Native tools count: ${nativeList.length}`);
+    } else {
+      logger.warn('No workspace folder available – skipping native tool discovery');
+    }
+    const mcpList = this._mcp.tools.map((tool) => ({
+      name: tool.tool,
+      description: tool.description,
+      server: tool.server,
+      tool: tool.tool,
+    }));
+    logger.info(`MCP tools count: ${mcpList.length}`);
+    const result = [...nativeList, ...mcpList];
+    logger.info(`Total inventory count: ${result.length}`);
+    return result;
+  } catch (e) {
+    logger.error(`twinny-tool-inventory failed: ${e instanceof Error ? e.message : e}`);
+    throw e;
   }
-
-  /* ------------------------------------------------------------------------ */
-  /*  Public API                                                               */
-  /* ------------------------------------------------------------------------ */
-
+});
+}
+  
+  
+  
   public get cancelled(): boolean {
     return this._generation.cancelled
   }

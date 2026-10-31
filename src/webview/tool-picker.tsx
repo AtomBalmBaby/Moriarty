@@ -5,6 +5,7 @@ import { EVENT_NAME } from "../common/constants";
 
 export const ToolPicker: React.FC = () => {
   const [inventory, setInventory] = useState<any[]>([]);
+  const [error, setError] = useState<string | null>(null);
   const [showDialog, setShowDialog] = useState(false);
 
   useEffect(() => {
@@ -13,7 +14,7 @@ export const ToolPicker: React.FC = () => {
         const data = await bridge.request(EVENT_NAME.twinnyToolInventory as any);
         setInventory((data ?? []) as any[]);
       } catch (e) {
-        console.error("Failed to fetch tool inventory", e);
+        setError(e instanceof Error ? e.message : String(e));
       }
     };
     fetchInventory();
@@ -26,6 +27,7 @@ export const ToolPicker: React.FC = () => {
   return (
     <div>
       <button onClick={() => setShowDialog(true)}>Configure Tools</button>
+{error && <div style={{color: 'red', marginTop: '8px'}}>{error}</div>}
       {showDialog && (
         <ToolInventoryDialog
           inventory={inventory}
