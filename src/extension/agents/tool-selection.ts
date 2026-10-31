@@ -30,61 +30,67 @@ const builtinName = (name: string) => {
 }
 
 export const resolveAgentToolSelection = <TNative extends NamedAgentTool, TMcp extends McpAgentTool>(
-  requested: string[] | undefined,
+  requestedTools: (string | string[]) | undefined,
   nativeTools: TNative[],
   mcpTools: TMcp[]
 ): AgentToolSelection<TNative, TMcp> => {
-  if (requested === undefined) {
+  const requested: string[] = !requestedTools ? [] : Array.isArray(requestedTools) ? requestedTools : [requestedTools]
+  if (requested.length === 0) {
     return { explicit: false, native: nativeTools, mcp: mcpTools, unmatched: [] }
   }
-
-  const nativeByName = new Map(nativeTools.map((tool) => [normalize(tool.name), tool]))
+  const nativeByName = new Map<string, TNative>()
+  nativeTools.forEach(tool => nativeByName.set(normalize(tool.name), tool))
   const selectedNative = new Set<TNative>()
   const selectedMcp = new Set<TMcp>()
   const unmatched: string[] = []
-
   for (const rawName of requested) {
     const name = normalize(rawName)
     if (name === "*") {
-      nativeTools.forEach((tool) => selectedNative.add(tool))
-      mcpTools.forEach((tool) => selectedMcp.add(tool))
+      nativeTools.forEach(t => selectedNative.add(t))
+      mcpTools.forEach(t => selectedMcp.add(t))
       continue
     }
-
-    const nativeName = normalize(builtinName(name))
-    const nativeMatch = nativeByName.get(nativeName)
+    const builtin = builtinName(name)
+    const nativeMatch = nativeByName.get(normalize(builtin))
     let matched = false
     if (nativeMatch) {
       selectedNative.add(nativeMatch)
       matched = true
-    }
-    for (const alias of NATIVE_GROUPS[name] ?? NATIVE_GROUPS[nativeName] ?? []) {
-      const tool = nativeByName.get(normalize(alias))
-      if (tool) {
-        selectedNative.add(tool)
-        matched = true
+    } else {
+      const group = NATIVE_GROUPS[name] ?? NATIVE_GROUPS[normalize(builtin)] ?? []
+      for (const alias of group) {
+        const tool = nativeByName.get(normalize(alias))
+        if (tool) {
+          selectedNative.add(tool)
+          matched = true
+        }
       }
     }
-
-    const qualified = name.split("/", 2)
-    const isBuiltinNamespace = qualified.length === 2 && ["twinny", "vscode", "workspace", "builtin"].includes(qualified[0])
-    const isNativeAlias = !!(NATIVE_GROUPS[name] ?? NATIVE_GROUPS[nativeName])
-    const mcpMatches = qualified.length === 2 && !isBuiltinNamespace
-      ? mcpTools.filter((tool) => normalize(tool.server) === qualified[0] && (qualified[1] === "*" || normalize(tool.tool) === qualified[1]))
-      : nativeMatch || isNativeAlias
-        ? []
-        : mcpTools.filter((tool) => normalize(tool.tool) === name)
-    mcpMatches.forEach((tool) => selectedMcp.add(tool))
-    if (mcpMatches.length) matched = true
-    if (!matched) unmatched.push(rawName)
+    const parts = name.split("/", 2)
+    let mcpMatchFound = false
+    if (parts.length === 2) {
+      for (const tool of mcpTools) {
+        if (normalize(tool.server) === normalize(parts[0]) && (parts[1] === "*" || normalize(tool.tool) === normalize(parts[1]))) {
+          selectedMcp.add(tool)
+          mcpMatchFound = true
+        }
+      }
+    } else {
+      for (const tool of mcpTools) {
+        if (normalize(tool.tool) === name) {
+          selectedMcp.add(tool)
+          mcpMatchFound = true
+        }
+      }
+    }
+    if (matched || mcpMatchFound) {
+      continue
+    }
+    unmatched.push(rawName)
   }
-
-  return {
-    explicit: true,
-    native: nativeTools.filter((tool) => selectedNative.has(tool)),
-    mcp: mcpTools.filter((tool) => selectedMcp.has(tool)),
-    unmatched
-  }
+  const resolvedNative = nativeTools.filter(t => selectedNative.has(t))
+  const resolvedMcp = mcpTools.filter(t => selectedMcp.has(t))
+  return { explicit: true, native: resolvedNative, mcp: resolvedMcp, unmatched }
 }
 
 export const agentToolSelectionDiagnostic = (

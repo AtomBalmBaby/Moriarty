@@ -1,3 +1,4 @@
+/* eslint-disable simple-import-sort/imports */
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import cx from "classnames"
@@ -11,6 +12,7 @@ import { StorageType, useStorageContext } from "./hooks/useStorageContext"
 import { bridge, emit, useServerEvent } from "./messaging"
 
 import styles from "./styles/agent-settings.module.css"
+import { ToolPicker } from "./tool-picker";
 
 /** Steps a reply may take, offered as presets; `DEFAULT_AGENT_STEPS` is the default. */
 export const STEP_PRESETS = AGENT_STEP_PRESETS
@@ -575,8 +577,10 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
         unit="turns"
         title="How many previous prompt/response turns to include as context when refining a new request."
         onChange={setIntentCompilerMaxTurns}
-      />
+        />
       <label className={styles.row} aria-label="Trace intent compiler requests">
+      <ToolPicker />
+        
         <span className={styles.label}>Trace intent compiler requests</span>
         <input
           type="checkbox"
@@ -712,4 +716,5 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
   )
 }
 
-export default AgentSettings
+
+export default AgentSettings;

@@ -11,6 +11,13 @@ import {
   TEAM_SHARE_EVENT_NAME
 } from "../constants"
 import type { DiscoveredServer } from "../provider-discovery"
+
+export interface ToolInventoryItem {
+  name: string
+  description: string
+  server: string
+  tool: string
+}
 import type {
   TeamApplyRequest,
   TeamApplyResult,
@@ -363,6 +370,7 @@ export interface IntentCompilerResult {
 /* -------------------------------------------------------------------------- */
 
 export interface ClientEvents {
+  [EVENT_NAME.twinnyToolInventory]: Channel<void, ToolInventoryItem[]>
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>
   [EVENT_NAME.twinnyAgentRegistry]: Channel<AgentRegistryRequest, AgentProfileSummary[]>

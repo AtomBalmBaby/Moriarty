@@ -12,3 +12,4 @@ packages/twinny-server/*.tgz
 .claude/
 twinny.gateway.json
 src/test/twinny-providers.json
+.maxential/

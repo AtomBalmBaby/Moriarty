@@ -37,8 +37,20 @@ const booleanField = (value: unknown, key: string, fallback: boolean): boolean =
   if (typeof value !== "boolean") throw new Error(`The '${key}' field must be true or false.`)
   return value
 }
+export const writeAgentProfile = (filePath: string, profile: ParsedAgentProfile) => {
+  // Reconstruct YAML frontmatter from the profile object
+  const frontmatter: Record<string, unknown> = { ...profile.frontmatter } as any
+  // Ensure tools field mirrors profile.tools if defined
+  if (profile.tools) frontmatter.tools = profile.tools
+  // Keep non-supported fields removed - but they were already in frontmatter
+  const yamlText = require("js-yaml").dump(frontmatter, { lineWidth: 1024 })
+  const content = "---\n" + yamlText + "---\n" + (profile.instructions ?? "")
+  const fs = require("fs") as typeof import("fs")
+  fs.writeFileSync(filePath, content, { encoding: "utf8" })
+}
 
-export const parseAgentProfile = (content: string, filePath: string): ParsedAgentProfile => {
+export const parseAgentProfile
+ = (content: string, filePath: string): ParsedAgentProfile => {
   if (!filePath.endsWith(".agent.md")) throw new Error("Selectable agent files must end in '.agent.md'.")
   if (content.length > 1_000_000) throw new Error("Agent profile files must be smaller than 1 MB.")
   const source = content.replace(/^\uFEFF/, "")

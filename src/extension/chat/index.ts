@@ -399,6 +399,18 @@ export class Chat extends Base {
     this._search = search
     this._agents = agents
     this._steps = new ToolSteps((steps) => bridge.emit(EVENT_NAME.twinnyToolSteps, steps))
+
+    // Expose tool inventory to the webview
+    this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
+  // Ensure MCP servers are ready and tools are loaded
+  await this._mcp.ready();
+  return this._mcp.tools.map((tool) => ({
+    name: tool.tool,
+    description: tool.description,
+    server: tool.server,
+    tool: tool.tool,
+  }));
+})
     // Stopping the reply skips a command still waiting for Run or Skip.
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
     this._generation = new ChatGeneration(bridge, generations)
@@ -417,7 +429,7 @@ export class Chat extends Base {
   public get cancelled(): boolean {
     return this._generation.cancelled
   }
-
+  
   public abort = () => {
     this._steps.cancelWaiting()
     this._generation.abort()
