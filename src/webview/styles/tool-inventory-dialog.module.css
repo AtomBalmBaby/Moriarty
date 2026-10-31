@@ -1,0 +1,74 @@
+/* Dialog overlay */
+.dialogOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+/* Dialog container */
+.dialogContainer {
+  background: var(--tw-bg);
+  border: 1px solid var(--tw-rule);
+  border-radius: 4px;
+  max-width: 600px;
+  width: 90%;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.close {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--tw-fg-faint);
+}
+
+.close:hover,
+.close:focus-visible {
+  color: var(--tw-fg);
+}
+
+.search {
+  margin-bottom: 8px;
+}
+
+.groupHeader {
+  display: flex;
+  align-items: center;
+  margin-top: 8px;
+  font-weight: 600;
+}
+
+.groupCheckbox {
+  margin-right: 4px;
+}
+
+.toolItem {
+  display: flex;
+  align-items: center;
+  margin-left: 20px;
+  margin-top: 4px;
+}
+
+.toolCheckbox {
+  margin-right: 4px;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}

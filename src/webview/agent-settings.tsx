@@ -222,6 +222,7 @@ const AgentRegistryPanel = () => {
 
   return (
     <section className={styles.agentsSection} aria-label="Selectable agents">
+      <ToolPicker />
       <div className={styles.agentsHeading}>
         <strong>Agents</strong>
         <button type="button" className={styles.choice} disabled={busy} onClick={() => void perform({ action: "refresh" })}>Refresh</button>

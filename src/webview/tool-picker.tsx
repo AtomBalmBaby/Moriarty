@@ -1,10 +1,11 @@
-
 import React, { useEffect, useState } from "react";
 import { bridge } from "./messaging";
+import { ToolInventoryDialog } from "./tool-inventory-dialog";
 import { EVENT_NAME } from "../common/constants";
 
 export const ToolPicker: React.FC = () => {
   const [inventory, setInventory] = useState<any[]>([]);
+  const [showDialog, setShowDialog] = useState(false);
 
   useEffect(() => {
     const fetchInventory = async () => {
@@ -18,17 +19,20 @@ export const ToolPicker: React.FC = () => {
     fetchInventory();
   }, []);
 
+  const handleConfirm = (selected: any[]) => {
+    console.log("Selected tools", selected);
+  };
+
   return (
     <div>
-      <h3>Tool Inventory</h3>
-      <ul>
-        {inventory.map((tool, idx) => (
-          <li key={idx}>
-            {tool.server}/{tool.tool} - {tool.description}
-          </li>
-        ))}
-      </ul>
+      <button onClick={() => setShowDialog(true)}>Configure Tools</button>
+      {showDialog && (
+        <ToolInventoryDialog
+          inventory={inventory}
+          onClose={() => setShowDialog(false)}
+          onConfirm={handleConfirm}
+        />
+      )}
     </div>
   );
 };
-
