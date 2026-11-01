@@ -408,6 +408,8 @@ export class Chat extends Base {
 this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   try {
     logger.info('twinny-tool-inventory requested');
+    // Ensure MCP is ready before accessing its tools
+    await this._mcp.ready();
     const root = workspace.workspaceFolders?.[0]?.uri.fsPath;
     let nativeList: any[] = [];
     if (root) {
