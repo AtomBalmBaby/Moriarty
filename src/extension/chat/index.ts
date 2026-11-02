@@ -50,7 +50,7 @@ import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { DEFAULT_MAX_STEPS, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import { WorkspaceView } from "../tools/view"
-import { WorkspaceTools, workspaceTools } from "../tools/workspace"
+import { WorkspaceTools, workspaceTools, ToolExtras } from "../tools/workspace"
 import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
@@ -406,36 +406,50 @@ export class Chat extends Base {
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
 
 this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
+  logger.info('twinny-tool-inventory requested');
   try {
-    logger.info('twinny-tool-inventory requested');
     // Ensure MCP is ready before accessing its tools
     await this._mcp.ready();
-    const root = workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const root = workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
     let nativeList: any[] = [];
     if (root) {
-      const nativeTools = workspaceTools(root, [], {});
+      // Build a minimal extras object that enables all native tools
+      const extras: ToolExtras = {
+        edits: {
+          mode: "apply" as const,
+          read: async (): Promise<string | undefined> => undefined,
+          edit: async () => ({ ok: true, message: "" }),
+          create: async () => ({ ok: true, message: "" }),
+          remove: async () => ({ ok: true, message: "" }),
+          move: async () => ({ ok: true, message: "" }),
+        },
+        editor: {
+          diagnostics: async () => [],
+          references: async () => [],
+          definition: async () => [],
+          rename: async () => ({ ok: true, message: "" }),
+          context: async () => ({ openFiles: [] }),
+        },
+      };
+      const nativeTools = workspaceTools(root, [], extras);
       nativeList = nativeTools.tools.map((t) => ({
         name: t.name,
         description: t.description,
-        server: 'Native Tools',
+        server: "native",
         tool: t.name,
       }));
-      logger.info(`Native tools count: ${nativeList.length}`);
-    } else {
-      logger.warn('No workspace folder available – skipping native tool discovery');
     }
-    const mcpList = this._mcp.tools.map((tool) => ({
-      name: tool.tool,
-      description: tool.description,
-      server: tool.server,
-      tool: tool.tool,
+    const mcpList = this._mcp.tools.map((t) => ({
+      name: t.tool,
+      description: t.description,
+      server: t.server,
+      tool: t.tool,
     }));
-    logger.info(`MCP tools count: ${mcpList.length}`);
-    const result = [...nativeList, ...mcpList];
-    logger.info(`Total inventory count: ${result.length}`);
-    return result;
+    const inventory = [...nativeList, ...mcpList];
+    logger.info(`twinny-tool-inventory: native=${nativeList.length} mcp=${mcpList.length} total=${inventory.length}`);
+    return inventory;
   } catch (e) {
-    logger.error(`twinny-tool-inventory failed: ${e instanceof Error ? e.message : e}`);
+    logger.error(`twinny-tool-inventory error: ${e}`);
     throw e;
   }
 });
