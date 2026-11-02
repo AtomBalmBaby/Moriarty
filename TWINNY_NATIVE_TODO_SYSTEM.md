@@ -1,0 +1,402 @@
+# Twinny Native TODO System
+
+**Status:** Proposed implementation specification  
+**Version:** 0.1, 2026-11-02  
+**Parent architecture:** [TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md)
+
+## 1. Objective
+
+Add a **single, native, persistent TODO system** to Twinny. Tasks are scoped to projects and chats, visible in a compact collapsible checklist, accessible through native tools, and recoverable after reload, model failure, or an interrupted coding session.
+
+This is the first vertical slice of the larger intent, execution, feedback, and recovery architecture. It must be useful **before** Cerebras orchestration or evaluator scoring is implemented.
+
+**Hard requirement:** Do not create a separate `todo.md` for every conversation, task, run, or project. Thousands of tiny documents are neither a reliable query engine nor a sane backing store.
+
+## 2. Storage decision
+
+### 2.1 Recommended default
+
+**One SQLite database per Twinny extension-host storage location**, placed under VS Code's `ExtensionContext.globalStorageUri`:
+
+```text
+ExtensionContext.globalStorageUri/
+  twinny-state.sqlite
+  twinny-state.sqlite-wal   (present when WAL is active)
+  twinny-state.sqlite-shm   (present when WAL is active)
+```
+
+These names are illustrative; resolve the actual location from the ExtensionContext at runtime. The directory may need to be created. Do not hardcode `~/.vscode-oss`, `.vscode`, or repository paths.
+
+The database is **physically global to this extension host**, but **logically scoped** using stable project IDs, conversation IDs, and list IDs. Nothing appears in a project's source tree unless explicitly exported.
+
+Why SQLite:
+
+- One compact managed store instead of thousands of Markdown files.
+- Transactional changes and crash recovery.
+- Efficient lookup by project, chat, status, task ID, and revision.
+- Atomic state transitions and an append-only evidence/audit trail.
+- Works offline with a self-hosted agent; no database server to administer.
+- A simple export/backup story, with an adapter boundary for future engines.
+
+Do **not** put the full TODO database in `globalState` or `workspaceState` key/value storage. These are suitable for small preferences and the current selection marker, not a growing relational task journal. Workspace-local `storageUri` is a valid alternative for one-workspace data, but a single global database is better for cross-workspace search, conversation discovery, migration management, and one consistent backup.
+
+### 2.2 Remote-host behavior
+
+The store exists **where the extension host executes**. A local VSCodium instance and an SSH/remote extension host may have different physical `globalStorageUri` directories. The UI must not imply automatic synchronization. The first release is local-to-host only, with explicit portable export/import planned.
+
+For WAL, require a local filesystem on the same host for all database connections. SQLite's WAL mode is not suitable for direct multi-machine access over NFS/SMB. If a future configurable path is on a network filesystem, reject or switch to a separately designed supported strategy; do not silently use WAL there.
+
+### 2.3 Storage abstraction
+
+Expose a narrowly scoped `TodoRepository` interface to the rest of Twinny. SQLite is the first adapter, not a dependency of React, model prompts, or the execution controller.
+
+```ts
+interface TodoRepository {
+  initialize(): Promise<void>;
+  resolveProject(workspace: WorkspaceIdentity): Promise<ProjectId>;
+  ensureConversation(projectId: ProjectId, chatId: string): Promise<void>;
+  getOrCreateList(scope: TodoScope): Promise<TodoList>;
+  getList(listId: string): Promise<TodoListSnapshot>;
+  createItem(input: CreateTodoInput, requestId: string): Promise<TodoItem>;
+  updateItem(input: UpdateTodoInput, requestId: string): Promise<TodoItem>;
+  addEvidence(input: AddEvidenceInput, requestId: string): Promise<TodoEvidence>;
+  getEvents(listId: string, afterRevision?: number): Promise<TodoEvent[]>;
+  close(): Promise<void>;
+}
+```
+
+These are contract sketches, not a claim about current Twinny type names. Keep database transactions inside the adapter and ensure all mutating operations support idempotency or optimistic concurrency.
+
+## 3. Identity and scoping
+
+### 3.1 Project identity
+
+A project gets a stable `project_id` (UUID). Resolve it from the current workspace identity, using normalized folder URIs, remote authority, and a deterministic fingerprint as a **lookup hint**, not as the permanent identity itself. Store aliases so a moved/renamed directory or linked Git worktree can later be associated with the original project intentionally.
+
+Requirements:
+
+- Support normal folders, `.code-workspace` multi-root workspaces, and remote URIs.
+- Do not equate identical folder names with identical projects.
+- Do not treat a Git branch change as a new project.
+- Do not merge two projects automatically just because their Git remote matches.
+- Provide a reserved unscoped project for chats with no open workspace.
+- Avoid assuming `workspace.workspaceFolders[0]` always represents the intended project.
+
+### 3.2 Conversation identity
+
+A conversation gets a stable `conversation_id`, preferably reusing Twinny's existing persistent chat ID after verifying its lifecycle. If it cannot be trusted, add a UUID mapping. Conversation title, model, provider, and message order are **not** identities.
+
+- Reloading or reopening a chat must resolve to the same TODO list.
+- Switching providers or compaction must not change the task identity.
+- A chat may link to one primary project in v1; plan for explicit relinking and moves.
+- Renaming a conversation does not create another list.
+- Importing a conversation must detect identifier conflicts and resolve them deliberately.
+
+### 3.3 TODO list scopes
+
+| Scope | Ownership | Visibility | First release |
+|---|---|---|---|
+| Chat | `project_id + conversation_id` | One list shown in that chat | **Required** |
+| Project | `project_id`, no conversation | Shared board across the project's chats | Schema-ready; UI can follow |
+| Cross-project | Explicitly linked IDs | Future portfolios or coordinated tasks | Not in v1 |
+
+A project can contain many chats; each chat has its own canonical list. Project-scoped work is a *separate* intentional list, not an automatic union that silently duplicates chat tasks. A task can later be promoted or linked by an explicit operation that retains its stable ID and provenance.
+
+## 4. Data model
+
+### 4.1 Main entities
+
+| Entity | Main fields | Purpose |
+|---|---|---|
+| `projects` | `id`, `display_name`, `created_at` | Stable project namespace |
+| `project_aliases` | `project_id`, `workspace_fingerprint`, `remote_authority`, `observed_uri` | Resolve physical workspace references |
+| `conversations` | `id`, `project_id`, `title`, `created_at`, `updated_at` | Tie chats to projects without using filenames |
+| `todo_lists` | `id`, `project_id`, `conversation_id?`, `scope`, `revision`, `intent_id?`, `created_at` | One canonical board per scope |
+| `todo_items` | `id`, `list_id`, `parent_id?`, `title`, `details?`, `status`, `verification`, `priority`, `sort_order`, `version`, `assigned_run_id?`, `blocked_reason?`, timestamps | Current task state |
+| `todo_dependencies` | `item_id`, `depends_on_item_id` | Explicit dependency graph |
+| `todo_events` | `id`, `list_id`, `item_id?`, `list_revision`, `event_type`, `actor`, `request_id`, `payload_json`, `created_at` | Append-only record of changes |
+| `todo_evidence` | `id`, `item_id`, `run_id?`, `kind`, `summary`, `result`, `reference?`, `created_at` | Verification and observations |
+| `agent_runs` | `id`, `conversation_id`, `item_id?`, `provider`, `model`, `status`, `started_at`, `finished_at` | Trace task attempts and interruptions |
+
+Later, introduce separate `intents`, `intent_revisions`, evaluator judgments, playbook invocations, and richer handoff records. Do not prematurely embed those semantics in TODO title fields.
+
+### 4.2 Example schema (conceptual migration)
+
+```sql
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  title TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS todo_lists (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  conversation_id TEXT REFERENCES conversations(id),
+  scope TEXT NOT NULL CHECK (scope IN ('chat', 'project')),
+  revision INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  CHECK ((scope = 'chat' AND conversation_id IS NOT NULL)
+      OR (scope = 'project' AND conversation_id IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_chat_todo_list
+  ON todo_lists(conversation_id) WHERE scope = 'chat';
+CREATE UNIQUE INDEX IF NOT EXISTS one_project_todo_list
+  ON todo_lists(project_id) WHERE scope = 'project';
+
+CREATE TABLE IF NOT EXISTS todo_items (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  parent_id TEXT REFERENCES todo_items(id),
+  title TEXT NOT NULL,
+  details TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  verification TEXT NOT NULL DEFAULT 'not_checked',
+  priority INTEGER NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  assigned_run_id TEXT,
+  blocked_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (status IN ('pending','in_progress','in_review',
+                   'blocked','completed','cancelled')),
+  CHECK (verification IN ('not_checked','passed','failed','waived'))
+);
+
+CREATE INDEX IF NOT EXISTS todo_items_by_list_status
+  ON todo_items(list_id, status, sort_order);
+
+CREATE TABLE IF NOT EXISTS todo_events (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT REFERENCES todo_items(id),
+  list_revision INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(list_id, list_revision)
+);
+
+CREATE TABLE IF NOT EXISTS todo_evidence (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  run_id TEXT,
+  kind TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  result TEXT NOT NULL,
+  reference TEXT,
+  created_at TEXT NOT NULL
+);
+```
+
+This is a representative core, **not** a complete drop-in migration: add the remaining entity tables, foreign-key consistency enforcement, full migration metadata, and dependency-cycle validation before shipping. Use monotonically increasing list revisions and item versions. A task's `parent_id`, dependencies, project and conversation relationship must be validated within the repository, not trusted from raw model input.
+
+### 4.3 Write transactions and event journal
+
+Each accepted mutation executes in **one SQLite transaction**:
+
+1. Validate project/chat/list scope and agent authorization.
+2. Check `request_id` for repeat delivery; return the existing result if already applied.
+3. Compare `expected_item_version` or `expected_list_revision` to the database.
+4. Validate the state transition and any dependencies/verification constraints.
+5. Update current task rows, increment revision, and append the event.
+6. Commit and notify subscribers; never notify before a successful commit.
+
+An event is provenance, not an enormous copy of source code or an entire chat transcript. Store compact metadata and bounded result summaries. Link to external trace logs or artifacts when needed.
+
+Concurrency: SQLite has a single writer at a time. Keep write transactions short, use a busy timeout, use connection coordination for multiple extension windows, and test concurrent revision conflicts. Use an appropriate SQLite online backup method rather than blindly copying a live WAL database file.
+
+## 5. Task state machine
+
+### 5.1 Status vs. verification
+
+The **task status** reflects workflow progress; **verification** reflects the quality of evidence. Keep these independent.
+
+```text
+pending -> in_progress -> in_review -> completed
+   |          |              |
+   +-------> blocked <--------+
+   |          |              |
+   +-------> cancelled <------+
+              |
+              +-> in_progress (resumed after blocker resolved)
+```
+
+- `pending`: accepted into the plan, not being executed.
+- `in_progress`: assigned to an active or recoverable work attempt.
+- `in_review`: implementer reports ready; verification is not yet accepted.
+- `blocked`: requires an explicit reason and next recovery action.
+- `completed`: acceptance criteria met with recorded verification, or a deliberate user-authorized waiver.
+- `cancelled`: intentionally discontinued; not a successful result.
+
+Verification values: `not_checked`, `passed`, `failed`, `waived`.
+
+**Guardrails:**
+
+- A model's `todo_update(status="completed")` must not bypass evidence validation.
+- Failed verification returns the task to `in_progress` or `blocked`, with an event explaining why.
+- `waived` requires an authorized user or explicit controller policy and must preserve a reason.
+- After a crash, an orphaned `in_progress` task is marked as interrupted/stale at the run level, not auto-completed or silently duplicated.
+- Reopening a task preserves its previous attempts and evidence.
+- Parent completion requires satisfied child/dependency rules or explicit documented override.
+
+### 5.2 Single-active-task rule for v1
+
+Allow at most **one active task per chat** at a time by controller policy, to simplify context projection, verification, and error recovery. The schema can accommodate parallel tasks later. Project-scoped tasks may be read from any chat, but must not accidentally start multiple conflicting agents.
+
+## 6. Native TODO tool API
+
+Use namespaced native tools to avoid ambiguity with an existing external Todos MCP server. Suggested initial tool names:
+
+| Native tool | Arguments (conceptual) | Result |
+|---|---|---|
+| `twinny_todo_list` | `project_id?`, `conversation_id?`, `include_completed?` | Canonical list snapshot with revision |
+| `twinny_todo_get` | `item_id` | Task details, acceptance checks, evidence summary, version |
+| `twinny_todo_create` | `list_id`, `title`, `details?`, `parent_id?`, `priority?`, `request_id` | Created task and list revision |
+| `twinny_todo_update` | `item_id`, `expected_version`, patch, `request_id` | Updated task, version, or explicit conflict |
+| `twinny_todo_evidence` | `item_id`, `kind`, `summary`, `result`, `run_id?`, `request_id` | Evidence record and updated revision |
+
+The controller supplies trustworthy scope and caller identity. Do not let a model forge `project_id`, agent identity, or completed verification results merely by providing strings. Read tools are read-only. Mutations pass through a single validated service, never directly through webview SQL.
+
+Tasks can be created manually in the UI or proposed by models. Bulk replace/reconcile and reordering can wait for a subsequent stage; when introduced, preserve task IDs, human edits, evidence, and explicit user decisions.
+
+### Example tool result
+
+```json
+{
+  "list_id": "list-uuid",
+  "project_id": "project-uuid",
+  "conversation_id": "chat-uuid",
+  "revision": 14,
+  "items": [
+    {
+      "id": "task-uuid",
+      "title": "Repair first TypeScript compiler error",
+      "status": "in_progress",
+      "verification": "not_checked",
+      "version": 3,
+      "acceptance": ["npx tsc -p . --noEmit exits 0"],
+      "last_run_id": "run-uuid"
+    }
+  ]
+}
+```
+
+These IDs are illustrative and need not match Twinny's current format.
+
+## 7. UI requirements
+
+### 7.1 Above-chat TODO control
+
+- Compact collapsible list displayed above chat, **not** inside a transient settings popup.
+- Show current task and `n of m` count; distinguish completed, blocked, in review, and executing.
+- Checkbox/action changes must be validated by the extension host and then reflected from its authoritative response.
+- Expand to see nested tasks, priority/dependencies, verification evidence, latest failure, and who made changes.
+- Keep the list stable when the model generates new chat output or the user changes providers.
+- Avoid duplicate lists when an intent compiler or implementer emits plans in chat.
+- Search/filter completed items; hide completed by default without deleting their history.
+- Surface an interrupted run clearly and offer resume/retry or manual intervention.
+
+### 7.2 Human control
+
+- User can create, edit, reorder, block, reopen, cancel, or explicitly approve completion.
+- Manual actions supersede uncommitted model proposals. Record the actor and revision.
+- A model may suggest revising a user-authored task, but must not silently overwrite the user's instructions.
+- The panel is a projection of stored state, never a second copy of TODO truth.
+
+## 8. Integrating with the Intent Compiler and evaluator
+
+**Stage 1:** Native TODOs work with no intent compiler, no Cerebras, and no external TODO MCP.
+
+**Stage 2:** An intent compiler creates or revises tasks using stable IDs and acceptance criteria. Plan reconciliation compares an incoming proposal to the existing list and performs targeted updates, not wholesale deletion/recreation.
+
+**Stage 3:** Mycroft or another implementer operates on the current task. The execution controller links actual tool results and compiler/test evidence to the task. Implementer claims become `in_review` proposals rather than automatic completion.
+
+**Stage 4:** An evaluator compares task evidence to the latest intent and criteria, requests correction or accepts completion, and may suggest a revised plan. Its decision and rationale are recorded. It can send feedback to the implementer through the controller, and the implementer may send new facts upstream.
+
+The models are replaceable. The store, state machine, and tool contracts do not depend on a single model or provider.
+
+## 9. Recovery, retention, and backup
+
+- Every model invocation has a `run_id` and an outcome (started, completed, failed, cancelled, interrupted).
+- If a malformed GPT-OSS tool response produces HTTP 500, record bounded details (status, error category, request/correlation IDs, provider/model, token counts when available). Keep the task pending/in-progress/review as appropriate; **never** infer success from a failed response.
+- On restart, reconstruct list state from canonical rows, reconcile interrupted runs, and show an actionable resume status.
+- Tool argument size limits and duplicate-edit detection belong to the execution/tool layer, not the TODO database.
+- Prune or archive old verbose run diagnostics by policy while retaining task/event provenance needed for audit and deduplication.
+- Offer export of a task list as Markdown or JSON on demand. Markdown is a presentation/export format, **not** the system of record.
+- Support deliberate JSON export/import for portability. Include schema version and stable IDs; detect collisions and avoid duplicate imports.
+- Use SQLite's backup facility or a safe checkpoint/closed-database process. Include WAL considerations and backup restoration tests.
+
+## 10. Delivery: one complete vertical slice
+
+### Slice A: persistence + tools + UI
+
+1. Inspect existing Twinny chat IDs, workspace identity, and extension lifecycle; do not assume conventions.
+2. Add a `TodoRepository` interface and SQLite implementation in extension-host code.
+3. Implement migrations and project/chat resolution, including no-workspace fallback.
+4. Implement canonical list CRUD, item versions, request idempotency, and event logging.
+5. Add initial native TODO tools to the existing model-facing tool registry, subject to normal permission checks.
+6. Add the above-chat collapsible checklist and bridge events for snapshots/changes.
+7. On startup, load the correct list; on reload, render the same IDs/states with no duplicates.
+8. Add unit/integration tests, run `npx tsc -p . --noEmit` and `npm run build`, inspect the diff, then test actual UI behavior.
+
+**Slice A is complete only when:** A task can be created by the user or native tool, displayed exactly once, updated, reopened, and recovered after editor restart. A stale update produces a conflict rather than overwriting newer changes. The existing Tool Picker, MCP discovery, and inference still work.
+
+### Slice B: execution and evidence
+
+Link active tasks to model attempts, tool outcomes, and verification evidence. Simulate failure between mutation and UI notification; verify exactly-once durable mutation and correct rendering on restart. A model's unsupported completion claim must remain unverified.
+
+### Slice C: planner/evaluator and repair playbook
+
+Add plan reconciliation, context-budgeted task projection, TypeScript compile/fix/retry with bounded attempts, and an independent evaluator. Inject a simulated PEG-native 500 mid-task; verify the existing task and evidence are preserved, with a new attempt on resume instead of a duplicated task.
+
+**Do not build Slices A, B, and C as one enormous agent edit.** Each slice has explicit tests, stable checkpoints, and a reviewable diff.
+
+## 11. Acceptance test matrix
+
+| Scenario | Expected result |
+|---|---|
+| Chat A and B in same project | Separate chat lists; no task bleed |
+| Two projects with same folder name | Separate project IDs |
+| Chat reload, rename, provider switch | Same canonical list and task IDs |
+| Window/extension restart | Persisted statuses and revisions restored |
+| Repeated identical tool request ID | No duplicate task/event |
+| Conflicting concurrent update | Explicit version conflict; no last-writer-wins overwrite |
+| Complete without verified evidence | Rejected or moved to review |
+| Compiler test passes | Evidence linked; controller may accept completion |
+| Runtime HTTP 500 or parser error | Task remains recoverable; never falsely completed |
+| Remote extension host vs local host | Clearly distinct stores unless explicitly imported/synced |
+| Project-scope task vs chat-scope task | Correct isolation and intentional project sharing |
+| Existing MCP Todo server enabled | Namespaced native tools; no accidental duplicate canonical state |
+| Large task history | Fast indexed list queries; no thousands of Markdown files |
+| Existing Tool Picker and agent tooling | No regressions |
+
+## 12. Decisions still requiring code inspection
+
+- Which existing conversation ID, storage service, and chat UI entry points are actually stable in the current Twinny source tree?
+- Which SQLite driver is compatible with supported desktop/remote extension runtimes and packaging? Verify this before committing native binaries or relying on a specific Node version.
+- Does Twinny already have a database abstraction worth extending, and can it serve as the adapter boundary?
+- How should a worktree alias or project move be confirmed by the user without ambiguous automatic merging?
+- What is the minimal supported verification-evidence vocabulary for v1?
+- Should external Todos MCP be hidden, left separately available, or offered an explicit import path? **Never silently merge an MCP server's data with the native store.**
+
+## 13. References
+
+- [VS Code extension data storage](https://code.visualstudio.com/api/extension-capabilities/common-capabilities)
+- [VS Code ExtensionContext API](https://code.visualstudio.com/api/references/vscode-api)
+- [SQLite WAL design and limitations](https://www.sqlite.org/wal.html)
+- [SQLite isolation and concurrency](https://www.sqlite.org/isolation.html)
