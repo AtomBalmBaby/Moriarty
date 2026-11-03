@@ -735,3 +735,24 @@ test("a read that failed is tried again rather than pointed back to", async () =
   await collect(withTools(client, workspaceTools(root), { mode: "native", onStep: (step) => steps.push(step) }).chat(ask("Read.")))
   assert.ok(steps[1].failed && !steps[1].summary.includes("repeated"), steps[1].summary)
 })
+
+test("run_command exposes trusted output and exit-code provenance to the completed-tool callback", async () => {
+  const root = workspace({ "README.md": "test" })
+  const tools = workspaceTools(root, [], {
+    instructions: false,
+    commands: {
+      mode: "allow",
+      run: async (command) => ({ ran: true, output: `verified ${command}`, exitCode: 0 })
+    }
+  })
+  const { client } = scripted([
+    { calls: [{ id: "command-1", name: "run_command", arguments: JSON.stringify({ command: "npm test" }) }] },
+    "The command passed."
+  ])
+  const observations: { name: string; exitCode?: number; output?: string }[] = []
+  await collect(withTools(client, tools, {
+    mode: "native",
+    onToolResult: (call, result) => { observations.push({ name: call.name, exitCode: result.execution?.exitCode, output: result.execution?.output }) }
+  }).chat(ask("Run the tests.")))
+  assert.deepStrictEqual(observations, [{ name: "run_command", exitCode: 0, output: "verified npm test" }])
+})

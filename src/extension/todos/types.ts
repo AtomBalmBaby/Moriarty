@@ -1,6 +1,6 @@
-import type { TodoEvidence, TodoItem, TodoPriority } from "../../common/types"
+import type { TodoEvaluation,TodoEvidence, TodoItem, TodoPriority, TodoToolObservation } from "../../common/types"
 
-export type { TodoEvidence, TodoItem, TodoListSnapshot, TodoPriority, TodoSource, TodoStatus, TodoVerification } from "../../common/types"
+export type { TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoPriority, TodoSource, TodoStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
 
 export type { IntentTaskDefinition, IntentTaskPlan } from "../../common/types"
@@ -15,6 +15,8 @@ export interface IntentPlanContext {
   acceptanceCriteria: string[]
   dependencies: { id: string; title: string; status: TodoItem["status"] }[]
   evidence: TodoEvidence[]
+  observations?: TodoToolObservation[]
+  lastEvaluation?: TodoEvaluation
 }
 
 export interface TodoListRequest {
@@ -44,6 +46,32 @@ export interface AddTodoEvidenceInput {
   summary: string
   result: TodoEvidence["result"]
   requestId: string
+}
+
+export interface TodoToolObservationInput {
+  itemId: string
+  toolName: string
+  arguments: Record<string, string>
+  output: string
+  failed: boolean
+  exitCode?: number
+  requestId: string
+}
+
+export interface TodoReviewPackage {
+  projectFingerprint: string
+  conversationId: string
+  planId: string
+  planRevision: number
+  goal: string
+  constraints: string[]
+  planTaskId: string
+  task: TodoItem
+  acceptanceCriteria: string[]
+  dependencies: { id: string; title: string; status: TodoItem["status"] }[]
+  evidence: TodoEvidence[]
+  observations: TodoToolObservation[]
+  lastEvaluation?: TodoEvaluation
 }
 
 export class TodoConflictError extends Error {

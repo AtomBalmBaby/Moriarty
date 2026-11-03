@@ -109,7 +109,7 @@ Example loop:
 6. Evaluator accepts, requests changes, revises the plan, or marks the task blocked with evidence.
 7. Controller commits the validated transition and chooses the next step.
 
-An evaluator score can be added later (for example completion, correctness, alignment, evidence quality on a configurable scale). Scores are advisory. **Completion is a validated state transition**, never a score threshold or a fluent assertion.
+Feedback & Verification v1 uses a separate, structured evaluator prompt over the configured Intent-role provider. It records versioned decisions, criterion results, supporting observation IDs, corrective instructions, and completion/correctness/alignment scores in the existing project-and-chat-scoped TODO database. Scores are advisory. **Completion is a validated state transition**, never a score threshold or a fluent assertion. Model-authored evidence notes are kept distinct from Twinny-recorded tool results; accepting a test or compile criterion requires a trusted successful run_command observation with exit code 0. Review happens after the implementing turn has persisted its TODO claims and tool results. Stale, malformed, timed-out, or unavailable evaluations do not change task state; revision feedback is projected into the next task context.
 
 Feedback is ongoing: an implementer can report a newly discovered dependency, a verifier can invalidate an earlier assumption, and a user can change scope. Every actor can trigger reconciliation without destroying the original goal.
 

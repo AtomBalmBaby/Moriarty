@@ -13,7 +13,7 @@ import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
 
-import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../../common/constants"
+import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../../common/constants"
 import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
 import { Chat } from "../../extension/chat/index"
@@ -128,6 +128,50 @@ suite("Agent reply, end to end", function () {
     } finally {
       bridge.dispose()
       fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("chat remains responsive and does not invoke review when automatic feedback is disabled", async () => {
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
+    const previousCompiler = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
+    await settings.update("chatToolsFeedbackEvaluatorEnabled", false, vscode.ConfigurationTarget.Global)
+    await settings.update("chatToolsIntentCompilerEnabled", false, vscode.ConfigurationTarget.Global)
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-feedback-disabled-"))
+    const chatModel = new ScriptedModel(["The chat is still working."])
+    const evaluatorModel = new ScriptedModel(["{ malformed }"])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => chatModel })
+    providerRegistry.register("scripted-reviewer", { id: "scripted-reviewer", create: () => evaluatorModel })
+    const evaluatorProvider: TwinnyProvider = { ...provider, id: "scripted-reviewer", provider: "scripted-reviewer", type: "intent" }
+    const stored: Record<string, unknown> = {
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider,
+      [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: evaluatorProvider
+    }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const scope = { projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))), conversationId: "feedback-disabled-chat" }
+    const plan = { planId: "feedback-disabled-plan", version: 1 as const, revision: 1, goal: "Verify one task", constraints: [], tasks: [
+      { id: "review-me", title: "Review me", description: "A task to remain in review", acceptanceCriteria: ["Source inspected"], dependencies: [] as string[] }
+    ] }
+    const item = (await repository.synchronizeIntentPlan(scope, plan, { prompt: "Verify one task" })).items[0]
+    await repository.updateItem(scope, { itemId: item.id, expectedVersion: item.version, patch: { status: "completed" }, actor: "model", requestId: "feedback-disabled-claim" })
+    const chat = new Chat(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
+    try {
+      await chat.completion([{ role: "user", content: "Keep chatting." }], [], "off", scope.conversationId)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(chatModel.requests.length, 1)
+      assert.equal(evaluatorModel.requests.length, 0)
+      assert.equal((await repository.getList(scope)).items[0].status, "in_review")
+    } finally {
+      chat.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsIntentCompilerEnabled", previousCompiler, vscode.ConfigurationTarget.Global)
     }
   })
 

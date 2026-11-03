@@ -50,6 +50,7 @@ export interface ToolResult {
    * the step: the instructions of a folder the call reached.
    */
   preface?: string
+  execution?: { command: string; exitCode?: number; output: string }
 }
 
 /** What a running tool is told: when the user has stopped the reply. */
@@ -510,6 +511,7 @@ const runCommand = (sink: CommandSink): Tool => ({
     }
     if (outcome.stoppedByUser) {
       return {
+        execution: { command: line, output: outcome.output },
         output: `$ ${line}\n(stopped by the user before it ended; this is its output so far)\n${outcome.output.trim() || "(no output)"}`,
         summary: `\`${line}\` stopped`
       }
@@ -526,7 +528,8 @@ const runCommand = (sink: CommandSink): Tool => ({
       ? outcome.timedOut === "running" ? "still running" : "timed out"
       : outcome.exitCode === undefined ? "done" : `exit ${outcome.exitCode}`
     return {
-      failed: outcome.timedOut === "stopped" || (!outcome.timedOut && !!outcome.exitCode),
+      failed: outcome.timedOut === "running" || (outcome.exitCode !== undefined && outcome.exitCode !== 0),
+      execution: { command: line, output: outcome.output, exitCode: outcome.exitCode },
       output: `$ ${line}\n(${status})\n${outcome.output.trim() || "(no output)"}`,
       summary: `ran \`${line}\` · ${outcomeWord}`
     }

@@ -104,6 +104,11 @@ export interface TodoCompleteRequest {
   expectedVersion: number
 }
 
+export interface TodoEvaluateRequest {
+  conversationId: string
+  itemId: string
+}
+
 export interface ChatRequest {
   messages: ChatCompletionMessage[]
   agentSelection?: import("../agents").AgentSelection
@@ -402,6 +407,7 @@ export interface ClientEvents {
   [TODO_EVENT_NAME.createItem]: Channel<TodoCreateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.updateItem]: Channel<TodoUpdateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.completeItem]: Channel<TodoCompleteRequest, TodoListSnapshot>
+  [TODO_EVENT_NAME.evaluateItem]: Channel<TodoEvaluateRequest, TodoListSnapshot>
   [EVENT_NAME.twinnyToolInventory]: Channel<void, ToolInventoryItem[]>
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>

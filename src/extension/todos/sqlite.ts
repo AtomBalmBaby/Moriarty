@@ -88,7 +88,32 @@ CREATE TABLE IF NOT EXISTS todo_intent_tasks (
   active INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(list_id, task_id)
 );
-PRAGMA user_version = 2;
+CREATE TABLE IF NOT EXISTS todo_tool_observations (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  arguments_json TEXT NOT NULL,
+  output TEXT NOT NULL,
+  failed INTEGER NOT NULL,
+  exit_code INTEGER,
+  created_at TEXT NOT NULL,
+  UNIQUE(list_id, request_id)
+);
+CREATE TABLE IF NOT EXISTS todo_evaluations (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL,
+  task_version INTEGER NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN ('accept','revise','needs_evidence','blocked')),
+  evaluation_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(list_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS todo_evaluations_item ON todo_evaluations(item_id, created_at);
+PRAGMA user_version = 3;
 `
 
 export class SqliteFile {
@@ -120,7 +145,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 2) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 3) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -129,6 +154,10 @@ export class SqliteFile {
           database.run(
             "CREATE TABLE IF NOT EXISTS todo_intent_plans (list_id TEXT PRIMARY KEY REFERENCES todo_lists(id) ON DELETE CASCADE, plan_id TEXT NOT NULL, revision INTEGER NOT NULL, goal TEXT NOT NULL, constraints_json TEXT NOT NULL, intent_result_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS todo_intent_tasks (list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE, task_id TEXT NOT NULL, item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE, acceptance_json TEXT NOT NULL, dependencies_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(list_id, task_id)); PRAGMA user_version = 2;"
           )
+          await this.persist(database)
+        }
+        if (version > 0 && version < 3) {
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_observations"), SCHEMA.indexOf("PRAGMA user_version = 3;") + "PRAGMA user_version = 3;".length))
           await this.persist(database)
         }
       } finally {

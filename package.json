@@ -762,6 +762,12 @@
           "default": false,
           "markdownDescription": "Before agent-mode execution, optionally refine the user's request into a clearer execution prompt. The original request remains authoritative and is kept for review or comparison. This adds one side-effect-free inference request per eligible agent turn."
         },
+        "twinny.chatToolsFeedbackEvaluatorEnabled": {
+          "order": 21,
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "After an agent turn has persisted its TODO claims and tool results, ask the configured Intent provider to independently review eligible tasks. Disable to leave TODOs in review until manually retried."
+        },
         "twinny.chatToolsIntentCompilerMode": {
           "order": 20,
           "type": "string",

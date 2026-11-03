@@ -31,6 +31,37 @@ export interface TodoEvidence {
   createdAt: string
 }
 
+export type TodoEvaluationDecision = "accept" | "revise" | "needs_evidence" | "blocked"
+
+export interface TodoEvaluationCriterion {
+  criterion: string
+  status: "passed" | "failed" | "unverified"
+  evidenceRefs: string[]
+}
+
+export interface TodoEvaluation {
+  schemaVersion: 1
+  taskId: string
+  decision: TodoEvaluationDecision
+  criteria: TodoEvaluationCriterion[]
+  problems: string[]
+  correctiveInstructions: string[]
+  explanation: string
+  scores: { completion: number; correctness: number; alignment: number }
+  metadata: { evaluator: string; evaluatedAt: string; taskVersion: number; planRevision: number }
+}
+
+export interface TodoToolObservation {
+  id: string
+  itemId: string
+  toolName: string
+  arguments: Record<string, string>
+  output: string
+  failed: boolean
+  exitCode?: number
+  createdAt: string
+}
+
 export interface TodoListSnapshot {
   id: string
   projectId: string

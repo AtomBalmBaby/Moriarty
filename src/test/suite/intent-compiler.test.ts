@@ -113,6 +113,8 @@ suite("Intent compiler", () => {
     const settings = vscode.workspace.getConfiguration("twinny")
     const previousEnabled = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
     const previousMode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
+    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
+    await settings.update("chatToolsFeedbackEvaluatorEnabled", false, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
     const provider = {
@@ -164,6 +166,7 @@ suite("Intent compiler", () => {
       await fs.rm(root, { recursive: true, force: true })
       await settings.update("chatToolsIntentCompilerEnabled", previousEnabled, vscode.ConfigurationTarget.Global)
       await settings.update("chatToolsIntentCompilerMode", previousMode, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
     }
   })
 

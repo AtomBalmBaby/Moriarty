@@ -145,6 +145,8 @@ export interface ToolLoopOptions {
   /** Called before each call runs. */
   onToolStart?(start: ToolStart): void
   onStep?(step: ToolStep): void
+  /** Called after a tool has really run, before its result is sent back to the model. */
+  onToolResult?(call: ToolCall, result: ToolResult): void | Promise<void>
   /** Called once per request with the characters it sends and what they are estimated to be in tokens. */
   onRequest?(promptChars: number, step: number, mode: ToolMode, estimatedTokens: number): void
   /** Called after each request the server counted. */
@@ -617,6 +619,7 @@ class ToolLoop {
                 summary: `${repeated.summary} · repeated, not run again`
               }
             : await this.runCall(pending.call, outer)
+        if (pending.call && !repeated) await this._options.onToolResult?.(pending.call, ran)
         // A read that failed (a search that ran out of time, a language
         // server still starting) is worth trying again, so it is not kept.
         keys.push(repeated || ran.failed ? undefined : key)

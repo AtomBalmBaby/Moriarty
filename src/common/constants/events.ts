@@ -69,6 +69,7 @@ export const TODO_EVENT_NAME = {
   createItem: "twinny.todo.create-item",
   updateItem: "twinny.todo.update-item",
   completeItem: "twinny.todo.complete-item",
+  evaluateItem: "twinny.todo.evaluate-item",
   changed: "twinny.todo.changed"
 } as const
 

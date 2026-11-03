@@ -298,6 +298,12 @@ export class BaseProvider {
         )
         return this.emitTodoSnapshot(conversationId)
       },
+      [TODO_EVENT_NAME.evaluateItem]: async ({ conversationId, itemId }) => {
+        const snapshot = await this.chat?.evaluateTodoTask(this.todoScope(conversationId), itemId)
+        if (!snapshot) throw new Error("The feedback evaluator is unavailable")
+        this.bridge?.emit(TODO_EVENT_NAME.changed, snapshot)
+        return snapshot
+      },
       [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels, conversationId }) =>
         (await this.chat?.compileIntent(prompt, history, maxLevels, conversationId)) ?? undefined,
       [EVENT_NAME.twinnyClickSuggestion]: (template) =>

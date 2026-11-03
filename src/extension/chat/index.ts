@@ -24,6 +24,7 @@ import type { ComposerTurn, ToolInventoryItem } from "../../common/messaging/pro
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
 import { kebabToSentence } from "../../common/text"
+import type { TodoListSnapshot } from "../../common/types"
 import {
   ChatCompletionMessage,
   Conversation,
@@ -49,14 +50,17 @@ import { PromptInstructionResolver } from "../prompts/instructions"
 import { Base } from "../providers/base"
 import { describeProviderError, stripThinking } from "../providers/errors"
 import { TemplateProvider } from "../templates/provider"
+import { evaluateTodoReview, feedbackContext, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { validateIntentTaskPlan } from "../todos/intent-plan"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { DEFAULT_MAX_STEPS, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
+import type { ToolCall } from "../tools/protocol"
 import { todoTools, todoWorkspaceTools } from "../tools/todos"
 import { WorkspaceView } from "../tools/view"
+import type { ToolResult } from "../tools/workspace"
 import { ToolExtras, WorkspaceTools, workspaceTools } from "../tools/workspace"
 import { getLanguage } from "../utils"
 
@@ -1155,6 +1159,61 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     )
   }
 
+  public async evaluateTodoTask(scope: TodoListRequest, itemId: string): Promise<TodoListSnapshot> {
+    await this.reviewTodoTasks(scope, itemId)
+    return this._todoRepository!.getList(scope)
+  }
+
+  private async reviewTodoTasks(scope: TodoListRequest, itemId?: string, changes?: ReplyChangesView): Promise<void> {
+    if (!this._todoRepository) return
+    const reviews = await this._todoRepository.getReviewPackages(scope)
+    const candidates = itemId
+      ? reviews.filter((review) => review.task.id === itemId)
+      : reviews.filter((review) => !review.lastEvaluation || review.lastEvaluation.metadata.taskVersion !== review.task.version - 1)
+    if (!candidates.length) {
+      if (itemId) throw new Error("This TODO is not awaiting evaluation")
+      return
+    }
+    const provider = this.getIntentProvider()
+    if (!provider) {
+      logger.warn("Feedback evaluator is unavailable: configure an active Intent provider to review in-review TODOs")
+      if (itemId) throw new Error("Configure an active Intent provider before retrying TODO evaluation")
+      return
+    }
+    await Promise.all(candidates.map(async (review) => {
+      try {
+        const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async () => {
+          const controller = new AbortController()
+          let timeout: ReturnType<typeof setTimeout>
+          const timedOut = new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              const error = new Error("Feedback evaluator timed out after 30 seconds")
+              controller.abort(error)
+              reject(error)
+            }, 30_000)
+          })
+          try {
+            return await Promise.race([readText(resolveInferenceProvider(provider).chat({
+              model: provider.modelName,
+              messages: [
+                { role: SYSTEM, content: todoReviewSystemPrompt },
+                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined) }
+              ] as ChatCompletionMessage[]
+            }, { signal: controller.signal })), timedOut])
+          } finally {
+            clearTimeout(timeout!)
+          }
+        }, provider.modelName)
+        logger.info("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
+        const snapshot = await this._todoRepository!.getList(scope)
+        this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
+      } catch (error) {
+        logger.warn("Feedback evaluation failed for TODO " + review.task.id + ": " + (error instanceof Error ? error.message : String(error)))
+        if (itemId) throw error
+      }
+    }))
+  }
+
   private activeTodoScope(): TodoListRequest | undefined {
     if (!this._todoRepository || !this._activeConversationId) return undefined
     return {
@@ -1165,15 +1224,16 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
   private async activeIntentTaskProjection(): Promise<string> {
     const settings = workspace.getConfiguration("twinny")
-    if (!settings.get<boolean>("chatToolsIntentCompilerEnabled", false) || settings.get<string>("chatToolsIntentCompilerMode", "ask") === "always-original") return ""
+    const compilerDisabled = !settings.get<boolean>("chatToolsIntentCompilerEnabled", false) || settings.get<string>("chatToolsIntentCompilerMode", "ask") === "always-original"
     const scope = this.activeTodoScope()
     if (!scope || !this._todoRepository) return ""
     try {
       const active = await this._todoRepository.getActiveIntentContext(scope)
-      if (!active) return ""
+      if (!active || (compilerDisabled && active.lastEvaluation?.decision !== "revise")) return ""
       const clip = (value: string, limit: number) => value.length > limit ? value.slice(0, limit - 1) + "…" : value
       const projection = {
         type: "twinny_active_intent_task",
+        feedbackIsNonAuthoritative: true,
         plan: { id: active.planId, revision: active.revision, goal: clip(active.goal, 400) },
         constraints: active.constraints.slice(0, 3).map((value) => clip(value, 160)),
         task: {
@@ -1190,10 +1250,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             status: dependency.status
           })),
           previousEvidence: active.evidence.slice(0, 2).map((evidence) => ({
+            id: evidence.id,
             kind: clip(evidence.kind, 80),
             result: evidence.result,
             summary: clip(evidence.summary, 220)
-          }))
+          })),
+          feedback: feedbackContext(active) || undefined
         }
       }
       return "Active task from Twinny's native TODO plan (context only; preserve all other instructions):\n" + JSON.stringify(projection)
@@ -1223,7 +1285,27 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onUsage: (counted: ToolLoopUsage) => Object.assign(usage, counted),
       onTools: (tools: WorkspaceTools) => (instructionFiles = () => tools.instructionFiles?.() ?? []),
       onChanges: (changes: ReplyChanges) => (tracked = changes),
-      onOutOfSteps: () => (outOfSteps = true)
+      onOutOfSteps: () => (outOfSteps = true),
+      onToolResult: async (call: ToolCall, result: ToolResult) => {
+        if (!this._todoRepository || call.name.startsWith("twinny_todo_") || (call.name === "run_command" && !result.execution)) return
+        const scope = this.activeTodoScope()
+        if (!scope) return
+        try {
+          const active = await this._todoRepository.getActiveIntentContext(scope)
+          if (!active) return
+          await this._todoRepository.recordToolObservation(scope, {
+            itemId: active.task.id,
+            toolName: call.name,
+            arguments: call.args,
+            output: result.execution?.output ?? result.output,
+            failed: result.failed ?? false,
+            exitCode: result.execution?.exitCode,
+            requestId: randomUUID()
+          })
+        } catch (error) {
+          logger.warn("Could not persist trusted TODO tool observation: " + (error instanceof Error ? error.message : String(error)))
+        }
+      }
     }
     const todoScope = this.activeTodoScope()
     // Native TODO actions are conversation-scoped and do not require workspace Agent mode.
@@ -1276,6 +1358,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         { role: ASSISTANT, content: reply }
       ]
     }
+    const feedbackEnabled = workspace.getConfiguration("twinny").get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
+    if (reply !== undefined && feedbackEnabled && todoScope) void this.reviewTodoTasks(todoScope, undefined, changed).catch((error) => {
+      logger.error("Automatic TODO evaluation could not load review tasks: " + (error instanceof Error ? error.message : String(error)))
+    })
     return reply
   }
 
@@ -1294,6 +1380,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onTools(tools: WorkspaceTools): void
       onChanges(changes: ReplyChanges): void
       onOutOfSteps(): void
+      onToolResult(call: ToolCall, result: ToolResult): Promise<void>
     }
   ) {
     this._steps.reset()
@@ -1337,6 +1424,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onUsage: hooks.onUsage,
       onRequest: (chars, step, mode, tokens) => logger.info(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`),
       onToolStart: (start) => this._steps.start(start),
+      onToolResult: hooks.onToolResult,
       onStep: (step) => {
         this._steps.finish(step)
         logger.info(`Chat TODO tools · ${step.summary}`)
@@ -1356,6 +1444,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onTools(tools: WorkspaceTools): void
       onChanges(changes: ReplyChanges): void
       onOutOfSteps(): void
+      onToolResult(call: ToolCall, result: ToolResult): Promise<void>
     }
   ) {
     this._steps.reset()
@@ -1518,6 +1607,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           `Chat tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`
         ),
       onToolStart: (start) => this._steps.start(start),
+      onToolResult: hooks.onToolResult,
       onStep: (step) => {
         this._steps.finish(step)
         logger.info(`Chat tools · ${step.summary}`)

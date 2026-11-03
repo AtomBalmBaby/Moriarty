@@ -111,6 +111,11 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     }))
   }
 
+  const evaluate = (item: TodoItem) => {
+    if (!conversationId) return
+    void mutate(() => bridge.request(TODO_EVENT_NAME.evaluateItem, { conversationId, itemId: item.id }))
+  }
+
   const renderItem = (item: TodoItem) => (
     <li key={item.id} className={styles.item} data-status={item.status} style={{ marginLeft: item.parentId ? 16 : 0 }}>
       <span className={styles.status} title={item.status.replace(/_/g, " ")} aria-label={item.status.replace(/_/g, " ")}>
@@ -148,6 +153,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
               <button type="button" disabled={busy} onClick={() => update(item, { status: "pending" })}>{t("todo-reopen")}</button>
             ) : (
               <>
+                {item.status === "in_review" && <button type="button" disabled={busy} onClick={() => evaluate(item)}>{t("todo-review-now")}</button>}
                 <button type="button" disabled={busy} onClick={() => complete(item)}>{t("todo-complete")}</button>
                 {item.status !== "blocked" ? (
                   <button type="button" disabled={busy} onClick={() => {
