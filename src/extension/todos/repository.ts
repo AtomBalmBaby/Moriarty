@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { Database, SqlValue } from "sql.js"
 
-import { hasTrustedEvidenceForCriterion } from "./feedback"
+import { hasTrustedEvidenceForCriterion, isAnalysisOnlyIntent } from "./feedback"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
 import {
@@ -487,7 +487,7 @@ export class TodoRepository {
       if (!row) throw new Error("Review task was not found in the active conversation")
       if (row.status !== "in_review") throw new TodoConflictError("Cannot review a TODO in " + row.status + " status")
       if (row.version !== expectedVersion) throw new TodoConflictError("TODO changed since review version " + expectedVersion + "; current version is " + row.version)
-      const currentPlan = rows<{ revision: number }>(database, "SELECT revision FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
+      const currentPlan = rows<{ revision: number; goal: string }>(database, "SELECT revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
       if (!currentPlan || currentPlan.revision !== evaluation.metadata.planRevision) throw new TodoConflictError("Intent plan changed while its TODO was being evaluated")
       if (evaluation.taskId !== row.task_id) throw new Error("Evaluation task ID does not match the reviewed task")
       const taskDefinition = rows<{ acceptance_json: string }>(database, "SELECT acceptance_json FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [itemId, list.id])[0]
@@ -506,7 +506,9 @@ export class TodoRepository {
             id: observation.id, itemId, toolName: observation.tool_name, arguments: JSON.parse(observation.arguments_json) as Record<string, string>, output: "",
             failed: observation.failed !== 0, exitCode: observation.exit_code ?? undefined, createdAt: ""
           }))
-          return criterion.status !== "passed" || !hasTrustedEvidenceForCriterion(criterion.criterion, refs, trusted)
+          const needsCommandEvidence = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
+          const evidenceFreeAnalysis = isAnalysisOnlyIntent(currentPlan.goal) && !needsCommandEvidence
+          return criterion.status !== "passed" || (!hasTrustedEvidenceForCriterion(criterion.criterion, refs, trusted) && !evidenceFreeAnalysis)
         })
         if (unsupported) throw new Error("Evaluation cannot accept criteria without adequate trusted tool observations")
         const unfinishedDependency = rows<{ id: string }>(database,

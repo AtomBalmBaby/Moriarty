@@ -12,7 +12,7 @@
  * file git has no copy of, and changing `.vscode/` or a `.gitignore`.
  */
 import { ChildProcess, execFile, spawn } from "child_process"
-import { existsSync } from "fs"
+import { existsSync, readFileSync } from "fs"
 import path from "path"
 import {
   commands,
@@ -48,7 +48,106 @@ import { WorkspaceView } from "../tools/view"
 import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink } from "../tools/workspace"
 
 import { changesBetween, MAX_COMMAND_CHANGES, snapshotTree, TreeSnapshot } from "./command-snapshot"
-import type { ReplyChanges } from "./reply-changes"
+import { forbiddenDeleteReason } from "./execution-reconciliation"
+import { ReplyChanges } from "./reply-changes"
+import { CheckpointFile, DiagnosticRegressionMonitor, SafeEditCheckpoints } from "./safe-edit-recovery"
+
+export interface EditRecoveryNotice {
+  file: string
+  introducedErrors: number
+  diagnostics: string
+  restored: boolean
+  reason: string
+}
+
+export interface EditSafetyOptions {
+  goal?: string
+  checkpoints?: SafeEditCheckpoints
+  errorSpikeThreshold?: number
+  cumulativeErrorThreshold?: number
+  diagnosticMonitor?: DiagnosticRegressionMonitor
+  onCatastrophic?(notice: EditRecoveryNotice): Promise<void> | void
+  canMutate?(): boolean
+  blockMutations?(): void
+}
+
+export const createSafeEditCheckpoints = (storageUri: Uri): SafeEditCheckpoints => {
+  const metadataUri = Uri.joinPath(storageUri, "active-execution-edit-checkpoint.json")
+  const readSnapshot = async (file: string): Promise<string | null | undefined> => {
+    const document = workspace.textDocuments.find((entry) => entry.uri.scheme === "file" && entry.uri.fsPath === file)
+    let disk: string | null = null
+    if (existsSync(file)) {
+      const contents = readFileSync(file)
+      if (contents.length > 1024 * 1024 || contents.includes(0)) return undefined
+      disk = contents.toString("utf8")
+    }
+    const buffer = document?.getText() ?? disk
+    if (buffer === null && disk === null && !document) return null
+    if (buffer !== null && buffer !== undefined && Buffer.byteLength(buffer, "utf8") > 1024 * 1024) return undefined
+    return JSON.stringify({ version: 1, buffer, disk, dirty: !!document?.isDirty })
+  }
+
+  return new SafeEditCheckpoints({
+    read: readSnapshot,
+    restore: async (files: CheckpointFile[]) => {
+      const edit = new WorkspaceEdit()
+      const restoreAfter: Array<{ uri: Uri; path: string; snapshot: { buffer: string | null; disk: string | null; dirty: boolean } }> = []
+      for (const checkpoint of files) {
+        const uri = Uri.file(checkpoint.path)
+        const current = await readSnapshot(checkpoint.path)
+        if (current === undefined) return false
+        if (checkpoint.before === null) {
+          if (current !== null) edit.deleteFile(uri, { ignoreIfNotExists: true })
+          continue
+        }
+        let snapshot: { version: number; buffer: string | null; disk: string | null; dirty: boolean }
+        try {
+          snapshot = JSON.parse(checkpoint.before)
+        } catch {
+          return false
+        }
+        if (snapshot.version !== 1 || (snapshot.buffer !== null && typeof snapshot.buffer !== "string") || (snapshot.disk !== null && typeof snapshot.disk !== "string") || typeof snapshot.dirty !== "boolean") return false
+        const text = snapshot.buffer ?? snapshot.disk
+        if (text === null) {
+          if (current !== null) edit.deleteFile(uri, { ignoreIfNotExists: true })
+          restoreAfter.push({ uri, path: checkpoint.path, snapshot })
+          continue
+        }
+        if (current === null) {
+          edit.createFile(uri, { contents: Buffer.from(text, "utf8"), ignoreIfExists: false })
+        } else {
+          const document = await workspace.openTextDocument(uri)
+          edit.replace(uri, new Range(document.positionAt(0), document.positionAt(document.getText().length)), text)
+        }
+        restoreAfter.push({ uri, path: checkpoint.path, snapshot })
+      }
+      if (!(await workspace.applyEdit(edit))) return false
+      for (const { uri, path, snapshot } of restoreAfter) {
+        if (snapshot.disk === null) {
+          if (existsSync(path)) await workspace.fs.delete(uri, { useTrash: false })
+          continue
+        }
+        if (snapshot.dirty) {
+          await workspace.fs.writeFile(uri, Buffer.from(snapshot.disk, "utf8"))
+          continue
+        }
+        const document = workspace.textDocuments.find((entry) => entry.uri.toString() === uri.toString())
+        if (document?.isDirty && !(await document.save())) return false
+      }
+      return true
+    },
+    persist: async (files) => {
+      const data = Buffer.from(JSON.stringify({ version: 1, files }), "utf8")
+      if (data.length > 5 * 1024 * 1024) throw new Error("Safe edit recovery metadata exceeded its storage limit.")
+      await workspace.fs.createDirectory(storageUri)
+      await workspace.fs.writeFile(metadataUri, data)
+    },
+    clear: async () => {
+      await workspace.fs.createDirectory(storageUri)
+      await workspace.fs.writeFile(metadataUri, Buffer.from(JSON.stringify({ version: 1, files: [] }), "utf8"))
+    }
+  })
+}
 
 export type ChatCommandMode = "ask" | "allow" | "off"
 /** Where the model's commands run: a process of their own, or the twinny tools terminal. */
@@ -199,83 +298,109 @@ export const editorEdits = (
   view: WorkspaceView,
   mode: ChatEditMode,
   approve: ApproveChange,
-  /** Keeps each file as it was before the reply changed it, for undo. */
-  changes?: Pick<ReplyChanges, "touch" | "hold">
+  changes?: Pick<ReplyChanges, "touch" | "hold">,
+  safety: EditSafetyOptions = {}
 ): EditSink & FileOpsSink => {
-  /** A protected file's change is always shown as a diff first, by its name or by where a link leads. */
   const isProtected = (file: string) => isProtectedPath(view.relative(file)) || isProtectedPath(view.realRelative(file))
   const modeFor = (file: string): ChatEditMode => (isProtected(file) ? "review" : mode)
-  /** A change in progress, which the reply's record waits for. */
   const held = <T>(work: () => Promise<T>): Promise<T> => changes?.hold(work()) ?? work()
+  let mutationsBlocked = false
+  const blocked = (): EditOutcome | undefined => mutationsBlocked || safety.canMutate?.() === false
+    ? { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
+    : undefined
+  const checkedOutcome = async (file: string, outcome: EditOutcome): Promise<EditOutcome> => {
+    if (!outcome.ok || outcome.pending) return outcome
+    const introduced = outcome.newErrors ?? 0
+    if (safety.checkpoints) await safety.checkpoints.markChanged([file])
+    const catastrophic = safety.diagnosticMonitor?.record(file, introduced) ?? (introduced >= (safety.errorSpikeThreshold ?? 20))
+    if (!catastrophic) {
+      if (introduced === 0) await safety.checkpoints?.commit([file])
+      return outcome
+    }
+    mutationsBlocked = true
+    safety.blockMutations?.()
+    const rollback = safety.checkpoints
+      ? await safety.checkpoints.rollback()
+      : { restored: false, reason: "No safe checkpoint service is available." }
+    const reason = rollback.restored
+      ? `Restored the last safe checkpoint after ${introduced} new diagnostics in ${view.relative(file)}.`
+      : `Could not safely restore after ${introduced} new diagnostics in ${view.relative(file)}: ${rollback.reason}`
+    await safety.onCatastrophic?.({ file: view.relative(file), introducedErrors: introduced, diagnostics: outcome.message.slice(0, 2000), restored: rollback.restored, reason })
+    return { ...outcome, ok: false, message: `${reason} Further file mutations are blocked for this execution.` }
+  }
   return {
     mode,
-    edit: (file, replacement) =>
-      withNewErrors(view, file, modeFor(file), changedLines(replacement), () =>
-        held(async () => {
-          // A change waiting for review is the user's to make; one applied now is kept for undo.
-          if (modeFor(file) === "apply") await changes?.touch(file)
-          return (
-            (await commands.executeCommand<ChatEditOutcome>(
-              TWINNY_COMMAND_NAME.chatFileEdit,
-              { file, ...replacement },
-              modeFor(file)
-            )) ?? {
-              ok: false,
-              message: "Not changed: the editor did not answer."
-            }
-          )
-        })
-      ),
-    create: (file, content) =>
-      withNewErrors(view, file, modeFor(file), undefined, () =>
+    async edit(file, replacement) {
+      const denied = blocked()
+      if (denied) return denied
+      if (modeFor(file) === "apply") await safety.checkpoints?.capture([file])
+      const outcome = await withNewErrors(view, file, modeFor(file), changedLines(replacement), () =>
         held(async () => {
           if (modeFor(file) === "apply") await changes?.touch(file)
-          return (
-            (await commands.executeCommand<ChatEditOutcome>(
-              TWINNY_COMMAND_NAME.chatFileCreate,
-              file,
-              content,
-              modeFor(file)
-            )) ?? {
-              ok: false,
-              message: "Not created: the editor did not answer."
-            }
-          )
+          return (await commands.executeCommand<ChatEditOutcome>(
+            TWINNY_COMMAND_NAME.chatFileEdit,
+            { file, ...replacement },
+            modeFor(file)
+          )) ?? { ok: false, message: "Not changed: the editor did not answer." }
         })
-      ),
+      )
+      return checkedOutcome(file, outcome)
+    },
+    async create(file, content) {
+      const denied = blocked()
+      if (denied) return denied
+      if (modeFor(file) === "apply") await safety.checkpoints?.capture([file])
+      const outcome = await withNewErrors(view, file, modeFor(file), undefined, () =>
+        held(async () => {
+          if (modeFor(file) === "apply") await changes?.touch(file)
+          return (await commands.executeCommand<ChatEditOutcome>(
+            TWINNY_COMMAND_NAME.chatFileCreate,
+            file,
+            content,
+            modeFor(file)
+          )) ?? { ok: false, message: "Not created: the editor did not answer." }
+        })
+      )
+      return checkedOutcome(file, outcome)
+    },
     async remove(file) {
       const relative = view.relative(file)
-      // Without asking only when nothing is lost: git has the file as it is.
+      const denied = blocked()
+      if (denied) return denied
+      const conflict = safety.goal ? forbiddenDeleteReason(safety.goal, relative) : undefined
+      if (conflict) return { ok: false, message: `Not deleted: ${conflict}` }
       const lost = mode === "apply" && !isProtected(file) && !(await recoverableFromGit(file))
-      if (
-        (mode === "review" || isProtected(file) || lost) &&
-        !(await approve(`delete ${relative}${lost ? "\n(git has no copy of it as it is now)" : ""}`, "change"))
-      ) {
+      if ((mode === "review" || isProtected(file) || lost) && !(await approve(`delete ${relative}${lost ? "\n(git has no copy of it as it is now)" : ""}`, "change"))) {
         return { ok: false, message: "The user chose not to delete it." }
       }
       return held(async () => {
+        await safety.checkpoints?.capture([file])
         await changes?.touch(file)
         const edit = new WorkspaceEdit()
         edit.deleteFile(Uri.file(file), { ignoreIfNotExists: false })
-        return (await workspace.applyEdit(edit))
+        const applied = await workspace.applyEdit(edit)
+        if (applied) await safety.checkpoints?.markChanged([file])
+        return applied
           ? { ok: true, message: `Deleted ${relative}.` }
           : { ok: false, message: `The editor refused to delete ${relative}.` }
       })
     },
     async move(from, to) {
+      const denied = blocked()
+      if (denied) return denied
       const [source, target] = [view.relative(from), view.relative(to)]
-      if (
-        (mode === "review" || isProtected(from) || isProtected(to)) &&
-        !(await approve(`move ${source} → ${target}`, "change"))
-      ) {
+      if ((mode === "review" || isProtected(from) || isProtected(to)) && !(await approve(`move ${source} → ${target}`, "change"))) {
         return { ok: false, message: "The user chose not to move it." }
       }
       return held(async () => {
+        await safety.checkpoints?.capture([from, to])
         await changes?.touch(from)
         await changes?.touch(to)
         const edit = new WorkspaceEdit()
         edit.renameFile(Uri.file(from), Uri.file(to), { overwrite: false })
-        return (await applyAndSave(edit))
+        const applied = await applyAndSave(edit)
+        if (applied) await safety.checkpoints?.markChanged([from, to])
+        return applied
           ? { ok: true, message: `Moved ${source} to ${target}.` }
           : { ok: false, message: `The editor refused to move ${source}.` }
       })
@@ -343,7 +468,8 @@ export const editorKnowledge = (
   mode: ChatEditMode,
   approve: ApproveChange,
   /** Keeps each file a rename reaches as it was, for undo. */
-  replyChanges?: Pick<ReplyChanges, "touch" | "hold">
+  replyChanges?: Pick<ReplyChanges, "touch" | "hold">,
+  safety: EditSafetyOptions = {}
 ): EditorSink => ({
   async diagnostics(file) {
     if (file) {
@@ -378,6 +504,7 @@ export const editorKnowledge = (
     )
   },
   async rename(file, line, character, newName) {
+    if (safety.canMutate?.() === false) return { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
     let edit: WorkspaceEdit | undefined
     try {
       edit = await commands.executeCommand<WorkspaceEdit>(
@@ -415,9 +542,54 @@ export const editorKnowledge = (
     ) {
       return { ok: false, message: "The user chose not to rename it." }
     }
+    const absoluteFiles = edit.entries().map(([uri]) => uri.fsPath)
+    let renameFailure: string | undefined
     const rename = async () => {
+      await safety.checkpoints?.capture(absoluteFiles)
+      const baseline = new Map<string, string[]>()
+      for (const absolute of absoluteFiles) {
+        const uri = Uri.file(absolute)
+        const settled = settledDiagnostics(uri)
+        await workspace.openTextDocument(uri)
+        await settled
+        baseline.set(absolute, errorsIn(uri).map((diagnostic) => diagnostic.message))
+      }
       for (const [uri] of edit!.entries()) await replyChanges?.touch(uri.fsPath)
-      return applyAndSave(edit!)
+      const applied = await applyAndSave(edit!)
+      if (!applied) return false
+      await safety.checkpoints?.markChanged(absoluteFiles)
+      let catastrophic: { absolute: string; messages: string[] } | undefined
+      for (const absolute of absoluteFiles) {
+        const uri = Uri.file(absolute)
+        await settledDiagnostics(uri)
+        const previous = [...(baseline.get(absolute) ?? [])]
+        const fresh = errorsIn(uri).filter((diagnostic) => {
+          const found = previous.indexOf(diagnostic.message)
+          if (found < 0) return true
+          previous.splice(found, 1)
+          return false
+        })
+        if (fresh.length && safety.diagnosticMonitor?.record(absolute, fresh.length)) {
+          catastrophic = { absolute, messages: fresh.slice(0, 20).map((diagnostic) => `${diagnostic.range.start.line + 1}: ${diagnostic.message.split("\n")[0]}`) }
+          break
+        }
+      }
+      if (!catastrophic) return true
+      safety.blockMutations?.()
+      const rollback = safety.checkpoints
+        ? await safety.checkpoints.rollback()
+        : { restored: false, reason: "No safe checkpoint service is available." }
+      renameFailure = rollback.restored
+        ? `Restored the last safe checkpoint after rename introduced diagnostics: ${catastrophic.messages.join("; ")}`
+        : `Could not safely restore after rename introduced diagnostics: ${rollback.reason}`
+      await safety.onCatastrophic?.({
+        file: view.relative(catastrophic.absolute),
+        introducedErrors: catastrophic.messages.length,
+        diagnostics: catastrophic.messages.join("\n"),
+        restored: rollback.restored,
+        reason: renameFailure
+      })
+      return false
     }
     return (await (replyChanges?.hold(rename()) ?? rename()))
       ? {
@@ -425,7 +597,7 @@ export const editorKnowledge = (
           files,
           message: `Renamed to ${newName}: ${changes} changes in ${files.join(", ")}, saved.`
         }
-      : { ok: false, message: "The editor refused the rename." }
+      : { ok: false, message: renameFailure ?? "The editor refused the rename." }
   },
   async context() {
     const editor = window.activeTextEditor

@@ -89,11 +89,12 @@ export class ReplyChangesEditor {
 
     const edit = new WorkspaceEdit()
     const saved: Uri[] = []
+    const removeAfter: Uri[] = []
     for (const step of steps) {
       const uri = Uri.file(step.absolute)
       const there = existsSync(step.absolute)
       if (step.restore === null) {
-        if (there) edit.deleteFile(uri, { ignoreIfNotExists: true })
+        if (there) removeAfter.push(uri)
       } else if (there) {
         const document = await workspace.openTextDocument(uri)
         edit.replace(uri, document.validateRange(new Range(0, 0, document.lineCount, 0)), step.restore)
@@ -103,6 +104,14 @@ export class ReplyChangesEditor {
       }
     }
     if (!(await workspace.applyEdit(edit))) return { error: "The editor refused to undo the changes." }
+    for (const uri of removeAfter) {
+      try {
+        await workspace.fs.delete(uri, { useTrash: false })
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        return { error: `Could not remove the file created by the reply: ${detail}` }
+      }
+    }
     for (const uri of saved) {
       const document = workspace.textDocuments.find((d) => d.uri.toString() === uri.toString())
       if (document?.isDirty) await document.save()

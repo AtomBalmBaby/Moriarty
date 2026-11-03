@@ -5,7 +5,7 @@ import path from "node:path"
 import { test } from "node:test"
 import initSqlJs from "sql.js"
 
-import { evaluateTodoReview, feedbackContext, parseTodoEvaluation } from "../../extension/todos/feedback"
+import { evaluateTodoReview, feedbackContext, parseTodoEvaluation, todoReviewInput } from "../../extension/todos/feedback"
 import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
 
@@ -287,6 +287,37 @@ test("a plan revision invalidates an evaluation package even when the item versi
     const result = parseTodoEvaluation(responseFor(review, { refs: [observation.id] }), review, "mock-reviewer")
     await state.repository.synchronizeIntentPlan(state.scope, { ...plan([{ id: "revision", acceptance: "Source inspection is complete" }]), revision: 2, goal: "Changed goal" }, { prompt: "Changed goal" })
     await assert.rejects(state.repository.applyEvaluation(state.scope, item.id, review.task.version, result, "old-plan-review"), /Intent plan changed/)
+    assert.equal((await state.repository.getList(state.scope)).items[0].status, "in_review")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("analysis-only evaluation may accept a complete answer without file edits", async () => {
+  const state = await fixture([{ id: "explain", acceptance: "The design tradeoffs are explained" }])
+  try {
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const evaluation = parseTodoEvaluation(responseFor(review), review, "mock-reviewer", new Date().toISOString(), true)
+    assert.equal(evaluation.decision, "accept")
+    const input = todoReviewInput(review, undefined, "Here is the analysis")
+    assert.match(input, /implementerFinalResponseUntrusted/)
+    assert.match(input, /Here is the analysis/)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("an implementation cannot be accepted from prose without verified workspace changes", async () => {
+  const state = await fixture([{ id: "implement", acceptance: "The requested component is updated" }])
+  try {
+    const item = state.items[0]
+    const observation = await addObservation(state.repository, state.scope, item.id)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review,
+      async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer",
+      { requireWorkspaceChanges: true, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "needs_evidence")
+    assert.match(evaluation.problems.join(" "), /No verified workspace file changes/)
     assert.equal((await state.repository.getList(state.scope)).items[0].status, "in_review")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })

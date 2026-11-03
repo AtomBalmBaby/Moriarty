@@ -17,6 +17,7 @@ import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, E
 import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
 import { Chat } from "../../extension/chat/index"
+import { createSafeEditCheckpoints } from "../../extension/chat/tool-sinks"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
@@ -106,6 +107,7 @@ suite("Agent reply, end to end", function () {
     const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),
       globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -149,6 +151,7 @@ suite("Agent reply, end to end", function () {
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),
       globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -179,6 +182,8 @@ suite("Agent reply, end to end", function () {
     const settings = vscode.workspace.getConfiguration("twinny")
     const previousEnabled = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
     const previousMode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
+    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
+    await settings.update("chatToolsFeedbackEvaluatorEnabled", false, vscode.ConfigurationTarget.Global)
     await settings.update("chatToolsIntentCompilerMode", "ask", vscode.ConfigurationTarget.Global)
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-task-context-"))
     const model = new ScriptedModel(["Done.", "Done."])
@@ -186,6 +191,7 @@ suite("Agent reply, end to end", function () {
     const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),
       globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -231,7 +237,181 @@ suite("Agent reply, end to end", function () {
       chat.dispose()
       await settings.update("chatToolsIntentCompilerEnabled", previousEnabled, vscode.ConfigurationTarget.Global)
       await settings.update("chatToolsIntentCompilerMode", previousMode, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
       fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("an incomplete implementation report automatically dispatches a corrective turn", async () => {
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
+    await settings.update("chatToolsFeedbackEvaluatorEnabled", true, vscode.ConfigurationTarget.Global)
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-reconcile-continuation-"))
+    const chatModel = new ScriptedModel(["Implementation report: all requested work is complete.", "I will now inspect and implement the requested changes."])
+    const criterion = "The existing TODO panel is updated."
+    const evaluation = (decision: "revise" | "blocked") => JSON.stringify({
+      schemaVersion: 1,
+      taskId: "panel-task-1",
+      decision,
+      criteria: [{ criterion, status: decision === "revise" ? "failed" : "unverified", evidenceRefs: [] }],
+      problems: decision === "revise" ? ["No source changes were made."] : [],
+      correctiveInstructions: decision === "revise" ? ["Edit the existing TODO panel instead of reporting a proposed implementation."] : [],
+      explanation: decision === "revise" ? "The requested implementation is not present." : "Execution stopped for this deterministic integration test.",
+      scores: { completion: 0, correctness: 0, alignment: 0 }
+    })
+    const evaluatorModel = new ScriptedModel([evaluation("revise"), evaluation("blocked")])
+    const agentProvider = { ...provider, id: "reconciliation-agent", provider: "reconciliation-agent" }
+    const evaluatorProvider: TwinnyProvider = { ...provider, id: "reconciliation-evaluator", provider: "reconciliation-evaluator", type: "intent" }
+    providerRegistry.register("reconciliation-agent", { id: "reconciliation-agent", create: () => chatModel })
+    providerRegistry.register("reconciliation-evaluator", { id: "reconciliation-evaluator", create: () => evaluatorModel })
+    const stored: Record<string, unknown> = {
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: agentProvider,
+      [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: evaluatorProvider
+    }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const goal = "Implement the requested TODO panel improvements."
+    const scope = {
+      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      conversationId: "premature-surrender-regression"
+    }
+    const plan = {
+      planId: "premature-surrender-plan",
+      version: 1 as const,
+      revision: 1,
+      goal,
+      constraints: ["Modify the existing component; do not delete it."],
+      tasks: Array.from({ length: 9 }, (_, index) => ({
+        id: `panel-task-${index + 1}`,
+        title: `Implement panel requirement ${index + 1}`,
+        description: `Make and verify panel change ${index + 1}.`,
+        acceptanceCriteria: [criterion],
+        dependencies: [] as string[]
+      }))
+    }
+    await repository.synchronizeIntentPlan(scope, plan, { prompt: goal, plan })
+    const chat = new Chat(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
+    try {
+      await chat.completion([{ role: "user", content: goal }], [], "off", scope.conversationId)
+      assert.equal(chatModel.requests.length, 2, "the same user request must cause an automatic second agent turn")
+      assert.equal(evaluatorModel.requests.length, 2, "each implementing turn must receive independent evaluation")
+      const continuation = chatModel.requests[1].messages.map((message) => String(message.content ?? "")).join("\n")
+      assert.match(continuation, /Implement the requested TODO panel improvements/)
+      assert.match(continuation, /Modify the existing component; do not delete it/)
+      assert.match(continuation, /Edit the existing TODO panel instead of reporting a proposed implementation/)
+      assert.equal((await repository.getList({ ...scope, includeCompleted: true })).items.filter((item) => item.status === "completed").length, 0)
+    } finally {
+      chat.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
+    }
+  })
+
+  test("safe edit rollback preserves a dirty editor buffer and its distinct disk contents", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-dirty-buffer-checkpoint-"))
+    const file = path.join(root, "panel.tsx")
+    fs.writeFileSync(file, "disk before\n")
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const setText = async (text: string) => {
+      const edit = new vscode.WorkspaceEdit()
+      edit.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), text)
+      assert.equal(await vscode.workspace.applyEdit(edit), true)
+    }
+    const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "global-storage")))
+    try {
+      await setText("user's unsaved buffer\n")
+      assert.equal(document.isDirty, true)
+      await checkpoints.capture([file])
+      await setText("agent regression\n")
+      assert.equal(await document.save(), true)
+      await checkpoints.markChanged([file])
+      assert.deepEqual(await checkpoints.rollback(), { restored: true })
+      assert.equal(document.getText(), "user's unsaved buffer\n")
+      assert.equal(fs.readFileSync(file, "utf8"), "disk before\n")
+    } finally {
+      await vscode.commands.executeCommand("workbench.action.closeAllEditors")
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a recovery deletion of an in-scope component is rejected and automatically reviewed", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-destructive-recovery-"))
+    const file = path.join(root, "src", "webview", "todo-panel.tsx")
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, "export const TodoPanel = () => <div />\n")
+    const closeWorkspace = await openWorkspace(root)
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
+    await settings.update("chatToolsFeedbackEvaluatorEnabled", true, vscode.ConfigurationTarget.Global)
+    const criterion = "The existing TODO panel remains and is updated."
+    const review = (decision: "revise" | "blocked") => JSON.stringify({
+      schemaVersion: 1,
+      taskId: "todo-panel-task",
+      decision,
+      criteria: [{ criterion, status: decision === "revise" ? "failed" : "unverified", evidenceRefs: [] }],
+      problems: decision === "revise" ? ["The component was not modified safely."] : [],
+      correctiveInstructions: decision === "revise" ? ["Keep the existing component and make the requested edits in place."] : [],
+      explanation: decision === "revise" ? "The requested component must not be deleted." : "Execution stopped for this deterministic integration test.",
+      scores: { completion: 0, correctness: 0, alignment: 0 }
+    })
+    const agentModel = new ScriptedModel([
+      call("delete_file", { path: "src/webview/todo-panel.tsx" }),
+      "The attempted deletion was rejected; I will continue safely."
+    ])
+    const evaluatorModel = new ScriptedModel([review("revise"), review("blocked")])
+    const agentProvider = { ...provider, id: "destructive-recovery-agent", provider: "destructive-recovery-agent" }
+    const evaluatorProvider: TwinnyProvider = { ...provider, id: "destructive-recovery-evaluator", provider: "destructive-recovery-evaluator", type: "intent" }
+    providerRegistry.register("destructive-recovery-agent", { id: "destructive-recovery-agent", create: () => agentModel })
+    providerRegistry.register("destructive-recovery-evaluator", { id: "destructive-recovery-evaluator", create: () => evaluatorModel })
+    const stored: Record<string, unknown> = {
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: agentProvider,
+      [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: evaluatorProvider,
+      [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
+    }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const goal = "Modify src/webview/todo-panel.tsx with collapsible TODO cards; do not delete the component."
+    const scope = {
+      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      conversationId: "destructive-recovery-regression"
+    }
+    const plan = {
+      planId: "destructive-recovery-plan",
+      version: 1 as const,
+      revision: 1,
+      goal,
+      constraints: ["Preserve the existing TODO panel component."],
+      tasks: [{ id: "todo-panel-task", title: "Update the TODO panel", description: "Implement the requested card changes in place.", acceptanceCriteria: [criterion], dependencies: [] as string[] }]
+    }
+    await repository.synchronizeIntentPlan(scope, plan, { prompt: goal, plan })
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
+    chat.root = root
+    try {
+      await chat.completion([{ role: "user", content: goal }], [], "off", scope.conversationId)
+      assert.equal(fs.readFileSync(file, "utf8"), "export const TodoPanel = () => <div />\n")
+      assert.equal(evaluatorModel.requests.length, 2)
+      assert.ok(agentModel.requests.length >= 3, "the delete call, its result, and an automatic corrective turn must reach the implementing provider")
+      assert.match(JSON.stringify(agentModel.requests[1].messages.at(-1)?.content), /Not deleted:.*conflicts/i)
+      const continuation = agentModel.requests.slice(2).flatMap((request) => request.messages).map((message) => String(message.content ?? "")).join("\n")
+      assert.match(continuation, /Preserve the existing TODO panel component/)
+      assert.match(continuation, /Keep the existing component and make the requested edits in place/)
+    } finally {
+      chat.dispose()
+      await closeWorkspace()
+      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      fs.rmSync(root, { recursive: true, force: true })
     }
   })
 
@@ -254,6 +434,7 @@ suite("Agent reply, end to end", function () {
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
       globalState: {
         get: (key: string) => stored[key],
         update: async (key: string, value: unknown) => {
@@ -313,6 +494,8 @@ suite("Agent reply, end to end", function () {
   test("an MCP server's tool is asked for first, and Always run keeps the tool, not the call", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-agent-mcp-"))
     const settings = vscode.workspace.getConfiguration("twinny")
+    const previousApproval = settings.inspect<boolean>("mcpNeverAskAgain")?.globalValue
+    await settings.update("mcpNeverAskAgain", false, vscode.ConfigurationTarget.Global)
     await settings.update(
       "chatToolsMcpServers",
       {
@@ -336,6 +519,7 @@ suite("Agent reply, end to end", function () {
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
       globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -367,6 +551,7 @@ suite("Agent reply, end to end", function () {
       assert.deepStrictEqual(stored[`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.alwaysRunMcpTools}`], ["fake/add"])
     } finally {
       chat.dispose()
+      await settings.update("mcpNeverAskAgain", previousApproval, vscode.ConfigurationTarget.Global)
       await settings.update("chatToolsMcpServers", undefined, vscode.ConfigurationTarget.Global)
     }
   })
@@ -391,6 +576,7 @@ suite("Agent reply, end to end", function () {
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
       globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -515,6 +701,7 @@ suite("Agent reply, end to end", function () {
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
       globalState: { get: (key: string) => stored[key], update: async () => undefined },
       workspaceState: { get: () => undefined, update: async () => undefined },
       storageUri: vscode.Uri.file(path.join(root, ".git", "twinny-storage")),
@@ -597,6 +784,7 @@ suite("Agent reply, end to end", function () {
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
       globalState: { get: (key: string) => stored[key], update: async () => undefined },
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
@@ -752,6 +940,7 @@ suite("Agent reply, end to end", function () {
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
       globalState: {
         get: (key: string) => stored[key],
         update: async (key: string, value: unknown) => {

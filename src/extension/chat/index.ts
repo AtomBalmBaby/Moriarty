@@ -53,7 +53,7 @@ import { TemplateProvider } from "../templates/provider"
 import { evaluateTodoReview, feedbackContext, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { validateIntentTaskPlan } from "../todos/intent-plan"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
-import { TodoListRequest } from "../todos/types"
+import { TodoEvaluation, TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { DEFAULT_MAX_STEPS, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
@@ -66,16 +66,20 @@ import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
+import { continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, requiresWorkspaceChanges } from "./execution-reconciliation"
 import { ChatGeneration } from "./generation"
 import { McpHost } from "./mcp-host"
 import { ChangeStore, ReplyChanges, viewOf } from "./reply-changes"
 import { ReplyChangesEditor } from "./reply-changes-editor"
+import { DiagnosticRegressionMonitor, SafeEditCheckpoints } from "./safe-edit-recovery"
 import {
   ChatCommandMode,
   ChatCommandPlace,
+  createSafeEditCheckpoints,
   editorEdits,
   editorHint,
   editorKnowledge,
+  EditRecoveryNotice,
   indexSearch,
   normalCommand,
   openDocumentText,
@@ -389,6 +393,8 @@ export class Chat extends Base {
   private readonly _bridge: ExtensionBridge
   private readonly _context: ChatContextBuilder
   private readonly _generation: ChatGeneration
+  private _executionAbort?: AbortController
+  private _activeExecution?: ExecutionReconciliationController
   private readonly _search: WorkspaceSearch | undefined
   private readonly _agents: AgentRegistry
   private _requestAgentSelection: AgentSelection = "off"
@@ -514,6 +520,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   
   public abort = () => {
     this._steps.cancelWaiting()
+    this._executionAbort?.abort()
+    this._activeExecution?.cancel()
     this._generation.abort()
   }
 
@@ -1164,27 +1172,35 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return this._todoRepository!.getList(scope)
   }
 
-  private async reviewTodoTasks(scope: TodoListRequest, itemId?: string, changes?: ReplyChangesView): Promise<void> {
-    if (!this._todoRepository) return
+  private async reviewTodoTasks(
+    scope: TodoListRequest,
+    itemId?: string,
+    changes?: ReplyChangesView,
+    options: { strict?: boolean; finalResponse?: string; requireWorkspaceChanges?: boolean; signal?: AbortSignal } = {}
+  ): Promise<TodoEvaluation[]> {
+    if (!this._todoRepository) return []
     const reviews = await this._todoRepository.getReviewPackages(scope)
     const candidates = itemId
       ? reviews.filter((review) => review.task.id === itemId)
       : reviews.filter((review) => !review.lastEvaluation || review.lastEvaluation.metadata.taskVersion !== review.task.version - 1)
     if (!candidates.length) {
       if (itemId) throw new Error("This TODO is not awaiting evaluation")
-      return
+      return []
     }
     const provider = this.getIntentProvider()
     if (!provider) {
       logger.warn("Feedback evaluator is unavailable: configure an active Intent provider to review in-review TODOs")
-      if (itemId) throw new Error("Configure an active Intent provider before retrying TODO evaluation")
-      return
+      if (itemId || options.strict) throw new Error("Configure an active Intent provider before retrying TODO evaluation")
+      return []
     }
-    await Promise.all(candidates.map(async (review) => {
+    const evaluations = await Promise.all(candidates.map(async (review) => {
       try {
         const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async () => {
           const controller = new AbortController()
           let timeout: ReturnType<typeof setTimeout>
+          const abortFromExecution = () => controller.abort(options.signal?.reason)
+          if (options.signal?.aborted) abortFromExecution()
+          else options.signal?.addEventListener("abort", abortFromExecution, { once: true })
           const timedOut = new Promise<never>((_, reject) => {
             timeout = setTimeout(() => {
               const error = new Error("Feedback evaluator timed out after 30 seconds")
@@ -1197,21 +1213,170 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
               model: provider.modelName,
               messages: [
                 { role: SYSTEM, content: todoReviewSystemPrompt },
-                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined) }
+                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse) }
               ] as ChatCompletionMessage[]
             }, { signal: controller.signal })), timedOut])
           } finally {
             clearTimeout(timeout!)
+            options.signal?.removeEventListener("abort", abortFromExecution)
           }
-        }, provider.modelName)
+        }, provider.modelName, {
+          requireWorkspaceChanges: options.requireWorkspaceChanges,
+          hasVerifiedFileChanges: !!changes?.files.length,
+          allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal)
+        })
         logger.info("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
         const snapshot = await this._todoRepository!.getList(scope)
         this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
+        return evaluation
       } catch (error) {
         logger.warn("Feedback evaluation failed for TODO " + review.task.id + ": " + (error instanceof Error ? error.message : String(error)))
-        if (itemId) throw error
+        if (itemId || options.strict) throw error
+        return undefined
       }
     }))
+    return evaluations.filter((evaluation): evaluation is TodoEvaluation => !!evaluation)
+  }
+
+  private async reconcileIntentTurn(
+    scope: TodoListRequest,
+    intent: NonNullable<Awaited<ReturnType<TodoRepository["getActiveIntentContext"]>>>,
+    finalResponse: string,
+    changes: ReplyChangesView | undefined,
+    view: WorkspaceView | undefined,
+    workflow: ExecutionReconciliationController,
+    recovery?: EditRecoveryNotice
+  ): Promise<string | undefined> {
+    if (!this._todoRepository || this.cancelled || workflow.isCancelled()) {
+      if (this.cancelled) workflow.cancel()
+      return undefined
+    }
+    if (recovery && !recovery.restored) {
+      workflow.reconcile("blocked", recovery.reason)
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution is blocked because safe rollback was not possible: ${recovery.reason}` })
+      logger.error("[Execution] safe rollback failed: " + recovery.reason)
+      return undefined
+    }
+
+    const goal = intent.goal
+    const requireChanges = requiresWorkspaceChanges(goal)
+    let evaluation: TodoEvaluation | undefined
+    let reviewFailure: string | undefined
+    const before = await this._todoRepository.getList({ ...scope, includeCompleted: true })
+    let current = before.items.find((item) => item.id === intent.task.id)
+
+    if (current && current.status !== "completed" && current.status !== "cancelled" && current.status !== "blocked") {
+      if (current.status !== "in_review") {
+        current = await this._todoRepository.updateItem(scope, {
+          itemId: current.id,
+          expectedVersion: current.version,
+          patch: { status: "in_review" },
+          actor: "model",
+          requestId: randomUUID()
+        })
+      }
+      try {
+        const results = await this.reviewTodoTasks(scope, current.id, changes, {
+          strict: true,
+          finalResponse,
+          requireWorkspaceChanges: requireChanges,
+          signal: this._executionAbort?.signal
+        })
+        evaluation = results.find((result) => result.taskId === intent.planTaskId)
+        if (!evaluation) throw new Error("Independent evaluator returned no decision for the active task")
+      } catch (error) {
+        reviewFailure = error instanceof Error ? error.message : String(error)
+        logger.error("[Execution] independent evaluation failed: " + reviewFailure)
+      }
+    }
+
+    if (this.cancelled || workflow.state === "cancelled") {
+      workflow.cancel()
+      return undefined
+    }
+
+    const after = await this._todoRepository.getList({ ...scope, includeCompleted: true })
+    current = after.items.find((item) => item.id === intent.task.id)
+    if (reviewFailure && current?.status === "in_review") {
+      current = await this._todoRepository.updateItem(scope, {
+        itemId: current.id,
+        expectedVersion: current.version,
+        patch: { status: "in_progress" },
+        actor: "model",
+        requestId: randomUUID()
+      })
+    }
+
+    const outstandingPlanTasks = after.items.filter((item) => item.source === "intent_compiler" && item.status !== "completed" && item.status !== "cancelled")
+    if (evaluation?.decision === "blocked" || current?.status === "blocked") {
+      const reason = evaluation?.explanation ?? current?.blockedReason ?? "The active task is blocked."
+      workflow.reconcile("blocked", "blocked:" + intent.planTaskId)
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
+        role: ASSISTANT,
+        content: `Execution is blocked: ${reason.slice(0, 800)}`
+      })
+      logger.warn("[Execution] blocked: " + reason)
+      return undefined
+    }
+
+    if (!outstandingPlanTasks.length) {
+      workflow.reconcile("accept", `accepted:${intent.planId}:${intent.revision}`)
+      logger.info("[Execution] accepted after all intent-plan tasks were completed")
+      return undefined
+    }
+
+    if (evaluation?.decision === "revise" || evaluation?.decision === "needs_evidence") {
+      if (current?.status === "in_review") {
+        current = await this._todoRepository.updateItem(scope, {
+          itemId: current.id,
+          expectedVersion: current.version,
+          patch: { status: "in_progress" },
+          actor: "model",
+          requestId: randomUUID()
+        })
+      }
+    }
+
+    const next = await this._todoRepository.getActiveIntentContext(scope)
+    if (!next) {
+      const reasons = outstandingPlanTasks.map((task) => `${task.title} (${task.status})`).slice(0, 5)
+      const reason = `No eligible task remains; unresolved plan tasks: ${reasons.join(", ")}`
+      workflow.reconcile("blocked", reason)
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution is blocked: ${reason}.` })
+      logger.warn("[Execution] blocked: " + reason)
+      return undefined
+    }
+
+    const progress = `${intent.planTaskId}|${changes?.files.map((file) => `${file.path}:${file.added}:${file.removed}`).sort().join(",") ?? "no-file-changes"}`
+    const decision = evaluation?.decision === "revise" ? "revise" : "needs_evidence"
+    const outcome = workflow.reconcile(decision, progress, !!changes?.files.length || evaluation?.decision === "accept")
+    if (!outcome.continue) {
+      const reason = outcome.reason ?? "The autonomous execution retry budget was exhausted."
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution stopped: ${reason}` })
+      logger.warn("[Execution] stopped: " + reason)
+      return undefined
+    }
+
+    const feedback = recovery?.restored
+      ? [recovery.reason, "Diagnostics: " + recovery.diagnostics, "The regression was rolled back. Reinspect diagnostics before making a corrected edit."]
+      : reviewFailure
+        ? [`Independent evaluation failed: ${reviewFailure}. Do not treat this as approval; continue with verifiable work.`]
+        : evaluation?.decision === "accept"
+        ? [`The prior task was accepted. Continue with the next unresolved task: ${next.task.title}.`]
+        : [
+            ...(evaluation?.problems ?? ["The requested outcome is not yet demonstrated."]),
+            ...(evaluation?.correctiveInstructions ?? []),
+            ...(evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => `${criterion.status}: ${criterion.criterion}`) ?? [])
+          ]
+    if (view === undefined && requireChanges) feedback.push("No workspace editing tools are currently available; do not claim implementation completion.")
+    return continuationContext({
+      goal,
+      constraints: intent.constraints,
+      task: `${next.task.title}${next.task.details ? ` — ${next.task.details}` : ""}`,
+      criteria: next.acceptanceCriteria,
+      feedback,
+      finalResponse
+    })
   }
 
   private activeTodoScope(): TodoListRequest | undefined {
@@ -1269,11 +1434,25 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * Send the conversation; the reply joins it, so the next turn follows on.
    * With a `view`, the model may work in the workspace first.
    */
-  private async run(provider: TwinnyProvider, prefix = "", view?: WorkspaceView) {
+  private async run(
+    provider: TwinnyProvider,
+    prefix = "",
+    view?: WorkspaceView,
+    workflow?: ExecutionReconciliationController,
+    checkpoints?: SafeEditCheckpoints
+  ): Promise<string> {
+    if (!workflow) this._executionAbort = new AbortController()
+    const execution = workflow ?? new ExecutionReconciliationController({
+      maxIterations: clampNumericSetting(this.config.get<number>("chatToolsReconciliationMaxIterations", 12), 1, 20, 12),
+      maxNoProgress: clampNumericSetting(this.config.get<number>("chatToolsReconciliationMaxNoProgressTurns", 2), 1, 5, 2)
+    })
+    if (!workflow) this._activeExecution = execution
     let toolNotes: string | undefined
     let instructionFiles = (): string[] => []
     let tracked: ReplyChanges | undefined
     let changed: ReplyChangesView | undefined
+    let recoveryNotice: EditRecoveryNotice | undefined
+    const activeCheckpoints = checkpoints ?? (view ? createSafeEditCheckpoints(this._extensionContext.globalStorageUri) : undefined)
     const usage: ToolLoopUsage = {}
     let outOfSteps = false
     // Asked now, so the reply can say how much of the context it used.
@@ -1308,10 +1487,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }
     const todoScope = this.activeTodoScope()
+    const intentAtStart = todoScope && this._todoRepository ? await this._todoRepository.getActiveIntentContext(todoScope) : undefined
     // Native TODO actions are conversation-scoped and do not require workspace Agent mode.
     const todoOnly = !view && !!todoScope
+    const onCatastrophic = async (notice: EditRecoveryNotice) => {
+      recoveryNotice = notice
+      if (todoScope && intentAtStart && this._todoRepository) {
+        await this._todoRepository.addEvidence(todoScope, {
+          itemId: intentAtStart.task.id,
+          kind: "automatic_edit_recovery",
+          summary: `${notice.reason}\n${notice.diagnostics}`.slice(0, 2000),
+          result: notice.restored ? "observed" : "failed",
+          requestId: randomUUID()
+        })
+      }
+    }
     const client = view
-      ? this.toolsClient(provider, view, hooks)
+      ? this.toolsClient(provider, view, hooks, intentAtStart?.goal, activeCheckpoints, onCatastrophic)
       : todoOnly && todoScope
         ? this.todoToolsClient(provider, todoScope, hooks)
         : resolveInferenceProvider(provider)
@@ -1359,9 +1551,25 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ]
     }
     const feedbackEnabled = workspace.getConfiguration("twinny").get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
-    if (reply !== undefined && feedbackEnabled && todoScope) void this.reviewTodoTasks(todoScope, undefined, changed).catch((error) => {
-      logger.error("Automatic TODO evaluation could not load review tasks: " + (error instanceof Error ? error.message : String(error)))
-    })
+    if (this.cancelled) execution.cancel()
+    if (reply !== undefined && !this.cancelled && feedbackEnabled && todoScope && intentAtStart) {
+      const continuation = await this.reconcileIntentTurn(todoScope, intentAtStart, reply, changed, view, execution, recoveryNotice)
+      if (continuation && execution.claimContinuation() && !this.cancelled) {
+        this._conversation = [...this._conversation, { role: USER, content: continuation }]
+        logger.info("[Execution] continuing automatically after independent reconciliation")
+        execution.continuationStarted()
+        return this.run(provider, "Twinny · continuing automatically\n\n", view, execution, activeCheckpoints)
+      }
+    } else if (reply !== undefined && feedbackEnabled && todoScope) {
+      void this.reviewTodoTasks(todoScope, undefined, changed).catch((error) => {
+        logger.error("Automatic TODO evaluation could not load review tasks: " + (error instanceof Error ? error.message : String(error)))
+      })
+    }
+    if (!this.cancelled && (!recoveryNotice || recoveryNotice.restored)) await activeCheckpoints?.clear()
+    if (this._activeExecution === execution) {
+      this._executionAbort = undefined
+      this._activeExecution = undefined
+    }
     return reply
   }
 
@@ -1445,7 +1653,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onChanges(changes: ReplyChanges): void
       onOutOfSteps(): void
       onToolResult(call: ToolCall, result: ToolResult): Promise<void>
-    }
+    },
+    intentGoal: string | undefined,
+    checkpoints: SafeEditCheckpoints | undefined,
+    onCatastrophic: (notice: EditRecoveryNotice) => Promise<void>
   ) {
     this._steps.reset()
     // The team's rules only ever tighten what the developer set.
@@ -1453,6 +1664,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const commandMode = team?.commands === "off" ? "off" : this.config.get<ChatCommandMode>("chatToolsCommands", "ask")
     const editMode = team?.edits === "review" ? "review" : this.config.get<ChatEditMode>("chatToolsEdits", "apply")
     const changes = new ReplyChanges(view.root, openDocumentText)
+    let mutationsBlocked = false
+    const safety = {
+      goal: intentGoal,
+      checkpoints,
+      diagnosticMonitor: new DiagnosticRegressionMonitor(
+        clampNumericSetting(this.config.get<number>("chatToolsRegressionErrorSpike", 20), 10, 1000, 20),
+        clampNumericSetting(this.config.get<number>("chatToolsRegressionCumulativeErrors", 40), 20, 2000, 40)
+      ),
+      canMutate: () => !mutationsBlocked,
+      blockMutations: () => { mutationsBlocked = true },
+      onCatastrophic
+    }
     hooks.onChanges(changes)
     const approveChange = (detail: string, approval: "command" | "change") =>
       this._steps.approve(detail, approval)
@@ -1474,8 +1697,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       conversationId: this._activeConversationId
     } : undefined
     let available = workspaceTools(view, [], {
-      edits: editorEdits(view, editMode, approveChange, changes),
-      editor: editorKnowledge(view, editMode, approveChange, changes),
+      edits: editorEdits(view, editMode, approveChange, changes, safety),
+      editor: editorKnowledge(view, editMode, approveChange, changes, safety),
       readFileMaxLines: maxReadLines,
       todos: this._todoRepository && todoScope ? {
         repository: this._todoRepository,

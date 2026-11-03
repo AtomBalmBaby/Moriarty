@@ -768,6 +768,38 @@
           "default": true,
           "markdownDescription": "After an agent turn has persisted its TODO claims and tool results, ask the configured Intent provider to independently review eligible tasks. Disable to leave TODOs in review until manually retried."
         },
+        "twinny.chatToolsReconciliationMaxIterations": {
+          "order": 22,
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 20,
+          "markdownDescription": "Maximum independent reconciliation and automatic continuation turns for one intent execution."
+        },
+        "twinny.chatToolsReconciliationMaxNoProgressTurns": {
+          "order": 23,
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 5,
+          "markdownDescription": "Stop automatic execution after this many consecutive turns without verified file progress."
+        },
+        "twinny.chatToolsRegressionErrorSpike": {
+          "order": 24,
+          "type": "number",
+          "default": 20,
+          "minimum": 10,
+          "maximum": 1000,
+          "markdownDescription": "New language-server errors in one workspace edit that trigger automatic rollback."
+        },
+        "twinny.chatToolsRegressionCumulativeErrors": {
+          "order": 25,
+          "type": "number",
+          "default": 40,
+          "minimum": 20,
+          "maximum": 2000,
+          "markdownDescription": "Cumulative new errors threshold used with a single-edit increase of at least eight errors."
+        },
         "twinny.chatToolsIntentCompilerMode": {
           "order": 20,
           "type": "string",
