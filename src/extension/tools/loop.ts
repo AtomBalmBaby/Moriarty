@@ -147,6 +147,8 @@ export interface ToolLoopOptions {
   onStep?(step: ToolStep): void
   /** Called after a tool has really run, before its result is sent back to the model. */
   onToolResult?(call: ToolCall, result: ToolResult): void | Promise<void>
+  /** Stop dispatching tools and inference after a controller has blocked mutations. */
+  shouldStop?(): boolean
   /** Called once per request with the characters it sends and what they are estimated to be in tokens. */
   onRequest?(promptChars: number, step: number, mode: ToolMode, estimatedTokens: number): void
   /** Called after each request the server counted. */
@@ -605,7 +607,10 @@ class ToolLoop {
         // A result trimmed out of the context is gone from the model's view, and is run again.
         const repeated = earlier && !earlier.slot?.trimmed ? earlier : undefined
         if (repeated) this._repeats++
-        const ran: ToolResult = !pending.call
+        const stopped = this._options.shouldStop?.() === true
+        const ran: ToolResult = stopped
+          ? { output: "This call was not run because execution stopped after a catastrophic edit regression.", summary: name + " not run after catastrophic regression", failed: true }
+          : !pending.call
           ? {
               output: unreadableCallMessage(pending, native),
               summary: `tool call not understood · ${pending.error}`,
@@ -670,6 +675,7 @@ class ToolLoop {
       // calls that cannot be read, is not getting anywhere with more steps.
       if (this._repeats >= MAX_REPEATED_CALLS || this._unreadable >= MAX_UNREADABLE_IN_A_ROW) this._stuck = true
       settled = results.some((result) => result.final)
+      if (this._options.shouldStop?.()) return
     }
   }
 

@@ -2,6 +2,7 @@ import assert from "assert"
 import test from "node:test"
 
 import {
+  allIntentTasksComplete,
   continuationContext,
   ExecutionReconciliationController,
   forbiddenDeleteReason,
@@ -60,4 +61,24 @@ test("cancellation prevents dispatching a continuation", () => {
   controller.cancel()
   assert.equal(controller.reconcile("revise", "no-progress").state, "cancelled")
   assert.equal(controller.claimContinuation(), false)
+})
+
+
+test("an accepted task advances to the next task without accepting the overall goal", () => {
+  const controller = new ExecutionReconciliationController({ maxIterations: 4, maxNoProgress: 2 })
+  const advanced = controller.advanceAcceptedTask("task-1:inspection-accepted")
+  assert.deepEqual(advanced, { state: "continue", continue: true })
+  assert.equal(controller.claimContinuation(), true)
+  controller.continuationStarted()
+  assert.equal(controller.state, "executing")
+  assert.equal(controller.reconcile("accept", "all-plan-tasks-verified").state, "accepted")
+})
+
+
+test("overall goal completion requires every nonempty intent plan task to be completed", () => {
+  assert.equal(allIntentTasksComplete(["completed", "pending"]), false)
+  assert.equal(allIntentTasksComplete(["completed", "in_progress"]), false)
+  assert.equal(allIntentTasksComplete(["completed", "cancelled"]), false)
+  assert.equal(allIntentTasksComplete(["completed", "completed"]), true)
+  assert.equal(allIntentTasksComplete([]), false)
 })

@@ -19,7 +19,7 @@ import {
   USER,
   WEBUI_TABS
 } from "../../common/constants"
-import { formatCount, logger } from "../../common/logger"
+import { formatCount, logger, redact } from "../../common/logger"
 import type { ComposerTurn, ToolInventoryItem } from "../../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
@@ -35,7 +35,7 @@ import {
 import { composeAgentPrompt } from "../agents/prompt"
 import type { LoadedAgent } from "../agents/registry"
 import { AgentRegistry } from "../agents/registry"
-import { agentToolSelectionDiagnostic, resolveAgentToolSelection } from "../agents/tool-selection"
+import { agentToolSelectionDiagnostic, projectTaskRelevantTools, resolveAgentToolSelection } from "../agents/tool-selection"
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
@@ -50,7 +50,7 @@ import { PromptInstructionResolver } from "../prompts/instructions"
 import { Base } from "../providers/base"
 import { describeProviderError, stripThinking } from "../providers/errors"
 import { TemplateProvider } from "../templates/provider"
-import { evaluateTodoReview, feedbackContext, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { evaluateTodoReview, feedbackContext, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { validateIntentTaskPlan } from "../todos/intent-plan"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { TodoEvaluation, TodoListRequest } from "../todos/types"
@@ -66,7 +66,7 @@ import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
-import { continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, requiresWorkspaceChanges } from "./execution-reconciliation"
+import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, requiresWorkspaceChanges } from "./execution-reconciliation"
 import { ChatGeneration } from "./generation"
 import { McpHost } from "./mcp-host"
 import { ChangeStore, ReplyChanges, viewOf } from "./reply-changes"
@@ -1195,7 +1195,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
     const evaluations = await Promise.all(candidates.map(async (review) => {
       try {
-        const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async () => {
+        const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async (correction) => {
           const controller = new AbortController()
           let timeout: ReturnType<typeof setTimeout>
           const abortFromExecution = () => controller.abort(options.signal?.reason)
@@ -1209,19 +1209,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             }, 30_000)
           })
           try {
-            return await Promise.race([readText(resolveInferenceProvider(provider).chat({
+            try {
+              return await Promise.race([readText(resolveInferenceProvider(provider).chat({
               model: provider.modelName,
               messages: [
                 { role: SYSTEM, content: todoReviewSystemPrompt },
-                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse) }
+                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse) + (correction ? "\n\nCorrection required: " + correction : "") }
               ] as ChatCompletionMessage[]
             }, { signal: controller.signal })), timedOut])
+            } catch (error) {
+              throw new TodoEvaluationProviderError(redact(error instanceof Error ? error.message : String(error)))
+            }
           } finally {
             clearTimeout(timeout!)
             options.signal?.removeEventListener("abort", abortFromExecution)
           }
         }, provider.modelName, {
-          requireWorkspaceChanges: options.requireWorkspaceChanges,
+          requireWorkspaceChanges: options.requireWorkspaceChanges && taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria),
           hasVerifiedFileChanges: !!changes?.files.length,
           allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal)
         })
@@ -1230,7 +1234,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
         return evaluation
       } catch (error) {
-        logger.warn("Feedback evaluation failed for TODO " + review.task.id + ": " + (error instanceof Error ? error.message : String(error)))
+        logger.warn("Feedback evaluation failed for TODO " + review.task.id + " (" + (error instanceof TodoEvaluationProviderError ? "provider" : "validation/parsing") + "): " + redact(error instanceof Error ? error.message : String(error)))
         if (itemId || options.strict) throw error
         return undefined
       }
@@ -1251,7 +1255,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (this.cancelled) workflow.cancel()
       return undefined
     }
-    if (recovery && !recovery.restored) {
+    if (recovery && (!recovery.fileVerified || !recovery.diagnosticsVerified)) {
       workflow.reconcile("blocked", recovery.reason)
       this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution is blocked because safe rollback was not possible: ${recovery.reason}` })
       logger.error("[Execution] safe rollback failed: " + recovery.reason)
@@ -1286,7 +1290,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         if (!evaluation) throw new Error("Independent evaluator returned no decision for the active task")
       } catch (error) {
         reviewFailure = error instanceof Error ? error.message : String(error)
-        logger.error("[Execution] independent evaluation failed: " + reviewFailure)
+        logger.error("[Execution] independent evaluation failed (" + (error instanceof TodoEvaluationProviderError ? "provider" : "validation/parsing") + "): " + redact(reviewFailure))
       }
     }
 
@@ -1307,7 +1311,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       })
     }
 
-    const outstandingPlanTasks = after.items.filter((item) => item.source === "intent_compiler" && item.status !== "completed" && item.status !== "cancelled")
+    const allPlanTasks = after.items.filter((item) => item.source === "intent_compiler")
+    const outstandingPlanTasks = allPlanTasks.filter((item) => item.status !== "completed")
+    if (reviewFailure) {
+      const reason = "Independent evaluator could not validate this task; no decision was persisted. " + reviewFailure
+      workflow.reconcile("blocked", "evaluation-failed:" + intent.planTaskId)
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: "Execution is blocked: " + reason.slice(0, 800) })
+      logger.warn("[Execution] progression blocked because evaluation failed for " + intent.planTaskId)
+      return undefined
+    }
     if (evaluation?.decision === "blocked" || current?.status === "blocked") {
       const reason = evaluation?.explanation ?? current?.blockedReason ?? "The active task is blocked."
       workflow.reconcile("blocked", "blocked:" + intent.planTaskId)
@@ -1319,7 +1331,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return undefined
     }
 
-    if (!outstandingPlanTasks.length) {
+    if (allIntentTasksComplete(allPlanTasks.map((task) => task.status))) {
       workflow.reconcile("accept", `accepted:${intent.planId}:${intent.revision}`)
       logger.info("[Execution] accepted after all intent-plan tasks were completed")
       return undefined
@@ -1349,7 +1361,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
     const progress = `${intent.planTaskId}|${changes?.files.map((file) => `${file.path}:${file.added}:${file.removed}`).sort().join(",") ?? "no-file-changes"}`
     const decision = evaluation?.decision === "revise" ? "revise" : "needs_evidence"
-    const outcome = workflow.reconcile(decision, progress, !!changes?.files.length || evaluation?.decision === "accept")
+    const outcome = evaluation?.decision === "accept"
+      ? workflow.advanceAcceptedTask(progress)
+      : workflow.reconcile(decision, progress, !!changes?.files.length)
     if (!outcome.continue) {
       const reason = outcome.reason ?? "The autonomous execution retry budget was exhausted."
       this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution stopped: ${reason}` })
@@ -1362,7 +1376,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       : reviewFailure
         ? [`Independent evaluation failed: ${reviewFailure}. Do not treat this as approval; continue with verifiable work.`]
         : evaluation?.decision === "accept"
-        ? [`The prior task was accepted. Continue with the next unresolved task: ${next.task.title}.`]
+        ? [`The prior task was accepted. Begin the next unresolved task now: ${next.task.title}. Use the verified observations below instead of repeating source discovery.`]
         : [
             ...(evaluation?.problems ?? ["The requested outcome is not yet demonstrated."]),
             ...(evaluation?.correctiveInstructions ?? []),
@@ -1375,6 +1389,16 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       task: `${next.task.title}${next.task.details ? ` — ${next.task.details}` : ""}`,
       criteria: next.acceptanceCriteria,
       feedback,
+      verifiedObservations: [
+        ...(intent.observations ?? []).filter((observation) => !observation.failed).slice(0, 5).map((observation) => {
+          const path = observation.arguments.path ?? observation.arguments.file
+          return observation.toolName + (path ? " " + path : "") + ": " + observation.output.slice(0, 240)
+        }),
+        ...(changes?.files ?? []).slice(0, 5).map((file) => "Current reply change: " + file.path + " (" + file.status + ", +" + file.added + "/-" + file.removed + ")")
+      ],
+      failedActions: (intent.observations ?? []).filter((observation) => observation.failed).slice(0, 3).map((observation) =>
+        observation.toolName + " " + JSON.stringify(observation.arguments) + ": " + observation.output.slice(0, 240)
+      ),
       finalResponse
     })
   }
@@ -1496,8 +1520,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         await this._todoRepository.addEvidence(todoScope, {
           itemId: intentAtStart.task.id,
           kind: "automatic_edit_recovery",
-          summary: `${notice.reason}\n${notice.diagnostics}`.slice(0, 2000),
-          result: notice.restored ? "observed" : "failed",
+          summary: `${notice.reason}\nFile verified: ${notice.fileVerified}; diagnostics: ${notice.diagnosticsStatus}.\n${notice.diagnostics}`.slice(0, 2000),
+          result: notice.fileVerified && notice.diagnosticsVerified ? "observed" : "failed",
           requestId: randomUUID()
         })
       }
@@ -1761,22 +1785,26 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ? undefined
       : this._activeAgent?.profile.tools
     const selection = resolveAgentToolSelection(requestedTools, nativeTools, this._activeMcpTools)
-    logger.info(`[ToolTrace] eligible=${selection.native.length} native, ${selection.mcp.length} MCP`)
+    logger.info("[ToolTrace] eligible=" + selection.native.length + " native, " + selection.mcp.length + " MCP")
+    const adaptiveExposure = this.config.get<boolean>("chatToolsAdaptiveExposureEnabled", false)
+    const projection = projectTaskRelevantTools(selection.native, selection.mcp, intentGoal ?? "", adaptiveExposure)
+    const permittedNames = new Set([...selection.native, ...selection.mcp].map((tool) => tool.name))
+    const schemaChars = (tools: typeof available.tools) => JSON.stringify(tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))).length
+    const beforeSchemaChars = schemaChars(available.tools.filter((tool) => permittedNames.has(tool.name)))
 
     // Select by the actual model-facing names. Native and MCP metadata stay
     // separate; the returned WorkspaceTools object still contains Tool values.
     const selectedNames = new Set([
-      ...selection.native.map((tool) => tool.name),
-      ...selection.mcp.map((tool) => tool.name)
+      ...projection.native.map((tool) => tool.name),
+      ...projection.mcp.map((tool) => tool.name)
     ])
     available = {
       ...available,
       tools: available.tools.filter((tool) => selectedNames.has(tool.name))
     }
-    this._activeMcpTools = selection.mcp
 
     if (requestedTools === undefined && this._activeAgent?.profile.tools !== undefined) {
-      const exposed = selection.native.length + selection.mcp.length
+      const exposed = projection.native.length + projection.mcp.length
       this._agentToolDiagnostic = `Ignored the agent profile's tool restrictions; ${exposed} eligible tool${exposed === 1 ? "" : "s"} exposed to the provider.`
       logger.warn(this._agentToolDiagnostic)
       this._bridge.emit(EVENT_NAME.twinnyNotification, this._agentToolDiagnostic)
@@ -1794,7 +1822,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     // These are the definitions passed to the tool loop; the provider may
     // subsequently choose native or text-mode tool serialization.
     const outgoingNames = available.tools.map((tool) => tool.name)
+    const outgoingSchemaChars = schemaChars(available.tools)
     logger.info(`[ToolTrace] outgoing=${outgoingNames.length} tools: ${outgoingNames.join(", ")}`)
+    if (adaptiveExposure) logger.info("[ToolTrace] adaptive projection retained " + projection.native.length + " native, " + projection.mcp.length + " MCP; excluded=" + (projection.excluded.map((entry) => entry.name + " (" + entry.reason + ")").join(", ") || "none") + "; schema chars " + beforeSchemaChars + " (~" + Math.ceil(beforeSchemaChars / 4) + " tokens) -> " + outgoingSchemaChars + " (~" + Math.ceil(outgoingSchemaChars / 4) + " tokens)")
     const missingFromOutgoing = [...selectedNames].filter((name) => !outgoingNames.includes(name))
     if (missingFromOutgoing.length) {
       logger.warn(`[ToolTrace] selected tools absent from outgoing definitions: ${missingFromOutgoing.join(", ")}`)
@@ -1831,6 +1861,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         ),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
+      shouldStop: () => !safety.canMutate(),
       onStep: (step) => {
         this._steps.finish(step)
         logger.info(`Chat tools · ${step.summary}`)

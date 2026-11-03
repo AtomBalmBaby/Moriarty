@@ -768,6 +768,12 @@
           "default": true,
           "markdownDescription": "After an agent turn has persisted its TODO claims and tool results, ask the configured Intent provider to independently review eligible tasks. Disable to leave TODOs in review until manually retried."
         },
+        "twinny.chatToolsAdaptiveExposureEnabled": {
+          "order": 21,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Reduce MCP tools sent to chat agent turns using deterministic task-capability matching. Disabled by default; when disabled, the authorized Tool Picker selection is exposed unchanged. This never grants tools or changes approval settings."
+        },
         "twinny.chatToolsReconciliationMaxIterations": {
           "order": 22,
           "type": "number",

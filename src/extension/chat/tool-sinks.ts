@@ -57,6 +57,9 @@ export interface EditRecoveryNotice {
   introducedErrors: number
   diagnostics: string
   restored: boolean
+  fileVerified: boolean
+  diagnosticsVerified: boolean
+  diagnosticsStatus: "verified" | "mismatch" | "unavailable"
   reason: string
 }
 
@@ -245,13 +248,14 @@ const withNewErrors = async (
   mode: ChatEditMode,
   changed: { start: number; end: number } | undefined,
   change: () => Promise<ChatEditOutcome>
-): Promise<EditOutcome> => {
+): Promise<EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean }> => {
   if (mode !== "apply" || UNCHECKED_FILES.test(file)) return change()
   const uri = Uri.file(file)
   const open = workspace.textDocuments.find((document) => document.uri.toString() === uri.toString())
   if (open && UNCHECKED_LANGUAGES.has(open.languageId)) return change()
   const known = !!open && !!changed
   const before = known ? errorsIn(uri).map((diagnostic) => diagnostic.message) : []
+  const recoveryBaseline = known ? [...before] : undefined
   const checked = settledDiagnostics(uri, known ? DIAGNOSTICS_QUIET_MS : FIRST_CHECK_QUIET_MS)
   const outcome = await change()
   if (!outcome.ok || outcome.pending) return outcome
@@ -283,6 +287,8 @@ const withNewErrors = async (
   return {
     ...outcome,
     newErrors: fresh.length,
+    recoveryBaseline,
+    diagnosticCheckAvailable: !!recoveryBaseline,
     message:
       `${outcome.message}\nThe editor now reports ${one ? "an error" : `${fresh.length} errors`} in ${view.relative(file)} ${where}:\n` +
       `${named.join("\n")}${more}\nFix ${one ? "it" : "them"} if your change caused ${one ? "it" : "them"}.`
@@ -308,7 +314,7 @@ export const editorEdits = (
   const blocked = (): EditOutcome | undefined => mutationsBlocked || safety.canMutate?.() === false
     ? { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
     : undefined
-  const checkedOutcome = async (file: string, outcome: EditOutcome): Promise<EditOutcome> => {
+  const checkedOutcome = async (file: string, outcome: EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean }): Promise<EditOutcome> => {
     if (!outcome.ok || outcome.pending) return outcome
     const introduced = outcome.newErrors ?? 0
     if (safety.checkpoints) await safety.checkpoints.markChanged([file])
@@ -322,10 +328,21 @@ export const editorEdits = (
     const rollback = safety.checkpoints
       ? await safety.checkpoints.rollback()
       : { restored: false, reason: "No safe checkpoint service is available." }
-    const reason = rollback.restored
-      ? `Restored the last safe checkpoint after ${introduced} new diagnostics in ${view.relative(file)}.`
-      : `Could not safely restore after ${introduced} new diagnostics in ${view.relative(file)}: ${rollback.reason}`
-    await safety.onCatastrophic?.({ file: view.relative(file), introducedErrors: introduced, diagnostics: outcome.message.slice(0, 2000), restored: rollback.restored, reason })
+    let diagnosticsVerified = false
+    let diagnosticsStatus: EditRecoveryNotice["diagnosticsStatus"] = "unavailable"
+    if (rollback.restored && outcome.recoveryBaseline && outcome.diagnosticCheckAvailable) {
+      await settledDiagnostics(Uri.file(file))
+      const restoredErrors = errorsIn(Uri.file(file)).map((diagnostic) => diagnostic.message).sort()
+      diagnosticsVerified = JSON.stringify(restoredErrors) === JSON.stringify([...outcome.recoveryBaseline].sort())
+      diagnosticsStatus = diagnosticsVerified ? "verified" : "mismatch"
+    }
+    const fileVerified = rollback.restored
+    const reason = !fileVerified
+      ? "Could not safely restore after " + introduced + " new diagnostics in " + view.relative(file) + ": " + rollback.reason
+      : !diagnosticsVerified
+        ? "Restored the last safe checkpoint in " + view.relative(file) + ", but diagnostics could not be verified against the pre-edit baseline."
+        : "Restored and verified the last safe checkpoint in " + view.relative(file) + " after " + introduced + " new diagnostics."
+    await safety.onCatastrophic?.({ file: view.relative(file), introducedErrors: introduced, diagnostics: outcome.message.slice(0, 2000), restored: rollback.restored, fileVerified, diagnosticsVerified, diagnosticsStatus, reason })
     return { ...outcome, ok: false, message: `${reason} Further file mutations are blocked for this execution.` }
   }
   return {
@@ -579,14 +596,29 @@ export const editorKnowledge = (
       const rollback = safety.checkpoints
         ? await safety.checkpoints.rollback()
         : { restored: false, reason: "No safe checkpoint service is available." }
-      renameFailure = rollback.restored
-        ? `Restored the last safe checkpoint after rename introduced diagnostics: ${catastrophic.messages.join("; ")}`
-        : `Could not safely restore after rename introduced diagnostics: ${rollback.reason}`
+      let diagnosticsVerified = rollback.restored
+      if (rollback.restored) {
+        for (const absolute of absoluteFiles) {
+          const uri = Uri.file(absolute)
+          await settledDiagnostics(uri)
+          const restored = errorsIn(uri).map((diagnostic) => diagnostic.message).sort()
+          const before = [...(baseline.get(absolute) ?? [])].sort()
+          if (JSON.stringify(restored) !== JSON.stringify(before)) diagnosticsVerified = false
+        }
+      }
+      renameFailure = !rollback.restored
+        ? "Could not safely restore after rename introduced diagnostics: " + rollback.reason
+        : !diagnosticsVerified
+          ? "Restored files after rename regression, but the diagnostic baseline could not be verified."
+          : "Restored and verified the last safe checkpoint after rename introduced diagnostics: " + catastrophic.messages.join("; ")
       await safety.onCatastrophic?.({
         file: view.relative(catastrophic.absolute),
         introducedErrors: catastrophic.messages.length,
         diagnostics: catastrophic.messages.join("\n"),
         restored: rollback.restored,
+        fileVerified: rollback.restored,
+        diagnosticsVerified,
+        diagnosticsStatus: rollback.restored ? (diagnosticsVerified ? "verified" : "mismatch") : "unavailable",
         reason: renameFailure
       })
       return false

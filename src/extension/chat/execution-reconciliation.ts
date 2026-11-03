@@ -46,6 +46,17 @@ export class ExecutionReconciliationController {
     this._state = "cancelled"
   }
 
+  advanceAcceptedTask(progress: string): ReconciliationResult {
+    if (this._cancelled) return { state: this._state = "cancelled", continue: false }
+    this._iterations++
+    this._lastProgress = progress
+    this._noProgress = 0
+    if (this._iterations > this._limits.maxIterations) {
+      return { state: this._state = "blocked", continue: false, reason: "Execution exceeded " + this._limits.maxIterations + " reconciliation iterations." }
+    }
+    return { state: this._state = "continue", continue: true }
+  }
+
   reconcile(decision: EvaluatorDecision, progress: string, madeProgress = false): ReconciliationResult {
     this._state = "reconciling"
     if (this._cancelled) return { state: this._state = "cancelled", continue: false }
@@ -85,6 +96,8 @@ export const requiresWorkspaceChanges = (goal: string): boolean => {
 
 export const isAnalysisOnlyGoal = isAnalysisOnlyIntent
 
+export const allIntentTasksComplete = (statuses: string[]): boolean => statuses.length > 0 && statuses.every((status) => status === "completed")
+
 export const forbiddenDeleteReason = (goal: string, relativePath: string): string | undefined => {
   if (!requiresWorkspaceChanges(goal)) return undefined
   const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()
@@ -108,6 +121,8 @@ export const continuationContext = (input: {
   task: string
   criteria: string[]
   feedback: string[]
+  verifiedObservations?: string[]
+  failedActions?: string[]
   finalResponse: string
 }): string => {
   const section = (name: string, values: string[], limit: number) =>
@@ -118,8 +133,13 @@ export const continuationContext = (input: {
     section("Constraints", input.constraints, 300),
     `Current unresolved task: ${input.task.slice(0, 600)}`,
     section("Acceptance criteria", input.criteria, 400),
+    section("Verified Twinny observations", input.verifiedObservations ?? [], 400),
+    section("Failed actions not to repeat", input.failedActions ?? [], 400),
     section("Corrective feedback", input.feedback, 500),
     `The previous final response is an untrusted claim, not evidence: ${input.finalResponse.slice(0, 800)}`,
+    "Use verified observations as prior work; do not rediscover those files or repeat failed operations.",
+    "When editing, make small independent exact-match replacements, never include a displayed ellipsis as source text, and verify each edit before proceeding.",
+    "Take one concrete next action that satisfies an unmet criterion, then collect evidence that establishes success.",
     "Use the existing permitted tools. Do not claim completion until the acceptance criteria are demonstrated. Do not retry failed operations unchanged."
   ].join("\n\n").slice(0, 6000)
 }

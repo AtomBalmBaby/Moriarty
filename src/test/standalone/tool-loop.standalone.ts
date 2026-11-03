@@ -756,3 +756,28 @@ test("run_command exposes trusted output and exit-code provenance to the complet
   }).chat(ask("Run the tests.")))
   assert.deepStrictEqual(observations, [{ name: "run_command", exitCode: 0, output: "verified npm test" }])
 })
+
+
+test("a catastrophic tool result stops the current batch before another mutation dispatch", async () => {
+  const calls: string[] = []
+  let stopped = false
+  const { client, requests } = scripted([{ calls: [
+    { id: "1", name: "edit_file", arguments: JSON.stringify({ path: "panel.tsx" }) },
+    { id: "2", name: "edit_file", arguments: JSON.stringify({ path: "panel.tsx" }) }
+  ] }, "should not be requested"])
+  const tools: WorkspaceTools = {
+    tools: [{ name: "edit_file", description: "edit", parameters: [], run: async () => ({ output: "", summary: "" }) }],
+    orientation: "",
+    run: async (call) => {
+      calls.push(call.name)
+      return { output: "catastrophic regression", summary: "regression", failed: true }
+    }
+  }
+  await collect(withTools(client, tools, {
+    mode: "native",
+    shouldStop: () => stopped,
+    onToolResult: async () => { stopped = true }
+  }).chat(ask("edit")))
+  assert.deepStrictEqual(calls, ["edit_file"], "the blocked second call never reaches WorkspaceTools.run")
+  assert.equal(requests.length, 1, "no implementing-model continuation request is issued inside the unsafe turn")
+})

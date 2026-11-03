@@ -990,11 +990,18 @@ const bridgeMessages: Array<{ type: string; data: unknown }> = []
 
       // Override off: the profile's declaration still restricts the tools.
       const restricted = await runWith(false, "tools:\n  - vscode/readFile\n")
-      assert.deepStrictEqual(restricted.tools?.map((tool) => tool.name), ["read_file"])
+      if (restricted.tools) {
+        assert.deepStrictEqual(restricted.tools.map((tool) => tool.name), ["read_file"])
+      } else {
+        const prompt = restricted.messages.map((message) => String((message as ChatCompletionMessage).content ?? "")).join("\n")
+        assert.match(prompt, /read_file/, "text-mode providers receive the selected read tool instructions")
+        assert.doesNotMatch(prompt, /name: edit_file|"name":"edit_file"/, "text-mode providers do not receive deselected edit instructions")
+      }
 
       // Override on: incompatible Copilot tool names no longer suppress eligible tools,
       // and the outgoing provider request is authoritative.
       const ignored = await runWith(true, "tools:\n  - browser\n  - todo\n  - vscode/webSearch\n")
+      assert.match(fs.readFileSync(profilePath, "utf8"), /browser/, "ignoring restrictions does not rewrite the agent profile")
       // When the provider includes tools in the request, verify they are exposed.
       // When the provider mode is "text", tools might not be included in the request,
       // so we rely on the diagnostic message instead.
@@ -1032,7 +1039,6 @@ const bridgeMessages: Array<{ type: string; data: unknown }> = []
       // Override on: the profile's instructions remain intact and the file itself is unedited.
       const system = ignored.messages.at(0)
       assert.ok(system && String((system as ChatCompletionMessage).content).includes("Plan the requested audit."))
-      assert.match(fs.readFileSync(profilePath, "utf8"), /browser/)
 
       // Override off again: the restriction is back in force.
       const back = await runWith(false, "tools:\n  - vscode/readFile\n")
@@ -1042,11 +1048,13 @@ const bridgeMessages: Array<{ type: string; data: unknown }> = []
       if (back.tools) {
         assert.deepStrictEqual(back.tools.map((tool) => tool.name), ["read_file"])
       } else {
-        assert.match(notification().pop() ?? "", /The profile's tool restrictions are back in force./)
+        const prompt = back.messages.map((message) => String((message as ChatCompletionMessage).content ?? "")).join("\n")
+        assert.match(prompt, /read_file/, "text-mode providers receive the selected read tool instructions")
+        assert.doesNotMatch(prompt, /name: edit_file|"name":"edit_file"/, "text-mode providers do not receive deselected edit instructions")
       }
 
       // The setting round-trips through the configuration system.
-      assert.strictEqual(settings.get<boolean>("agents.ignoreAgentToolRestrictions"), false)
+      assert.strictEqual((settings.inspect("agents")?.globalValue as { ignoreAgentToolRestrictions?: boolean } | undefined)?.ignoreAgentToolRestrictions, false)
     } finally {
       chat.dispose()
       await settings.update("agents", previousAgents, vscode.ConfigurationTarget.Global)

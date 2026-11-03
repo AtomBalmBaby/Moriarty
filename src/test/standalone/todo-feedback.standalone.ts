@@ -5,12 +5,13 @@ import path from "node:path"
 import { test } from "node:test"
 import initSqlJs from "sql.js"
 
-import { evaluateTodoReview, feedbackContext, parseTodoEvaluation, todoReviewInput } from "../../extension/todos/feedback"
+import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
+import { evaluateTodoReview, feedbackContext, parseTodoEvaluation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput } from "../../extension/todos/feedback"
 import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
-const plan = (tasks: { id: string; acceptance: string }[]) => ({
+const plan = (tasks: { id: string; acceptance: string; dependencies?: string[] }[]) => ({
   planId: "feedback-plan",
   version: 1 as const,
   revision: 1,
@@ -21,25 +22,27 @@ const plan = (tasks: { id: string; acceptance: string }[]) => ({
     title: task.id,
     description: `Work for ${task.id}`,
     acceptanceCriteria: [task.acceptance],
-    dependencies: [] as string[]
+    dependencies: task.dependencies ?? []
   }))
 })
 
-const fixture = async (tasks: { id: string; acceptance: string }[]) => {
+const fixture = async (tasks: { id: string; acceptance: string; dependencies?: string[] }[], complete = true) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-feedback-"))
   const databasePath = path.join(directory, "twinny-state.sqlite")
   const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///feedback-project"]), conversationId: "feedback-chat" }
   const repository = new TodoRepository(databasePath, wasmPath)
   const initial = await repository.synchronizeIntentPlan(scope, plan(tasks), { prompt: "Verify the requested work" })
-  const items = []
-  for (const item of initial.items) {
-    items.push(await repository.updateItem(scope, {
-      itemId: item.id,
-      expectedVersion: item.version,
-      patch: { status: "completed" },
-      actor: "model",
-      requestId: `claim-${item.id}`
-    }))
+  const items = complete ? [] : initial.items
+  if (complete) {
+    for (const item of initial.items) {
+      items.push(await repository.updateItem(scope, {
+        itemId: item.id,
+        expectedVersion: item.version,
+        patch: { status: "completed" },
+        actor: "model",
+        requestId: `claim-${item.id}`
+      }))
+    }
   }
   return { directory, databasePath, scope, repository, items }
 }
@@ -319,6 +322,140 @@ test("an implementation cannot be accepted from prose without verified workspace
     assert.equal(evaluation.decision, "needs_evidence")
     assert.match(evaluation.problems.join(" "), /No verified workspace file changes/)
     assert.equal((await state.repository.getList(state.scope)).items[0].status, "in_review")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+
+test("evaluator fixtures validate schema, canonical plan IDs, and wrapped JSON independently", async () => {
+  const state = await fixture([{ id: "task-1", acceptance: "Source paths are documented" }])
+  try {
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const valid = responseFor(review)
+    assert.equal(parseTodoEvaluation(valid, review, "mock-reviewer").taskId, review.planTaskId)
+    assert.equal(todoReviewInput(review).includes("\"taskId\":\"task-1\""), true)
+    assert.equal(todoReviewInput(review).includes("\"todoId\":\"" + review.task.id + "\""), true)
+    assert.equal(parseTodoEvaluation("Assessment follows.\n\x60\x60\x60json\n" + valid + "\n\x60\x60\x60\nEnd.", review, "mock-reviewer").taskId, review.planTaskId)
+
+    const wrongId = JSON.parse(valid)
+    wrongId.taskId = review.task.id
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(wrongId), review, "mock-reviewer"), (error: unknown) => error instanceof TodoEvaluationValidationError && error.code === "task_id" && error.expected === review.planTaskId && error.received === review.task.id)
+
+    const missingVersion = JSON.parse(valid)
+    delete missingVersion.schemaVersion
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(missingVersion), review, "mock-reviewer"), (error: unknown) => error instanceof TodoEvaluationValidationError && error.code === "missing_field")
+    const wrongVersion = JSON.parse(valid)
+    wrongVersion.schemaVersion = 2
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(wrongVersion), review, "mock-reviewer"), (error: unknown) => error instanceof TodoEvaluationValidationError && error.code === "schema_version")
+    const unknownDecision = JSON.parse(valid)
+    unknownDecision.decision = "approve"
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(unknownDecision), review, "mock-reviewer"), (error: unknown) => error instanceof TodoEvaluationValidationError && error.code === "decision")
+    assert.throws(() => parseTodoEvaluation("{broken", review, "mock-reviewer"), (error: unknown) => error instanceof TodoEvaluationValidationError && error.code === "malformed_json")
+    assert.throws(() => parseTodoEvaluation("", review, "mock-reviewer"), (error: unknown) => error instanceof TodoEvaluationValidationError && error.code === "empty_response")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("one malformed evaluator response can be corrected once and only the validated result persists", async () => {
+  const state = await fixture([{ id: "task-retry", acceptance: "Source paths are documented" }])
+  try {
+    const item = state.items[0]
+    const observation = await addObservation(state.repository, state.scope, item.id)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const wrong = JSON.parse(responseFor(review, { refs: [observation.id] }))
+    wrong.taskId = review.task.id
+    let calls = 0
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async (correction) => {
+      calls++
+      if (calls === 1) {
+        assert.equal(correction, undefined)
+        return JSON.stringify(wrong)
+      }
+      assert.match(correction ?? "", /canonical taskId/)
+      return responseFor(review, { refs: [observation.id] })
+    }, "mock-reviewer")
+    assert.equal(calls, 2)
+    assert.equal(evaluation.decision, "accept")
+    assert.equal((await state.repository.getEvaluationHistory(state.scope, item.id)).length, 1)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("failed correction and provider failures are never persisted or accepted", async () => {
+  const malformedState = await fixture([{ id: "task-bad-retry", acceptance: "Source paths are documented" }])
+  try {
+    const review = (await malformedState.repository.getReviewPackages(malformedState.scope))[0]
+    let calls = 0
+    await assert.rejects(evaluateTodoReview(malformedState.repository, malformedState.scope, review, async () => {
+      calls++
+      return "not JSON"
+    }, "mock-reviewer"), (error: unknown) => error instanceof TodoEvaluationValidationError && error.code === "malformed_json")
+    assert.equal(calls, 2)
+    assert.equal((await malformedState.repository.getEvaluationHistory(malformedState.scope, review.task.id)).length, 0)
+  } finally {
+    fs.rmSync(malformedState.directory, { recursive: true, force: true })
+  }
+
+  const providerState = await fixture([{ id: "task-provider-error", acceptance: "Source paths are documented" }])
+  try {
+    const review = (await providerState.repository.getReviewPackages(providerState.scope))[0]
+    let calls = 0
+    await assert.rejects(evaluateTodoReview(providerState.repository, providerState.scope, review, async () => {
+      calls++
+      throw new Error("provider unavailable")
+    }, "mock-reviewer"), /provider unavailable/)
+    assert.equal(calls, 1, "provider errors are not malformed-output retries")
+    assert.equal((await providerState.repository.getEvaluationHistory(providerState.scope, review.task.id)).length, 0)
+  } finally {
+    fs.rmSync(providerState.directory, { recursive: true, force: true })
+  }
+})
+
+
+test("accepted source inspection persists and unlocks implementation without accepting the goal", async () => {
+  const state = await fixture([
+    { id: "task-1", acceptance: "TODO panel file paths are documented" },
+    { id: "task-2", acceptance: "Compact collapsible cards are implemented", dependencies: ["task-1"] }
+  ], false)
+  try {
+    const controller = new ExecutionReconciliationController()
+    const inspection = await state.repository.getActiveIntentContext(state.scope)
+    assert.equal(inspection?.planTaskId, "task-1")
+    assert.equal(inspection?.task.status, "pending")
+    const inReview = await state.repository.updateItem(state.scope, {
+      itemId: inspection!.task.id,
+      expectedVersion: inspection!.task.version,
+      patch: { status: "in_review" },
+      actor: "model",
+      requestId: "inspection-in-review"
+    })
+    const observation = await addObservation(state.repository, state.scope, inReview.id)
+    const review = (await state.repository.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === inReview.id)!
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review,
+      async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer", { requireWorkspaceChanges: taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria), hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", "an inspection task can complete without editing source files")
+    assert.equal(taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria), false)
+    assert.equal((await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.id === inReview.id)?.status, "completed")
+
+    const implementation = await state.repository.getActiveIntentContext(state.scope)
+    assert.equal(implementation?.planTaskId, "task-2", "the completed inspection dependency unlocks implementation")
+    assert.equal(taskRequiresWorkspaceChanges(implementation!.task, implementation!.acceptanceCriteria), true)
+    assert.equal(controller.advanceAcceptedTask("task-1:accepted").state, "continue")
+    const continuation = continuationContext({
+      goal: inspection!.goal,
+      constraints: inspection!.constraints,
+      task: implementation!.task.title,
+      criteria: implementation!.acceptanceCriteria,
+      feedback: ["The inspection task was accepted. Implement the outstanding feature."],
+      verifiedObservations: ["read_file src/webview/todo-panel.tsx: identified the existing task card handler"],
+      finalResponse: "The files are inspected."
+    })
+    assert.match(continuation, /Current unresolved task: task-2/)
+    assert.match(continuation, /identified the existing task card handler/)
+    assert.equal(controller.state, "continue", "task acceptance does not declare goal-level completion")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }

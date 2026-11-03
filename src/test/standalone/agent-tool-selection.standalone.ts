@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { agentToolSelectionDiagnostic, resolveAgentToolSelection } from "../../extension/agents/tool-selection"
+import { agentToolSelectionDiagnostic, projectTaskRelevantTools, resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 
 const native = ["read_file", "list_dir", "grep", "edit_file", "run_command"].map((name) => ({ name }))
 const mcp = [
@@ -47,4 +47,26 @@ test("explicit restrictive and empty declarations never expand to available tool
   assert.deepEqual(empty.native, [])
   assert.deepEqual(empty.mcp, [])
   assert.match(agentToolSelectionDiagnostic([], [], native.map((tool) => tool.name), 0), /explicitly declares an empty tools list/)
+})
+
+
+test("adaptive task projection reduces unrelated MCP tools without granting tools", () => {
+  const available = [
+    { server: "filesystem", tool: "read_file" },
+    { server: "maxential-thinking", tool: "start_session" },
+    { server: "context7", tool: "query_docs" },
+    { server: "workspace", tool: "run_command" }
+  ]
+  const authorized = resolveAgentToolSelection(["filesystem/read_file", "workspace/run_command", "maxential-thinking/start_session"], native, available)
+  const adaptive = projectTaskRelevantTools(authorized.native, authorized.mcp, "Implement compact TODO panel cards", true)
+  assert.deepEqual(adaptive.mcp.map((tool) => tool.server + "/" + tool.tool), ["filesystem/read_file", "workspace/run_command"])
+  assert.deepEqual(adaptive.native, authorized.native)
+  assert.deepEqual(adaptive.excluded.map((tool) => tool.name), ["maxential-thinking/start_session"])
+  assert.ok(!adaptive.mcp.some((tool) => tool.server === "context7"), "an unauthorized MCP tool is never introduced")
+})
+
+test("unrestricted exposure preserves the authorized inventory and adaptive fallback is conservative", () => {
+  const unrelated = [{ server: "unknown", tool: "opaque_operation" }]
+  assert.deepEqual(projectTaskRelevantTools(native, unrelated, "Implement the panel", false).mcp, unrelated)
+  assert.deepEqual(projectTaskRelevantTools(native, unrelated, "Implement the panel", true).mcp, unrelated, "preserve inventory if capability relevance is unknown")
 })

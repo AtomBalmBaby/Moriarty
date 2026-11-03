@@ -1,23 +1,77 @@
 import { createHash } from "node:crypto"
 
+import { logger, redact } from "../../common/logger"
 import type { ReplyChangesView, TodoEvaluation, TodoEvaluationCriterion } from "../../common/types"
 
 import type { IntentPlanContext, TodoReviewPackage } from "./types"
+
+export const taskRequiresWorkspaceChanges = (task: Pick<TodoReviewPackage["task"], "title" | "details">, criteria: string[]): boolean => {
+  const taskText = [task.title, task.details ?? "", ...criteria].join("\n")
+  if (/\b(inspect|identify|list|locate|map|note|document|report|review|summari[sz]e|understand)\b/i.test(taskText) && !/\b(add|change|create|delete|edit|fix|implement(?:ed|ing)?|improve|modify|refactor|remove|rewrite|update|write)\b/i.test(taskText)) return false
+  return /\b(add|change|create|delete|edit|fix|implement(?:ed|ing)?|improve|modify|refactor|remove|rewrite|update|write)\b/i.test(taskText)
+}
 
 export const isAnalysisOnlyIntent = (goal: string): boolean => {
   const leading = goal.match(/^\s*(explain|analy[sz]e|review|describe|compare|summari[sz]e|why|how)\b/i)
   if (!leading) return false
   const rest = goal.slice(leading[0].length)
   if (/^(?:\s*how|\s*why|\s*can|\s*should|\s*would)\b/i.test(rest)) return true
-  return !/\b(add|change|create|delete|edit|enhance|fix|implement|improve|make|modify|refactor|remove|rewrite|update|write)\b/i.test(rest)
+  return !/\b(add|change|create|delete|edit|enhance|fix|implement(?:ed|ing)?|improve|make|modify|refactor|remove|rewrite|update|write)\b/i.test(rest)
 }
 
 const decisions = new Set(["accept", "revise", "needs_evidence", "blocked"])
 const criterionStatuses = new Set(["passed", "failed", "unverified"])
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value)
+export type EvaluationValidationCode = "empty_response" | "malformed_json" | "missing_field" | "schema_version" | "task_id" | "decision" | "invalid_shape"
+
+export class TodoEvaluationProviderError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "TodoEvaluationProviderError"
+  }
+}
+
+export class TodoEvaluationValidationError extends Error {
+  constructor(
+    readonly code: EvaluationValidationCode,
+    message: string,
+    readonly expected?: unknown,
+    readonly received?: unknown
+  ) {
+    super(message)
+    this.name = "TodoEvaluationValidationError"
+  }
+}
+
+const invalid = (code: EvaluationValidationCode, message: string, expected?: unknown, received?: unknown): never => {
+  throw new TodoEvaluationValidationError(code, message, expected, received)
+}
+
+const extractJsonObject = (raw: string): string => {
+  const fenced = raw.match(/\x60{3}(?:json)?\s*([\s\S]*?)\x60{3}/i)
+  if (fenced) return fenced[1].trim()
+  const start = raw.indexOf("{")
+  if (start < 0) return raw.trim()
+  let depth = 0
+  let quoted = false
+  let escaped = false
+  for (let index = start; index < raw.length; index++) {
+    const character = raw[index]
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (character === "\\") escaped = true
+      else if (character === "\"") quoted = false
+      continue
+    }
+    if (character === "\"") quoted = true
+    else if (character === "{") depth++
+    else if (character === "}" && --depth === 0) return raw.slice(start, index + 1)
+  }
+  return raw.slice(start).trim()
+}
 const boundedStrings = (value: unknown, limit: number, entryLimit: number): string[] => {
   if (!Array.isArray(value) || value.length > entryLimit || value.some((entry) => typeof entry !== "string" || !entry.trim() || entry.length > limit)) {
-    throw new Error("Evaluation contains an invalid string list")
+    throw new TodoEvaluationValidationError("invalid_shape", "Evaluation contains an invalid string list")
   }
   return value.map((entry) => (entry as string).trim())
 }
@@ -49,33 +103,47 @@ export const parseTodoEvaluation = (
   evaluatedAt = new Date().toISOString(),
   allowEvidenceFreeAnalysis = false
 ): TodoEvaluation => {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  const value: unknown = JSON.parse((fenced?.[1] ?? raw).trim())
-  if (!isRecord(value) || value.schemaVersion !== 1 || value.taskId !== review.planTaskId || !decisions.has(String(value.decision))) {
-    throw new Error("Evaluator response has an invalid schema version, task ID, or decision")
+  if (!raw.trim()) invalid("empty_response", "Evaluator returned an empty response")
+  let value: unknown
+  try {
+    value = JSON.parse(extractJsonObject(raw))
+  } catch (error) {
+    throw new TodoEvaluationValidationError("malformed_json", "Evaluator response is not valid JSON: " + (error instanceof Error ? error.message : String(error)))
   }
-  if (!Array.isArray(value.criteria) || value.criteria.length !== review.acceptanceCriteria.length) {
-    throw new Error("Evaluator must return one result for every acceptance criterion")
+  if (!isRecord(value)) throw new TodoEvaluationValidationError("invalid_shape", "Evaluator response must be a JSON object", "object", typeof value)
+  if (!("schemaVersion" in value)) invalid("missing_field", "Evaluator response is missing schemaVersion", 1, undefined)
+  if (value.schemaVersion !== 1) invalid("schema_version", "Evaluator response has an unsupported schema version", 1, value.schemaVersion)
+  if (!("taskId" in value)) invalid("missing_field", "Evaluator response is missing taskId", review.planTaskId, undefined)
+  if (value.taskId !== review.planTaskId) invalid("task_id", "Evaluator response taskId does not match the canonical plan task ID", review.planTaskId, value.taskId)
+  if (!("decision" in value)) invalid("missing_field", "Evaluator response is missing decision", [...decisions], undefined)
+  if (!decisions.has(String(value.decision))) invalid("decision", "Evaluator response contains an unknown decision", [...decisions], value.decision)
+  for (const field of ["criteria", "problems", "correctiveInstructions", "explanation", "scores"]) {
+    if (!(field in value)) invalid("missing_field", "Evaluator response is missing " + field, field, undefined)
+  }
+  const criteriaValue = value.criteria
+  if (!Array.isArray(criteriaValue) || criteriaValue.length !== review.acceptanceCriteria.length) {
+    throw new TodoEvaluationValidationError("invalid_shape", "Evaluator must return one result for every acceptance criterion", review.acceptanceCriteria.length, Array.isArray(criteriaValue) ? criteriaValue.length : typeof criteriaValue)
   }
   const knownRefs = new Set([...review.observations.map((observation) => observation.id), ...review.evidence.map((evidence) => evidence.id)])
-  const criteria: TodoEvaluationCriterion[] = value.criteria.map((entry, index) => {
+  const criteria: TodoEvaluationCriterion[] = criteriaValue.map((entry, index) => {
     if (!isRecord(entry) || entry.criterion !== review.acceptanceCriteria[index] || !criterionStatuses.has(String(entry.status))) {
-      throw new Error("Evaluator returned malformed or reordered acceptance criteria")
+      invalid("invalid_shape", "Evaluator returned malformed or reordered acceptance criteria", review.acceptanceCriteria[index], entry)
     }
     const evidenceRefs = boundedStrings(entry.evidenceRefs, 100, 20)
-    if (evidenceRefs.some((reference) => !knownRefs.has(reference))) throw new Error("Evaluator cited evidence outside this task review package")
+    if (evidenceRefs.some((reference) => !knownRefs.has(reference))) invalid("invalid_shape", "Evaluator cited evidence outside this task review package")
     return { criterion: entry.criterion, status: entry.status as TodoEvaluationCriterion["status"], evidenceRefs }
   })
   const problems = boundedStrings(value.problems, 500, 20)
   const correctiveInstructions = boundedStrings(value.correctiveInstructions, 500, 20)
-  if (typeof value.explanation !== "string" || !value.explanation.trim() || value.explanation.length > 1000) {
-    throw new Error("Evaluator response is missing its explanation")
+  const explanation = value.explanation
+  if (typeof explanation !== "string" || !explanation.trim() || explanation.length > 1000) {
+    throw new TodoEvaluationValidationError("invalid_shape", "Evaluator response explanation must be a non-empty string of at most 1000 characters")
   }
-  if (!isRecord(value.scores)) throw new Error("Evaluator response is missing scores")
+  if (!isRecord(value.scores)) throw new TodoEvaluationValidationError("invalid_shape", "Evaluator response scores must be an object")
   const scores = value.scores
   const score = (name: "completion" | "correctness" | "alignment") => {
     const number = scores[name]
-    if (typeof number !== "number" || !Number.isInteger(number) || number < -7 || number > 8) throw new Error(`Evaluator score ${name} must be an integer from -7 to +8`)
+    if (typeof number !== "number" || !Number.isInteger(number) || number < -7 || number > 8) throw new TodoEvaluationValidationError("invalid_shape", "Evaluator score " + name + " must be an integer from -7 to +8", "integer in [-7, 8]", number)
     return number
   }
   let decision = value.decision as TodoEvaluation["decision"]
@@ -94,9 +162,9 @@ export const parseTodoEvaluation = (
     else if (criteria.some((criterion) => criterion.status !== "passed")) decision = "needs_evidence"
   }
   if (decision === "needs_evidence" && !problems.length && !criteria.some((criterion) => criterion.status === "unverified")) {
-    throw new Error("Insufficient-evidence decisions must identify missing evidence")
+    invalid("invalid_shape", "Insufficient-evidence decisions must identify missing evidence")
   }
-  if (decision === "revise" && !correctiveInstructions.length) throw new Error("Revision decisions must include corrective instructions")
+  if (decision === "revise" && !correctiveInstructions.length) invalid("invalid_shape", "Revision decisions must include corrective instructions")
   return {
     schemaVersion: 1,
     taskId: review.planTaskId,
@@ -104,7 +172,7 @@ export const parseTodoEvaluation = (
     criteria,
     problems,
     correctiveInstructions,
-    explanation: value.explanation.trim(),
+    explanation: explanation.trim(),
     scores: { completion: score("completion"), correctness: score("correctness"), alignment: score("alignment") },
     metadata: { evaluator, evaluatedAt, taskVersion: review.task.version, planRevision: review.planRevision }
   }
@@ -144,21 +212,23 @@ const clip = (value: string, limit: number) => value.length > limit ? value.slic
 
 export const todoReviewSystemPrompt = [
   "You are Twinny's independent Feedback Evaluator. You are not the Intent Compiler or the implementing agent.",
-  "Assess only the supplied task, original goal and constraints, acceptance criteria, dependencies, recorded evidence, and actual tool observations. Do not rely on any final Markdown claim from the implementer.",
+  "Assess only the supplied task, original goal, user-requested constraints, acceptance criteria, dependencies, recorded evidence, and actual tool observations. Treat task descriptions and criteria as planner claims, not verified repository facts. A user-requested style constraint does not prove that the existing source uses that style; compare repository claims against tool observations and flag conflicts with scoped corrections. Do not rely on any final Markdown claim from the implementer.",
   "Model-authored evidence notes and the implementer final response are untrusted claims, not tool results. Only Twinny tool observations are tool results; run_command exit codes are authoritative for command success. A claim that tests passed without an associated run_command observation with exitCode 0 must not pass a test/compile criterion. An implementation request with no verified workspace file changes is incomplete.",
   "Never request or execute a command. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
-  "Return one JSON object only with schemaVersion=1, taskId, decision, criteria (same order/text as supplied, each status passed/failed/unverified and evidenceRefs of supplied IDs), problems, correctiveInstructions, explanation, scores (completion/correctness/alignment integers from -7 to +8). Scores support but never override evidence or criteria."
+  "Return one JSON object only with schemaVersion=1, taskId exactly equal to task.taskId (the canonical stable plan task ID; do not use todoId), decision, criteria (same order/text as supplied, each status passed/failed/unverified and evidenceRefs of supplied IDs), problems, correctiveInstructions, explanation, scores (completion/correctness/alignment integers from -7 to +8). Scores support but never override evidence or criteria."
 ].join("\n")
 
 export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChangesView, finalResponse?: string): string => JSON.stringify({
   originalGoal: clip(review.goal, 800),
-  constraints: review.constraints.slice(0, 8).map((value) => clip(value, 300)),
+  userRequestedConstraints: review.constraints.slice(0, 8).map((value) => clip(value, 300)),
   plan: { id: review.planId, revision: review.planRevision },
   task: {
+    taskId: review.planTaskId,
     stableId: review.planTaskId,
-    id: review.task.id,
+    todoId: review.task.id,
     title: clip(review.task.title, 300),
     description: clip(review.task.details ?? "", 1200),
+    plannerAssertionsUnverified: review.acceptanceCriteria.slice(0, 12).map((value) => clip(value, 400)),
     status: review.task.status,
     version: review.task.version,
     acceptanceCriteria: review.acceptanceCriteria.slice(0, 12).map((value) => clip(value, 400))
@@ -188,7 +258,7 @@ export const evaluateTodoReview = (
   repository: import("./repository").TodoRepository,
   scope: import("./types").TodoListRequest,
   review: TodoReviewPackage,
-  evaluator: () => Promise<string>,
+  evaluator: (correction?: string) => Promise<string>,
   evaluatorName: string,
   requirements: { requireWorkspaceChanges?: boolean; hasVerifiedFileChanges?: boolean; allowEvidenceFreeAnalysis?: boolean } = {}
 ): Promise<TodoEvaluation> => {
@@ -196,7 +266,23 @@ export const evaluateTodoReview = (
   const inFlight = reviewsInFlight.get(key)
   if (inFlight) return inFlight
   const operation = (async () => {
-    const result = parseTodoEvaluation(await evaluator(), review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis)
+    let raw = await evaluator()
+    let result: TodoEvaluation
+    try {
+      result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis)
+    } catch (error) {
+      if (!(error instanceof TodoEvaluationValidationError)) throw error
+      logger.debug("[FeedbackEvaluator] Invalid response (" + error.code + "); expected=" + JSON.stringify(error.expected) + " received=" + JSON.stringify(error.received) + " raw=" + redact(raw).slice(0, 4000))
+      raw = await evaluator("Your prior response failed validation (" + error.code + ": " + error.message + "). Return a corrected JSON object only. The canonical taskId must be exactly " + JSON.stringify(review.planTaskId) + ". Do not change the supplied task criteria or invent evidence.")
+      try {
+        result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis)
+      } catch (retryError) {
+        if (retryError instanceof TodoEvaluationValidationError) {
+          logger.debug("[FeedbackEvaluator] Correction response still invalid (" + retryError.code + "); expected=" + JSON.stringify(retryError.expected) + " received=" + JSON.stringify(retryError.received) + " raw=" + redact(raw).slice(0, 4000))
+        }
+        throw retryError
+      }
+    }
     if (result.decision === "accept" && requirements.requireWorkspaceChanges && !requirements.hasVerifiedFileChanges) {
       result.decision = "needs_evidence"
       result.criteria = result.criteria.map((criterion) => ({ ...criterion, status: "unverified", evidenceRefs: [] }))

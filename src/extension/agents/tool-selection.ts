@@ -34,10 +34,11 @@ export const resolveAgentToolSelection = <TNative extends NamedAgentTool, TMcp e
   nativeTools: TNative[],
   mcpTools: TMcp[]
 ): AgentToolSelection<TNative, TMcp> => {
-  const requested: string[] = !requestedTools ? [] : Array.isArray(requestedTools) ? requestedTools : [requestedTools]
-  if (requested.length === 0) {
+  if (requestedTools === undefined) {
     return { explicit: false, native: nativeTools, mcp: mcpTools, unmatched: [] }
   }
+  const requested: string[] = Array.isArray(requestedTools) ? requestedTools : [requestedTools]
+  if (requested.length === 0) return { explicit: true, native: [], mcp: [], unmatched: [] }
   const nativeByName = new Map<string, TNative>()
   nativeTools.forEach(tool => nativeByName.set(normalize(tool.name), tool))
   const selectedNative = new Set<TNative>()
@@ -75,7 +76,7 @@ export const resolveAgentToolSelection = <TNative extends NamedAgentTool, TMcp e
           mcpMatchFound = true
         }
       }
-    } else {
+    } else if (!matched) {
       for (const tool of mcpTools) {
         if (normalize(tool.tool) === name) {
           selectedMcp.add(tool)
@@ -107,4 +108,46 @@ export const agentToolSelectionDiagnostic = (
   const alternatives = available.length ? ` Available alternatives: ${available.join(", ")}.` : " No tools are currently eligible under Twinny's settings and security policy."
   const outcome = resolvedCount === 0 ? "Agent tool selection resolved to no tools." : "Agent tool selection is partially unresolved."
   return `${outcome} ${selection}${unresolved}${alternatives}`
+}
+
+
+export interface TaskToolProjection<TNative extends NamedAgentTool, TMcp extends McpAgentTool> {
+  native: TNative[]
+  mcp: TMcp[]
+  excluded: Array<{ name: string; reason: string }>
+}
+
+const TASK_RELEVANT_MCP = /(?:read|file|workspace|search|grep|symbol|diagnostic|test|command|git|todo|edit|write)/i
+const DOCUMENTATION_TASK = /(?:documentation|docs|library|api reference)/i
+
+export const projectTaskRelevantTools = <TNative extends NamedAgentTool, TMcp extends McpAgentTool>(
+  native: TNative[],
+  mcp: TMcp[],
+  taskContext: string,
+  adaptiveEnabled: boolean
+): TaskToolProjection<TNative, TMcp> => {
+  if (!adaptiveEnabled) return { native, mcp, excluded: [] }
+  const documentationTask = DOCUMENTATION_TASK.test(taskContext)
+  const eligible = mcp.filter((tool) => TASK_RELEVANT_MCP.test(tool.server + " " + tool.tool) || (documentationTask && /(?:context7|deepwiki|docs?)/i.test(tool.server + " " + tool.tool)))
+  if (mcp.length && !eligible.length) return { native, mcp, excluded: [] }
+  const seen = new Set<string>()
+  const retained: TMcp[] = []
+  const duplicates = new Set<TMcp>()
+  for (const tool of eligible) {
+    const key = (tool.server + "/" + tool.tool).toLowerCase()
+    if (seen.has(key)) duplicates.add(tool)
+    else {
+      seen.add(key)
+      retained.push(tool)
+    }
+  }
+  const retainedSet = new Set(retained)
+  return {
+    native,
+    mcp: retained,
+    excluded: mcp.filter((tool) => !retainedSet.has(tool)).map((tool) => ({
+      name: tool.server + "/" + tool.tool,
+      reason: duplicates.has(tool) ? "Duplicate MCP capability with the same server and tool" : "No matching task capability; adaptive exposure is enabled"
+    }))
+  }
 }
