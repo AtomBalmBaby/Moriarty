@@ -6,13 +6,15 @@ import * as vscode from "vscode"
 
 import {
   ACTIVE_CHAT_PROVIDER_STORAGE_KEY,
-  ACTIVE_INTENT_PROVIDER_STORAGE_KEY
+  ACTIVE_INTENT_PROVIDER_STORAGE_KEY,
+  TODO_EVENT_NAME
 } from "../../common/constants"
 import { ChatCompletionMessage } from "../../common/types"
 import { Chat, parseIntentCompilerResponse, summarizeIntentHistory } from "../../extension/chat/index"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
+import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
 
 const makeBridge = () => ({
   emit: () => undefined,
@@ -26,6 +28,7 @@ const makeBridge = () => ({
 class ScriptedCompilerModel implements InferenceProvider {
   public readonly id = "scripted-intent-compiler"
   public requests: ChatRequest[] = []
+  public output?: string
 
   async *chat(request: ChatRequest) {
     this.requests.push(structuredClone(request))
@@ -36,9 +39,21 @@ class ScriptedCompilerModel implements InferenceProvider {
       exclusions: ["Do not add unrelated features"],
       strategy: "Read the focused files, patch, then run the relevant test.",
       verification: ["Run the relevant test or validation command"],
-      assumptions: ["The user intends a minimal, safe change."]
+      assumptions: ["The user intends a minimal, safe change."],
+      plan: {
+        planId: "parser-plan",
+        version: 1,
+        revision: 1,
+        goal: "Make parser behavior reliable",
+        constraints: ["Preserve public API"],
+        tasks: [
+          { id: "inspect-parser", title: "Inspect parser", description: "Inspect parser behavior", acceptanceCriteria: ["Identify faulty branch"], dependencies: [] },
+          { id: "fix-parser", title: "Fix parser", description: "Correct faulty branch", acceptanceCriteria: ["Regression test passes"], dependencies: ["inspect-parser"] },
+          { id: "verify-parser", title: "Verify parser", description: "Run focused tests", acceptanceCriteria: ["Focused tests pass"], dependencies: ["fix-parser"] }
+        ]
+      }
     }
-    yield { content: JSON.stringify(payload) }
+    yield { content: this.output ?? JSON.stringify(payload) }
   }
 
   capabilities() {
@@ -55,7 +70,8 @@ suite("Intent compiler", () => {
       "exclusions": ["Do not add unrelated features"],
       "strategy": "Read the focused files, patch, then run the relevant test.",
       "verification": ["Run the relevant test or validation command"],
-      "assumptions": ["The user intends a minimal, safe change."]
+      "assumptions": ["The user intends a minimal, safe change."],
+      "plan": {"planId":"parser-plan","version":1,"revision":1,"goal":"Make parser behavior reliable","constraints":[],"tasks":[{"id":"inspect-parser","title":"Inspect parser","description":"Inspect parser behavior","acceptanceCriteria":["Identify faulty branch"],"dependencies":[]}]}
     }`)
 
     assert.ok(parsed)
@@ -91,6 +107,64 @@ suite("Intent compiler", () => {
     const result = await chat.compileIntent("Fix the bug in the parser.")
     assert.strictEqual(result, undefined)
     chat.dispose()
+  })
+
+  test("compilation synchronizes a structured plan into the real chat-scoped TODO repository", async () => {
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousEnabled = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
+    const previousMode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
+    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
+    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
+    const provider = {
+      id: "scripted-intent-provider",
+      label: "Scripted compiler",
+      modelName: "scripted-intent-model",
+      provider: "scripted-intent-compiler",
+      type: "intent" as const
+    }
+    const model = new ScriptedCompilerModel()
+    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalState: { get: (key: string) => key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY ? provider : undefined, update: async () => undefined },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-intent-sync-"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const emitted: string[] = []
+    const bridge = { ...makeBridge(), emit: (event: string) => emitted.push(event) } as unknown as ExtensionBridge
+    const chat = new Chat(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
+    const scope = {
+      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      conversationId: "intent-sync-chat"
+    }
+    try {
+      const first = await chat.compileIntent("Fix the parser.", [], undefined, scope.conversationId)
+      assert.ok(first?.plan)
+      const firstList = await repository.getList(scope)
+      assert.equal(firstList.items.filter((item) => item.source === "intent_compiler").length, 3)
+      assert.ok(emitted.includes(TODO_EVENT_NAME.changed))
+      assert.deepEqual(firstList.items.map((item) => item.title), ["Inspect parser", "Fix parser", "Verify parser"])
+      assert.equal((await repository.getIntentResult(scope) as { originalPrompt?: string } | undefined)?.originalPrompt, "Fix the parser.")
+
+      await chat.compileIntent("Fix the parser.", [], undefined, scope.conversationId)
+      const repeated = await repository.getList(scope)
+      assert.equal(repeated.id, firstList.id)
+      assert.equal(repeated.items.length, 3)
+      assert.equal(repeated.items.filter((item) => item.source === "intent_compiler").length, 3)
+      assert.ok(model.requests[1].messages.some((message) => typeof message.content === "string" && message.content.includes("Existing native TODO plan")))
+      assert.ok(first?.plan.tasks.every((task) => task.acceptanceCriteria.length > 0))
+
+      model.output = "malformed compiler output"
+      assert.equal(await chat.compileIntent("Keep the existing TODOs.", [], undefined, scope.conversationId), undefined)
+      assert.deepEqual(await repository.getList(scope), repeated)
+    } finally {
+      chat.dispose()
+      await fs.rm(root, { recursive: true, force: true })
+      await settings.update("chatToolsIntentCompilerEnabled", previousEnabled, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsIntentCompilerMode", previousMode, vscode.ConfigurationTarget.Global)
+    }
   })
 
   test("compilation independently resolves default, custom, and None instructions while enforcing JSON", async () => {

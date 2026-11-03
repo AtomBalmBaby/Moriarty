@@ -1,7 +1,21 @@
 import type { TodoEvidence, TodoItem, TodoPriority } from "../../common/types"
 
-export type { TodoEvidence, TodoItem, TodoListSnapshot,TodoPriority, TodoStatus, TodoVerification } from "../../common/types"
+export type { TodoEvidence, TodoItem, TodoListSnapshot, TodoPriority, TodoSource, TodoStatus, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
+
+export type { IntentTaskDefinition, IntentTaskPlan } from "../../common/types"
+
+export interface IntentPlanContext {
+  planId: string
+  revision: number
+  goal: string
+  constraints: string[]
+  task: TodoItem
+  planTaskId: string
+  acceptanceCriteria: string[]
+  dependencies: { id: string; title: string; status: TodoItem["status"] }[]
+  evidence: TodoEvidence[]
+}
 
 export interface TodoListRequest {
   projectFingerprint: string

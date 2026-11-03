@@ -203,3 +203,99 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test("intent plans reconcile atomically, preserve progress, evidence, and chat isolation", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-intent-todos-"))
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-a"]), conversationId: "chat-plan-a" }
+    const repository = new TodoRepository(databasePath, wasmPath)
+    const makePlan = (revision: number, title = "Inspect parser") => ({
+      planId: "plan-parser",
+      version: 1 as const,
+      revision,
+      goal: "Make parser behavior reliable",
+      constraints: ["Preserve public API"],
+      tasks: [
+        { id: "inspect-parser", title, description: "Inspect the parser implementation", acceptanceCriteria: ["Identify the faulty branch"], dependencies: [] },
+        { id: "fix-parser", title: "Fix parser", description: "Correct the faulty branch", acceptanceCriteria: ["Regression test passes"], dependencies: ["inspect-parser"] },
+        { id: "verify-parser", title: "Verify parser", description: "Run focused checks", acceptanceCriteria: ["Focused tests pass"], dependencies: ["fix-parser"] }
+      ]
+    })
+    const firstPlan = makePlan(1)
+    const intentResult = { objective: "Make parser behavior reliable", prompt: "Fix the parser", plan: firstPlan }
+    const first = await repository.synchronizeIntentPlan(scope, firstPlan, intentResult)
+    assert.equal(first.items.filter((item) => item.source === "intent_compiler").length, 3)
+    assert.deepEqual(first.items.map((item) => item.title), ["Inspect parser", "Fix parser", "Verify parser"])
+    assert.deepEqual(first.items[0].acceptanceCriteria, ["Identify the faulty branch"])
+    const repeated = await repository.synchronizeIntentPlan(scope, firstPlan, intentResult)
+    assert.equal(repeated.id, first.id)
+    assert.equal(repeated.items.length, 3)
+
+    const inspect = first.items[0]
+    const claimed = await repository.updateItem(scope, {
+      itemId: inspect.id,
+      expectedVersion: inspect.version,
+      patch: { status: "in_progress" },
+      actor: "user",
+      requestId: "plan-manual-claim"
+    })
+    await repository.addEvidence(scope, {
+      itemId: inspect.id,
+      kind: "review",
+      summary: "The parser accepts malformed delimiters.",
+      result: "observed",
+      requestId: "plan-evidence"
+    })
+    const revised = makePlan(2, "Inspect parser edge cases")
+    revised.tasks[0].description = "Inspect delimiter and recovery behavior"
+    const afterRevision = await repository.synchronizeIntentPlan(scope, revised, { ...intentResult, plan: revised })
+    const changedTask = afterRevision.items.find((item) => item.id === inspect.id)!
+    assert.equal(changedTask.title, "Inspect parser edge cases")
+    assert.equal(changedTask.status, "in_progress")
+    assert.equal(changedTask.source, "intent_compiler")
+    assert.equal(changedTask.version, claimed.version + 1)
+    assert.equal((await repository.getItem(scope, inspect.id)).evidence.length, 1)
+
+    const completed = await repository.completeByUser(scope, inspect.id, changedTask.version, "Inspection is complete", "plan-explicit-complete")
+    const thirdRevision = makePlan(3, "Inspect parser boundaries")
+    await repository.synchronizeIntentPlan(scope, thirdRevision, { ...intentResult, plan: thirdRevision })
+    const completedTask = (await repository.getList({ ...scope, includeCompleted: true })).items.find((item) => item.id === inspect.id)!
+    assert.equal(completed.status, "completed")
+    assert.equal(completedTask.status, "completed")
+    assert.equal(completedTask.verification, "waived")
+    assert.equal((await repository.getItem(scope, inspect.id)).evidence.length, 1)
+
+    const otherScope = { ...scope, conversationId: "chat-plan-b" }
+    const otherPlan = { ...makePlan(1), planId: "other-plan", goal: "Different chat goal", tasks: [
+      { id: "other-task", title: "Other chat task", description: "Keep chat plans isolated", acceptanceCriteria: ["Only this chat sees the task"], dependencies: [] }
+    ] }
+    await repository.synchronizeIntentPlan(otherScope, otherPlan, { prompt: "Other plan", plan: otherPlan })
+    assert.deepEqual((await repository.getList(otherScope)).items.map((item) => item.title), ["Other chat task"])
+    assert.equal((await repository.getList(scope)).items.length, 3)
+
+    const revisedWithoutOneTask = { ...makePlan(4, "Inspect parser boundaries"), tasks: makePlan(4, "Inspect parser boundaries").tasks.slice(0, 2) }
+    await repository.synchronizeIntentPlan(scope, revisedWithoutOneTask, { ...intentResult, plan: revisedWithoutOneTask })
+    assert.equal((await repository.getList({ ...scope, includeCompleted: true })).items.length, 3, "removed plan tasks remain in the native TODO history")
+    const beforeInvalid = await repository.getList(scope)
+    const invalidPlan = { ...makePlan(5), tasks: [] }
+    assert.throws(() => repository.synchronizeIntentPlan(scope, invalidPlan, { plan: invalidPlan }), /Invalid intent plan/)
+    assert.deepEqual(await repository.getList(scope), beforeInvalid)
+    await assert.rejects(repository.synchronizeIntentPlan(scope, makePlan(3, "Stale plan"), { plan: makePlan(3, "Stale plan") }), /older than the stored revision/)
+    assert.deepEqual(await repository.getList(scope), beforeInvalid)
+
+    const reopened = new TodoRepository(databasePath, wasmPath)
+    const persistedPlan = await reopened.getIntentTaskPlan(scope)
+    assert.equal(persistedPlan?.revision, 4)
+    assert.equal(persistedPlan?.tasks.length, 2)
+    assert.equal((await reopened.getIntentResult(scope) as { prompt?: string } | undefined)?.prompt, "Fix the parser")
+    assert.equal((await reopened.getItem(scope, inspect.id)).item.status, "completed")
+    assert.equal((await reopened.getItem(scope, inspect.id)).evidence[0].summary, "The parser accepts malformed delimiters.")
+    const context = await reopened.getActiveIntentContext(scope)
+    assert.equal(context?.planTaskId, "fix-parser")
+    assert.deepEqual(context?.acceptanceCriteria, ["Regression test passes"])
+    assert.equal(context?.goal, "Make parser behavior reliable")
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})

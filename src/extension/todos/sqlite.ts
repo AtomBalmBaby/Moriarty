@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS todo_items (
   verification TEXT NOT NULL CHECK(verification IN ('not_checked','passed','failed','waived')),
   priority TEXT NOT NULL CHECK(priority IN ('low','normal','high','urgent')),
   created_by TEXT NOT NULL CHECK(created_by IN ('user','model')),
+  source TEXT NOT NULL DEFAULT 'model' CHECK(source IN ('user','model','intent_compiler')),
   sort_order INTEGER NOT NULL DEFAULT 0,
   blocked_reason TEXT,
   version INTEGER NOT NULL DEFAULT 1,
@@ -69,7 +70,25 @@ CREATE TABLE IF NOT EXISTS todo_requests (
   created_at TEXT NOT NULL,
   PRIMARY KEY(list_id, request_id)
 );
-PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS todo_intent_plans (
+  list_id TEXT PRIMARY KEY REFERENCES todo_lists(id) ON DELETE CASCADE,
+  plan_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  goal TEXT NOT NULL,
+  constraints_json TEXT NOT NULL,
+  intent_result_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS todo_intent_tasks (
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  task_id TEXT NOT NULL,
+  item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE,
+  acceptance_json TEXT NOT NULL,
+  dependencies_json TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY(list_id, task_id)
+);
+PRAGMA user_version = 2;
 `
 
 export class SqliteFile {
@@ -101,9 +120,15 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 1) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 2) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
+          await this.persist(database)
+        } else if (version === 1) {
+          database.run("ALTER TABLE todo_items ADD COLUMN source TEXT NOT NULL DEFAULT 'model' CHECK(source IN ('user','model','intent_compiler'))")
+          database.run(
+            "CREATE TABLE IF NOT EXISTS todo_intent_plans (list_id TEXT PRIMARY KEY REFERENCES todo_lists(id) ON DELETE CASCADE, plan_id TEXT NOT NULL, revision INTEGER NOT NULL, goal TEXT NOT NULL, constraints_json TEXT NOT NULL, intent_result_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS todo_intent_tasks (list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE, task_id TEXT NOT NULL, item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE, acceptance_json TEXT NOT NULL, dependencies_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(list_id, task_id)); PRAGMA user_version = 2;"
+          )
           await this.persist(database)
         }
       } finally {

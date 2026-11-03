@@ -131,6 +131,66 @@ suite("Agent reply, end to end", function () {
     }
   })
 
+  test("the implementing chat receives only its bounded active intent-task projection", async () => {
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousEnabled = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
+    const previousMode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
+    await settings.update("chatToolsIntentCompilerMode", "ask", vscode.ConfigurationTarget.Global)
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-task-context-"))
+    const model = new ScriptedModel(["Done.", "Done."])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
+    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const repository = new TodoRepository(
+      path.join(directory, "todos.sqlite"),
+      path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm")
+    )
+    const scope = {
+      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      conversationId: "bounded-task-chat"
+    }
+    const plan = {
+      planId: "bounded-context-plan",
+      version: 1 as const,
+      revision: 1,
+      goal: "Implement the requested feature while preserving existing behavior.",
+      constraints: ["Preserve existing behavior"],
+      tasks: [
+        { id: "active-task", title: "Implement the focused change", description: "Modify only the relevant feature surface.", acceptanceCriteria: ["The active task acceptance criterion is visible to the model."], dependencies: [] },
+        { id: "other-task", title: "Do not project unrelated task", description: "This should not be included in the active task context.", acceptanceCriteria: ["Not part of this request"], dependencies: ["active-task"] }
+      ]
+    }
+    await repository.synchronizeIntentPlan(scope, plan, { prompt: "Implement the feature", plan })
+    const chat = new Chat(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
+    try {
+      await settings.update("chatToolsIntentCompilerEnabled", false, vscode.ConfigurationTarget.Global)
+      await chat.completion([{ role: "user", content: "Implement it." }], [], "off", scope.conversationId)
+      const disabledSystem = String(model.requests[0].messages[0]?.content ?? "")
+      assert.doesNotMatch(disabledSystem, /twinny_active_intent_task/)
+
+      await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
+      await chat.completion([{ role: "user", content: "Continue implementing it." }], [], "off", scope.conversationId)
+      const enabledSystem = String(model.requests[1].messages[0]?.content ?? "")
+      const taskProjection = enabledSystem.slice(enabledSystem.indexOf("Active task from Twinny's native TODO plan"))
+      assert.match(taskProjection, /twinny_active_intent_task/)
+      assert.match(taskProjection, /The active task acceptance criterion is visible to the model\./)
+      assert.match(taskProjection, /"status":"pending"/)
+      assert.doesNotMatch(taskProjection, /Do not project unrelated task/)
+      assert.ok(taskProjection.length < 4000, `Task context was unexpectedly large: ${taskProjection.length} characters`)
+      assert.match(enabledSystem, /You are a helpful, respectful and honest coding assistant/)
+    } finally {
+      chat.dispose()
+      await settings.update("chatToolsIntentCompilerEnabled", previousEnabled, vscode.ConfigurationTarget.Global)
+      await settings.update("chatToolsIntentCompilerMode", previousMode, vscode.ConfigurationTarget.Global)
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test("the webview message channel drives the same Chat completion and tool loop as a user prompt", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-webview-message-"))
     const file = path.join(root, "a.ts")

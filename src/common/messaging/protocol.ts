@@ -389,6 +389,7 @@ export interface IntentCompilerResult {
   strategy: string
   verification: string[]
   assumptions: string[]
+  plan: import("../types/todo").IntentTaskPlan
   originalPrompt?: string
 }
 
@@ -407,7 +408,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinnyAgentRegistry]: Channel<AgentRegistryRequest, AgentProfileSummary[]>
   [EVENT_NAME.twinnyPromptInstructions]: Channel<PromptInstructionsRequest, PromptInstructionsResponse>
   [EVENT_NAME.twinnyChatMessage]: Channel<ChatRequest>
-  [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string; history?: ChatCompletionMessage[]; maxLevels?: number }, IntentCompilerResult | undefined>
+  [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string; history?: ChatCompletionMessage[]; maxLevels?: number; conversationId?: string }, IntentCompilerResult | undefined>
   [EVENT_NAME.twinnyClickSuggestion]: Channel<string>
   /**
    * The rest of the message being typed, as the chat model guesses it from

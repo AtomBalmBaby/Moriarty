@@ -298,8 +298,8 @@ export class BaseProvider {
         )
         return this.emitTodoSnapshot(conversationId)
       },
-      [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels }) =>
-        (await this.chat?.compileIntent(prompt, history, maxLevels)) ?? undefined,
+      [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels, conversationId }) =>
+        (await this.chat?.compileIntent(prompt, history, maxLevels, conversationId)) ?? undefined,
       [EVENT_NAME.twinnyClickSuggestion]: (template) =>
         void vscode.commands.executeCommand(
           TWINNY_COMMAND_NAME.templateCompletion,

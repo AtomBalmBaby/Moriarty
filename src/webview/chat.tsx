@@ -71,6 +71,7 @@ const loadPromptHistory = (): string[] => {
 
 interface QueuedMessage {
   id: string
+  conversationId?: string
   /** As the composer had it, so it can go back there. */
   html: string
   /** As sent: paragraphs joined with line breaks. */
@@ -731,7 +732,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
     clearSearchReport()
     clearToolSteps()
 
-    const conversationId = conversation?.id || uuidv4()
+    const conversationId = message.conversationId || conversation?.id || uuidv4()
 
     setMessages((prevMessages) => {
       const executedPrompt = message.prompt ?? message.input
@@ -843,6 +844,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
     const message: QueuedMessage = {
       id: uuidv4(),
+      conversationId: conversation?.id || uuidv4(),
       html,
       input,
       text,
@@ -904,7 +906,8 @@ export const Chat = (props: ChatProps): JSX.Element => {
         .request(EVENT_NAME.twinnyCompileIntent, {
           prompt: message.text,
           history: resolveCompilerHistory(),
-          maxLevels: Math.max(0, Math.round(currentIntentCompilerMaxTurns))
+          maxLevels: Math.max(0, Math.round(currentIntentCompilerMaxTurns)),
+          conversationId: message.conversationId
         })
         .catch(() => undefined)
 

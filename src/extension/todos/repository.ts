@@ -1,20 +1,23 @@
 import { createHash, randomUUID } from "node:crypto"
 import { Database, SqlValue } from "sql.js"
 
+import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
 import {
   type AddTodoEvidenceInput,
   type CreateTodoInput,
+  type IntentPlanContext,
+  type IntentTaskPlan,
   TodoConflictError,
   type TodoEvidence,
   type TodoItem,
   type TodoListRequest,
   type TodoListSnapshot,
   type TodoPriority,
+  type TodoSource,
   type TodoStatus,
   type TodoVerification,
-  type UpdateTodoInput
-} from "./types"
+  type UpdateTodoInput} from "./types"
 
 interface ProjectRow {
   id: string
@@ -38,6 +41,8 @@ interface ItemRow {
   verification: TodoVerification
   priority: TodoPriority
   created_by: "user" | "model"
+  source: TodoSource
+  acceptance_criteria?: string | null
   sort_order: number
   blocked_reason: string | null
   version: number
@@ -79,6 +84,8 @@ const itemOf = (row: ItemRow): TodoItem => ({
   verification: row.verification,
   priority: row.priority,
   createdBy: row.created_by,
+  source: row.source,
+  acceptanceCriteria: row.acceptance_criteria ? JSON.parse(row.acceptance_criteria) as string[] : undefined,
   sortOrder: row.sort_order,
   blockedReason: row.blocked_reason ?? undefined,
   version: row.version,
@@ -133,9 +140,12 @@ const ensureList = (database: Database, request: TodoListRequest): ListRow => {
 const snapshotFor = (database: Database, list: ListRow, includeCompleted = true): TodoListSnapshot => {
   const itemRows = rows<ItemRow>(
     database,
-    `SELECT id, list_id, parent_id, title, details, status, verification, priority, created_by, sort_order, blocked_reason, version, created_at, updated_at
-     FROM todo_items WHERE list_id = ? ${includeCompleted ? "" : "AND status NOT IN ('completed','cancelled')"}
-     ORDER BY sort_order, created_at`,
+    `SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority,
+            items.created_by, items.source, tasks.acceptance_json AS acceptance_criteria, items.sort_order, items.blocked_reason,
+            items.version, items.created_at, items.updated_at
+     FROM todo_items AS items LEFT JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id
+     WHERE items.list_id = ? ${includeCompleted ? "" : "AND items.status NOT IN ('completed','cancelled')"}
+     ORDER BY items.sort_order, items.created_at`,
     [list.id]
   )
   return {
@@ -173,6 +183,199 @@ export class TodoRepository {
     return this.sqlite.initialize()
   }
 
+  getIntentTaskPlan(request: TodoListRequest): Promise<IntentTaskPlan | undefined> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return undefined
+      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+      if (!list) return undefined
+      const stored = rows<{ plan_id: string; revision: number; goal: string; constraints_json: string }>(
+        database, "SELECT plan_id, revision, goal, constraints_json FROM todo_intent_plans WHERE list_id = ?", [list.id]
+      )[0]
+      if (!stored) return undefined
+      const tasks = rows<{ task_id: string; title: string; details: string; acceptance_json: string; dependencies_json: string }>(
+        database,
+        `SELECT tasks.task_id, items.title, items.details, tasks.acceptance_json, tasks.dependencies_json
+         FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
+         WHERE tasks.list_id = ? AND tasks.active = 1 ORDER BY items.sort_order, items.created_at`, [list.id]
+      )
+      return {
+        planId: stored.plan_id,
+        version: 1,
+        revision: stored.revision,
+        goal: stored.goal,
+        constraints: JSON.parse(stored.constraints_json) as string[],
+        tasks: tasks.map((task) => ({
+          id: task.task_id,
+          title: task.title,
+          description: task.details,
+          acceptanceCriteria: JSON.parse(task.acceptance_json) as string[],
+          dependencies: JSON.parse(task.dependencies_json) as string[]
+        }))
+      }
+    })
+  }
+
+  getIntentResult(request: TodoListRequest): Promise<unknown | undefined> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return undefined
+      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+      if (!list) return undefined
+      const stored = rows<{ intent_result_json: string }>(database, "SELECT intent_result_json FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
+      return stored ? JSON.parse(stored.intent_result_json) as unknown : undefined
+    })
+  }
+
+  synchronizeIntentPlan(request: TodoListRequest, candidate: unknown, intentResult: unknown): Promise<TodoListSnapshot> {
+    const validation = validateIntentTaskPlan(candidate)
+    if (!validation.plan) throw new Error("Invalid intent plan: " + validation.diagnostic)
+    const plan = validation.plan
+    const resultJson = JSON.stringify(intentResult)
+    if (!resultJson || resultJson.length > 100_000) throw new Error("Intent result must be serializable and no larger than 100,000 characters")
+
+    return this.sqlite.write((database) => {
+      const list = ensureList(database, request)
+      const existing = rows<{
+        plan_id: string; revision: number; goal: string; constraints_json: string; intent_result_json: string
+      }>(database, "SELECT plan_id, revision, goal, constraints_json, intent_result_json FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
+      if (existing) {
+        if (existing.plan_id !== plan.planId) throw new TodoConflictError("Intent plan ID changed for this conversation; preserve the existing planId when revising it")
+        if (plan.revision < existing.revision) throw new TodoConflictError("Intent plan revision is older than the stored revision")
+      }
+
+      const priorTasks = rows<{
+        task_id: string; item_id: string; acceptance_json: string; dependencies_json: string; active: number
+        title: string; details: string | null; sort_order: number
+      }>(database,
+        `SELECT tasks.task_id, tasks.item_id, tasks.acceptance_json, tasks.dependencies_json, tasks.active,
+                items.title, items.details, items.sort_order
+         FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
+         WHERE tasks.list_id = ?`, [list.id])
+      const priorById = new Map(priorTasks.map((task) => [task.task_id, task]))
+      const unchanged = !!existing && plan.revision === existing.revision
+      if (unchanged) {
+        if (existing.goal !== plan.goal || existing.constraints_json !== JSON.stringify(plan.constraints)) {
+          throw new TodoConflictError("Intent plan definitions changed without increasing plan.revision")
+        }
+        if (priorTasks.filter((task) => task.active).length !== plan.tasks.length || plan.tasks.some((task) => {
+          const prior = priorById.get(task.id)
+          return !prior || !prior.active || prior.title !== task.title || prior.details !== task.description ||
+            prior.acceptance_json !== JSON.stringify(task.acceptanceCriteria) || prior.dependencies_json !== JSON.stringify(task.dependencies)
+        })) throw new TodoConflictError("Intent tasks changed without increasing plan.revision")
+        database.run("UPDATE todo_intent_plans SET intent_result_json = ?, updated_at = ? WHERE list_id = ?", [resultJson, now(), list.id])
+        return snapshotFor(database, list, request.includeCompleted)
+      }
+
+      const createdAt = now()
+      const itemIds = new Map<string, string>()
+      for (const [index, task] of plan.tasks.entries()) {
+        const prior = priorById.get(task.id)
+        if (prior) {
+          itemIds.set(task.id, prior.item_id)
+        } else {
+          const itemId = randomUUID()
+          const order = rows<{ next_order: number }>(database, "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM todo_items WHERE list_id = ?", [list.id])[0].next_order
+          database.run(
+            `INSERT INTO todo_items(id, list_id, title, details, status, verification, priority, created_by, source, sort_order, version, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'pending', 'not_checked', 'normal', 'model', 'intent_compiler', ?, 1, ?, ?)`,
+            [itemId, list.id, task.title, task.description, order + index, createdAt, createdAt]
+          )
+          itemIds.set(task.id, itemId)
+        }
+      }
+
+      database.run("UPDATE todo_intent_tasks SET active = 0 WHERE list_id = ?", [list.id])
+      const userOrder = rows<{ max_order: number | null }>(database, "SELECT MAX(sort_order) AS max_order FROM todo_items WHERE list_id = ? AND source != 'intent_compiler'", [list.id])[0].max_order
+      const firstPlanOrder = (userOrder ?? -1) + 1
+      for (const [index, task] of plan.tasks.entries()) {
+        const itemId = itemIds.get(task.id)!
+        const prior = priorById.get(task.id)
+        const desiredOrder = firstPlanOrder + index
+        if (prior) {
+          const changedDefinition = prior.title !== task.title || prior.details !== task.description || prior.sort_order !== desiredOrder
+          if (changedDefinition) {
+            database.run("UPDATE todo_items SET title = ?, details = ?, sort_order = ?, version = version + 1, updated_at = ? WHERE id = ?", [task.title, task.description, desiredOrder, createdAt, itemId])
+          }
+        }
+        database.run(
+          `INSERT INTO todo_intent_tasks(list_id, task_id, item_id, acceptance_json, dependencies_json, active)
+           VALUES (?, ?, ?, ?, ?, 1)
+           ON CONFLICT(list_id, task_id) DO UPDATE SET acceptance_json = excluded.acceptance_json,
+             dependencies_json = excluded.dependencies_json, active = 1`,
+          [list.id, task.id, itemId, JSON.stringify(task.acceptanceCriteria), JSON.stringify(task.dependencies)]
+        )
+        database.run("DELETE FROM todo_dependencies WHERE item_id = ?", [itemId])
+      }
+      for (const task of plan.tasks) {
+        const itemId = itemIds.get(task.id)!
+        for (const dependency of task.dependencies) {
+          database.run("INSERT INTO todo_dependencies(item_id, depends_on_item_id) VALUES (?, ?)", [itemId, itemIds.get(dependency)!])
+        }
+      }
+      if (existing) {
+        database.run(
+          "UPDATE todo_intent_plans SET revision = ?, goal = ?, constraints_json = ?, intent_result_json = ?, updated_at = ? WHERE list_id = ?",
+          [plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, createdAt, list.id]
+        )
+      } else {
+        database.run(
+          "INSERT INTO todo_intent_plans(list_id, plan_id, revision, goal, constraints_json, intent_result_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [list.id, plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, createdAt]
+        )
+      }
+      bumpList(database, list.id, undefined, "intent_plan_synchronized", "model", "intent-plan:" + plan.planId + ":" + plan.revision, {
+        planId: plan.planId, revision: plan.revision, taskIds: plan.tasks.map((task) => task.id)
+      })
+      return snapshotFor(database, list, request.includeCompleted)
+    })
+  }
+
+  getActiveIntentContext(request: TodoListRequest): Promise<IntentPlanContext | undefined> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return undefined
+      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+      if (!list) return undefined
+      const plan = rows<{ plan_id: string; revision: number; goal: string; constraints_json: string }>(
+        database, "SELECT plan_id, revision, goal, constraints_json FROM todo_intent_plans WHERE list_id = ?", [list.id]
+      )[0]
+      if (!plan) return undefined
+      const tasks = rows<ItemRow & { task_id: string; acceptance_json: string; dependencies_json: string }>(
+        database,
+        `SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification,
+                items.priority, items.created_by, items.source, items.sort_order, items.blocked_reason, items.version,
+                items.created_at, items.updated_at, tasks.task_id, tasks.acceptance_json, tasks.acceptance_json AS acceptance_criteria, tasks.dependencies_json
+         FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
+         WHERE tasks.list_id = ? AND tasks.active = 1 ORDER BY items.sort_order, items.created_at`, [list.id]
+      )
+      const byId = new Map(tasks.map((task) => [task.task_id, task]))
+      const current = tasks.find((task) => task.status === "in_progress") ?? tasks.find((task) =>
+        task.status === "pending" && JSON.parse(task.dependencies_json as string).every((id: string) => byId.get(id)?.status === "completed")
+      )
+      if (!current) return undefined
+      const dependencyIds = JSON.parse(current.dependencies_json as string) as string[]
+      const evidence = rows<TodoEvidence>(database,
+        "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 3",
+        [current.id]
+      )
+      return {
+        planId: plan.plan_id,
+        revision: plan.revision,
+        goal: plan.goal,
+        constraints: JSON.parse(plan.constraints_json) as string[],
+        task: itemOf(current),
+        planTaskId: current.task_id,
+        acceptanceCriteria: JSON.parse(current.acceptance_json as string) as string[],
+        dependencies: dependencyIds.flatMap((id) => {
+          const dependency = byId.get(id)
+          return dependency ? [{ id, title: dependency.title, status: dependency.status }] : []
+        }),
+        evidence
+      }
+    })
+  }
+
   getList(request: TodoListRequest): Promise<TodoListSnapshot> {
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
@@ -185,8 +388,10 @@ export class TodoRepository {
       const list = ensureList(database, request)
       const row = rows<ItemRow>(
         database,
-        `SELECT id, list_id, parent_id, title, details, status, verification, priority, created_by, sort_order, blocked_reason, version, created_at, updated_at
-         FROM todo_items WHERE id = ? AND list_id = ?`,
+        `SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority,
+                items.created_by, items.source, tasks.acceptance_json AS acceptance_criteria, items.sort_order, items.blocked_reason, items.version, items.created_at, items.updated_at
+         FROM todo_items AS items LEFT JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id
+         WHERE items.id = ? AND items.list_id = ?`,
         [itemId, list.id]
       )[0]
       if (!row) throw new Error("TODO item was not found in the active conversation")
@@ -219,9 +424,9 @@ export class TodoRepository {
       const createdAt = now()
       const id = randomUUID()
       database.run(
-        `INSERT INTO todo_items(id, list_id, parent_id, title, details, status, verification, priority, created_by, sort_order, version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', 'not_checked', ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM todo_items WHERE list_id = ?), 1, ?, ?)`,
-        [id, list.id, parentId ?? null, title, input.details ?? null, priority, actor, list.id, createdAt, createdAt]
+        `INSERT INTO todo_items(id, list_id, parent_id, title, details, status, verification, priority, created_by, source, sort_order, version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', 'not_checked', ?, ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM todo_items WHERE list_id = ?), 1, ?, ?)`,
+        [id, list.id, parentId ?? null, title, input.details ?? null, priority, actor, actor, list.id, createdAt, createdAt]
       )
       bumpList(database, list.id, id, "item_created", actor, requestId, { title, parentId, priority })
       const item = itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [id])[0])

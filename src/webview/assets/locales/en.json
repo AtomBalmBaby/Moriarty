@@ -508,7 +508,9 @@
   "todo-priority-low": "Low",
   "todo-priority-normal": "Normal",
   "todo-priority-high": "High",
-  "todo-priority-urgent": "Urgent"
+  "todo-priority-urgent": "Urgent",
+  "todo-source-intent-compiler": "Intent plan",
+  "todo-acceptance-criteria": "Acceptance criteria"
 ,
   "todo-move-up": "Move task up",
   "todo-move-down": "Move task down"

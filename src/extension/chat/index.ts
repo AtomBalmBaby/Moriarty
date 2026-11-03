@@ -49,6 +49,7 @@ import { PromptInstructionResolver } from "../prompts/instructions"
 import { Base } from "../providers/base"
 import { describeProviderError, stripThinking } from "../providers/errors"
 import { TemplateProvider } from "../templates/provider"
+import { validateIntentTaskPlan } from "../todos/intent-plan"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
@@ -99,7 +100,7 @@ const MIN_RESULT_CHARS = 10_000
 const MAX_RESULT_CHARS = 200_000
 const INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxTurns"
 const LEGACY_INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxLevels"
-const INTENT_COMPILER_PROTOCOL = "Return exactly one valid JSON object, with no prose or Markdown fences, using this required shape: {\"objective\": string, \"prompt\": string, \"constraints\": string[], \"exclusions\": string[], \"strategy\": string, \"verification\": string[], \"assumptions\": string[]}. Every key is required. Do not add keys. The compiler validates this structure before accepting a result."
+const INTENT_COMPILER_PROTOCOL = "Return exactly one valid JSON object, with no prose or Markdown fences, using required fields objective (string), prompt (string), constraints (string[]), exclusions (string[]), strategy (string), verification (string[]), assumptions (string[]), and plan. plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, acceptanceCriteria: string[], dependencies: string[]}]}. Include 1-100 ordered tasks, stable planId and task IDs, and no unknown or cyclic dependencies. On re-planning, preserve the existing planId and task IDs, increment revision when definitions change, and do not reset task progress. Every field is required. Do not add other top-level keys. Return this JSON even when the provider does not support structured output."
 
 const clampNumericSetting = (value: number | undefined, min: number, max: number, fallback: number) => {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback
@@ -240,23 +241,49 @@ export const parseIntentCompilerResponse = (output: string | undefined) => {
   } catch {
     const start = candidate.indexOf("{")
     const end = candidate.lastIndexOf("}")
-    if (start === -1 || end === -1 || end <= start) return undefined
+    if (start === -1 || end === -1 || end <= start) {
+      logger.warn("[Intent] Compiler response is not valid JSON; return the required structured task plan.")
+      return undefined
+    }
     try {
       parsed = JSON.parse(candidate.slice(start, end + 1))
     } catch {
+      logger.warn("[Intent] Compiler response is malformed JSON; return one complete JSON object containing the required task plan.")
       return undefined
     }
   }
-  if (!parsed || typeof parsed !== "object") return undefined
+  if (!parsed || typeof parsed !== "object") {
+    logger.warn("[Intent] Compiler response must be a JSON object with the required task plan.")
+    return undefined
+  }
   const details = parsed as Record<string, unknown>
-  const expectedKeys = ["objective", "prompt", "constraints", "exclusions", "strategy", "verification", "assumptions"]
-  if (Object.keys(details).length !== expectedKeys.length || expectedKeys.some((key) => !Object.prototype.hasOwnProperty.call(details, key))) return undefined
-  if (typeof details.objective !== "string" || typeof details.prompt !== "string" || typeof details.strategy !== "string") return undefined
+  const expectedKeys = ["objective", "prompt", "constraints", "exclusions", "strategy", "verification", "assumptions", "plan"]
+  const missing = expectedKeys.filter((key) => !Object.prototype.hasOwnProperty.call(details, key))
+  const unexpected = Object.keys(details).filter((key) => !expectedKeys.includes(key))
+  if (missing.length || unexpected.length) {
+    logger.warn("[Intent] Invalid compiler response shape: " + [missing.length ? "missing " + missing.join(", ") : "", unexpected.length ? "unexpected " + unexpected.join(", ") : ""].filter(Boolean).join("; "))
+    return undefined
+  }
+  if (typeof details.objective !== "string" || typeof details.prompt !== "string" || typeof details.strategy !== "string") {
+    logger.warn("[Intent] Compiler objective, prompt, and strategy must be strings.")
+    return undefined
+  }
   const lists = [details.constraints, details.exclusions, details.verification, details.assumptions]
-  if (!lists.every((value) => Array.isArray(value) && value.every((entry) => typeof entry === "string"))) return undefined
+  if (!lists.every((value) => Array.isArray(value) && value.every((entry) => typeof entry === "string"))) {
+    logger.warn("[Intent] Compiler constraints, exclusions, verification, and assumptions must be string arrays.")
+    return undefined
+  }
   const objective = details.objective.trim()
   const prompt = details.prompt.trim()
-  if (!objective || !prompt) return undefined
+  if (!objective || !prompt) {
+    logger.warn("[Intent] Compiler objective and prompt must not be empty.")
+    return undefined
+  }
+  const validation = validateIntentTaskPlan(details.plan)
+  if (!validation.plan) {
+    logger.warn(`[Intent] Invalid task plan: ${validation.diagnostic ?? "plan validation failed"}`)
+    return undefined
+  }
   return {
     objective,
     prompt,
@@ -264,10 +291,10 @@ export const parseIntentCompilerResponse = (output: string | undefined) => {
     exclusions: ensureStringList(details.exclusions),
     strategy: details.strategy.trim(),
     verification: ensureStringList(details.verification),
-    assumptions: ensureStringList(details.assumptions)
+    assumptions: ensureStringList(details.assumptions),
+    plan: validation.plan
   }
 }
-
 const writeIntentTrace = async ({
   context,
   provider,
@@ -607,8 +634,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   public async compileIntent(
     prompt: string,
     history: ChatCompletionMessage[] = [],
-    maxTurns?: number
+    maxTurns?: number,
+    conversationId?: string
   ) {
+    if (conversationId) this._activeConversationId = conversationId
     const provider = this.getIntentProvider()
     if (!provider) return undefined
     const settings = workspace.getConfiguration("twinny")
@@ -628,6 +657,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const systemPrompt = [resolvedInstructions.content.trim(), INTENT_COMPILER_PROTOCOL].filter(Boolean).join("\n\n")
     logger.debug("[Prompt] intent mode=" + resolvedInstructions.mode + " agent=none order=" + [resolvedInstructions.content.trim() ? "intent-base" : "", "compiler-input", "compiler-protocol"].filter(Boolean).join(","))
     const userPrompt = priorHistory ? `${priorHistory}\n\nCurrent request:\n${trimmed}` : trimmed
+    const todoScope = this.activeTodoScope()
     const historySummary = summarizeIntentHistory(history, limit)
     logger.debug(`[Intent] Maximum levels: ${limit}`)
     logger.debug(`[Intent] Completed history pairs found: ${historySummary.pairs.length}`)
@@ -638,11 +668,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     })
     logger.debug(`[Intent] Current prompt: ${trimmed.length} characters`)
     try {
+      const previousPlan = this._todoRepository && todoScope ? await this._todoRepository.getIntentTaskPlan(todoScope) : undefined
+      const compilerInput = previousPlan
+        ? `${userPrompt}\n\nExisting native TODO plan to revise (preserve its planId and unchanged task IDs; increase revision only for changed definitions):\n${JSON.stringify(previousPlan)}`
+        : userPrompt
       const request = {
         model: provider.modelName,
         messages: [
           { role: SYSTEM, content: systemPrompt },
-          { role: USER, content: userPrompt }
+          { role: USER, content: compilerInput }
         ] as ChatCompletionMessage[]
       }
       const traceEnabled = settings.get<boolean>("chatToolsIntentCompilerTrace", false)
@@ -666,11 +700,22 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         })
       }
       const result = parseIntentCompilerResponse(content)
-      if (!result) return undefined
-      return {
-        ...result,
-        originalPrompt: trimmed
+      if (!result) {
+        logger.warn("[Intent] Compiler response did not contain a complete valid plan; stored TODOs were not changed")
+        return undefined
       }
+      const compiledResult = { ...result, originalPrompt: trimmed }
+      if (this._todoRepository && todoScope) {
+        try {
+          const snapshot = await this._todoRepository.synchronizeIntentPlan(todoScope, result.plan, compiledResult)
+          this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
+        } catch (error) {
+          logger.warn(`[Intent] Plan synchronization failed for conversation ${todoScope.conversationId}: ${error instanceof Error ? error.message : String(error)}`)
+          this._bridge.emit(EVENT_NAME.twinnyNotification, `Intent plan was not synchronized: ${error instanceof Error ? error.message : String(error)}`)
+          return undefined
+        }
+      }
+      return compiledResult
     } catch (error) {
       if (!isCancelled(error)) {
         logger.warn(`Chat compiler · ${describeProviderError(error, provider)}`)
@@ -802,14 +847,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           const base = snapshot.prompt
           const baseLayers = [snapshot.hasTeamPolicy ? "team-policy" : "", snapshot.instructions.content.trim() ? "chat-base" : ""].filter(Boolean)
           const agentId = this._activeAgent?.summary.id ?? this._requestAgentSelection
+          const taskContext = await this.activeIntentTaskProjection()
           if (this._requestAgentSelection === "off") {
-            logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=off order=" + [...baseLayers, "runtime-user-context", ...(view ? ["provider-tool-definitions"] : [])].join(","))
-            return base
+            logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=off order=" + [...baseLayers, ...(taskContext ? ["active-intent-task"] : []), "runtime-user-context", ...(view ? ["provider-tool-definitions"] : [])].join(","))
+            return taskContext ? base + "\n\n" + taskContext : base
           }
-          const context = await this.agentWorkspaceContext(view)
+          const workspaceContext = await this.agentWorkspaceContext(view)
+          const context = [workspaceContext, taskContext].filter(Boolean).join("\n\n")
           const layers = [...baseLayers]
           if (this._activeAgent?.profile.instructions.trim()) layers.push("agent-profile")
-          if (context.trim()) layers.push("workspace-context")
+          if (workspaceContext.trim()) layers.push("workspace-context")
+          if (taskContext) layers.push("active-intent-task")
           if (this._missingMcpCapabilities.length) layers.push("mcp-capability-notes")
           layers.push("runtime-user-context")
           if (view) layers.push("provider-tool-definitions")
@@ -1112,6 +1160,46 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return {
       projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
       conversationId: this._activeConversationId
+    }
+  }
+
+  private async activeIntentTaskProjection(): Promise<string> {
+    const settings = workspace.getConfiguration("twinny")
+    if (!settings.get<boolean>("chatToolsIntentCompilerEnabled", false) || settings.get<string>("chatToolsIntentCompilerMode", "ask") === "always-original") return ""
+    const scope = this.activeTodoScope()
+    if (!scope || !this._todoRepository) return ""
+    try {
+      const active = await this._todoRepository.getActiveIntentContext(scope)
+      if (!active) return ""
+      const clip = (value: string, limit: number) => value.length > limit ? value.slice(0, limit - 1) + "…" : value
+      const projection = {
+        type: "twinny_active_intent_task",
+        plan: { id: active.planId, revision: active.revision, goal: clip(active.goal, 400) },
+        constraints: active.constraints.slice(0, 3).map((value) => clip(value, 160)),
+        task: {
+          id: active.planTaskId,
+          todoItemId: active.task.id,
+          title: clip(active.task.title, 180),
+          description: clip(active.task.details ?? "", 400),
+          status: active.task.status,
+          acceptanceCriteria: active.acceptanceCriteria.slice(0, 6).map((value) => clip(value, 180)),
+          acceptanceCriteriaTruncated: active.acceptanceCriteria.length > 6,
+          dependencies: active.dependencies.slice(0, 3).map((dependency) => ({
+            id: dependency.id,
+            title: clip(dependency.title, 120),
+            status: dependency.status
+          })),
+          previousEvidence: active.evidence.slice(0, 2).map((evidence) => ({
+            kind: clip(evidence.kind, 80),
+            result: evidence.result,
+            summary: clip(evidence.summary, 220)
+          }))
+        }
+      }
+      return "Active task from Twinny's native TODO plan (context only; preserve all other instructions):\n" + JSON.stringify(projection)
+    } catch (error) {
+      logger.warn(`[Intent] Could not load active task context: ${error instanceof Error ? error.message : String(error)}`)
+      return ""
     }
   }
 

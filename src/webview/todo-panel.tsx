@@ -136,8 +136,9 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
       ) : (
         <div className={styles.itemBody}>
           <span className={styles.itemTitle}>{item.title}</span>
-          <span className={styles.itemMeta}>{t(`todo-status-${item.status}`)} · {t(`todo-priority-${item.priority}`)}</span>
+          <span className={styles.itemMeta}>{t(`todo-status-${item.status}`)} · {t(`todo-priority-${item.priority}`)}{item.source === "intent_compiler" ? ` · ${t("todo-source-intent-compiler")}` : ""}</span>
           {!!item.details && <span className={styles.details}>{item.details}</span>}
+          {!!item.acceptanceCriteria?.length && <span className={styles.details}>{t("todo-acceptance-criteria")}: {item.acceptanceCriteria.join(" · ")}</span>}
           {!!item.blockedReason && <span className={styles.blockedReason}>{item.blockedReason}</span>}
           <div className={styles.actions}>
             <button type="button" disabled={busy || item.sortOrder === 0} title={t("todo-move-up")} onClick={() => update(item, { sortOrder: item.sortOrder - 1 })}>↑</button>
