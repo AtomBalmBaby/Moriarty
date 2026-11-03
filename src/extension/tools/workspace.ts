@@ -9,6 +9,9 @@
  * (see `view.ts`). Every result is capped, and says so, because a small
  * model's context fills after a couple of whole files.
  */
+import { TodoRepository } from "../todos/repository"
+import { TodoListRequest } from "../todos/types"
+
 import { planReplacement, Replacement } from "./edit"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
 import { coerceArguments, JsonSchema, McpToolSpec } from "./mcp"
@@ -27,6 +30,7 @@ import {
   renameSymbol
 } from "./more"
 import { ToolCall, ToolSpec } from "./protocol"
+import { todoTools } from "./todos"
 import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
 
 export interface ToolResult {
@@ -577,6 +581,8 @@ export interface ToolExtras {
   git?: boolean
   /** Whether the project's `AGENTS.md` files are read; on by default. */
   instructions?: boolean
+  /** The canonical native TODO service and host-trusted chat scope. */
+  todos?: { repository: TodoRepository; scope: TodoListRequest; onChanged: () => void }
   /** Tools from MCP servers the user set up, and how to call one. */
   mcp?: McpSink
 }
@@ -631,6 +637,7 @@ export const workspaceTools = (
     tools.push(moveFile(view, ops), deleteFile(view, ops))
   }
   if (commands) tools.push(runCommand(commands))
+  if (extras.todos) tools.push(...todoTools(extras.todos.repository, extras.todos.scope, extras.todos.onChanged))
   for (const spec of extras.mcp?.tools ?? []) tools.push(mcpTool(spec, extras.mcp!))
   const top = view.entries(view.root).map((e) => (e.dir ? `${e.name}/` : e.name))
   const reading = extras.instructions !== false

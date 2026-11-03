@@ -64,6 +64,14 @@ export const EVENT_NAME = {
   twinnyWorkspaceSearch: "twinny-workspace-search"
 } as const
 
+export const TODO_EVENT_NAME = {
+  getList: "twinny.todo.get-list",
+  createItem: "twinny.todo.create-item",
+  updateItem: "twinny.todo.update-item",
+  completeItem: "twinny.todo.complete-item",
+  changed: "twinny.todo.changed"
+} as const
+
 export const CONVERSATION_EVENT_NAME = {
   clearAllConversations: "twinny.clear-all-conversations",
   getActiveConversation: "twinny.get-active-conversation",

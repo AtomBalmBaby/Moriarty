@@ -8,22 +8,25 @@ import type { AgentSelection } from "../../common/agents"
 import { AGENT_SELECTION_STORAGE_KEY, isAgentSelectionEnabled, normalizeAgentSelection, resolveAgentSelection, selectionFromLegacyAgentMode } from "../../common/agents"
 import { cleanModelSuggestion, composerSuggestionMessages } from "../../common/composer-predict"
 import {
+  ACTIVE_CONVERSATION_STORAGE_KEY,
   API_PROVIDERS,
   ASSISTANT,
   EVENT_NAME,
   EXTENSION_CONTEXT_NAME,
   GLOBAL_STORAGE_KEY,
   SYSTEM,
+  TODO_EVENT_NAME,
   USER,
   WEBUI_TABS
 } from "../../common/constants"
 import { formatCount, logger } from "../../common/logger"
-import type { ComposerTurn } from "../../common/messaging/protocol"
+import type { ComposerTurn, ToolInventoryItem } from "../../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
 import { kebabToSentence } from "../../common/text"
 import {
   ChatCompletionMessage,
+  Conversation,
   MentionType,
   ReplyChangesView,
   TwinnyProvider
@@ -46,11 +49,14 @@ import { PromptInstructionResolver } from "../prompts/instructions"
 import { Base } from "../providers/base"
 import { describeProviderError, stripThinking } from "../providers/errors"
 import { TemplateProvider } from "../templates/provider"
+import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
+import { TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { DEFAULT_MAX_STEPS, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
+import { todoTools, todoWorkspaceTools } from "../tools/todos"
 import { WorkspaceView } from "../tools/view"
-import { WorkspaceTools, workspaceTools, ToolExtras } from "../tools/workspace"
+import { ToolExtras, WorkspaceTools, workspaceTools } from "../tools/workspace"
 import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
@@ -382,6 +388,8 @@ export class Chat extends Base {
   private readonly _generations: GenerationTracker
   private readonly _extensionContext: ExtensionContext
   private readonly _promptInstructions: PromptInstructionResolver
+  private readonly _todoRepository?: TodoRepository
+  private _activeConversationId?: string
 
   constructor(
     generations: GenerationTracker,
@@ -389,11 +397,13 @@ export class Chat extends Base {
     extensionContext: ExtensionContext,
     bridge: ExtensionBridge,
     search: WorkspaceSearch | undefined,
-    agents: AgentRegistry = new AgentRegistry(extensionContext)
+    agents: AgentRegistry = new AgentRegistry(extensionContext),
+    todoRepository?: TodoRepository
   ) {
     super(extensionContext)
     this._generations = generations
     this._extensionContext = extensionContext
+    this._todoRepository = todoRepository
     this._promptInstructions = new PromptInstructionResolver(extensionContext)
     this._bridge = bridge
     this._search = search
@@ -406,12 +416,12 @@ export class Chat extends Base {
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
 
 this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
-  logger.info('twinny-tool-inventory requested');
+  logger.info("twinny-tool-inventory requested");
   try {
     // Ensure MCP is ready before accessing its tools
     await this._mcp.ready();
     const root = workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-    let nativeList: any[] = [];
+    let nativeList: ToolInventoryItem[] = [];
     if (root) {
       // Build a minimal extras object that enables all native tools
       const extras: ToolExtras = {
@@ -439,6 +449,16 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         tool: t.name,
       }));
     }
+    const activeConversation = this._extensionContext.globalState.get<Conversation>(ACTIVE_CONVERSATION_STORAGE_KEY)
+    const todoInventory = this._todoRepository ? todoTools(
+      this._todoRepository,
+      {
+        projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+        conversationId: activeConversation?.id ?? "__todo-inventory__"
+      },
+      () => undefined
+    ).map((tool) => ({ name: tool.name, description: tool.description, server: "native", tool: tool.name })) : []
+    nativeList = [...nativeList, ...todoInventory]
     const mcpList = this._mcp.tools.map((t) => ({
       name: t.tool,
       description: t.description,
@@ -690,8 +710,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   public async completion(
     messages: ChatCompletionMessage[],
     mentions?: MentionType[],
-    requestedSelection?: AgentSelection
+    requestedSelection?: AgentSelection,
+    conversationId?: string
   ): Promise<string | undefined> {
+    this._activeConversationId = conversationId
     const provider = this.start()
     if (!provider) return undefined
     // Gathering context can take a while (a workspace search, the team's
@@ -1085,6 +1107,14 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     )
   }
 
+  private activeTodoScope(): TodoListRequest | undefined {
+    if (!this._todoRepository || !this._activeConversationId) return undefined
+    return {
+      projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      conversationId: this._activeConversationId
+    }
+  }
+
   /**
    * Send the conversation; the reply joins it, so the next turn follows on.
    * With a `view`, the model may work in the workspace first.
@@ -1100,22 +1130,29 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     void contextWindowOf(provider)
     this._steering = []
     this._steerable = !!view
+    const hooks = {
+      onNotes: (notes: string | undefined) => (toolNotes = notes),
+      onUsage: (counted: ToolLoopUsage) => Object.assign(usage, counted),
+      onTools: (tools: WorkspaceTools) => (instructionFiles = () => tools.instructionFiles?.() ?? []),
+      onChanges: (changes: ReplyChanges) => (tracked = changes),
+      onOutOfSteps: () => (outOfSteps = true)
+    }
+    const todoScope = this.activeTodoScope()
+    // Native TODO actions are conversation-scoped and do not require workspace Agent mode.
+    const todoOnly = !view && !!todoScope
+    const client = view
+      ? this.toolsClient(provider, view, hooks)
+      : todoOnly && todoScope
+        ? this.todoToolsClient(provider, todoScope, hooks)
+        : resolveInferenceProvider(provider)
     const reply = await this._generation.generate(
-      view
-        ? this.toolsClient(provider, view, {
-            onNotes: (notes) => (toolNotes = notes),
-            onUsage: (counted) => Object.assign(usage, counted),
-            onTools: (tools) => (instructionFiles = () => tools.instructionFiles?.() ?? []),
-            onChanges: (changes) => (tracked = changes),
-            onOutOfSteps: () => (outOfSteps = true)
-          })
-        : resolveInferenceProvider(provider),
+      client,
       { model: provider.modelName, messages: this._conversation },
       provider,
       prefix,
       {
         toolNotes: () => toolNotes,
-        keepEmpty: () => !!view && this._steps.steps.length > 0,
+        keepEmpty: () => (!!view || todoOnly) && this._steps.steps.length > 0,
         // What the reply changed, read once it is over and kept for undo.
         settle: async () => {
           if (!tracked?.touched) return
@@ -1160,6 +1197,68 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * servers know, editing files and running commands, each as the
    * settings say.
    */
+  private todoToolsClient(
+    provider: TwinnyProvider,
+    scope: TodoListRequest,
+    hooks: {
+      onNotes(notes: string | undefined): void
+      onUsage(usage: ToolLoopUsage): void
+      onTools(tools: WorkspaceTools): void
+      onChanges(changes: ReplyChanges): void
+      onOutOfSteps(): void
+    }
+  ) {
+    this._steps.reset()
+    let available = todoWorkspaceTools(this._todoRepository!, scope, () => {
+      void this._todoRepository!.getList(scope).then((snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)).catch((error) => {
+        logger.error(`Native TODO snapshot refresh failed: ${error}`)
+      })
+    })
+    const requestedTools = this.config.get<boolean>("agents.ignoreAgentToolRestrictions", false)
+      ? undefined
+      : this._activeAgent?.profile.tools
+    const selection = resolveAgentToolSelection(requestedTools, available.tools, [])
+    const selectedNames = new Set(selection.native.map((tool) => tool.name))
+    available = { ...available, tools: available.tools.filter((tool) => selectedNames.has(tool.name)) }
+    logger.info(`[ToolTrace] outgoing=${available.tools.length} native TODO tools: ${available.tools.map((tool) => tool.name).join(", ")}`)
+    hooks.onTools(available)
+    const maxResultChars = clampNumericSetting(
+      this.config.get<number>("chatToolsMaxResultChars", DEFAULT_RESULT_CHARS),
+      MIN_RESULT_CHARS,
+      MAX_RESULT_CHARS,
+      DEFAULT_RESULT_CHARS
+    )
+    let warned = false
+    return withTools(resolveInferenceProvider(provider), available, {
+      mode: toolModeFor(provider.provider),
+      maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
+      maxResultChars,
+      reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
+      contextWindow: async () => {
+        const told = await contextWindowOf(provider)
+        if (told && told < SMALL_CONTEXT_TOKENS && !warned) {
+          warned = true
+          logger.warn(`Chat tools · ${provider.modelName} is loaded with a ${formatCount(told)}-token context. Tools need about 8k to work well.`)
+        }
+        return told ?? assumedContextWindow(provider)
+      },
+      stepLines: false,
+      steering: () => this.takeSteering(),
+      onOutOfSteps: hooks.onOutOfSteps,
+      onNotes: hooks.onNotes,
+      onUsage: hooks.onUsage,
+      onRequest: (chars, step, mode, tokens) => logger.info(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`),
+      onToolStart: (start) => this._steps.start(start),
+      onStep: (step) => {
+        this._steps.finish(step)
+        logger.info(`Chat TODO tools · ${step.summary}`)
+      },
+      onTrim: (results, tokens) => logger.info(`Chat TODO tools · trimmed ${results} older result${results === 1 ? "" : "s"} (now about ${formatCount(tokens)} tokens)`),
+      onFallback: (reason) => logger.warn(`Chat TODO tools · provider fell back to text tool calls: ${reason}`),
+      onEnd: () => this._steps.settle()
+    })
+  }
+
   private toolsClient(
     provider: TwinnyProvider,
     view: WorkspaceView,
@@ -1193,10 +1292,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       MAX_RESULT_CHARS,
       DEFAULT_RESULT_CHARS
     )
+    const todoScope = this._todoRepository && this._activeConversationId ? {
+      projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      conversationId: this._activeConversationId
+    } : undefined
     let available = workspaceTools(view, [], {
       edits: editorEdits(view, editMode, approveChange, changes),
       editor: editorKnowledge(view, editMode, approveChange, changes),
       readFileMaxLines: maxReadLines,
+      todos: this._todoRepository && todoScope ? {
+        repository: this._todoRepository,
+        scope: todoScope,
+        onChanged: () => {
+          void this._todoRepository!.getList(todoScope).then((snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)).catch((error) => {
+            logger.error(`Native TODO snapshot refresh failed: ${error}`)
+          })
+        }
+      } : undefined,
       commands:
         commandMode === "off"
           ? undefined

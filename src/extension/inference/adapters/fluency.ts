@@ -88,6 +88,37 @@ export const parsableToolArguments = (messages: ChatMessage[]): ChatMessage[] =>
 
 type ChatParameters = Pick<ChatRequest, "maxTokens" | "temperature" | "think" | "tools" | "reasoningEffort">
 
+const llamaCppSchema = (schema: Record<string, unknown>): Record<string, unknown> => {
+  const compatible: Record<string, unknown> = {}
+  const type = schema.type
+  if (typeof type === "string") compatible.type = type
+  else if (Array.isArray(type)) {
+    const types = type.filter((value): value is string => typeof value === "string")
+    if (types.length === 1) compatible.type = types[0]
+  }
+  const description = typeof schema.description === "string" ? schema.description : ""
+  const allowedValues = Array.isArray(schema.enum) ? schema.enum.filter((value): value is string => typeof value === "string") : []
+  const enumDescription = allowedValues.length ? `Allowed values: ${allowedValues.join(", ")}.` : ""
+  if (description || enumDescription) compatible.description = [description, enumDescription].filter(Boolean).join(" ")
+  if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+    compatible.properties = Object.fromEntries(
+      Object.entries(schema.properties).map(([name, property]) => [
+        name,
+        property && typeof property === "object" && !Array.isArray(property)
+          ? llamaCppSchema(property as Record<string, unknown>)
+          : {}
+      ])
+    )
+  }
+  if (Array.isArray(schema.required)) {
+    compatible.required = schema.required.filter((value): value is string => typeof value === "string")
+  }
+  if (schema.items && typeof schema.items === "object" && !Array.isArray(schema.items)) {
+    compatible.items = llamaCppSchema(schema.items as Record<string, unknown>)
+  }
+  return compatible
+}
+
 const DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 
 const requiresCompatibilitySystemMessage = (provider: TwinnyProvider) =>
@@ -136,7 +167,11 @@ const requestParameters = (provider: TwinnyProvider, request: ChatParameters) =>
     ? {
         tools: request.tools.map((tool) => ({
           type: "function" as const,
-          function: { name: tool.name, description: tool.description, parameters: tool.parameters }
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: provider.provider === API_PROVIDERS.LlamaCpp ? llamaCppSchema(tool.parameters) : tool.parameters
+          }
         }))
       }
     : {})

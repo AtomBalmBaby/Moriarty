@@ -249,8 +249,10 @@ const gapAfter = (shown: string) =>
   !shown.trim() || shown.endsWith("\n\n") ? "" : shown.endsWith("\n") ? "\n" : "\n\n"
 
 /** A refusal that names tools or function calling, as opposed to any other failure. */
-const mentionsTools = (error: unknown) =>
-  !isCancelled(error) && error instanceof Error && /\btools?\b|function.?call/i.test(error.message)
+const refusesNativeTools = (error: unknown) =>
+  !isCancelled(error) &&
+  error instanceof Error &&
+  (/\btools?\b|function.?call/i.test(error.message) || /failed to parse grammar/i.test(error.message))
 
 /** A model that does not take a reasoning effort, as opposed to one that will not mix it with tools. */
 const refusesReasoningEffort = (error: unknown) =>
@@ -514,9 +516,9 @@ class ToolLoop {
           step--
           continue
         }
-        if (native && !reply.text && mentionsTools(error)) {
-          // Refused before any tool ran: the server or model has no native
-          // tool-calling, and the text protocol takes over.
+        if (native && !reply.text && refusesNativeTools(error)) {
+          // A server can reject native calls outright or fail to build its
+          // tool-schema grammar; either way, no tool ran and text mode is safe.
           if (!this._results.length) {
             this._options.onFallback?.((error as Error).message, "tools")
             this._mode = "text"

@@ -254,7 +254,7 @@ test("native calls go out as tools and come back as tool messages; the last requ
     second.slice(2).map((m) => [m.role, (m as { tool_call_id?: string }).tool_call_id]),
     [["assistant", undefined], ["tool", "a"], ["tool", "b"]]
   )
-  assert.strictEqual(second[2].content, null, "a reply that is only calls carries no empty text (Anthropic refuses it)")
+  assert.strictEqual(second[2].content, "", "assistant tool-call messages use an empty string so OpenAI-compatible servers do not receive null")
   assert.strictEqual(requests[2].tools, undefined)
 })
 
@@ -272,6 +272,24 @@ test("a server that refuses tools gets the text protocol instead", async () => {
     }).chat({ model: "m", messages: [{ role: "user", content: "What is here?" }] })
   )
   assert.strictEqual(fellBack.length, 1)
+  assert.strictEqual(requests[1].tools, undefined)
+  assert.match(requests[1].messages[0].content as string, /```tool/)
+  assert.strictEqual(shown, "> listed the workspace root · 3 entries\n\nThree entries.")
+})
+
+test("llama.cpp tool grammar errors retry with the text protocol", async () => {
+  const { client, requests } = scripted([
+    { refuse: "llama.cpp returned an error. 400 Failed to initialize samplers: failed to parse grammar | 400" },
+    "```tool\n{\"name\": \"list_dir\", \"arguments\": {}}\n```",
+    "Three entries."
+  ])
+  const fallbacks: string[] = []
+  const shown = await collect(withTools(client, workspaceTools(makeWorkspace()), {
+    mode: "native",
+    onFallback: (reason) => fallbacks.push(reason)
+  }).chat({ model: "m", messages: [{ role: "user", content: "What is here?" }] }))
+  assert.strictEqual(fallbacks.length, 1)
+  assert.match(fallbacks[0], /failed to parse grammar/i)
   assert.strictEqual(requests[1].tools, undefined)
   assert.match(requests[1].messages[0].content as string, /```tool/)
   assert.strictEqual(shown, "> listed the workspace root · 3 entries\n\nThree entries.")

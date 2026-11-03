@@ -42,6 +42,42 @@ test("OpenAI-style servers are asked to count a streamed request; others are not
   }
 })
 
+test("llama.cpp receives a reduced JSON Schema", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      title: { type: "string", maxLength: 500, description: "Task title" },
+      status: { type: "string", enum: ["pending", "in_progress"] },
+      expected_version: { type: "integer", minimum: 1 },
+      due: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
+      result: { type: "string", enum: ["observed", "passed", "failed"] },
+      labels: { type: "array", items: { type: "string", maxLength: 40 } }
+    },
+    required: ["title", "expected_version"],
+    additionalProperties: false
+  }
+  const toolWithSchema = { name: "twinny_todo_update", description: "Update a task", parameters: schema }
+  const llamaRequest = buildStreamingRequest(provider("llamacpp"), conversation, { tools: [toolWithSchema] }) as unknown as {
+    tools: Array<{ function: { parameters: Record<string, unknown> } }>
+  }
+  assert.deepStrictEqual(llamaRequest.tools[0].function.parameters, {
+    type: "object",
+    properties: {
+      title: { type: "string", description: "Task title" },
+      status: { type: "string", description: "Allowed values: pending, in_progress." },
+      expected_version: { type: "integer" },
+      due: {},
+      result: { type: "string", description: "Allowed values: observed, passed, failed." },
+      labels: { type: "array", items: { type: "string" } }
+    },
+    required: ["title", "expected_version"]
+  })
+  const otherRequest = buildStreamingRequest(provider("openai-compatible"), conversation, { tools: [toolWithSchema] }) as unknown as {
+    tools: Array<{ function: { parameters: Record<string, unknown> } }>
+  }
+  assert.deepStrictEqual(otherRequest.tools[0].function.parameters, schema, "other providers retain their exact schemas")
+})
+
 test("Anthropic is told to cache the system prompt, tools and steps so far of a tool conversation, and only of one", () => {
   const marked = (request: { messages: unknown[] }) =>
     (request.messages as Array<{ role: string; cache_control?: unknown }>).filter((m) => m.cache_control)

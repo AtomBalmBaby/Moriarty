@@ -247,7 +247,7 @@ Verification values: `not_checked`, `passed`, `failed`, `waived`.
 
 **Guardrails:**
 
-- A model's `todo_update(status="completed")` must not bypass evidence validation.
+- A model's `todo_update(status="completed")` remains `in_review`; only the dedicated `twinny_todo_complete` tool, used in response to an explicit user completion request, can record a waived completion. Parent and dependency requirements still apply.
 - Failed verification returns the task to `in_progress` or `blocked`, with an event explaining why.
 - `waived` requires an authorized user or explicit controller policy and must preserve a reason.
 - After a crash, an orphaned `in_progress` task is marked as interrupted/stale at the run level, not auto-completed or silently duplicated.
@@ -267,7 +267,8 @@ Use namespaced native tools to avoid ambiguity with an existing external Todos M
 | `twinny_todo_list` | `project_id?`, `conversation_id?`, `include_completed?` | Canonical list snapshot with revision |
 | `twinny_todo_get` | `item_id` | Task details, acceptance checks, evidence summary, version |
 | `twinny_todo_create` | `list_id`, `title`, `details?`, `parent_id?`, `priority?`, `request_id` | Created task and list revision |
-| `twinny_todo_update` | `item_id`, `expected_version`, patch, `request_id` | Updated task, version, or explicit conflict |
+| `twinny_todo_update` | `item_id`, `expected_version`, patch, `request_id` | Updated task, version, or explicit conflict; completion claims become `in_review` |
+| `twinny_todo_complete` | `item_id`, `expected_version`, `request_id`, explicit user-request reason | Completed task with `waived` verification, subject to child/dependency rules |
 | `twinny_todo_evidence` | `item_id`, `kind`, `summary`, `result`, `run_id?`, `request_id` | Evidence record and updated revision |
 
 The controller supplies trustworthy scope and caller identity. Do not let a model forge `project_id`, agent identity, or completed verification results merely by providing strings. Read tools are read-only. Mutations pass through a single validated service, never directly through webview SQL.
@@ -387,14 +388,20 @@ Add plan reconciliation, context-budgeted task projection, TypeScript compile/fi
 
 ## 12. Decisions still requiring code inspection
 
-- Which existing conversation ID, storage service, and chat UI entry points are actually stable in the current Twinny source tree?
-- Which SQLite driver is compatible with supported desktop/remote extension runtimes and packaging? Verify this before committing native binaries or relying on a specific Node version.
-- Does Twinny already have a database abstraction worth extending, and can it serve as the adapter boundary?
-- How should a worktree alias or project move be confirmed by the user without ambiguous automatic merging?
-- What is the minimal supported verification-evidence vocabulary for v1?
-- Should external Todos MCP be hidden, left separately available, or offered an explicit import path? **Never silently merge an MCP server's data with the native store.**
+- **Resolved:** the existing stable conversation ID scopes one list per conversation. Project scope uses the sorted workspace URI set; chats without a workspace use a reserved unscoped project.
+- **Resolved:** use `sql.js` SQLite WASM instead of relying on `node:sqlite`, which is not guaranteed by the supported VS Code engine. The build packages the WASM runtime with the extension. Writes are serialized with a lock, a SQLite transaction, and atomic database-file replacement rather than WAL.
+- **Resolved for Slice A:** the repository is the persistence boundary; no existing database abstraction was suitable to extend.
+- **Deferred:** moved/renamed project aliases require a deliberate association flow; URI changes currently resolve to a distinct project identity.
+- **Resolved for Slice A:** verification states are `not_checked`, `passed`, `failed`, and `waived`. Model completion claims change task status to `in_review`; the explicit `twinny_todo_complete` tool or checklist action can waive verification only in response to a user completion request.
+- **Resolved:** this is a native Twinny toolset. It does not depend on, import, or merge with an external Todos MCP; any separately configured MCP tools remain independent.
 
-## 13. References
+## 13. Implementation status
+
+The first vertical slice is implemented: one persistent, project-and-chat-scoped list; host-validated native tools (`twinny_todo_list`, `twinny_todo_get`, `twinny_todo_create`, `twinny_todo_update`, `twinny_todo_complete`, and `twinny_todo_evidence`); and an above-chat checklist for creating, editing, reordering, and changing task status. The extension host owns scope and authoritative state. The native TODO-only tool loop is available in ordinary chats even when Agent mode is off; it exposes no workspace tools. User-authored task content is protected from silent model overwrite; stale writes conflict; model completion claims become `in_review`; explicit user completion through the checklist or `twinny_todo_complete` is audited as `waived`; reopening clears stale verification.
+
+Persistence, tool, protocol, and checklist code are in place. llama.cpp receives a reduced projection of tool JSON schemas (types, object/array structure, required fields, and enum values conveyed in descriptions) to avoid constraints that its grammar parser may reject; Twinny still validates tool arguments at execution. If llama.cpp nevertheless rejects native tools, the loop falls back to the text tool protocol before any tool runs. Other providers receive their original schemas. Empty optional parent IDs are normalized to no parent, evidence accepts common success/failure aliases for canonical results, and tool instructions require reporting errors even if a later retry succeeds. An explicit chat request to complete a TODO can use `twinny_todo_complete`; a model status claim through `twinny_todo_update` continues to become `in_review`. The focused persistence, scope-isolation, idempotency, concurrency, completion-guard, and native-tool tests pass; the bundled-WASM test passes, and the packaged VSIX includes `out/sql-wasm.wasm`. In-editor interaction and restart checks remain part of the final Slice A validation. Execution/run recovery and automated evidence attribution, plan reconciliation, and evaluator/repair workflows remain future slices; they are not represented as delivered behavior here.
+
+## 14. References
 
 - [VS Code extension data storage](https://code.visualstudio.com/api/extension-capabilities/common-capabilities)
 - [VS Code ExtensionContext API](https://code.visualstudio.com/api/references/vscode-api)

@@ -1,0 +1,145 @@
+.panel {
+  margin: 0 12px 8px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  color: var(--vscode-foreground);
+  font-size: 12px;
+}
+
+.header,
+.toggle,
+.addForm,
+.actions,
+.editForm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header {
+  min-height: 32px;
+  padding: 0 8px;
+}
+
+.toggle {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  padding: 4px 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.count,
+.completedCount,
+.itemMeta {
+  color: var(--vscode-descriptionForeground);
+}
+
+.content {
+  padding: 0 8px 8px;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.addForm {
+  padding: 8px 0;
+}
+
+.addForm input,
+.editForm input {
+  min-width: 0;
+  flex: 1;
+  padding: 5px 7px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+}
+
+.addForm button,
+.editForm button,
+.actions button,
+.showCompleted {
+  color: var(--vscode-textLink-foreground);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 3px 4px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.item {
+  display: flex;
+  gap: 8px;
+  padding: 7px 2px;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.status {
+  width: 14px;
+  flex: 0 0 14px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.item[data-status="completed"] .status {
+  color: var(--vscode-testing-iconPassed, var(--vscode-descriptionForeground));
+}
+
+.itemBody {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.itemTitle,
+.details,
+.blockedReason {
+  overflow-wrap: anywhere;
+}
+
+.details,
+.blockedReason {
+  white-space: pre-wrap;
+  color: var(--vscode-descriptionForeground);
+}
+
+.blockedReason,
+.error {
+  color: var(--vscode-errorForeground);
+}
+
+.actions {
+  flex-wrap: wrap;
+  margin-left: -4px;
+}
+
+.editForm {
+  flex: 1;
+  min-width: 0;
+}
+
+.empty {
+  color: var(--vscode-descriptionForeground);
+}
+
+.error {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+
+.showCompleted {
+  margin-top: 6px;
+}

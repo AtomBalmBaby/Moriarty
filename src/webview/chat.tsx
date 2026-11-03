@@ -42,6 +42,7 @@ import MessageItem from "./message-item"
 import { bridge, emit, useServerEvent } from "./messaging"
 import { Shortcuts } from "./shortcuts"
 import { Suggestions } from "./suggestions"
+import { TodoPanel } from "./todo-panel"
 import { answerToolStep } from "./tool-steps"
 import { conversationMarkdown } from "./transcript"
 import { CustomKeyMap, getThinkingMessage } from "./utils"
@@ -1456,6 +1457,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
             {contextItems.map(renderContextItem)}
           </div>
         )}
+        <TodoPanel conversationId={conversation?.id} />
         <div className={styles.transcript}>
           {intentCompilerReview ? (
             <div className={styles.intentReviewPanel}>

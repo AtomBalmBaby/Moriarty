@@ -47,6 +47,10 @@ const lanceGlibcCheck = {
             to: "./out/ort-wasm-simd.wasm"
           },
           {
+            from: "./node_modules/sql.js/dist/sql-wasm.wasm",
+            to: "./out/sql-wasm.wasm"
+          },
+          {
             from: "./node_modules/tree-sitter-wasms/out/**/*.wasm",
             to: "./out/tree-sitter-wasms"
           },

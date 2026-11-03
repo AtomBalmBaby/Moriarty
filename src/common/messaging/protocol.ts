@@ -8,16 +8,10 @@ import {
   PROVIDER_EVENT_NAME,
   REVIEW_EVENT_NAME,
   TEAM_PLUGINS_EVENT_NAME,
-  TEAM_SHARE_EVENT_NAME
+  TEAM_SHARE_EVENT_NAME,
+  TODO_EVENT_NAME
 } from "../constants"
 import type { DiscoveredServer } from "../provider-discovery"
-
-export interface ToolInventoryItem {
-  name: string
-  description: string
-  server: string
-  tool: string
-}
 import type {
   TeamApplyRequest,
   TeamApplyResult,
@@ -42,9 +36,19 @@ import type {
   ModelCatalogue,
   ReplyChangesView,
   ThemeType,
+  TodoItem,
+  TodoListSnapshot,
+  TodoPriority,
   ToolStepView,
   TwinnyProvider
 } from "../types"
+
+export interface ToolInventoryItem {
+  name: string
+  description: string
+  server: string
+  tool: string
+}
 
 /**
  * A single channel in the protocol.
@@ -75,6 +79,29 @@ export interface ContextValue<T = unknown> {
 export interface ComposerTurn {
   role: string
   content: string
+}
+
+export interface TodoCreateRequest {
+  conversationId: string
+  requestId: string
+  title: string
+  details?: string
+  priority?: TodoPriority
+}
+
+export interface TodoUpdateRequest {
+  conversationId: string
+  requestId: string
+  itemId: string
+  expectedVersion: number
+  patch: Partial<Pick<TodoItem, "title" | "details" | "status" | "priority" | "blockedReason">>
+}
+
+export interface TodoCompleteRequest {
+  conversationId: string
+  requestId: string
+  itemId: string
+  expectedVersion: number
 }
 
 export interface ChatRequest {
@@ -370,6 +397,10 @@ export interface IntentCompilerResult {
 /* -------------------------------------------------------------------------- */
 
 export interface ClientEvents {
+  [TODO_EVENT_NAME.getList]: Channel<{ conversationId: string }, TodoListSnapshot>
+  [TODO_EVENT_NAME.createItem]: Channel<TodoCreateRequest, TodoListSnapshot>
+  [TODO_EVENT_NAME.updateItem]: Channel<TodoUpdateRequest, TodoListSnapshot>
+  [TODO_EVENT_NAME.completeItem]: Channel<TodoCompleteRequest, TodoListSnapshot>
   [EVENT_NAME.twinnyToolInventory]: Channel<void, ToolInventoryItem[]>
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>
@@ -525,6 +556,7 @@ export interface ClientEvents {
 /* -------------------------------------------------------------------------- */
 
 export interface ServerEvents {
+  [TODO_EVENT_NAME.changed]: TodoListSnapshot
   [EVENT_NAME.twinnyAddMessage]: ChatCompletionMessage | undefined
   [EVENT_NAME.twinnyAgentRegistry]: AgentProfileSummary[]
   [EVENT_NAME.twinnyPromptInstructions]: PromptInstructionsResponse
@@ -612,6 +644,7 @@ type EveryName =
   | (typeof REVIEW_EVENT_NAME)[keyof typeof REVIEW_EVENT_NAME]
   | (typeof TEAM_SHARE_EVENT_NAME)[keyof typeof TEAM_SHARE_EVENT_NAME]
   | (typeof TEAM_PLUGINS_EVENT_NAME)[keyof typeof TEAM_PLUGINS_EVENT_NAME]
+  | (typeof TODO_EVENT_NAME)[keyof typeof TODO_EVENT_NAME]
 
 /**
  * Every declared name must be used by at least one direction, and no channel

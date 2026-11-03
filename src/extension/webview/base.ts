@@ -1,9 +1,12 @@
 import { models } from "fluency.js"
+import path from "node:path"
 import * as vscode from "vscode"
 
 import {
+  ACTIVE_CONVERSATION_STORAGE_KEY,
   ACTIVE_FIM_PROVIDER_STORAGE_KEY,
   EVENT_NAME,
+  TODO_EVENT_NAME,
   TWINNY_COMMAND_NAME,
   WORKSPACE_STORAGE_KEY
 } from "../../common/constants"
@@ -16,7 +19,9 @@ import {
 } from "../../common/messaging/protocol"
 import {
   AnyContextItem,
+  Conversation,
   ModelCatalogue,
+  TodoListSnapshot,
   TwinnyProvider
 } from "../../common/types"
 import { AgentRegistry } from "../agents/registry"
@@ -38,6 +43,8 @@ import { TeamPluginsBridge, TeamShareBridge } from "../team/bridge"
 import type { TeamPlugins } from "../team/plugins-page"
 import { TeamShare } from "../team/share"
 import { TemplateProvider } from "../templates/provider"
+import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
+import type { CreateTodoInput, UpdateTodoInput } from "../todos/types"
 import { getLanguage, getTerminal, getTextSelection, getTheme } from "../utils"
 
 import { resolveLanguageId, stripShellPrompts } from "./code-actions"
@@ -60,6 +67,7 @@ export class BaseProvider {
   private _teamPluginsBridge: TeamPluginsBridge | undefined
   private _sessionManager: SessionManager | undefined
   private _generations: GenerationTracker
+  private readonly _todoRepository: TodoRepository
   private _templateDir: string | undefined
   private _templateProvider: TemplateProvider
   private _disposables: vscode.Disposable[] = []
@@ -88,6 +96,10 @@ export class BaseProvider {
     teamPlugins?: TeamPlugins
   ) {
     this.context = context
+    this._todoRepository = new TodoRepository(
+      path.join(context.globalStorageUri.fsPath, "twinny-state.sqlite"),
+      path.join(context.extensionPath, "out", "sql-wasm.wasm")
+    )
     this._agentRegistry = new AgentRegistry(context)
     this._fileTreeProvider = new FileTreeProvider()
     this._workspaceIndex = index
@@ -127,6 +139,23 @@ export class BaseProvider {
     this._disposables = []
   }
 
+  private todoScope(conversationId: string) {
+    const active = this.context.globalState.get<Conversation>(ACTIVE_CONVERSATION_STORAGE_KEY)
+    if (!conversationId || active?.id !== conversationId) {
+      throw new Error("TODO operations are limited to the active conversation")
+    }
+    return {
+      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      conversationId
+    }
+  }
+
+  private async emitTodoSnapshot(conversationId: string): Promise<TodoListSnapshot> {
+    const snapshot = await this._todoRepository.getList(this.todoScope(conversationId))
+    this.bridge?.emit(TODO_EVENT_NAME.changed, snapshot)
+    return snapshot
+  }
+
   private initializeServices(bridge: ExtensionBridge) {
     this.chat = new Chat(
       this._generations,
@@ -134,7 +163,8 @@ export class BaseProvider {
       this.context,
       bridge,
       this._workspaceIndex?.search,
-      this._agentRegistry
+      this._agentRegistry,
+      this._todoRepository
     )
 
     this.conversationHistory = new ConversationHistory(
@@ -249,8 +279,25 @@ export class BaseProvider {
         return profiles
       },
       [EVENT_NAME.twinnyPromptInstructions]: (request) => this.promptInstructions(request),
-      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection }) =>
-        void this.chat?.completion(messages, mentions, agentSelection),
+      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection, conversationId }) =>
+        void this.chat?.completion(messages, mentions, agentSelection, conversationId),
+      [TODO_EVENT_NAME.getList]: ({ conversationId }) =>
+        this._todoRepository.getList(this.todoScope(conversationId)),
+      [TODO_EVENT_NAME.createItem]: async ({ conversationId, requestId, ...input }) => {
+        await this._todoRepository.createItem(this.todoScope(conversationId), input as CreateTodoInput, requestId, "user")
+        return this.emitTodoSnapshot(conversationId)
+      },
+      [TODO_EVENT_NAME.updateItem]: async ({ conversationId, ...input }) => {
+        await this._todoRepository.updateItem(this.todoScope(conversationId), { ...input, actor: "user" } as UpdateTodoInput)
+        return this.emitTodoSnapshot(conversationId)
+      },
+      [TODO_EVENT_NAME.completeItem]: async ({ conversationId, itemId, expectedVersion, requestId }) => {
+        await this._todoRepository.completeByUser(
+          this.todoScope(conversationId), itemId, expectedVersion,
+          "Completed by an explicit action in the TODO checklist.", requestId
+        )
+        return this.emitTodoSnapshot(conversationId)
+      },
       [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels }) =>
         (await this.chat?.compileIntent(prompt, history, maxLevels)) ?? undefined,
       [EVENT_NAME.twinnyClickSuggestion]: (template) =>

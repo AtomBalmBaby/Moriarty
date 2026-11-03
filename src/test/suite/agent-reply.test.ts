@@ -20,6 +20,7 @@ import { Chat } from "../../extension/chat/index"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
+import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
 
 /** A model that answers each request with the next scripted reply. */
 class ScriptedModel implements InferenceProvider {
@@ -94,6 +95,41 @@ const fakeWebview = () => {
 
 suite("Agent reply, end to end", function () {
   this.timeout(60000)
+
+  test("native TODO tools remain available in ordinary chat when Agent mode is off", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-chat-todos-"))
+    const model = new ScriptedModel([
+      call("twinny_todo_create", { title: "Verify native TODO persistence", request_id: "create-todo" }),
+      "Created the TODO."
+    ])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
+    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const bridge = new ExtensionBridge(fakeWebview() as unknown as vscode.Webview)
+    const repository = new TodoRepository(
+      path.join(directory, "todos.sqlite"),
+      path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm")
+    )
+    const chat = new Chat(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
+
+    try {
+      await chat.completion([{ role: "user", content: "Create a native TODO." }], [], "off", "ordinary-chat")
+      const snapshot = await repository.getList({
+        projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+        conversationId: "ordinary-chat"
+      })
+      assert.deepStrictEqual(snapshot.items.map((item) => item.title), ["Verify native TODO persistence"])
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    } finally {
+      bridge.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
 
   test("the webview message channel drives the same Chat completion and tool loop as a user prompt", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-webview-message-"))
@@ -204,6 +240,7 @@ suite("Agent reply, end to end", function () {
     const chatRef: { current?: ChatIn } = {}
     const asked: string[] = []
     const bridge = {
+      handle: () => undefined,
       emit: (type: string, data: unknown) => {
         if (type !== EVENT_NAME.twinnyToolSteps) return
         const waiting = (data as ToolStepView[]).find((step) => step.status === "waiting")
@@ -259,6 +296,7 @@ suite("Agent reply, end to end", function () {
     providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
     const firstRef: { current?: ChatIn } = {}
     const firstBridge = {
+      handle: () => undefined,
       emit: (type: string, data: unknown) => {
         if (type !== EVENT_NAME.twinnyToolSteps) return
         const waiting = (data as ToolStepView[]).find((step) => step.status === "waiting")
@@ -286,6 +324,7 @@ suite("Agent reply, end to end", function () {
       ])
       const secondRef: { current?: ChatIn } = {}
       const secondBridge = {
+        handle: () => undefined,
         emit: (type: string, data: unknown) => {
           if (type !== EVENT_NAME.twinnyToolSteps) return
           const waiting = (data as ToolStepView[]).find((step) => step.status === "waiting")
@@ -311,6 +350,7 @@ suite("Agent reply, end to end", function () {
       model = ordinaryModel
       const ordinaryRef: { current?: ChatIn } = {}
       const ordinaryBridge = {
+        handle: () => undefined,
         emit: (type: string, data: unknown) => {
           if (type !== EVENT_NAME.twinnyToolSteps) return
           const waiting = (data as ToolStepView[]).find((step) => step.status === "waiting")
@@ -363,7 +403,7 @@ suite("Agent reply, end to end", function () {
     ])
     providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
     const emitted: { type: string; data: unknown }[] = []
-    const bridge = { emit: (type: string, data: unknown) => emitted.push({ type, data }) } as unknown as ExtensionBridge
+    const bridge = { handle: () => undefined, emit: (type: string, data: unknown) => emitted.push({ type, data }) } as unknown as ExtensionBridge
     const stored: Record<string, unknown> = {
       [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider,
       [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true,
@@ -461,6 +501,7 @@ suite("Agent reply, end to end", function () {
     const emitted: { type: string; data: unknown }[] = []
     let offered = false
     const bridge = {
+      handle: () => undefined,
       emit: (type: string, data: unknown) => {
         emitted.push({ type, data })
         // The user types while the first read runs.
@@ -537,7 +578,7 @@ suite("Agent reply, end to end", function () {
     } as unknown as vscode.ExtensionContext
     const registry = new AgentRegistry(context)
     const bridgeMessages: Array<{ type: string; data: unknown }> = []
-    const bridge = { emit: (type: string, data?: unknown) => bridgeMessages.push({ type, data }) } as unknown as ExtensionBridge
+    const bridge = { handle: () => undefined, emit: (type: string, data?: unknown) => bridgeMessages.push({ type, data }) } as unknown as ExtensionBridge
     const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
     chat.root = root
 
@@ -619,7 +660,7 @@ suite("Agent reply, end to end", function () {
     } as unknown as vscode.ExtensionContext
 
 const bridgeMessages: Array<{ type: string; data: unknown }> = []
-    const bridge = { emit: (type: string, data?: unknown) => bridgeMessages.push({ type, data }) } as unknown as ExtensionBridge
+    const bridge = { handle: () => undefined, emit: (type: string, data?: unknown) => bridgeMessages.push({ type, data }) } as unknown as ExtensionBridge
     const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
     chat.root = root
 
