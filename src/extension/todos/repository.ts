@@ -412,7 +412,7 @@ export class TodoRepository {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
         const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed_number: number; exitCode: number | null; createdAt: string }>(database,
-          "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed AS failed_number, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC LIMIT 20", [row.id]
+          "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed AS failed_number, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC", [row.id]
         ).map((observation) => ({
           id: observation.id,
           itemId: observation.itemId,

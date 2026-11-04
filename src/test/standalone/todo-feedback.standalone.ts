@@ -310,6 +310,57 @@ test("analysis-only evaluation may accept a complete answer without file edits",
   }
 })
 
+test("criteria entries must use the canonical criterion field and preserve evidence order", async () => {
+  const state = await fixture([{ id: "field-check", acceptance: "The validation rule is documented" }])
+  try {
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const wrong = JSON.parse(responseFor(review))
+    wrong.criteria = [{ text: review.acceptanceCriteria[0], status: "passed", evidenceRefs: [] }]
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(wrong), review, "mock-reviewer"), (error: unknown) => {
+      return error instanceof TodoEvaluationValidationError && error.code === "missing_field" && /criterion/i.test(error.message)
+    })
+
+    const valid = JSON.parse(responseFor(review))
+    valid.criteria = [{ criterion: review.acceptanceCriteria[0], status: "passed", evidenceRefs: [] }]
+    const evaluation = parseTodoEvaluation(JSON.stringify(valid), review, "mock-reviewer")
+    assert.equal(evaluation.criteria[0].criterion, review.acceptanceCriteria[0])
+    assert.deepEqual(evaluation.criteria[0].evidenceRefs, [])
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("an early successful read remains available after later observations and continuation", async () => {
+  const state = await fixture([{ id: "retain-evidence", acceptance: "The relevant file is inspected" }])
+  try {
+    const item = state.items[0]
+    const initial = await state.repository.recordToolObservation(state.scope, {
+      itemId: item.id,
+      toolName: "read_file",
+      arguments: { path: "src/early-read.ts" },
+      output: "The relevant file contents were inspected successfully.",
+      failed: false,
+      requestId: "early-read"
+    })
+    for (let index = 0; index < 25; index++) {
+      await state.repository.recordToolObservation(state.scope, {
+        itemId: item.id,
+        toolName: "read_file",
+        arguments: { path: `src/late-${index}.ts` },
+        output: `Late observation ${index}`,
+        failed: false,
+        requestId: `late-read-${index}`
+      })
+    }
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    assert.ok(review.observations.some((observation) => observation.id === initial.id))
+    const evaluation = parseTodoEvaluation(responseFor(review, { refs: [initial.id] }), review, "mock-reviewer")
+    assert.equal(evaluation.criteria[0].evidenceRefs[0], initial.id)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("an implementation cannot be accepted from prose without verified workspace changes", async () => {
   const state = await fixture([{ id: "implement", acceptance: "The requested component is updated" }])
   try {
