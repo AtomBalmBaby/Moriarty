@@ -489,15 +489,27 @@ export class TodoRepository {
       if (row.version !== expectedVersion) throw new TodoConflictError("TODO changed since review version " + expectedVersion + "; current version is " + row.version)
       const currentPlan = rows<{ revision: number; goal: string }>(database, "SELECT revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
       if (!currentPlan || currentPlan.revision !== evaluation.metadata.planRevision) throw new TodoConflictError("Intent plan changed while its TODO was being evaluated")
+      if (evaluation.schemaVersion !== 1) throw new Error("Evaluation schemaVersion must be 1")
       if (evaluation.taskId !== row.task_id) throw new Error("Evaluation task ID does not match the reviewed task")
+      if (!["accept", "revise", "needs_evidence", "blocked"].includes(evaluation.decision)) throw new Error("Evaluation decision is not supported")
       const taskDefinition = rows<{ acceptance_json: string }>(database, "SELECT acceptance_json FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [itemId, list.id])[0]
       const acceptanceCriteria = JSON.parse(taskDefinition.acceptance_json) as string[]
       if (evaluation.criteria.length !== acceptanceCriteria.length || evaluation.criteria.some((criterion, index) => criterion.criterion !== acceptanceCriteria[index])) {
         throw new Error("Evaluation criteria do not match the stored task acceptance criteria")
       }
+      const observations = rows<{ id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null }>(database,
+        "SELECT id, tool_name, arguments_json, failed, exit_code FROM todo_tool_observations WHERE item_id = ?", [itemId])
+      const evidenceIds = new Set(rows<{ id: string }>(database, "SELECT id FROM todo_evidence WHERE item_id = ?", [itemId]).map((entry) => entry.id))
+      const observationIds = new Set(observations.map((observation) => observation.id))
+      for (const [index, criterion] of evaluation.criteria.entries()) {
+        if (!["passed", "failed", "unverified"].includes(criterion.status)) throw new Error(`Evaluation criteria[${index}].status is not supported`)
+        for (const reference of criterion.evidenceRefs) {
+          if (!observationIds.has(reference) && !evidenceIds.has(reference)) {
+            throw new Error(`Evaluation criteria[${index}].evidenceRefs references unknown evidence ID ${reference}`)
+          }
+        }
+      }
       if (evaluation.decision === "accept") {
-        const observations = rows<{ id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null }>(database,
-          "SELECT id, tool_name, arguments_json, failed, exit_code FROM todo_tool_observations WHERE item_id = ?", [itemId])
         const byId = new Map(observations.map((observation) => [observation.id, observation]))
         const unsupported = evaluation.criteria.some((criterion) => {
           if (criterion.status !== "passed") return true

@@ -1528,6 +1528,14 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           result: notice.fileVerified ? "observed" : "failed",
           requestId: randomUUID()
         })
+        await this._todoRepository.recordToolObservation(todoScope, {
+          itemId: intentAtStart.task.id,
+          toolName: "automatic_edit_recovery",
+          arguments: { fileVerified: String(notice.fileVerified), diagnosticsVerified: String(notice.diagnosticsVerified) },
+          output: `${notice.reason}\nFile verified: ${notice.fileVerified}; diagnostics: ${notice.diagnosticsStatus}.\n${notice.diagnostics}`.slice(0, 2000),
+          failed: !notice.fileVerified || !notice.diagnosticsVerified,
+          requestId: randomUUID()
+        })
       }
     }
     const client = view

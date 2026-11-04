@@ -310,39 +310,116 @@ test("analysis-only evaluation may accept a complete answer without file edits",
   }
 })
 
-test("criteria entries must use the canonical criterion field and preserve evidence order", async () => {
-  const state = await fixture([{ id: "field-check", acceptance: "The validation rule is documented" }])
+test("Cerebras-shaped malformed criteria are rejected with exact field diagnostics", async () => {
+  const state = await fixture([
+    { id: "field-check", acceptance: "The validation rule is documented" },
+    { id: "field-order", acceptance: "The schema version is documented", dependencies: ["field-check"] }
+  ], false)
   try {
+    const item = state.items[0]
+    await state.repository.updateItem(state.scope, {
+      itemId: item.id,
+      expectedVersion: item.version,
+      patch: { status: "in_review" },
+      actor: "model",
+      requestId: "criteria-review"
+    })
     const review = (await state.repository.getReviewPackages(state.scope))[0]
-    const wrong = JSON.parse(responseFor(review))
-    wrong.criteria = [{ text: review.acceptanceCriteria[0], status: "passed", evidenceRefs: [] }]
-    assert.throws(() => parseTodoEvaluation(JSON.stringify(wrong), review, "mock-reviewer"), (error: unknown) => {
-      return error instanceof TodoEvaluationValidationError && error.code === "missing_field" && /criterion/i.test(error.message)
+    review.acceptanceCriteria = ["The validation rule is documented", "The schema version " + "is checked ".repeat(50)]
+    assert.deepEqual(JSON.parse(todoReviewInput(review)).task.acceptanceCriteria, review.acceptanceCriteria)
+    const textInsteadOfCriterion = JSON.parse(responseFor(review))
+    textInsteadOfCriterion.criteria = review.acceptanceCriteria.map((criterion: string) => ({
+      text: criterion,
+      status: "passed",
+      evidenceRefs: []
+    }))
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(textInsteadOfCriterion), review, "mock-reviewer"), (error: unknown) => {
+      return error instanceof TodoEvaluationValidationError && error.code === "missing_field" && error.field === "criteria[0].criterion"
     })
 
-    const valid = JSON.parse(responseFor(review))
-    valid.criteria = [{ criterion: review.acceptanceCriteria[0], status: "passed", evidenceRefs: [] }]
-    const evaluation = parseTodoEvaluation(JSON.stringify(valid), review, "mock-reviewer")
-    assert.equal(evaluation.criteria[0].criterion, review.acceptanceCriteria[0])
-    assert.deepEqual(evaluation.criteria[0].evidenceRefs, [])
+    const droppedCriterionAndStringInstructions = JSON.parse(responseFor(review))
+    droppedCriterionAndStringInstructions.criteria = review.acceptanceCriteria.map(() => ({
+      status: "passed",
+      evidenceRefs: []
+    }))
+    droppedCriterionAndStringInstructions.correctiveInstructions = "Fix the schema"
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(droppedCriterionAndStringInstructions), review, "mock-reviewer"), (error: unknown) => {
+      return error instanceof TodoEvaluationValidationError && error.field === "criteria[0].criterion"
+    })
+
+    const reordered = JSON.parse(responseFor(review))
+    reordered.criteria.reverse()
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(reordered), review, "mock-reviewer"), (error: unknown) => {
+      return error instanceof TodoEvaluationValidationError && error.field === "criteria[0].criterion"
+    })
+
+    const stringInstructions = JSON.parse(responseFor(review))
+    stringInstructions.correctiveInstructions = "Fix the schema"
+    assert.throws(() => parseTodoEvaluation(JSON.stringify(stringInstructions), review, "mock-reviewer"), (error: unknown) => {
+      return error instanceof TodoEvaluationValidationError && error.field === "correctiveInstructions"
+    })
+
+    const valid = parseTodoEvaluation(responseFor(review), review, "mock-reviewer")
+    assert.deepEqual(valid.criteria.map((criterion) => criterion.criterion), review.acceptanceCriteria)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
 })
 
-test("an early successful read remains available after later observations and continuation", async () => {
-  const state = await fixture([{ id: "retain-evidence", acceptance: "The relevant file is inspected" }])
+test("an early file read remains evaluator-visible across later tool calls and automatic continuation", async () => {
+  const state = await fixture([{
+    id: "retain-evidence",
+    acceptance: "Inspect src/webview/styles/todo-panel.module.css and confirm its styling"
+  }], false)
   try {
     const item = state.items[0]
     const initial = await state.repository.recordToolObservation(state.scope, {
       itemId: item.id,
       toolName: "read_file",
-      arguments: { path: "src/early-read.ts" },
-      output: "The relevant file contents were inspected successfully.",
+      arguments: { path: "src/webview/styles/todo-panel.module.css" },
+      output: ".todoPanel { display: grid; }",
       failed: false,
-      requestId: "early-read"
+      requestId: "early-css-read"
     })
-    for (let index = 0; index < 25; index++) {
+
+    const firstReviewItem = await state.repository.updateItem(state.scope, {
+      itemId: item.id,
+      expectedVersion: item.version,
+      patch: { status: "in_review" },
+      actor: "model",
+      requestId: "first-turn-review"
+    })
+    const firstReview = (await state.repository.getReviewPackages(state.scope))[0]
+    const firstDecision = parseTodoEvaluation(responseFor(firstReview, {
+      decision: "needs_evidence",
+      status: "unverified",
+      problems: ["Continue with the remaining evidence."]
+    }), firstReview, "mock-reviewer")
+    await state.repository.applyEvaluation(state.scope, item.id, firstReviewItem.version, firstDecision, "first-turn-decision")
+
+    const inProgress = await state.repository.updateItem(state.scope, {
+      itemId: item.id,
+      expectedVersion: (await state.repository.getList(state.scope)).items[0].version,
+      patch: { status: "in_progress" },
+      actor: "model",
+      requestId: "automatic-continuation"
+    })
+    const active = await state.repository.getActiveIntentContext(state.scope)
+    assert.equal(active?.task.id, item.id)
+    const continuation = continuationContext({
+      goal: active!.goal,
+      constraints: active!.constraints,
+      task: active!.task.title,
+      criteria: active!.acceptanceCriteria,
+      feedback: ["Continue after independent evaluation."],
+      verifiedObservations: (active!.observations ?? []).map((observation) =>
+        `${observation.toolName} ${observation.arguments.path ?? ""}: ${observation.output}`
+      ),
+      finalResponse: "The first turn is complete."
+    })
+    assert.match(continuation, /todo-panel\.module\.css/)
+
+    for (let index = 0; index < 105; index++) {
       await state.repository.recordToolObservation(state.scope, {
         itemId: item.id,
         toolName: "read_file",
@@ -352,10 +429,54 @@ test("an early successful read remains available after later observations and co
         requestId: `late-read-${index}`
       })
     }
+    for (const [toolName, args, output] of [
+      ["edit_file", { path: "src/changed.ts" }, "Applied a targeted edit."],
+      ["diagnostics", { file: "src/changed.ts" }, "No new diagnostics."],
+      ["run_command", { command: "npm test" }, "Tests passed."],
+      ["automatic_edit_recovery", { fileVerified: "true" }, "Rollback restored the file."]
+    ] as const) {
+      await state.repository.recordToolObservation(state.scope, {
+        itemId: item.id,
+        toolName,
+        arguments: args,
+        output,
+        failed: false,
+        exitCode: toolName === "run_command" ? 0 : undefined,
+        requestId: `later-${toolName}`
+      })
+    }
+    await state.repository.updateItem(state.scope, {
+      itemId: item.id,
+      expectedVersion: inProgress.version,
+      patch: { status: "in_review" },
+      actor: "model",
+      requestId: "second-turn-review"
+    })
     const review = (await state.repository.getReviewPackages(state.scope))[0]
     assert.ok(review.observations.some((observation) => observation.id === initial.id))
+    const evaluatorInput = JSON.parse(todoReviewInput(review))
+    assert.ok(evaluatorInput.trustedTwinnyToolObservations.some((observation: { id: string }) => observation.id === initial.id))
+    assert.ok(evaluatorInput.trustedTwinnyToolObservations.some((observation: { output: string }) => observation.output.includes(".todoPanel")))
+    for (const toolName of ["edit_file", "diagnostics", "run_command", "automatic_edit_recovery"]) {
+      assert.ok(evaluatorInput.trustedTwinnyToolObservations.some((observation: { toolName: string }) => observation.toolName === toolName), `${toolName} evidence should be retained`)
+    }
+    const suppliedIds = new Set(evaluatorInput.trustedTwinnyToolObservations.map((observation: { id: string }) => observation.id))
+    const omittedObservation = review.observations.find((observation) => !suppliedIds.has(observation.id))
+    assert.ok(omittedObservation, "the evaluator payload remains bounded")
+    assert.throws(() => parseTodoEvaluation(responseFor(review, { refs: [omittedObservation!.id] }), review, "mock-reviewer"), (error: unknown) =>
+      error instanceof TodoEvaluationValidationError && error.field === "criteria[0].evidenceRefs")
     const evaluation = parseTodoEvaluation(responseFor(review, { refs: [initial.id] }), review, "mock-reviewer")
     assert.equal(evaluation.criteria[0].evidenceRefs[0], initial.id)
+    const fabricated = { ...evaluation, criteria: evaluation.criteria.map((criterion) => ({ ...criterion, evidenceRefs: ["fabricated-observation-id"] })) }
+    await assert.rejects(
+      state.repository.applyEvaluation(state.scope, item.id, review.task.version, fabricated, "fabricated-reference"),
+      /criteria\[0\]\.evidenceRefs references unknown evidence ID/
+    )
+    assert.equal((await state.repository.getEvaluationHistory(state.scope, item.id)).length, 1)
+    const persisted = await evaluateTodoReview(state.repository, state.scope, review,
+      async () => responseFor(review, { refs: [initial.id] }), "mock-reviewer")
+    assert.equal(persisted.decision, "accept")
+    assert.equal((await state.repository.getList(state.scope)).items[0].status, "completed")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
