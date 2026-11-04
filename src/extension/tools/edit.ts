@@ -6,10 +6,10 @@
  * Models copy `find` from what `read_file` showed them, so the line-number
  * prefixes it adds are dropped, and when the exact text is not there a
  * match that ignores indentation and trailing spaces is tried before
- * giving up. `read_file` also cuts very long lines short with "…", so a
- * line ending that way matches the full line it came from, and in the
- * replacement it stands for that line unchanged. A `find` that matches
- * more than once is refused rather than guessed at.
+ * giving up. `read_file` abbreviates very long lines with "…"; use its
+ * `full_line` option before changing one. In `find`, a cut line matches by
+ * its start, and in `replace` it stands for that original line unchanged.
+ * A `find` that matches more than once is refused rather than guessed at.
  */
 import { matchIndentation } from "../edit/prompt"
 
@@ -90,7 +90,7 @@ const restoreCutLines = (replace: string, original: string[]): string | undefine
 }
 
 const CUT_LINE_REFUSAL =
-  "replace has a line cut short with … that is not in find; leave long lines you do not change out of find and replace"
+  "replace has a line cut short with … that is not in find; read that line with read_file full_line=true, or leave it out of find and replace"
 
 const NOT_FOUND = "find is not in the file; read the lines again and copy them exactly, without the line numbers"
 

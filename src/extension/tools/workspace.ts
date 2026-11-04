@@ -31,7 +31,7 @@ import {
 } from "./more"
 import { ToolCall, ToolSpec } from "./protocol"
 import { todoTools } from "./todos"
-import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
+import { clip, linesOf, MAX_LINE_CHARS, plural, ToolInputError, WorkspaceView } from "./view"
 
 export interface ToolResult {
   /** What the model is sent. */
@@ -65,6 +65,7 @@ export interface Tool extends ToolSpec {
 const MIN_READ_LINES = 100
 const DEFAULT_READ_LINES = 1000
 const MAX_READ_LINES = 5000
+const MAX_FULL_LINE_CHARS = 20_000
 const MAX_GREP_MATCHES = 40
 /** Matches shown per file, so one noisy file does not hide the others. */
 const MAX_GREP_PER_FILE = 10
@@ -167,13 +168,14 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES): Tool => {
   return {
     name: "read_file",
     readOnly: true,
-    description: `A file's lines, numbered; at most ${limit} at a time, so ask for a range in long files.`,
+    description: `A file's lines, numbered; at most ${limit} at a time. Long lines are abbreviated; pass full_line=true with start_line to read one long line exactly.`,
     parameters: [
       { name: "path", description: "The file." },
       { name: "start_line", description: "First line to read, from 1.", optional: true, type: "integer" },
-      { name: "end_line", description: "Last line to read.", optional: true, type: "integer" }
+      { name: "end_line", description: "Last line to read.", optional: true, type: "integer" },
+      { name: "full_line", description: "Return the exact text of the single line at start_line.", optional: true, type: "boolean" }
     ],
-    async run({ path: file, start_line, end_line }) {
+    async run({ path: file, start_line, end_line, full_line }) {
       if (!file) throw new ToolInputError("read_file needs a path.")
       const absolute = view.resolve(file, "file")
       const rel = view.relative(absolute)
@@ -181,6 +183,17 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES): Tool => {
       if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
       const lines = linesOf(text)
       if (!lines.length) return { output: `${rel} is empty.`, summary: `read \`${rel}\` · empty` }
+      if (full_line === "true") {
+        const lineNumber = Number.parseInt(start_line ?? "", 10)
+        if (!Number.isInteger(lineNumber) || lineNumber < 1 || lineNumber > lines.length || (end_line && Number.parseInt(end_line, 10) !== lineNumber)) {
+          throw new ToolInputError(`${rel}: full_line needs one valid start_line and no different end_line.`)
+        }
+        const line = lines[lineNumber - 1]
+        if (line.length > MAX_FULL_LINE_CHARS) {
+          throw new ToolInputError(`${rel}:${lineNumber} is longer than ${MAX_FULL_LINE_CHARS} characters; use another read method rather than editing an abbreviated line.`)
+        }
+        return { output: `${rel} (full line ${lineNumber})\n${lineNumber}: ${line}`, summary: `read \`${rel}:${lineNumber}\` · full line` }
+      }
       const start = Math.max(1, Number.parseInt(start_line ?? "", 10) || 1)
       if (start > lines.length) {
         throw new ToolInputError(`${rel} has only ${plural(lines.length, "line")}.`)
@@ -194,8 +207,10 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES): Tool => {
       const cut = end < Math.min(asked, lines.length)
         ? `\n… stopped at line ${end} of ${lines.length}; read on with start_line ${end + 1}`
         : ""
+      const clipped = lines.slice(start - 1, end).some((line) => line.length > MAX_LINE_CHARS)
+      const lineNote = clipped ? "\nLong lines end in …; read the exact source with full_line=true before replacing one." : ""
       return {
-        output: `${rel} (lines ${start}–${end} of ${lines.length})\n${body}${cut}`,
+        output: `${rel} (lines ${start}–${end} of ${lines.length})\n${body}${lineNote}${cut}`,
         summary: `read \`${rel}:${start}–${end}\``
       }
     }

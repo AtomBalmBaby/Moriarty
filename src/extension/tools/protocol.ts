@@ -368,7 +368,7 @@ export interface ToolParameter {
   name: string
   description: string
   optional?: boolean
-  type?: "string" | "integer"
+  type?: "string" | "integer" | "boolean"
 }
 
 export interface ToolSpec {

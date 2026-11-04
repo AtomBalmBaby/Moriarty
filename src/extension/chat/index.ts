@@ -1257,8 +1257,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
     if (recovery && (!recovery.fileVerified || !recovery.diagnosticsVerified)) {
       workflow.reconcile("blocked", recovery.reason)
-      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution is blocked because safe rollback was not possible: ${recovery.reason}` })
-      logger.error("[Execution] safe rollback failed: " + recovery.reason)
+      const state = recovery.fileVerified
+        ? "File contents were restored and verified, but diagnostic verification was " + recovery.diagnosticsStatus + "."
+        : "File contents could not be safely restored."
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution is blocked after edit recovery. ${state} ${recovery.reason}` })
       return undefined
     }
 
@@ -1516,12 +1518,14 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const todoOnly = !view && !!todoScope
     const onCatastrophic = async (notice: EditRecoveryNotice) => {
       recoveryNotice = notice
+      if (!notice.fileVerified) logger.error("[Execution] edit recovery failed to restore file contents: " + notice.reason)
+      else if (!notice.diagnosticsVerified) logger.warn("[Execution] file contents restored; diagnostic verification " + notice.diagnosticsStatus + ": " + notice.reason)
       if (todoScope && intentAtStart && this._todoRepository) {
         await this._todoRepository.addEvidence(todoScope, {
           itemId: intentAtStart.task.id,
           kind: "automatic_edit_recovery",
           summary: `${notice.reason}\nFile verified: ${notice.fileVerified}; diagnostics: ${notice.diagnosticsStatus}.\n${notice.diagnostics}`.slice(0, 2000),
-          result: notice.fileVerified && notice.diagnosticsVerified ? "observed" : "failed",
+          result: notice.fileVerified ? "observed" : "failed",
           requestId: randomUUID()
         })
       }

@@ -50,7 +50,16 @@ import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink } from "
 import { changesBetween, MAX_COMMAND_CHANGES, snapshotTree, TreeSnapshot } from "./command-snapshot"
 import { forbiddenDeleteReason } from "./execution-reconciliation"
 import { ReplyChanges } from "./reply-changes"
-import { CheckpointFile, DiagnosticRegressionMonitor, SafeEditCheckpoints } from "./safe-edit-recovery"
+import {
+  CheckpointFile,
+  createDiagnosticObserver,
+  DiagnosticObservation,
+  DiagnosticRegressionMonitor,
+  DiagnosticVerificationStatus,
+  recoverSignificantEdit,
+  SafeEditCheckpoints,
+  verifyDiagnosticBaseline
+} from "./safe-edit-recovery"
 
 export interface EditRecoveryNotice {
   file: string
@@ -59,7 +68,7 @@ export interface EditRecoveryNotice {
   restored: boolean
   fileVerified: boolean
   diagnosticsVerified: boolean
-  diagnosticsStatus: "verified" | "mismatch" | "unavailable"
+  diagnosticsStatus: DiagnosticVerificationStatus
   reason: string
 }
 
@@ -221,47 +230,95 @@ const UNCHECKED_FILES = /\.(md|markdown|txt|log|csv)$|(^|[\\/])\.\w*ignore$/i
 const errorsIn = (uri: Uri) =>
   languages.getDiagnostics(uri).filter((diagnostic) => diagnostic.severity === DiagnosticSeverity.Error)
 
+const diagnosticObserver = (uri: Uri) =>
+  createDiagnosticObserver(
+    {
+      currentVersion: () => workspace.textDocuments.find((document) => document.uri.toString() === uri.toString())?.version,
+      errors: () => errorsIn(uri).map((diagnostic) => diagnostic.message),
+      onChange: (listener) =>
+        languages.onDidChangeDiagnostics((event) => {
+          if (event.uris.some((changed) => changed.toString() === uri.toString())) listener()
+        })
+    },
+    DIAGNOSTICS_QUIET_MS,
+    DIAGNOSTICS_MAX_MS
+  )
 /** The lines a replacement leaves in their place, 0-based in the new text; none for a deletion. */
 const changedLines = ({ startLine, text }: Replacement) =>
   text ? { start: startLine, end: startLine + text.split("\n").length - 1 } : { start: startLine, end: startLine - 1 }
 
-/** A file first opened by the edit: its checker gets longer to finish, since a project may be loading. */
-const FIRST_CHECK_QUIET_MS = 1200
-
 /**
- * An applied change, followed by the errors the language server then
- * reports that the change brought: the model sees what it broke without
- * spending a step on `diagnostics`. Warnings are left out; a small model
- * chases them.
- *
- * Which errors are the change's: in a file the editor already had open,
- * and so had checked, those whose message is new (the edit moves lines,
- * not words). A file opened by the edit has no checked "before" to
- * compare with (a cold language server reports a file's old errors late,
- * and they would be put down to the edit), so only errors on the lines
- * it changed are named. `changed` is those lines in the new text,
- * 0-based; a new file is all changed.
+ * Captures a stable diagnostic baseline before an edit, watches for an
+ * update after it, and only counts errors tied to the resulting document
+ * version. When there is no comparable baseline, errors are limited to
+ * the changed lines and are not treated as a confirmed regression.
  */
 const withNewErrors = async (
   view: WorkspaceView,
   file: string,
   mode: ChatEditMode,
   changed: { start: number; end: number } | undefined,
-  change: () => Promise<ChatEditOutcome>
-): Promise<EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean }> => {
-  if (mode !== "apply" || UNCHECKED_FILES.test(file)) return change()
+  change: () => Promise<ChatEditOutcome>,
+  onApplied?: () => Promise<void>
+): Promise<EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean; diagnosticsObserved?: boolean; diagnosticFailure?: DiagnosticObservation }> => {
+  const applyChange = async () => {
+    const outcome = await change()
+    if (outcome.ok && !outcome.pending) await onApplied?.()
+    return outcome
+  }
+  if (mode !== "apply" || UNCHECKED_FILES.test(file)) return applyChange()
   const uri = Uri.file(file)
   const open = workspace.textDocuments.find((document) => document.uri.toString() === uri.toString())
-  if (open && UNCHECKED_LANGUAGES.has(open.languageId)) return change()
+  if (open && UNCHECKED_LANGUAGES.has(open.languageId)) return applyChange()
   const known = !!open && !!changed
-  const before = known ? errorsIn(uri).map((diagnostic) => diagnostic.message) : []
-  const recoveryBaseline = known ? [...before] : undefined
-  const checked = settledDiagnostics(uri, known ? DIAGNOSTICS_QUIET_MS : FIRST_CHECK_QUIET_MS)
+  let baseline: string[] | undefined
+  let baselineVersion: number | undefined
+  let baselineFailure: DiagnosticObservation | undefined
+  if (known && open) {
+    const baselineObserver = diagnosticObserver(uri)
+    const observed = await baselineObserver.wait(open.version, false)
+    baselineObserver.dispose()
+    if ("status" in observed) baselineFailure = observed
+    else { baseline = observed.errors; baselineVersion = observed.version }
+  }
+  const watcher = diagnosticObserver(uri)
   const outcome = await change()
-  if (!outcome.ok || outcome.pending) return outcome
-  await checked
+  if (!outcome.ok || outcome.pending) {
+    watcher.dispose()
+    return outcome
+  }
+  await onApplied?.()
+  const document = workspace.textDocuments.find((entry) => entry.uri.toString() === uri.toString())
+  const after = document
+    ? await watcher.wait(document.version, true)
+    : { status: "unavailable" as const, errors: [], reason: "The edited document is no longer open in the editor." }
+  watcher.dispose()
+  if ("status" in after) {
+    return {
+      ...outcome,
+      recoveryBaseline: baseline,
+      diagnosticCheckAvailable: baseline !== undefined,
+      diagnosticsObserved: false,
+      diagnosticFailure: after
+    }
+  }
+  if (known && baselineVersion !== undefined && after.version <= baselineVersion) {
+    return {
+      ...outcome,
+      recoveryBaseline: baseline,
+      diagnosticCheckAvailable: baseline !== undefined,
+      diagnosticsObserved: false,
+      diagnosticFailure: {
+        status: "stale",
+        version: after.version,
+        errors: after.errors,
+        reason: "The diagnostic snapshot did not advance beyond pre-edit document version " + baselineVersion + "."
+      }
+    }
+  }
+  const before = [...(baseline ?? [])]
   const fresh = errorsIn(uri).filter((diagnostic) => {
-    if (!known) {
+    if (!known || !baseline) {
       const line = diagnostic.range.start.line
       return !changed || (line >= changed.start && line <= changed.end)
     }
@@ -270,7 +327,15 @@ const withNewErrors = async (
     before.splice(seen, 1)
     return false
   })
-  if (!fresh.length) return outcome
+  if (!fresh.length) {
+    return {
+      ...outcome,
+      recoveryBaseline: baseline,
+      diagnosticCheckAvailable: baseline !== undefined,
+      diagnosticsObserved: !known || baseline !== undefined,
+      diagnosticFailure: baselineFailure
+    }
+  }
   const one = fresh.length === 1
   const named = fresh
     .slice(0, MAX_NEW_ERRORS)
@@ -279,7 +344,7 @@ const withNewErrors = async (
         `${diagnostic.range.start.line + 1}: ${diagnostic.message.split("\n")[0]}${diagnostic.source ? ` (${diagnostic.source})` : ""}`
     )
   const more = fresh.length > named.length ? `\n… and ${fresh.length - named.length} more` : ""
-  const where = known
+  const where = known && baseline
     ? `that ${one ? "was" : "were"} not there before`
     : changed
       ? "on the lines you changed"
@@ -287,8 +352,10 @@ const withNewErrors = async (
   return {
     ...outcome,
     newErrors: fresh.length,
-    recoveryBaseline,
-    diagnosticCheckAvailable: !!recoveryBaseline,
+    recoveryBaseline: baseline,
+    diagnosticCheckAvailable: baseline !== undefined,
+    diagnosticsObserved: !known || baseline !== undefined,
+    diagnosticFailure: baselineFailure,
     message:
       `${outcome.message}\nThe editor now reports ${one ? "an error" : `${fresh.length} errors`} in ${view.relative(file)} ${where}:\n` +
       `${named.join("\n")}${more}\nFix ${one ? "it" : "them"} if your change caused ${one ? "it" : "them"}.`
@@ -314,36 +381,58 @@ export const editorEdits = (
   const blocked = (): EditOutcome | undefined => mutationsBlocked || safety.canMutate?.() === false
     ? { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
     : undefined
-  const checkedOutcome = async (file: string, outcome: EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean }): Promise<EditOutcome> => {
+  const checkedOutcome = async (file: string, outcome: EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean; diagnosticsObserved?: boolean; diagnosticFailure?: DiagnosticObservation }): Promise<EditOutcome> => {
     if (!outcome.ok || outcome.pending) return outcome
     const introduced = outcome.newErrors ?? 0
-    if (safety.checkpoints) await safety.checkpoints.markChanged([file])
-    const catastrophic = safety.diagnosticMonitor?.record(file, introduced) ?? (introduced >= (safety.errorSpikeThreshold ?? 20))
-    if (!catastrophic) {
-      if (introduced === 0) await safety.checkpoints?.commit([file])
+    const observer = outcome.recoveryBaseline && outcome.diagnosticCheckAvailable ? diagnosticObserver(Uri.file(file)) : undefined
+    let recovery: Awaited<ReturnType<typeof recoverSignificantEdit>>
+    try {
+      recovery = await recoverSignificantEdit({
+        file: view.relative(file),
+        introducedErrors: introduced,
+        diagnosticsObserved: outcome.diagnosticsObserved ?? false,
+        diagnosticCheckAvailable: outcome.diagnosticCheckAvailable ?? false,
+        baseline: outcome.recoveryBaseline,
+        diagnosticFailure: outcome.diagnosticFailure,
+        checkpoints: safety.checkpoints,
+        monitor: safety.diagnosticMonitor,
+        errorSpikeThreshold: safety.errorSpikeThreshold,
+        blockMutations: () => {
+          mutationsBlocked = true
+          safety.blockMutations?.()
+        },
+        observeRestoredDiagnostics: async () => {
+          const uri = Uri.file(file)
+          const document = workspace.textDocuments.find((entry) => entry.uri.toString() === uri.toString())
+          return observer && document
+            ? observer.wait(document.version, true)
+            : { status: "unavailable" as const, errors: [], reason: "The restored document is no longer open in the editor." }
+        }
+      })
+    } finally {
+      observer?.dispose()
+    }
+    if (!recovery) {
+      if ((outcome.diagnosticsObserved && introduced === 0) || (outcome.diagnosticsObserved === undefined && outcome.newErrors === undefined)) {
+        await safety.checkpoints?.commit([file])
+      }
       return outcome
     }
-    mutationsBlocked = true
-    safety.blockMutations?.()
-    const rollback = safety.checkpoints
-      ? await safety.checkpoints.rollback()
-      : { restored: false, reason: "No safe checkpoint service is available." }
-    let diagnosticsVerified = false
-    let diagnosticsStatus: EditRecoveryNotice["diagnosticsStatus"] = "unavailable"
-    if (rollback.restored && outcome.recoveryBaseline && outcome.diagnosticCheckAvailable) {
-      await settledDiagnostics(Uri.file(file))
-      const restoredErrors = errorsIn(Uri.file(file)).map((diagnostic) => diagnostic.message).sort()
-      diagnosticsVerified = JSON.stringify(restoredErrors) === JSON.stringify([...outcome.recoveryBaseline].sort())
-      diagnosticsStatus = diagnosticsVerified ? "verified" : "mismatch"
-    }
-    const fileVerified = rollback.restored
-    const reason = !fileVerified
-      ? "Could not safely restore after " + introduced + " new diagnostics in " + view.relative(file) + ": " + rollback.reason
-      : !diagnosticsVerified
-        ? "Restored the last safe checkpoint in " + view.relative(file) + ", but diagnostics could not be verified against the pre-edit baseline."
-        : "Restored and verified the last safe checkpoint in " + view.relative(file) + " after " + introduced + " new diagnostics."
-    await safety.onCatastrophic?.({ file: view.relative(file), introducedErrors: introduced, diagnostics: outcome.message.slice(0, 2000), restored: rollback.restored, fileVerified, diagnosticsVerified, diagnosticsStatus, reason })
-    return { ...outcome, ok: false, message: `${reason} Further file mutations are blocked for this execution.` }
+    const reason = recovery.reason.includes("Could not safely restore")
+      ? "Could not safely restore after " + introduced + " new diagnostics in " + view.relative(file) + ": " + recovery.reason.replace("Could not safely restore file contents: ", "")
+      : recovery.reason.replace("the safe file checkpoint", "the last safe checkpoint in " + view.relative(file))
+    const diagnostics = [outcome.message, recovery.diagnosticEvidence].filter(Boolean).join("\n").slice(0, 4000)
+    await safety.onCatastrophic?.({
+      file: view.relative(file),
+      introducedErrors: introduced,
+      diagnostics,
+      restored: recovery.restored,
+      fileVerified: recovery.fileVerified,
+      diagnosticsVerified: recovery.diagnosticsVerified,
+      diagnosticsStatus: recovery.diagnosticsStatus,
+      reason
+    })
+    return { ...outcome, ok: false, message: reason + " Further file mutations are blocked for this execution." }
   }
   return {
     mode,
@@ -359,7 +448,8 @@ export const editorEdits = (
             { file, ...replacement },
             modeFor(file)
           )) ?? { ok: false, message: "Not changed: the editor did not answer." }
-        })
+        }),
+        async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
       )
       return checkedOutcome(file, outcome)
     },
@@ -376,7 +466,8 @@ export const editorEdits = (
             content,
             modeFor(file)
           )) ?? { ok: false, message: "Not created: the editor did not answer." }
-        })
+        }),
+        async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
       )
       return checkedOutcome(file, outcome)
     },
@@ -563,27 +654,36 @@ export const editorKnowledge = (
     let renameFailure: string | undefined
     const rename = async () => {
       await safety.checkpoints?.capture(absoluteFiles)
-      const baseline = new Map<string, string[]>()
+      const baseline = new Map<string, { errors: string[]; version: number }>()
       for (const absolute of absoluteFiles) {
         const uri = Uri.file(absolute)
-        const settled = settledDiagnostics(uri)
-        await workspace.openTextDocument(uri)
-        await settled
-        baseline.set(absolute, errorsIn(uri).map((diagnostic) => diagnostic.message))
+        const document = await workspace.openTextDocument(uri)
+        const observer = diagnosticObserver(uri)
+        const observed = await observer.wait(document.version, false)
+        observer.dispose()
+        if (!("status" in observed)) baseline.set(absolute, observed)
       }
+      const editObservers = new Map(absoluteFiles.map((absolute) => [absolute, diagnosticObserver(Uri.file(absolute))]))
       for (const [uri] of edit!.entries()) await replyChanges?.touch(uri.fsPath)
       const applied = await applyAndSave(edit!)
-      if (!applied) return false
+      if (!applied) {
+        editObservers.forEach((observer) => observer.dispose())
+        return false
+      }
       await safety.checkpoints?.markChanged(absoluteFiles)
       let catastrophic: { absolute: string; messages: string[] } | undefined
       for (const absolute of absoluteFiles) {
+        const previous = baseline.get(absolute)
+        if (!previous) continue
         const uri = Uri.file(absolute)
-        await settledDiagnostics(uri)
-        const previous = [...(baseline.get(absolute) ?? [])]
+        const document = workspace.textDocuments.find((entry) => entry.uri.toString() === uri.toString())
+        const observed = document ? await editObservers.get(absolute)!.wait(document.version, true) : undefined
+        if (!observed || "status" in observed) continue
+        const before = [...previous.errors]
         const fresh = errorsIn(uri).filter((diagnostic) => {
-          const found = previous.indexOf(diagnostic.message)
+          const found = before.indexOf(diagnostic.message)
           if (found < 0) return true
-          previous.splice(found, 1)
+          before.splice(found, 1)
           return false
         })
         if (fresh.length && safety.diagnosticMonitor?.record(absolute, fresh.length)) {
@@ -591,34 +691,53 @@ export const editorKnowledge = (
           break
         }
       }
+      editObservers.forEach((observer) => observer.dispose())
       if (!catastrophic) return true
       safety.blockMutations?.()
+      const rollbackObservers = new Map(absoluteFiles.map((absolute) => [absolute, diagnosticObserver(Uri.file(absolute))]))
       const rollback = safety.checkpoints
         ? await safety.checkpoints.rollback()
-        : { restored: false, reason: "No safe checkpoint service is available." }
-      let diagnosticsVerified = rollback.restored
+        : { restored: false, contentVerified: false, reason: "No safe checkpoint service is available." }
+      let diagnosticsVerified = rollback.restored && baseline.size === absoluteFiles.length
+      let diagnosticsStatus: DiagnosticVerificationStatus = rollback.restored ? "verified" : "unavailable"
+      let diagnosticReason = "Restored diagnostics match the pre-rename baseline."
+      const evidence: string[] = []
       if (rollback.restored) {
         for (const absolute of absoluteFiles) {
+          const before = baseline.get(absolute)
+          const observer = rollbackObservers.get(absolute)
           const uri = Uri.file(absolute)
-          await settledDiagnostics(uri)
-          const restored = errorsIn(uri).map((diagnostic) => diagnostic.message).sort()
-          const before = [...(baseline.get(absolute) ?? [])].sort()
-          if (JSON.stringify(restored) !== JSON.stringify(before)) diagnosticsVerified = false
+          const document = workspace.textDocuments.find((entry) => entry.uri.toString() === uri.toString())
+          if (!before || !observer || !document) {
+            diagnosticsVerified = false
+            diagnosticsStatus = "unavailable"
+            diagnosticReason = "A stable pre-rename baseline or restored document version was unavailable for " + view.relative(absolute) + "."
+            continue
+          }
+          const observed = await observer.wait(document.version, true)
+          const verification = verifyDiagnosticBaseline(before.errors, observed)
+          evidence.push(verification.evidence)
+          if (!verification.verified) {
+            diagnosticsVerified = false
+            diagnosticsStatus = verification.status
+            diagnosticReason = verification.reason
+          }
         }
       }
+      rollbackObservers.forEach((observer) => observer.dispose())
       renameFailure = !rollback.restored
         ? "Could not safely restore after rename introduced diagnostics: " + rollback.reason
         : !diagnosticsVerified
-          ? "Restored files after rename regression, but the diagnostic baseline could not be verified."
+          ? "Restored and verified file contents after rename, but diagnostic verification " + diagnosticsStatus + ": " + diagnosticReason
           : "Restored and verified the last safe checkpoint after rename introduced diagnostics: " + catastrophic.messages.join("; ")
       await safety.onCatastrophic?.({
         file: view.relative(catastrophic.absolute),
         introducedErrors: catastrophic.messages.length,
-        diagnostics: catastrophic.messages.join("\n"),
+        diagnostics: [...catastrophic.messages, ...evidence].join("\n").slice(0, 4000),
         restored: rollback.restored,
-        fileVerified: rollback.restored,
+        fileVerified: rollback.contentVerified,
         diagnosticsVerified,
-        diagnosticsStatus: rollback.restored ? (diagnosticsVerified ? "verified" : "mismatch") : "unavailable",
+        diagnosticsStatus,
         reason: renameFailure
       })
       return false
