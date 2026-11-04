@@ -93,11 +93,14 @@ test("read_file counts lines as an editor does and never shows a byte-order mark
   write(root, "bom.ts", Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("const a = 1\n")]))
   write(root, "empty.ts", "")
   const tools = workspaceTools(root)
-  const read = (args: Record<string, string>) => tools.run({ name: "read_file", args })
+  const read = async (args: Record<string, string>) => {
+    const result = await tools.run({ name: "read_file", args })
+    return { ...result, output: result.output.split("\n").filter((line) => !line.startsWith("content_hash:")).join("\n") }
+  }
   assert.strictEqual((await read({ path: "three.ts" })).output, "three.ts (lines 1–3 of 3)\n1: a\n2: b\n3: c")
   assert.strictEqual((await read({ path: "crlf.ts" })).output, "crlf.ts (lines 1–2 of 2)\n1: a\n2: b")
   assert.strictEqual((await read({ path: "bom.ts" })).output, "bom.ts (lines 1–1 of 1)\n1: const a = 1")
-  assert.strictEqual((await read({ path: "empty.ts" })).output, "empty.ts is empty.")
+  assert.strictEqual((await read({ path: "empty.ts" })).output, "empty.ts (lines 0–0 of 0)")
   assert.strictEqual(
     (await read({ path: "three.ts", start_line: "2", end_line: "1" })).output,
     "three.ts (lines 2–2 of 3)\n2: b",

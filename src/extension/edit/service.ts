@@ -9,8 +9,10 @@ import { GenerationRun, GenerationTracker } from "../generations"
 import { isCancelled, resolveInferenceProvider } from "../inference"
 import { Base } from "../providers/base"
 import { describeProviderErrorPlain, isAbortError } from "../providers/errors"
+import { LineEditFailure, lineEditFailure, LineEditRequest } from "../tools/line-edit"
 
 import { DiffLayout, layoutDiff, locateSnippet } from "./diff"
+import { applyDocumentLineEdits } from "./line-edit"
 import {
   buildEditMessages,
   clampContext,
@@ -52,12 +54,16 @@ export type ChatEditMode = "apply" | "review"
 /** What became of a chat edit; `pending` while it waits for review. */
 export interface ChatEditOutcome {
   ok: boolean
+  error?: LineEditFailure
+  contentHash?: string
   message: string
   pending?: boolean
 }
 
-/** A whole-lines replacement in a file on disk, from the chat's `edit_file` tool. */
-export interface FileEditProposal {
+/** Both native editing tools use the existing chat edit command. */
+export type FileEditProposal = { file: string; lineEdits: LineEditRequest } | FileTextEditProposal
+
+export interface FileTextEditProposal {
   file: string
   startLine: number
   endLine: number
@@ -290,7 +296,7 @@ export class InlineEditService extends Base {
     // The tools keep to the workspace themselves; the command that reaches
     // this can be run by anything, so it holds the line too.
     if (outsideWorkspace(uri)) {
-      return { ok: false, message: `Not changed: ${relative} is outside the workspace.` }
+      return { ok: false, message: `Not changed: ${relative} is outside the workspace.`, error: lineEditFailure("permission_denied", "The document is outside the workspace.") }
     }
     if (this.running || (pending && (mode === "review" || pending.document.uri.fsPath === proposal.file))) {
       const where = pending ? ` in ${vscode.workspace.asRelativePath(pending.document.uri)}` : ""
@@ -298,6 +304,10 @@ export class InlineEditService extends Base {
         ok: false,
         message: `Not changed: an edit${where} is waiting for the user's review. Tell the user to accept or reject it, then ask again.`
       }
+    }
+    if ("lineEdits" in proposal) {
+      if (mode !== "apply") return { ok: false, message: "Line edits require approval before application.", error: lineEditFailure("permission_denied", "Line edits require approval before application.") }
+      return applyDocumentLineEdits(proposal.file, proposal.lineEdits)
     }
     const document = await vscode.workspace.openTextDocument(uri)
     const last = document.lineAt(Math.min(proposal.endLine, document.lineCount - 1))

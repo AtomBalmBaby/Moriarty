@@ -466,6 +466,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           mode: "apply" as const,
           read: async (): Promise<string | undefined> => undefined,
           edit: async () => ({ ok: true, message: "" }),
+          editLines: async () => ({ ok: true, message: "" }),
           create: async () => ({ ok: true, message: "" }),
           remove: async () => ({ ok: true, message: "" }),
           move: async () => ({ ok: true, message: "" }),

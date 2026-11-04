@@ -14,6 +14,7 @@ import { TodoListRequest } from "../todos/types"
 
 import { planReplacement, Replacement } from "./edit"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
+import { contentHash, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
 import { coerceArguments, JsonSchema, McpToolSpec } from "./mcp"
 import {
   deleteFile,
@@ -31,7 +32,7 @@ import {
 } from "./more"
 import { ToolCall, ToolSpec } from "./protocol"
 import { todoTools } from "./todos"
-import { clip, linesOf, MAX_LINE_CHARS, plural, ToolInputError, WorkspaceView } from "./view"
+import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
 
 export interface ToolResult {
   /** What the model is sent. */
@@ -65,7 +66,6 @@ export interface Tool extends ToolSpec {
 const MIN_READ_LINES = 100
 const DEFAULT_READ_LINES = 1000
 const MAX_READ_LINES = 5000
-const MAX_FULL_LINE_CHARS = 20_000
 const MAX_GREP_MATCHES = 40
 /** Matches shown per file, so one noisy file does not hide the others. */
 const MAX_GREP_PER_FILE = 10
@@ -92,12 +92,15 @@ export interface EditSink {
   read?(file: string): Promise<string | undefined>
   /** Make or show the change; resolves to what the model is told. */
   edit(file: string, replacement: Replacement): Promise<EditOutcome>
+  editLines?(file: string, request: LineEditRequest): Promise<EditOutcome>
   /** Make or show a new file; resolves to what the model is told. */
   create(file: string, content: string): Promise<EditOutcome>
 }
 
 export interface EditOutcome {
   ok: boolean
+  error?: LineEditFailure
+  contentHash?: string
   message: string
   /** Waiting for the user's review rather than made. */
   pending?: boolean
@@ -163,12 +166,12 @@ const clampReadLines = (limit: number | undefined) => {
   return Math.min(MAX_READ_LINES, Math.max(MIN_READ_LINES, value))
 }
 
-const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES): Tool => {
+const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink): Tool => {
   const limit = clampReadLines(maxLines)
   return {
     name: "read_file",
     readOnly: true,
-    description: `A file's lines, numbered; at most ${limit} at a time. Long lines are abbreviated; pass full_line=true with start_line to read one long line exactly.`,
+    description: `A file's lines, numbered; at most ${limit} at a time. Source lines are complete. Includes the SHA-256 hash of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
     parameters: [
       { name: "path", description: "The file." },
       { name: "start_line", description: "First line to read, from 1.", optional: true, type: "integer" },
@@ -179,20 +182,18 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES): Tool => {
       if (!file) throw new ToolInputError("read_file needs a path.")
       const absolute = view.resolve(file, "file")
       const rel = view.relative(absolute)
-      const text = await view.text(absolute)
+      const text = (await sink?.read?.(absolute)) ?? await view.text(absolute)
       if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
       const lines = linesOf(text)
-      if (!lines.length) return { output: `${rel} is empty.`, summary: `read \`${rel}\` · empty` }
+      const metadata = `content_hash: ${contentHash(text)} (sha256); total_lines: ${lines.length}`
+      if (!lines.length) return { output: `${rel} (lines 0–0 of 0)\n${metadata}`, summary: `read \`${rel}\` · empty` }
       if (full_line === "true") {
         const lineNumber = Number.parseInt(start_line ?? "", 10)
         if (!Number.isInteger(lineNumber) || lineNumber < 1 || lineNumber > lines.length || (end_line && Number.parseInt(end_line, 10) !== lineNumber)) {
           throw new ToolInputError(`${rel}: full_line needs one valid start_line and no different end_line.`)
         }
         const line = lines[lineNumber - 1]
-        if (line.length > MAX_FULL_LINE_CHARS) {
-          throw new ToolInputError(`${rel}:${lineNumber} is longer than ${MAX_FULL_LINE_CHARS} characters; use another read method rather than editing an abbreviated line.`)
-        }
-        return { output: `${rel} (full line ${lineNumber})\n${lineNumber}: ${line}`, summary: `read \`${rel}:${lineNumber}\` · full line` }
+        return { output: `${rel} (full line ${lineNumber})\n${metadata}\n${lineNumber}: ${line}`, summary: `read \`${rel}:${lineNumber}\` · full line` }
       }
       const start = Math.max(1, Number.parseInt(start_line ?? "", 10) || 1)
       if (start > lines.length) {
@@ -202,15 +203,13 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES): Tool => {
       const end = Math.min(lines.length, asked, start + limit - 1)
       const body = lines
         .slice(start - 1, end)
-        .map((line, i) => `${start + i}: ${clip(line)}`)
+        .map((line, i) => `${start + i}: ${line}`)
         .join("\n")
       const cut = end < Math.min(asked, lines.length)
         ? `\n… stopped at line ${end} of ${lines.length}; read on with start_line ${end + 1}`
         : ""
-      const clipped = lines.slice(start - 1, end).some((line) => line.length > MAX_LINE_CHARS)
-      const lineNote = clipped ? "\nLong lines end in …; read the exact source with full_line=true before replacing one." : ""
       return {
-        output: `${rel} (lines ${start}–${end} of ${lines.length})\n${body}${lineNote}${cut}`,
+        output: `${rel} (lines ${start}–${end} of ${lines.length})\n${metadata}\n${body}${cut}`,
         summary: `read \`${rel}:${start}–${end}\``
       }
     }
@@ -415,6 +414,90 @@ const createFile = (view: WorkspaceView, sink: EditSink): Tool => ({
       output: outcome.message,
       summary: `${outcome.pending ? "proposed a new file" : "created"} \`${rel}\` · ${plural(linesOf(content).length, "line")}${errorsNote(outcome)}`,
       final: outcome.pending
+    }
+  }
+})
+
+// Shared by tool sets/conversations: checkpoint, transaction and recovery stay together.
+let mutationTail: Promise<unknown> = Promise.resolve()
+const serializeMutation = <T>(run: () => Promise<T>): Promise<T> => {
+  const result = mutationTail.then(run)
+  mutationTail = result.then(() => undefined, () => undefined)
+  return result
+}
+
+const lineEditErrorResult = (error: LineEditFailure): ToolResult => ({
+  output: JSON.stringify({ ok: false, error, hash_algorithm: "sha256" }),
+  summary: `edit_lines failed · ${error.message}`,
+  failed: true
+})
+
+const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]>): Tool => ({
+  name: "edit_lines",
+  description:
+    "Edit complete source lines atomically, guarded by expected_hash from read_file (SHA-256 of the entire editor buffer). " +
+    "All coordinates refer to the SAME original snapshot, not earlier edits. Lines are 1-based; a terminal newline is not an extra line. " +
+    "replace/delete use inclusive start_line/end_line. insert_before accepts 1 through total_lines+1; insert_after accepts 1 through total_lines. " +
+    "For an empty document only insert_before line=1 or insert_after line=0 is valid. EOF insertion preserves the final-newline convention. " +
+    "content is an array of complete lines without newline characters (use [''] for a blank line). " +
+    "Overlaps, same-boundary insertions and insertions touching a replaced/deleted boundary are rejected. " +
+    "Hash mismatch leaves everything unchanged and returns current_hash; reread, never retry blindly. " +
+    "Uses existing edit permissions; review/protected files require approval. Changes remain unsaved in the editor buffer. Returns the resulting content_hash.",
+  guidance: "Prefer read_file then edit_lines for deterministic changes, especially long/repeated JSX lines; edit_file remains available for exact-text replacements.",
+  parameters: [
+    { name: "path", description: "Workspace-relative file path." },
+    { name: "expected_hash", description: "Full-document content_hash from read_file, raw SHA-256 hex." },
+    { name: "edits", description: "Array of replace/delete {start_line,end_line,content?} or insert_before/insert_after {line,content} operations, all against the original snapshot." }
+  ],
+  schema: {
+    type: "object",
+    required: ["path", "expected_hash", "edits"],
+    additionalProperties: false,
+    properties: {
+      path: { type: "string" },
+      expected_hash: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Full editor document SHA-256 from read_file." },
+      edits: {
+        type: "array", minItems: 1,
+        items: {
+          oneOf: ["replace", "delete", "insert_before", "insert_after"].map((operation) => {
+            const insertion = operation.startsWith("insert_")
+            return {
+              type: "object", additionalProperties: false,
+              required: ["operation", ...(insertion ? ["line"] : ["start_line", "end_line"]), ...(operation === "delete" ? [] : ["content"])],
+              properties: {
+                operation: { type: "string", enum: [operation] },
+                ...(insertion ? { line: { type: "integer", minimum: operation === "insert_after" ? 0 : 1 } } : {
+                  start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 1 }
+                }),
+                ...(operation === "delete" ? {} : { content: { type: "array", minItems: 1, items: { type: "string", pattern: "^[^\\r\\n]*$" } } })
+              }
+            }
+          })
+        }
+      }
+    }
+  },
+  async run({ path: file, expected_hash, edits }) {
+    if (!file || !/^[a-f0-9]{64}$/.test(expected_hash ?? "")) {
+      return lineEditErrorResult(lineEditFailure("invalid_range", "path and a 64-character SHA-256 expected_hash are required."))
+    }
+    let absolute: string
+    try {
+      absolute = view.resolve(file, "file")
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return lineEditErrorResult(lineEditFailure(/outside|ignored|rules/.test(message) ? "permission_denied" : "document_unavailable", message))
+    }
+    let operations: unknown
+    try { operations = JSON.parse(edits) } catch {
+      return lineEditErrorResult(lineEditFailure("invalid_range", "edits must be a JSON array of line operations."))
+    }
+    const outcome = await apply(absolute, { expected_hash, edits: operations })
+    if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
+    if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))
+    return {
+      output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: "sha256", message: outcome.message }),
+      summary: `edited \`${view.relative(absolute)}\` by lines${errorsNote(outcome)}`
     }
   }
 })
@@ -642,13 +725,14 @@ export const workspaceTools = (
     ...(editor ? [editorContext(view, editor)] : []),
     listDir(view),
     findFiles(view),
-    readFile(view, readFileMaxLines),
+    readFile(view, readFileMaxLines, edits),
     grep(view),
     findSymbol(view),
     ...(editor ? [goToDefinition(view, editor), findReferences(view, editor), diagnostics(view, editor)] : []),
     ...(extras.git !== false && insideGitRepository(view.root) ? [git(view)] : [])
   ]
   if (edits) tools.push(editFile(view, edits), createFile(view, edits))
+  if (edits?.editLines) tools.push(editLines(view, edits.editLines.bind(edits)))
   if (edits && editor) tools.push(renameSymbol(view, editor))
   if (edits?.remove && edits.move) {
     const ops = { remove: edits.remove.bind(edits), move: edits.move.bind(edits) }
@@ -682,12 +766,18 @@ export const workspaceTools = (
         }
       }
       try {
-        return withFolderInstructions(call, await tool.run(call.args, context))
+        const run = () => {
+          if (!tool.readOnly && context?.signal?.aborted) throw new ToolInputError("The execution stopped before this tool could run.")
+          return tool.run(call.args, context)
+        }
+        return withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
       } catch (error) {
         // Whatever goes wrong inside a tool is the model's to read and work
         // around; it never ends the reply. A refusal of the model's input is
         // given whole (it may show the lines to use instead); anything else,
         // and the step's summary, keeps to the first line.
+        if (error instanceof LineEditError) return lineEditErrorResult(error.detail)
+        if (call.name === "edit_lines") return lineEditErrorResult(lineEditFailure("application_failed", error instanceof Error ? error.message : String(error)))
         const full = error instanceof Error ? error.message : String(error)
         const message = full.split("\n")[0]
         return error instanceof ToolInputError

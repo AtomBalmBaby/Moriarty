@@ -211,7 +211,7 @@ test("ordinary successive edit diagnostics reset when the intermediate regressio
   assert.equal(monitor.record("panel.tsx", 8), true)
 })
 
-test("edit_file dispatch refuses a clipped replacement and offers an exact long-line read", async () => {
+test("edit_file dispatch still refuses clipped replacements while read_file returns complete long lines", async () => {
   const root = temporaryWorkspace()
   const file = path.join(root, "panel.tsx")
   const longLine = "const untouched = " + "x".repeat(300)
@@ -226,8 +226,9 @@ test("edit_file dispatch refuses a clipped replacement and offers an exact long-
   const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
   try {
     const read = await tools.run({ name: "read_file", args: { path: "panel.tsx" } })
-    assert.match(read.output, /Long lines end in …; read the exact source/)
-    const abbreviated = read.output.split("\n").find((line) => line.startsWith("2: ")) ?? ""
+    assert.ok(read.output.includes("2: " + longLine))
+    assert.ok(!read.output.includes("…"))
+    const abbreviated = "2: " + longLine.slice(0, 200) + "…"
     const refused = await tools.run({ name: "edit_file", args: { path: "panel.tsx", find: "const before = 1", replace: abbreviated } })
     assert.equal(refused.failed, true)
     assert.match(refused.output, /replace has a line cut short with …/)

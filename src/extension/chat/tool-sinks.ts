@@ -43,6 +43,7 @@ import { WorkspaceSearch } from "../embeddings/search"
 import { stripAnsi, tailOutput } from "../terminal/output"
 import type { Replacement } from "../tools/edit"
 import { isProtectedPath } from "../tools/helpers"
+import { contentHash, LineEditError, lineEditFailure, planLineEdits } from "../tools/line-edit"
 import { EditorDiagnostic, EditorLocation, EditorSink, FileOpsSink } from "../tools/more"
 import { WorkspaceView } from "../tools/view"
 import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink } from "../tools/workspace"
@@ -88,22 +89,25 @@ export const createSafeEditCheckpoints = (storageUri: Uri): SafeEditCheckpoints 
   const readSnapshot = async (file: string): Promise<string | null | undefined> => {
     const document = workspace.textDocuments.find((entry) => entry.uri.scheme === "file" && entry.uri.fsPath === file)
     let disk: string | null = null
+    let diskBase64: string | undefined
     if (existsSync(file)) {
       const contents = readFileSync(file)
-      if (contents.length > 1024 * 1024 || contents.includes(0)) return undefined
+      if (contents.length > 1024 * 1024 || (contents.includes(0) && (!document || document.getText().includes("\0")))) return undefined
       disk = contents.toString("utf8")
+      // Keep non-UTF-8 bytes intact when restoring the disk beneath a dirty buffer.
+      if (!Buffer.from(disk, "utf8").equals(contents)) diskBase64 = contents.toString("base64")
     }
     const buffer = document?.getText() ?? disk
     if (buffer === null && disk === null && !document) return null
     if (buffer !== null && buffer !== undefined && Buffer.byteLength(buffer, "utf8") > 1024 * 1024) return undefined
-    return JSON.stringify({ version: 1, buffer, disk, dirty: !!document?.isDirty })
+    return JSON.stringify({ version: 1, buffer, disk, diskBase64, dirty: !!document?.isDirty })
   }
 
   return new SafeEditCheckpoints({
     read: readSnapshot,
     restore: async (files: CheckpointFile[]) => {
       const edit = new WorkspaceEdit()
-      const restoreAfter: Array<{ uri: Uri; path: string; snapshot: { buffer: string | null; disk: string | null; dirty: boolean } }> = []
+      const restoreAfter: Array<{ uri: Uri; path: string; snapshot: { buffer: string | null; disk: string | null; diskBase64?: string; dirty: boolean } }> = []
       for (const checkpoint of files) {
         const uri = Uri.file(checkpoint.path)
         const current = await readSnapshot(checkpoint.path)
@@ -112,13 +116,13 @@ export const createSafeEditCheckpoints = (storageUri: Uri): SafeEditCheckpoints 
           if (current !== null) edit.deleteFile(uri, { ignoreIfNotExists: true })
           continue
         }
-        let snapshot: { version: number; buffer: string | null; disk: string | null; dirty: boolean }
+        let snapshot: { version: number; buffer: string | null; disk: string | null; diskBase64?: string; dirty: boolean }
         try {
           snapshot = JSON.parse(checkpoint.before)
         } catch {
           return false
         }
-        if (snapshot.version !== 1 || (snapshot.buffer !== null && typeof snapshot.buffer !== "string") || (snapshot.disk !== null && typeof snapshot.disk !== "string") || typeof snapshot.dirty !== "boolean") return false
+        if ((snapshot.diskBase64 !== undefined && typeof snapshot.diskBase64 !== "string") || snapshot.version !== 1 || (snapshot.buffer !== null && typeof snapshot.buffer !== "string") || (snapshot.disk !== null && typeof snapshot.disk !== "string") || typeof snapshot.dirty !== "boolean") return false
         const text = snapshot.buffer ?? snapshot.disk
         if (text === null) {
           if (current !== null) edit.deleteFile(uri, { ignoreIfNotExists: true })
@@ -140,7 +144,7 @@ export const createSafeEditCheckpoints = (storageUri: Uri): SafeEditCheckpoints 
           continue
         }
         if (snapshot.dirty) {
-          await workspace.fs.writeFile(uri, Buffer.from(snapshot.disk, "utf8"))
+          await workspace.fs.writeFile(uri, snapshot.diskBase64 ? Buffer.from(snapshot.diskBase64, "base64") : Buffer.from(snapshot.disk, "utf8"))
           continue
         }
         const document = workspace.textDocuments.find((entry) => entry.uri.toString() === uri.toString())
@@ -436,6 +440,54 @@ export const editorEdits = (
   }
   return {
     mode,
+    async read(file) {
+      return (await workspace.openTextDocument(Uri.file(file))).getText()
+    },
+    async editLines(file, request) {
+      const denied = blocked()
+      if (denied) return { ...denied, error: lineEditFailure("permission_denied", denied.message) }
+      let document
+      try {
+        document = await workspace.openTextDocument(Uri.file(file))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false, message, error: lineEditFailure("document_unavailable", message) }
+      }
+      let patches
+      try {
+        patches = planLineEdits(document.getText(), request)
+      } catch (error) {
+        if (error instanceof LineEditError) return { ok: false, message: error.message, error: error.detail }
+        throw error
+      }
+      if (modeFor(file) === "review" && !(await approve(
+        "edit lines in " + view.relative(file) + " (SHA-256 " + request.expected_hash + ")\n" + JSON.stringify(request.edits, null, 2), "change"
+      ))) {
+        const error = lineEditFailure("permission_denied", "The user declined the line edits; nothing was changed.")
+        return { ok: false, message: error.message, error }
+      }
+      const deniedAfterApproval = blocked()
+      if (deniedAfterApproval) return { ...deniedAfterApproval, error: lineEditFailure("permission_denied", deniedAfterApproval.message) }
+      await safety.checkpoints?.capture([file])
+      const changed = {
+        start: document.positionAt(patches[0].start).line,
+        end: document.positionAt(patches[patches.length - 1].end).line + patches.reduce((added, patch) => added + patch.text.split("\n").length - 1, 0)
+      }
+      const outcome = await withNewErrors(view, file, "apply", changed, () => held(async () => {
+        await changes?.touch(file)
+        return (await commands.executeCommand<ChatEditOutcome>(
+          TWINNY_COMMAND_NAME.chatFileEdit, { file, lineEdits: request }, "apply"
+        )) ?? { ok: false, message: "Not changed: the editor did not answer.", error: lineEditFailure("application_failed", "The editor did not answer.") }
+      }), async () => { await safety.checkpoints?.markChanged([file]) })
+      const checked = await checkedOutcome(file, outcome)
+      if (!checked.ok) return checked
+      const hash = contentHash(document.getText())
+      if (hash !== checked.contentHash) {
+        const error = lineEditFailure("application_failed", "The document changed while diagnostics were checked. Reread it before another edit.", hash)
+        return { ok: false, message: error.message, error }
+      }
+      return { ...checked, contentHash: hash }
+    },
     async edit(file, replacement) {
       const denied = blocked()
       if (denied) return denied

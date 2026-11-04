@@ -134,7 +134,7 @@ test("tools find, read and search, and stay inside the workspace", async () => {
   assert.strictEqual(method.output, "src/warmer.ts:2: public async warm() {")
 
   const read = await tools.run({ name: "read_file", args: { path: "./src/warmer.ts", start_line: "2", end_line: "3" } })
-  assert.match(read.output, /^src\/warmer.ts \(lines 2–3 of 5\)\n2: {3}public async warm\(\) \{\n3: {5}return 1$/)
+  assert.match(read.output, /^src\/warmer.ts \(lines 2–3 of 5\)\ncontent_hash: [a-f0-9]{64} \(sha256\); total_lines: 5\n2: {3}public async warm\(\) \{\n3: {5}return 1$/)
 
   const grep = await tools.run({ name: "grep", args: { pattern: "modelwarmer" } })
   assert.strictEqual(
@@ -640,7 +640,7 @@ test("the text protocol lists tools without the parentheses that invite function
   const { client, requests } = scripted(["Hi."])
   await collect(withTools(client, workspaceTools(makeWorkspace())).chat({ model: "m", messages: [{ role: "user", content: "Hi" }] }))
   const system = requests[0].messages[0].content as string
-  assert.match(system, /\n- read_file \{path, start_line\?, end_line\?\}: /)
+  assert.match(system, /\n- read_file \{path, start_line\?, end_line\?, full_line\?\}: /)
   assert.doesNotMatch(system, /\n- \w+\(/)
 })
 
