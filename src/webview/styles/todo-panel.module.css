@@ -80,15 +80,29 @@ button:disabled {
 }
 
 .item {
-  display: flex;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  column-gap: 8px;
+  row-gap: 4px;
+  align-items: start;
   padding: 7px 2px;
   border-top: 1px solid var(--vscode-panel-border);
 }
 
+.itemHeader {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  cursor: pointer;
+}
+
 .status {
+  grid-column: 1;
+  grid-row: 1;
   width: 14px;
-  flex: 0 0 14px;
   color: var(--vscode-descriptionForeground);
 }
 
@@ -97,11 +111,13 @@ button:disabled {
 }
 
 .itemBody {
+  grid-column: 2;
+  grid-row: 2;
   display: flex;
-  flex: 1;
   flex-direction: column;
   gap: 3px;
   min-width: 0;
+  width: 100%;
 }
 
 .itemTitle,
@@ -127,8 +143,10 @@ button:disabled {
 }
 
 .editForm {
-  flex: 1;
+  grid-column: 2;
+  grid-row: 2;
   min-width: 0;
+  width: 100%;
 }
 
 .empty {
