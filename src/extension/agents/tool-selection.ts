@@ -15,8 +15,8 @@ export interface AgentToolSelection<TNative extends NamedAgentTool, TMcp extends
 }
 
 const NATIVE_GROUPS: Record<string, string[]> = {
-  read: ["list_dir", "find_files", "read_file", "grep", "find_symbol", "editor_context", "find_references", "go_to_definition", "diagnostics"],
-  search: ["search_code", "grep", "find_files", "find_symbol", "find_references"],
+  read: ["list_dir", "find_files", "search_workspace", "read_file", "grep", "find_symbol", "editor_context", "find_references", "go_to_definition", "diagnostics"],
+  search: ["search_workspace", "search_code", "grep", "find_files", "find_symbol", "find_references"],
   edit: ["edit_file", "edit_lines", "create_file", "rename_symbol", "move_file", "delete_file"],
   execute: ["run_command"],
   run: ["run_command"],

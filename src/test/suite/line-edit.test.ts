@@ -28,7 +28,7 @@ suite("Hash-verified native line edits", () => {
     fs.rmSync(root, { recursive: true, force: true })
   })
 
-  const request = (text: string, edits: unknown): LineEditRequest => ({ expected_hash: contentHash(text), edits })
+  const request = async (text: string, edits: unknown): Promise<LineEditRequest> => ({ expected_hash: await contentHash(text), edits })
 
   test("real editor applies all operations once, preserves dirty text, and undo reverses the batch", async () => {
     const document = await vscode.workspace.openTextDocument(file)
@@ -38,14 +38,14 @@ suite("Hash-verified native line edits", () => {
     let events = 0
     const listener = vscode.workspace.onDidChangeTextDocument((event) => { if (event.document === document && event.contentChanges.length) events++ })
     try {
-      const result = await applyDocumentLineEdits(file, request(original, [
+      const result = await applyDocumentLineEdits(file, await request(original, [
         { operation: "replace", start_line: 2, end_line: 2, content: ["SECOND", "extra"] },
         { operation: "delete", start_line: 3, end_line: 3 },
         { operation: "insert_after", line: 4, content: ["last"] }
       ]))
       assert.ok(result.ok, result.message)
       assert.strictEqual(document.getText(), "dirty\nSECOND\nextra\nfourth\nlast\n")
-      assert.strictEqual(result.contentHash, contentHash(document.getText()))
+      assert.strictEqual(result.contentHash, await contentHash(document.getText()))
       assert.strictEqual(events, 1, "no intermediate document state")
       assert.ok(document.isDirty)
       assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nsecond\nthird\nfourth\n")
@@ -57,7 +57,7 @@ suite("Hash-verified native line edits", () => {
   for (const eol of ["\n", "\r\n"]) test(`real editor retains ${eol === "\n" ? "LF" : "CRLF"} and unaffected lines`, async () => {
     fs.writeFileSync(file, ["one", "two", "three", ""].join(eol))
     const document = await vscode.workspace.openTextDocument(file)
-    const result = await applyDocumentLineEdits(file, request(document.getText(), [
+    const result = await applyDocumentLineEdits(file, await request(document.getText(), [
       { operation: "replace", start_line: 2, end_line: 2, content: ["TWO", "inserted"] }
     ]))
     assert.ok(result.ok, result.message)
@@ -71,9 +71,9 @@ suite("Hash-verified native line edits", () => {
     const listener = vscode.workspace.onDidChangeTextDocument((event) => { if (event.document === document && event.contentChanges.length) events++ })
     try {
       for (const [expected, edits, code] of [
-        [contentHash("outdated"), [{ operation: "delete", start_line: 1, end_line: 1 }], "hash_mismatch"],
-        [contentHash(original), [{ operation: "delete", start_line: 1, end_line: 1 }, { operation: "delete", start_line: 99, end_line: 99 }], "invalid_range"],
-        [contentHash(original), [{ operation: "delete", start_line: 1, end_line: 2 }, { operation: "delete", start_line: 2, end_line: 3 }], "overlapping_edits"]
+        [await contentHash("outdated"), [{ operation: "delete", start_line: 1, end_line: 1 }], "hash_mismatch"],
+        [await contentHash(original), [{ operation: "delete", start_line: 1, end_line: 1 }, { operation: "delete", start_line: 99, end_line: 99 }], "invalid_range"],
+        [await contentHash(original), [{ operation: "delete", start_line: 1, end_line: 2 }, { operation: "delete", start_line: 2, end_line: 3 }], "overlapping_edits"]
       ] as const) {
         const result = await applyDocumentLineEdits(file, { expected_hash: expected, edits })
         assert.strictEqual(result.ok, false)
@@ -94,7 +94,7 @@ suite("Hash-verified native line edits", () => {
       if (editor && !changed) changed = editor.edit((builder) => builder.insert(new vscode.Position(0, 0), "user: "))
     })
     try {
-      const result = await applyDocumentLineEdits(file, request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]))
+      const result = await applyDocumentLineEdits(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]))
       if (changed) await changed
       assert.strictEqual(result.ok, false, "a concurrent version change must not be overwritten")
       assert.ok(result.error?.code === "hash_mismatch" || result.error?.code === "application_failed")
@@ -120,15 +120,15 @@ suite("Hash-verified native line edits", () => {
       git: false, instructions: false
     })
     const read = await tools.run({ name: "read_file", args: { path: "source.txt", start_line: "1", end_line: "1" } })
-    assert.ok(read.output.includes(contentHash(original)))
-    const args = { path: "source.txt", expected_hash: contentHash(original), edits: JSON.stringify([{ operation: "replace", start_line: 2, end_line: 2, content: ["approved"] }]) }
+    assert.ok(read.output.includes(await contentHash(original)))
+    const args = { path: "source.txt", expected_hash: await contentHash(original), edits: JSON.stringify([{ operation: "replace", start_line: 2, end_line: 2, content: ["approved"] }]) }
     const denied = await tools.run({ name: "edit_lines", args })
     assert.strictEqual(JSON.parse(denied.output).error.code, "permission_denied")
     assert.strictEqual(document.getText(), original)
     approved = true
     const result = await tools.run({ name: "edit_lines", args })
     assert.ok(!result.failed, result.output)
-    assert.strictEqual(JSON.parse(result.output).content_hash, contentHash(document.getText()))
+    assert.strictEqual(JSON.parse(result.output).content_hash, await contentHash(document.getText()))
     assert.ok(document.getText().includes("approved"))
     assert.strictEqual(asked.length, 2)
     assert.ok(document.isDirty)
@@ -145,8 +145,8 @@ suite("Hash-verified native line edits", () => {
     const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
     const tools = workspaceTools(root, [], { edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { checkpoints }), git: false, instructions: false })
     const read = await tools.run({ name: "read_file", args: { path: "encoded.txt" } })
-    assert.ok(read.output.includes(contentHash(source)), read.output)
-    const result = await tools.run({ name: "edit_lines", args: { path: "encoded.txt", expected_hash: contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["after"] }]) } })
+    assert.ok(read.output.includes(await contentHash(source)), read.output)
+    const result = await tools.run({ name: "edit_lines", args: { path: "encoded.txt", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["after"] }]) } })
     assert.ok(!result.failed, result.output)
     assert.ok(await document.save())
     assert.deepStrictEqual(fs.readFileSync(file), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("after\r\nuntouched\r\n", "utf16le")]))
@@ -166,7 +166,7 @@ suite("Hash-verified native line edits", () => {
     let recoveries = 0
     const tools = workspaceTools(root, [], { edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { onCatastrophic: () => { recoveries++ } }), git: false, instructions: false })
     try {
-      const result = await tools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: contentHash(source), edits: JSON.stringify([
+      const result = await tools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: await contentHash(source), edits: JSON.stringify([
         { operation: "replace", start_line: 2, end_line: 2, content: ["export function Panel() {"] },
         { operation: "replace", start_line: 3, end_line: 3, content: ["  return " + jsx] },
         { operation: "replace", start_line: 4, end_line: 4, content: ["}"] }
@@ -174,7 +174,7 @@ suite("Hash-verified native line edits", () => {
       assert.ok(!result.failed, result.output)
       assert.deepStrictEqual(observed, ["// @ts-nocheck\nexport function Panel() {\n  return " + jsx + "\n}\n"])
       assert.strictEqual(recoveries, 0)
-      assert.strictEqual(JSON.parse(result.output).content_hash, contentHash(document.getText()))
+      assert.strictEqual(JSON.parse(result.output).content_hash, await contentHash(document.getText()))
     } finally { listener.dispose() }
   })
 
@@ -199,11 +199,11 @@ suite("Hash-verified native line edits", () => {
       git: false, instructions: false
     })
     try {
-      const result = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
+      const result = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
       assert.strictEqual(result.failed, true, result.output)
       assert.strictEqual(recoveries, 1)
       assert.strictEqual(document.getText(), source, "the existing safe checkpoint restored the complete snapshot")
-      const blocked = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: contentHash(source), edits: JSON.stringify([{ operation: "delete", start_line: 1, end_line: 1 }]) } })
+      const blocked = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "delete", start_line: 1, end_line: 1 }]) } })
       assert.strictEqual(JSON.parse(blocked.output).error.code, "permission_denied")
       assert.strictEqual(document.getText(), source)
     } finally {
@@ -226,7 +226,7 @@ suite("Hash-verified native line edits", () => {
     const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
     try {
       await checkpoints.capture([file])
-      const result = await applyDocumentLineEdits(file, request(dirty, [{ operation: "replace", start_line: 2, end_line: 2, content: ["changed"] }]))
+      const result = await applyDocumentLineEdits(file, await request(dirty, [{ operation: "replace", start_line: 2, end_line: 2, content: ["changed"] }]))
       assert.ok(result.ok, result.message)
       await checkpoints.markChanged([file])
       const restored = await checkpoints.rollback()
@@ -247,11 +247,11 @@ suite("Hash-verified native line edits", () => {
         return true
       }), git: false, instructions: false
     })
-    const result = await tools.run({ name: "edit_lines", args: { path: "source.txt", expected_hash: contentHash(original), edits: JSON.stringify([{ operation: "delete", start_line: 2, end_line: 2 }]) } })
+    const result = await tools.run({ name: "edit_lines", args: { path: "source.txt", expected_hash: await contentHash(original), edits: JSON.stringify([{ operation: "delete", start_line: 2, end_line: 2 }]) } })
     assert.strictEqual(result.failed, true)
     const error = JSON.parse(result.output).error
     assert.strictEqual(error.code, "hash_mismatch")
-    assert.strictEqual(error.current_hash, contentHash(document.getText()))
+    assert.strictEqual(error.current_hash, await contentHash(document.getText()))
     assert.strictEqual(document.getText(), "user: " + original)
   })
 

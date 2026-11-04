@@ -455,7 +455,7 @@ export const editorEdits = (
       }
       let patches
       try {
-        patches = planLineEdits(document.getText(), request)
+        patches = await planLineEdits(document.getText(), request)
       } catch (error) {
         if (error instanceof LineEditError) return { ok: false, message: error.message, error: error.detail }
         throw error
@@ -481,7 +481,7 @@ export const editorEdits = (
       }), async () => { await safety.checkpoints?.markChanged([file]) })
       const checked = await checkedOutcome(file, outcome)
       if (!checked.ok) return checked
-      const hash = contentHash(document.getText())
+      const hash = await contentHash(document.getText())
       if (hash !== checked.contentHash) {
         const error = lineEditFailure("application_failed", "The document changed while diagnostics were checked. Reread it before another edit.", hash)
         return { ok: false, message: error.message, error }

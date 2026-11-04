@@ -134,7 +134,7 @@ test("tools find, read and search, and stay inside the workspace", async () => {
   assert.strictEqual(method.output, "src/warmer.ts:2: public async warm() {")
 
   const read = await tools.run({ name: "read_file", args: { path: "./src/warmer.ts", start_line: "2", end_line: "3" } })
-  assert.match(read.output, /^src\/warmer.ts \(lines 2–3 of 5\)\ncontent_hash: [a-f0-9]{64} \(sha256\); total_lines: 5\n2: {3}public async warm\(\) \{\n3: {5}return 1$/)
+  assert.match(read.output, /^src\/warmer.ts \(lines 2–3 of 5\)\ncontent_hash: (?:xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}); total_lines: 5\n2: {3}public async warm\(\) \{\n3: {5}return 1$/)
 
   const grep = await tools.run({ name: "grep", args: { pattern: "modelwarmer" } })
   assert.strictEqual(

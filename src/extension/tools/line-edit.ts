@@ -1,8 +1,7 @@
-import { createHash } from "node:crypto"
-
+import { fingerprintContent, verifyContentFingerprint } from "./fingerprint"
 import { linesOf } from "./view"
 
-export const contentHash = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex")
+export const contentHash = fingerprintContent
 
 export type LineEditFailureCode = "hash_mismatch" | "invalid_range" | "overlapping_edits" | "document_unavailable" | "permission_denied" | "application_failed"
 
@@ -35,9 +34,10 @@ export const lineEditFailure = (code: LineEditFailureCode, message: string, curr
 function invalid(message: string): never { throw new LineEditError(lineEditFailure("invalid_range", message)) }
 
 /** All offsets address the original text. A terminal newline is not an extra source line. */
-export const planLineEdits = (text: string, request: LineEditRequest, eol = text.includes("\r\n") ? "\r\n" : "\n"): LinePatch[] => {
-  const hash = contentHash(text)
-  if (request.expected_hash !== hash) {
+export const planLineEdits = async (text: string, request: LineEditRequest, eol = text.includes("\r\n") ? "\r\n" : "\n"): Promise<LinePatch[]> => {
+  const matches = await verifyContentFingerprint(text, request.expected_hash)
+  if (!matches) {
+    const hash = await contentHash(text)
     throw new LineEditError(lineEditFailure("hash_mismatch", "The document changed. Reread it before editing; no changes were applied.", hash))
   }
   if (!Array.isArray(request.edits) || !request.edits.length) invalid("edits must be a nonempty array.")

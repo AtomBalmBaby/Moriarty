@@ -138,7 +138,7 @@ test("old results are trimmed, oldest first, when the next request would not fit
     last[0],
     "a.ts (lines 1–60 of 60)\n[The rest was trimmed to save context. Run the tool again if you need it.]"
   )
-  assert.match(last[3], /^d\.ts \(lines 1–60 of 60\)\ncontent_hash: [a-f0-9]{64} \(sha256\); total_lines: 60\n1: const value0/, "the newest result is whole")
+  assert.match(last[3], /^d\.ts \(lines 1–60 of 60\)\ncontent_hash: xxh64:[a-f0-9]{16}; total_lines: 60\n1: const value0/, "the newest result is whole")
   assert.ok(last[3].length <= plan.resultChars + 120, "and held to its share of the context")
   // Without a known context nothing is trimmed.
   const untrimmed = scripted([{ calls: [read("1", "a.ts")] }, { calls: [read("2", "b.ts")] }, "Done."])
@@ -211,7 +211,7 @@ test("a stopped reply still keeps what its tools did, for the next turn", async 
   )
   assert.deepStrictEqual(notes, [
     "read_file {\"path\":\"a.ts\"}\na.ts (lines 1–1 of 1)\n" +
-    `content_hash: ${contentHash("export const a = 1\n")} (sha256); total_lines: 1\n1: export const a = 1`
+    `content_hash: ${await contentHash("export const a = 1\n")}; total_lines: 1\n1: export const a = 1`
   ])
 })
 
@@ -289,7 +289,7 @@ test("a server that wants tools declared beside tool history gets the history as
   assert.strictEqual(retry.messages[2].content, "```tool\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.ts\"}}\n```")
   assert.match(
     String(retry.messages[3].content),
-    /^<tool_result name="read_file">\na\.ts \(lines 1–1 of 1\)\ncontent_hash: [a-f0-9]{64} \(sha256\); total_lines: 1\n1: export const a = 1\n<\/tool_result>\n\nYou are out of tool calls/
+    /^<tool_result name="read_file">\na\.ts \(lines 1–1 of 1\)\ncontent_hash: xxh64:[a-f0-9]{16}; total_lines: 1\n1: export const a = 1\n<\/tool_result>\n\nYou are out of tool calls/
   )
 })
 
@@ -444,7 +444,7 @@ test("a gateway from before tools refuses the field by name, and the loop carrie
   assert.ok(!requests[1].tools, "asked again without the field the gateway refused")
   assert.match(text, /It exports a\./)
   // The call was keyed `args`, and its path still reached the tool.
-  assert.match(String(requests[2].messages[requests[2].messages.length - 1].content), /a\.ts \(lines 1–1 of 1\)\ncontent_hash: [a-f0-9]{64} \(sha256\); total_lines: 1\n1: export const a = 1/)
+  assert.match(String(requests[2].messages[requests[2].messages.length - 1].content), /a\.ts \(lines 1–1 of 1\)\ncontent_hash: xxh64:[a-f0-9]{16}; total_lines: 1\n1: export const a = 1/)
 })
 
 test("arguments keyed args, input or params reach the tool", async () => {

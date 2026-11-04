@@ -171,7 +171,7 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
   return {
     name: "read_file",
     readOnly: true,
-    description: `A file's lines, numbered; at most ${limit} at a time. Source lines are complete. Includes the SHA-256 hash of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
+    description: `A file's lines, numbered; at most ${limit} at a time. Source lines are complete. Includes the content fingerprint of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
     parameters: [
       { name: "path", description: "The file." },
       { name: "start_line", description: "First line to read, from 1.", optional: true, type: "integer" },
@@ -185,7 +185,7 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
       const text = (await sink?.read?.(absolute)) ?? await view.text(absolute)
       if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
       const lines = linesOf(text)
-      const metadata = `content_hash: ${contentHash(text)} (sha256); total_lines: ${lines.length}`
+      const metadata = `content_hash: ${await contentHash(text)}; total_lines: ${lines.length}`
       if (!lines.length) return { output: `${rel} (lines 0–0 of 0)\n${metadata}`, summary: `read \`${rel}\` · empty` }
       if (full_line === "true") {
         const lineNumber = Number.parseInt(start_line ?? "", 10)
@@ -427,7 +427,7 @@ const serializeMutation = <T>(run: () => Promise<T>): Promise<T> => {
 }
 
 const lineEditErrorResult = (error: LineEditFailure): ToolResult => ({
-  output: JSON.stringify({ ok: false, error, hash_algorithm: "sha256" }),
+  output: JSON.stringify({ ok: false, error, ...(error.current_hash ? { hash_algorithm: error.current_hash.split(":")[0] } : {}) }),
   summary: `edit_lines failed · ${error.message}`,
   failed: true
 })
@@ -435,7 +435,7 @@ const lineEditErrorResult = (error: LineEditFailure): ToolResult => ({
 const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]>): Tool => ({
   name: "edit_lines",
   description:
-    "Edit complete source lines atomically, guarded by expected_hash from read_file (SHA-256 of the entire editor buffer). " +
+    "Edit complete source lines atomically, guarded by expected_hash from read_file (the fingerprint of the entire editor buffer). " +
     "All coordinates refer to the SAME original snapshot, not earlier edits. Lines are 1-based; a terminal newline is not an extra line. " +
     "replace/delete use inclusive start_line/end_line. insert_before accepts 1 through total_lines+1; insert_after accepts 1 through total_lines. " +
     "For an empty document only insert_before line=1 or insert_after line=0 is valid. EOF insertion preserves the final-newline convention. " +
@@ -446,7 +446,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
   guidance: "Prefer read_file then edit_lines for deterministic changes, especially long/repeated JSX lines; edit_file remains available for exact-text replacements.",
   parameters: [
     { name: "path", description: "Workspace-relative file path." },
-    { name: "expected_hash", description: "Full-document content_hash from read_file, raw SHA-256 hex." },
+    { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted." },
     { name: "edits", description: "Array of replace/delete {start_line,end_line,content?} or insert_before/insert_after {line,content} operations, all against the original snapshot." }
   ],
   schema: {
@@ -455,7 +455,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     additionalProperties: false,
     properties: {
       path: { type: "string" },
-      expected_hash: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Full editor document SHA-256 from read_file." },
+      expected_hash: { type: "string", pattern: "^(xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}|[a-f0-9]{64})$", description: "Full-document content_hash from read_file." },
       edits: {
         type: "array", minItems: 1,
         items: {
@@ -478,8 +478,8 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     }
   },
   async run({ path: file, expected_hash, edits }) {
-    if (!file || !/^[a-f0-9]{64}$/.test(expected_hash ?? "")) {
-      return lineEditErrorResult(lineEditFailure("invalid_range", "path and a 64-character SHA-256 expected_hash are required."))
+    if (!file || !/^(?:xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}|[a-f0-9]{64})$/.test(expected_hash ?? "")) {
+      return lineEditErrorResult(lineEditFailure("invalid_range", "path and a valid content fingerprint from read_file are required."))
     }
     let absolute: string
     try {
@@ -496,7 +496,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
     if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))
     return {
-      output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: "sha256", message: outcome.message }),
+      output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: outcome.contentHash.split(":")[0], message: outcome.message }),
       summary: `edited \`${view.relative(absolute)}\` by lines${errorsNote(outcome)}`
     }
   }
@@ -669,11 +669,65 @@ const searchCode = (view: WorkspaceView, index: CodeSearch): Tool => ({
   }
 })
 
+const searchWorkspace = (view: WorkspaceView, index: WorkspaceSearchProvider): Tool => ({
+  name: "search_workspace",
+  readOnly: true,
+  description: "Search indexed workspace paths, language-service symbols, and source contents. Use auto for a combined search, path for names, symbol for definitions, literal for exact identifiers/punctuation, or regex for regular expressions.",
+  guidance: "Search results are discovery aids only. Use read_file for the authoritative current editor buffer and its content_hash before making any edit; edit_lines verifies that fingerprint.",
+  parameters: [
+    { name: "query", description: "Filename, symbol, exact source text, or regular expression." },
+    { name: "mode", description: "auto, path, symbol, literal, or regex; defaults to auto.", optional: true },
+    { name: "path", description: "Optional workspace-relative path/glob filter.", optional: true },
+    { name: "limit", description: "Maximum result count, 1-100.", optional: true, type: "integer" },
+    { name: "offset", description: "Zero-based result offset for pagination.", optional: true, type: "integer" }
+  ],
+  schema: {
+    type: "object",
+    required: ["query"],
+    additionalProperties: false,
+    properties: {
+      query: { type: "string", minLength: 1 },
+      mode: { type: "string", enum: ["auto", "path", "symbol", "literal", "regex"], default: "auto" },
+      path: { type: "string" },
+      limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+      offset: { type: "integer", minimum: 0, default: 0 }
+    }
+  },
+  async run({ query, mode, path, limit, offset }, context) {
+    const wanted = query?.trim()
+    if (!wanted) throw new ToolInputError("search_workspace needs a nonempty query.")
+    const selectedMode = mode || "auto"
+    if (selectedMode !== "auto" && selectedMode !== "path" && selectedMode !== "symbol" && selectedMode !== "literal" && selectedMode !== "regex") {
+      throw new ToolInputError("search_workspace mode must be auto, path, symbol, literal, or regex.")
+    }
+    const pageSize = limit === undefined ? 20 : Number(limit)
+    const pageOffset = offset === undefined ? 0 : Number(offset)
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100 || !Number.isSafeInteger(pageOffset) || pageOffset < 0) {
+      throw new ToolInputError("limit must be 1-100 and offset must be a nonnegative integer.")
+    }
+    const result = await index.search({ query: wanted, mode: selectedMode, path: path || undefined, limit: pageSize, offset: pageOffset }, view.root, context?.signal)
+    return {
+      output: JSON.stringify({ query: wanted, mode: selectedMode, total: result.total, offset: pageOffset, limit: pageSize, results: result.results.map((hit) => ({
+        path: hit.path,
+        line: hit.line,
+        column: hit.column,
+        category: hit.category,
+        symbol: hit.symbol,
+        kind: hit.kind,
+        preview: hit.preview,
+        source: hit.source
+      })) }),
+      summary: `searched workspace for \`${wanted}\` · ${plural(result.total, "match")}`
+    }
+  }
+})
+
 /** What the tools can reach beyond reading files, when the host provides it. */
 export interface ToolExtras {
   edits?: EditSink & Partial<FileOpsSink>
   commands?: CommandSink
   codeSearch?: CodeSearch
+  workspaceSearch?: WorkspaceSearchProvider
   /** The editor's language servers and open files. */
   editor?: EditorSink
   /** The maximum number of lines a single `read_file` result may show. */
@@ -717,14 +771,15 @@ export const workspaceTools = (
   ignoredGlobs: string[] = [],
   extras: ToolExtras = {}
 ): WorkspaceTools => {
-  const { edits, commands, codeSearch, editor, readFileMaxLines } = extras
+  const { edits, commands, codeSearch, workspaceSearch, editor, readFileMaxLines } = extras
   const view =
     typeof root === "string" ? new WorkspaceView(root, ignoredGlobs, edits?.read?.bind(edits)) : root
   const tools = [
     ...(codeSearch ? [searchCode(view, codeSearch)] : []),
     ...(editor ? [editorContext(view, editor)] : []),
     listDir(view),
-    findFiles(view),
+    findFiles(view, workspaceSearch),
+    ...(workspaceSearch ? [searchWorkspace(view, workspaceSearch)] : []),
     readFile(view, readFileMaxLines, edits),
     grep(view),
     findSymbol(view),
@@ -786,4 +841,10 @@ export const workspaceTools = (
       }
     }
   }
+}
+
+export type WorkspaceSearchMode = "auto" | "path" | "symbol" | "literal" | "regex"
+export interface WorkspaceSearchHit { uri?: string; path: string; line?: number; column?: number; category: "path" | "symbol" | "content"; symbol?: string; kind?: string; preview: string; source: "index" | "live" }
+export interface WorkspaceSearchProvider {
+  search(request: { query: string; mode?: WorkspaceSearchMode; path?: string; limit?: number; offset?: number }, scope?: string, signal?: AbortSignal): Promise<{ results: WorkspaceSearchHit[]; total: number }>
 }

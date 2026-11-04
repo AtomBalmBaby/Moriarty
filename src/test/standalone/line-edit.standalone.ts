@@ -32,11 +32,11 @@ const fixture = (initial: string) => {
     edit: async () => ({ ok: true, message: "legacy" }),
     create: async () => ({ ok: true, message: "created" }),
     async editLines(_file, request) {
-      const patches = planLineEdits(text, request)
+      const patches = await planLineEdits(text, request)
       await Promise.resolve()
       for (const patch of [...patches].reverse()) text = text.slice(0, patch.start) + patch.text + text.slice(patch.end)
       transactions++
-      return { ok: true, message: "applied", contentHash: contentHash(text) }
+      return { ok: true, message: "applied", contentHash: await contentHash(text) }
     }
   }
   const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
@@ -51,14 +51,14 @@ test("read_file hashes the entire authoritative dirty document, not its range or
   const source = "first\nsecond\nthird\n"
   f.change(source)
   const read = await f.tools.run({ name: "read_file", args: { path: "panel.tsx", start_line: "2", end_line: "2" } })
-  assert.match(read.output, new RegExp(`content_hash: ${hash(source)} \\(sha256\\); total_lines: 3`))
+  assert.match(read.output, new RegExp(`content_hash: ${await contentHash(source)}; total_lines: 3`))
   assert.match(read.output, /^panel\.tsx \(lines 2–2 of 3\)/)
   assert.equal(parseReadFile(read.output)?.code, "second")
   assert.equal(fs.readFileSync(path.join(f.root, "panel.tsx"), "utf8"), "disk\n")
   f.change(source + "fourth\n")
   const reread = await f.tools.run({ name: "read_file", args: { path: "panel.tsx" } })
   assert.ok(!reread.output.includes(hash(source)))
-  assert.ok(reread.output.includes(hash(f.text())))
+  assert.ok(reread.output.includes(await contentHash(f.text())))
 })
 
 test("long JSX lines with repeated closing tags are returned intact and edited without exact-text matching", async () => {
@@ -97,7 +97,7 @@ for (const [name, before, edits, after] of cases) test(name, async () => {
   assert.equal(result.failed, undefined, result.output)
   assert.equal(f.text(), after)
   assert.equal(f.transactions(), 1)
-  assert.deepEqual(JSON.parse(result.output), { ok: true, path: "panel.tsx", content_hash: hash(after), hash_algorithm: "sha256", message: "applied" })
+  assert.deepEqual(JSON.parse(result.output), { ok: true, path: "panel.tsx", content_hash: await contentHash(after), hash_algorithm: "xxh64", message: "applied" })
 })
 
 const rejected: [string, unknown, string][] = [
@@ -133,7 +133,7 @@ test("outdated hashes reject atomically and return the current hash", async () =
   const result = await f.edit([{ operation: "replace", start_line: 1, end_line: 1, content: ["new"] }], stale)
   assert.equal(result.failed, true)
   assert.equal(JSON.parse(result.output).error.code, "hash_mismatch")
-  assert.equal(JSON.parse(result.output).error.current_hash, hash("dirty buffer\n"))
+  assert.equal(JSON.parse(result.output).error.current_hash, await contentHash("dirty buffer\n"))
   assert.equal(f.text(), "dirty buffer\n")
   assert.equal(f.transactions(), 0)
 })
@@ -187,6 +187,6 @@ test("legacy sinks without an open buffer still read the filesystem", async () =
   const tools = workspaceTools(f.root, [], { edits: { ...f.sink, read: async () => undefined }, git: false, instructions: false })
   const read = await tools.run({ name: "read_file", args: { path: "panel.tsx" } })
   assert.equal(read.failed, undefined)
-  assert.ok(read.output.includes(hash("disk\n")))
+  assert.ok(read.output.includes(await contentHash("disk\n")))
   assert.equal(parseReadFile(read.output)?.code, "disk")
 })

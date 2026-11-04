@@ -520,6 +520,40 @@
           "default": true,
           "markdownDescription": "When `true`, Twinny will automatically suggest completions. You can still manually trigger completions using the default shortcut (`Alt+\\`)."
         },
+        "twinny.contentHash.algorithm": {
+          "type": "string",
+          "enum": ["xxh64", "xxh3_128", "sha256"],
+          "default": "xxh64",
+          "description": "Algorithm used by editing and workspace indexing for self-describing content fingerprints."
+        },
+        "twinny.indexing.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable Twinny's persistent workspace index in extension-managed storage, separate from durable TODO data."
+        },
+        "twinny.indexing.auto": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically synchronize the workspace index on activation and relevant workspace changes."
+        },
+        "twinny.indexing.include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["**/*"],
+          "markdownDescription": "Workspace-relative glob patterns eligible for indexing."
+        },
+        "twinny.indexing.exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Additional workspace-relative glob patterns excluded from indexing. Dependencies, generated output, binaries, and common credential files are excluded by default."
+        },
+        "twinny.indexing.maxFileSize": {
+          "type": "number",
+          "minimum": 1024,
+          "default": 1048576,
+          "description": "Maximum file size in bytes for indexing. Larger files are reported as skipped."
+        },
         "twinny.contextLength": {
           "order": 4,
           "type": "number",
@@ -1102,6 +1136,7 @@
     "fuse.js": "^7.0.0",
     "handlebars": "^4.7.8",
     "handlebars-loader": "^1.7.3",
+    "hash-wasm": "^4.12.0",
     "hyperdht": "^6.34.0",
     "i18next": "^23.16.5",
     "i18next-http-backend": "^2.6.2",

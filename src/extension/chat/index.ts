@@ -61,7 +61,7 @@ import type { ToolCall } from "../tools/protocol"
 import { todoTools, todoWorkspaceTools } from "../tools/todos"
 import { WorkspaceView } from "../tools/view"
 import type { ToolResult } from "../tools/workspace"
-import { ToolExtras, WorkspaceTools, workspaceTools } from "../tools/workspace"
+import { ToolExtras, WorkspaceSearchProvider, WorkspaceTools, workspaceTools } from "../tools/workspace"
 import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
@@ -396,6 +396,7 @@ export class Chat extends Base {
   private _executionAbort?: AbortController
   private _activeExecution?: ExecutionReconciliationController
   private readonly _search: WorkspaceSearch | undefined
+  private readonly _workspaceSearch: WorkspaceSearchProvider | undefined
   private readonly _agents: AgentRegistry
   private _requestAgentSelection: AgentSelection = "off"
   private _activeAgent?: LoadedAgent
@@ -435,7 +436,8 @@ export class Chat extends Base {
     bridge: ExtensionBridge,
     search: WorkspaceSearch | undefined,
     agents: AgentRegistry = new AgentRegistry(extensionContext),
-    todoRepository?: TodoRepository
+    todoRepository?: TodoRepository,
+    workspaceSearch?: WorkspaceSearchProvider
   ) {
     super(extensionContext)
     this._generations = generations
@@ -445,6 +447,7 @@ export class Chat extends Base {
     this._bridge = bridge
     this._search = search
     this._agents = agents
+    this._workspaceSearch = workspaceSearch
     this._steps = new ToolSteps((steps) => bridge.emit(EVENT_NAME.twinnyToolSteps, steps))
 
     // Initialize generation and context
@@ -462,6 +465,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     if (root) {
       // Build a minimal extras object that enables all native tools
       const extras: ToolExtras = {
+        workspaceSearch: this._workspaceSearch,
         edits: {
           mode: "apply" as const,
           read: async (): Promise<string | undefined> => undefined,
@@ -1734,6 +1738,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       conversationId: this._activeConversationId
     } : undefined
     let available = workspaceTools(view, [], {
+      workspaceSearch: this._workspaceSearch,
       edits: editorEdits(view, editMode, approveChange, changes, safety),
       editor: editorKnowledge(view, editMode, approveChange, changes, safety),
       readFileMaxLines: maxReadLines,

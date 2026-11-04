@@ -45,6 +45,7 @@ import { TeamShare } from "../team/share"
 import { TemplateProvider } from "../templates/provider"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import type { CreateTodoInput, UpdateTodoInput } from "../todos/types"
+import type { WorkspaceSearchProvider } from "../tools/workspace"
 import { getLanguage, getTerminal, getTextSelection, getTheme } from "../utils"
 
 import { resolveLanguageId, stripShellPrompts } from "./code-actions"
@@ -65,6 +66,7 @@ export class BaseProvider {
   private _teamShareBridge: TeamShareBridge | undefined
   private _teamPlugins: TeamPlugins | undefined
   private _teamPluginsBridge: TeamPluginsBridge | undefined
+  private readonly _workspaceSearch: WorkspaceSearchProvider | undefined
   private _sessionManager: SessionManager | undefined
   private _generations: GenerationTracker
   private readonly _todoRepository: TodoRepository
@@ -93,7 +95,8 @@ export class BaseProvider {
     sessionManager?: SessionManager,
     p2p?: P2pRuntime,
     teamShare?: TeamShare,
-    teamPlugins?: TeamPlugins
+    teamPlugins?: TeamPlugins,
+    workspaceSearch?: WorkspaceSearchProvider
   ) {
     this.context = context
     this._todoRepository = new TodoRepository(
@@ -107,6 +110,7 @@ export class BaseProvider {
     this._teamShare = teamShare
     this._teamPlugins = teamPlugins
     this._sessionManager = sessionManager
+    this._workspaceSearch = workspaceSearch
     this._generations = generations
     this._templateDir = templateDir
     this._templateProvider = new TemplateProvider(templateDir)
@@ -164,7 +168,8 @@ export class BaseProvider {
       bridge,
       this._workspaceIndex?.search,
       this._agentRegistry,
-      this._todoRepository
+      this._todoRepository,
+      this._workspaceSearch
     )
 
     this.conversationHistory = new ConversationHistory(

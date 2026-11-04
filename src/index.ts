@@ -64,9 +64,11 @@ import { TemplateProvider } from "./extension/templates/provider"
 import { terminalHistory } from "./extension/terminal"
 import { runDescribedCommand } from "./extension/terminal/command"
 import { fixTerminalError } from "./extension/terminal/fix"
+import { ContentHashAlgorithm, isContentHashAlgorithm, setContentHashAlgorithmProvider } from "./extension/tools/fingerprint"
 import { delayExecution } from "./extension/utils"
 import { FullScreenProvider } from "./extension/webview/panel"
 import { SidebarProvider } from "./extension/webview/sidebar"
+import { WorkspaceIntelligenceIndex } from "./extension/workspace-index"
 
 /**
  * The editor commands whose answer is prose rather than code: these go
@@ -87,49 +89,86 @@ const EDIT_COMMANDS: Record<string, string> = {
 }
 
 /** Clicking the idle status bar item: the most-used toggles, one click away. */
-async function showStatusBarMenu(statusBar: TwinnyStatusBar) {
+async function showStatusBarMenu(statusBar: TwinnyStatusBar, index: WorkspaceIntelligenceIndex) {
   const config = workspace.getConfiguration("twinny")
   const autoSuggest = config.get<boolean>("autoSuggestEnabled", true)
-
-  const picked = await window.showQuickPick(
-    [
-      {
-        label: autoSuggest
-          ? "$(circle-slash) Pause auto-suggest"
-          : "$(play) Resume auto-suggest",
-        description: autoSuggest
-          ? "Completions only when triggered with Alt+\\"
-          : "Suggest completions as you type",
-        action: "toggle"
-      },
-      {
-        label: "$(comment-discussion) Open chat",
-        action: "chat"
-      },
-      {
-        label: "$(robot) Manage providers",
-        action: "providers"
-      },
-      {
-        label: "$(gear) Settings",
-        action: "settings"
-      },
-      {
-        label: "$(output) Show logs",
-        description: "Requests, timings and errors in the Output panel",
-        action: "logs"
-      }
-    ],
-    { title: "Twinny", placeHolder: "What would you like to do?" }
-  )
-
+  const state = index.snapshot
+  const items = [
+    {
+      label: `$(database) Workspace index: ${state.status}`,
+      description: `${state.filesIndexed}/${state.filesDiscovered} files · ${state.symbolsIndexed} symbols · ${state.filesSkipped} skipped · ${state.filesFailed} failed`,
+      action: "indexDetails"
+    },
+    {
+      label: "$(search) Search workspace",
+      description: "Find paths, symbols, and source contents",
+      action: "search"
+    },
+    {
+      label: "$(refresh) Rebuild workspace index",
+      description: "Rescan workspace files and refresh symbols",
+      action: "rebuild"
+    },
+    {
+      label: state.status === "paused" ? "$(play) Resume indexing" : "$(debug-pause) Pause indexing",
+      description: "Control automatic background synchronization",
+      action: "pause"
+    },
+    {
+      label: autoSuggest
+        ? "$(circle-slash) Pause auto-suggest"
+        : "$(play) Resume auto-suggest",
+      description: autoSuggest
+        ? "Completions only when triggered with Alt+\\"
+        : "Suggest completions as you type",
+      action: "toggle"
+    },
+    { label: "$(comment-discussion) Open chat", action: "chat" },
+    { label: "$(robot) Manage providers", action: "providers" },
+    { label: "$(gear) Settings", action: "settings" },
+    { label: "$(output) Show logs", description: "Requests, timings and errors in the Output panel", action: "logs" }
+  ]
+  const picked = await window.showQuickPick(items, { title: "Twinny", placeHolder: "Index status, search, or Twinny options" })
   switch (picked?.action) {
+    case "indexDetails": {
+      const current = index.snapshot
+      const details = [
+        `Status: ${current.status}`,
+        `Files: ${current.filesIndexed} indexed, ${current.filesPending} pending, ${current.filesSkipped} skipped, ${current.filesFailed} failed of ${current.filesDiscovered} discovered`,
+        `Symbols: ${current.symbolsIndexed}`,
+        `Storage: ${current.storageBytes} bytes${current.fts5 ? " (FTS5 enabled)" : " (literal search fallback)"}`,
+        `Last successful synchronization: ${current.lastSynchronized ?? "never"}`,
+        ...(current.error ? [`Error: ${current.error}`] : [])
+      ].join("\n")
+      await window.showInformationMessage(details, { modal: true })
+      break
+    }
+    case "search": {
+      const query = await window.showInputBox({ prompt: "Search workspace paths, symbols, and source", placeHolder: "read_file, WorkspaceTools, or foo.bar" })
+      if (!query?.trim()) break
+      const result = await index.search({ query: query.trim(), mode: "auto", limit: 50 })
+      if (!result.results.length) {
+        await window.showInformationMessage(`No workspace results for '${query}'.`)
+        break
+      }
+      const selected = await window.showQuickPick(result.results.map((hit) => ({
+        label: `${hit.path}${hit.line ? `:${hit.line}${hit.column ? `:${hit.column}` : ""}` : ""}`,
+        description: `${hit.category}${hit.symbol ? ` · ${hit.kind ?? "symbol"} ${hit.symbol}` : ""} · ${hit.source}`,
+        detail: hit.preview,
+        hit
+      })), { title: `Workspace search: ${query}`, matchOnDescription: true, matchOnDetail: true })
+      if (selected) await index.openHit(selected.hit)
+      break
+    }
+    case "rebuild":
+      await index.rebuild()
+      break
+    case "pause":
+      if (state.status === "paused") await index.resume()
+      else await index.pause()
+      break
     case "toggle":
-      await config.update(
-        "autoSuggestEnabled",
-        !autoSuggest,
-        vscode.ConfigurationTarget.Global
-      )
+      await config.update("autoSuggestEnabled", !autoSuggest, vscode.ConfigurationTarget.Global)
       statusBar.refresh()
       break
     case "chat":
@@ -170,6 +209,13 @@ const logStartup = (context: ExtensionContext, startedAt: number) => {
 }
 
 export async function activate(context: ExtensionContext) {
+  setContentHashAlgorithmProvider(() => {
+    const algorithm = workspace.getConfiguration("twinny").get<ContentHashAlgorithm>("contentHash.algorithm", "xxh64")
+    if (!isContentHashAlgorithm(algorithm)) {
+      throw new Error(`Unsupported twinny.contentHash.algorithm setting: ${algorithm}`)
+    }
+    return algorithm
+  })
   setContext(context)
   const store = new ProviderStore(context)
   try {
@@ -199,6 +245,9 @@ export async function activate(context: ExtensionContext) {
   // Every model request runs on the tracker: the spinner, the stop
   // keybinding and the stop command all read it.
   const generations = new GenerationTracker()
+  const workspaceSearchIndex = new WorkspaceIntelligenceIndex(context.globalStorageUri, context.extensionPath)
+  context.subscriptions.push(workspaceSearchIndex)
+  void workspaceSearchIndex.start().catch((error) => logger.error("Workspace index initialization failed: " + messageOf(error)))
   context.subscriptions.push(
     generations.onDidChange(({ stoppable }) => {
       void commands.executeCommand(
@@ -211,8 +260,10 @@ export async function activate(context: ExtensionContext) {
   const statusBar = new TwinnyStatusBar(
     window.createStatusBarItem(StatusBarAlignment.Right),
     context,
-    generations
+    generations,
+    workspaceSearchIndex
   )
+  context.subscriptions.push(statusBar)
 
   const startedAt = Date.now()
   const templateDir = path.join(os.homedir(), ".twinny/templates") as string
@@ -249,7 +300,8 @@ export async function activate(context: ExtensionContext) {
     generations,
     p2p,
     teamShare,
-    teamPlugins
+    teamPlugins,
+    workspaceSearchIndex
   )
 
   const workspaceIndex = await WorkspaceIndex.open(context)
@@ -263,7 +315,8 @@ export async function activate(context: ExtensionContext) {
     sessionManager,
     p2p,
     teamShare,
-    teamPlugins
+    teamPlugins,
+    workspaceSearchIndex
   )
 
   const completionProvider = new CompletionProvider(
@@ -406,7 +459,7 @@ export async function activate(context: ExtensionContext) {
       setEnabled(false)
     ),
     commands.registerCommand(TWINNY_COMMAND_NAME.statusBarMenu, () =>
-      showStatusBarMenu(statusBar)
+      showStatusBarMenu(statusBar, workspaceSearchIndex)
     ),
     commands.registerCommand(
       TWINNY_COMMAND_NAME.templateCompletion,

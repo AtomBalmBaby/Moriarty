@@ -23,7 +23,7 @@ import {
   withoutHiddenLines
 } from "./helpers"
 import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
-import type { EditOutcome, Tool } from "./workspace"
+import type { EditOutcome, Tool, WorkspaceSearchProvider } from "./workspace"
 
 const MAX_FOUND_FILES = 100
 const MAX_GIT_OUTPUT = 10_000
@@ -76,13 +76,13 @@ const globWords = (glob: string) =>
     (word) => !["src", "test", "tests", "index"].includes(word)
   )
 
-export const findFiles = (view: WorkspaceView): Tool => ({
+export const findFiles = (view: WorkspaceView, search?: WorkspaceSearchProvider): Tool => ({
   name: "find_files",
   readOnly: true,
   description:
-    "Files and folders whose path matches a glob, e.g. **/*.test.ts or src/**/index.*; a pattern without / matches the name anywhere. Folders end in /.",
-  parameters: [{ name: "pattern", description: "A glob." }],
-  async run({ pattern }) {
+    "Find files and folders by path or glob. In automatic mode, a plain-text query with no path match may also find source symbols or content; that fallback is labeled. Use mode=path to keep the search filename-only.",
+  parameters: [{ name: "pattern", description: "A filename or path glob, or a plain-text discovery query." }, { name: "mode", description: "auto (default) or path to disable symbol/content fallback.", optional: true }],
+  async run({ pattern, mode }) {
     const glob = pattern?.trim().replace(/\/+$/, "")
     if (!glob) throw new ToolInputError("find_files needs a pattern.")
     const regex = globToRegExp(glob)
@@ -91,6 +91,14 @@ export const findFiles = (view: WorkspaceView): Tool => ({
     const matches = [...dirs.filter((rel) => regex.test(rel)).map((rel) => `${rel}/`), ...files].sort()
     const shown = matches.slice(0, MAX_FOUND_FILES)
     if (!shown.length) {
+      const plainText = !glob.includes("/") && !/[/*?{}[\]]/.test(glob) && !/\.[a-z0-9]{1,10}$/i.test(glob)
+      if (search && mode !== "path" && plainText) {
+        const fallback = await search.search({ query: glob, mode: "auto", limit: MAX_FOUND_FILES }, view.root)
+        if (fallback.results.length) {
+          const entries = fallback.results.map((hit) => hit.category + ": " + hit.path + (hit.line ? ":" + hit.line + (hit.column ? ":" + hit.column : "") : "") + " [" + hit.source + "]" + (hit.symbol ? " " + (hit.kind ?? "symbol") + " " + hit.symbol : "") + " — " + hit.preview)
+          return { output: "No file path matched. Automatic symbol/content fallback (discovery only):\n" + entries.join("\n"), summary: "searched symbols and source for '" + glob + "' · " + plural(fallback.total, "match") }
+        }
+      }
       // A dead end costs a step; a folder with the same word in its name is usually where to look.
       const words = globWords(glob)
       const near = dirs

@@ -4,6 +4,7 @@ import { GenerationTracker } from "../generations"
 import { P2pRuntime } from "../p2p/runtime"
 import type { TeamPlugins } from "../team/plugins-page"
 import { TeamShare } from "../team/share"
+import type { WorkspaceSearchProvider } from "../tools/workspace"
 import { getNonce } from "../utils"
 
 import { BaseProvider } from "./base"
@@ -17,9 +18,10 @@ export class FullScreenProvider extends BaseProvider {
     generations: GenerationTracker,
     p2p?: P2pRuntime,
     teamShare?: TeamShare,
-    teamPlugins?: TeamPlugins
+    teamPlugins?: TeamPlugins,
+    workspaceSearch?: WorkspaceSearchProvider
   ) {
-    super(context, templateDir, generations, undefined, undefined, p2p, teamShare, teamPlugins)
+    super(context, templateDir, generations, undefined, undefined, p2p, teamShare, teamPlugins, workspaceSearch)
     this.context = context
   }
 
