@@ -21,6 +21,24 @@ const formatBytes = (size: number) => {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
 
+const formatDuration = (milliseconds: number | undefined) => {
+  if (milliseconds === undefined) return "not recorded"
+  if (milliseconds < 1000) return `${milliseconds} ms`
+  return `${(milliseconds / 1000).toFixed(1)} s`
+}
+
+const formatSyncTime = (value: string) => {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  })
+}
+
 /**
  * Twinny's existing status item reflects FIM settings and the workspace index.
  */
@@ -28,6 +46,10 @@ export class TwinnyStatusBar {
   private readonly _subscription: { dispose(): void }
   private readonly _indexSubscription?: { dispose(): void }
   private _refreshTimer?: ReturnType<typeof setTimeout>
+  private _renderedText?: string
+  private _renderedTooltip?: string
+  private _renderedCommand?: string
+  private _visible = false
 
   constructor(
     private readonly _item: StatusBarItem,
@@ -54,15 +76,17 @@ export class TwinnyStatusBar {
     if (!state) return ["Workspace index: not initialized"]
     const folders = (workspace.workspaceFolders ?? []).map((folder) => folder.name).join(", ") || "no workspace folder"
     const pending = state.filesPending ? ` · ${state.filesPending} pending` : ""
-    const progress = state.status === "scanning"
-      ? `${state.filesDiscovered} files discovered`
+    const progress = state.status === "scanning" || (state.status === "indexing" && !state.discoveryComplete)
+      ? `${state.filesIndexed} files indexed · ${state.filesDiscovered} discovered (total unknown)`
       : state.status === "indexing"
         ? `${state.filesIndexed}/${state.filesDiscovered} files indexed${pending}`
         : `${state.filesIndexed} files indexed`
     return [
       `Workspace index: ${state.status} · ${folders}`,
       `${progress} · ${state.symbolsIndexed} symbols · ${state.filesSkipped} skipped · ${state.filesFailed} failed`,
-      `Storage: ${formatBytes(state.storageBytes)}${state.lastSynchronized ? ` · last sync ${state.lastSynchronized}` : " · never synchronized"}`,
+      `Workers: ${state.activeWorkers} active · queue ${state.queueDepth} · duration ${formatDuration(state.currentIndexDurationMs ?? state.lastIndexDurationMs)}`,
+      `Database ${formatBytes(state.storageBytes)} · SQLite cache cap ${formatBytes(state.sqliteCacheLimitBytes)} · active file buffers ${formatBytes(state.activeSourceBytes)} (peak ${formatBytes(state.peakSourceBytes)})`,
+      `Symbol provider calls: ${state.symbolProviderCalls}${state.lastSynchronized ? ` · last sync ${formatSyncTime(state.lastSynchronized)}` : " · never synchronized"}`,
       ...(state.error ? [`Index error: ${state.error}`] : [])
     ]
   }
@@ -75,11 +99,31 @@ export class TwinnyStatusBar {
     return ""
   }
 
+  private render(text: string, tooltip: string, command: string) {
+    if (this._renderedText !== text) {
+      this._item.text = text
+      this._renderedText = text
+    }
+    if (this._renderedTooltip !== tooltip) {
+      this._item.tooltip = tooltip
+      this._renderedTooltip = tooltip
+    }
+    if (this._renderedCommand !== command) {
+      this._item.command = command
+      this._renderedCommand = command
+    }
+    if (!this._visible) {
+      this._item.show()
+      this._visible = true
+    }
+  }
+
   private showBusy() {
-    this._item.text = `${ICON_BUSY}${this.indexIcon()}`
-    this._item.tooltip = ["Twinny is generating — click to stop", ...this.indexLines(this._workspaceIndex?.snapshot)].join("\n")
-    this._item.command = TWINNY_COMMAND_NAME.stopGeneration
-    this._item.show()
+    this.render(
+      `${ICON_BUSY}${this.indexIcon()}`,
+      ["Twinny is generating — click to stop", ...this.indexLines(this._workspaceIndex?.snapshot)].join("\n"),
+      TWINNY_COMMAND_NAME.stopGeneration
+    )
   }
 
   /** Re-read FIM settings and index metrics; no-op while generation state owns the item. */
@@ -88,7 +132,10 @@ export class TwinnyStatusBar {
 
     const config = workspace.getConfiguration("twinny")
     if (!config.get<boolean>("enabled", true)) {
-      this._item.hide()
+      if (this._visible) {
+        this._item.hide()
+        this._visible = false
+      }
       return
     }
 
@@ -108,10 +155,11 @@ export class TwinnyStatusBar {
       "Click for options"
     ]
 
-    this._item.text = `${autoSuggest ? ICON_IDLE : `${ICON_IDLE} off`}${this.indexIcon()}`
-    this._item.tooltip = lines.join("\n")
-    this._item.command = TWINNY_COMMAND_NAME.statusBarMenu
-    this._item.show()
+    this.render(
+      `${autoSuggest ? ICON_IDLE : `${ICON_IDLE} off`}${this.indexIcon()}`,
+      lines.join("\n"),
+      TWINNY_COMMAND_NAME.statusBarMenu
+    )
   }
 
   public dispose() {

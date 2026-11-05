@@ -39,3 +39,7 @@ out/test/**
 !node_modules/bare-semver/**
 !node_modules/bare-events/**
 !node_modules/events-universal/**
+
+!node_modules/sqlite3/**
+!node_modules/bindings/**
+!node_modules/file-uri-to-path/**

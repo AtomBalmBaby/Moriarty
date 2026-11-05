@@ -135,9 +135,12 @@ async function showStatusBarMenu(statusBar: TwinnyStatusBar, index: WorkspaceInt
       const details = [
         `Status: ${current.status}`,
         `Files: ${current.filesIndexed} indexed, ${current.filesPending} pending, ${current.filesSkipped} skipped, ${current.filesFailed} failed of ${current.filesDiscovered} discovered`,
-        `Symbols: ${current.symbolsIndexed}`,
-        `Storage: ${current.storageBytes} bytes${current.fts5 ? " (FTS5 enabled)" : " (literal search fallback)"}`,
-        `Last successful synchronization: ${current.lastSynchronized ?? "never"}`,
+        `Symbols: ${current.symbolsIndexed} · language-service provider calls: ${current.symbolProviderCalls}`,
+        `Files: ${current.filesDiscovered} discovered · ${current.filesPending} pending · ${current.activeWorkers} active workers · queue ${current.queueDepth}`,
+        `Index duration: ${current.currentIndexDurationMs ?? current.lastIndexDurationMs ?? "not recorded"} ms`,
+        `Storage: ${current.storageBytes} bytes · SQLite page-cache cap: ${current.sqliteCacheLimitBytes} bytes${current.fts5 ? " · FTS5 enabled" : " · literal search fallback"}`,
+        `Active source payload: ${current.activeSourceBytes} bytes · peak: ${current.peakSourceBytes} bytes (source payload only, not total extension memory)`,
+        `Last completed synchronization: ${current.lastSynchronized ?? "never"}`,
         ...(current.error ? [`Error: ${current.error}`] : [])
       ].join("\n")
       await window.showInformationMessage(details, { modal: true })
@@ -245,7 +248,7 @@ export async function activate(context: ExtensionContext) {
   // Every model request runs on the tracker: the spinner, the stop
   // keybinding and the stop command all read it.
   const generations = new GenerationTracker()
-  const workspaceSearchIndex = new WorkspaceIntelligenceIndex(context.globalStorageUri, context.extensionPath)
+  const workspaceSearchIndex = new WorkspaceIntelligenceIndex(context.globalStorageUri)
   context.subscriptions.push(workspaceSearchIndex)
   void workspaceSearchIndex.start().catch((error) => logger.error("Workspace index initialization failed: " + messageOf(error)))
   context.subscriptions.push(

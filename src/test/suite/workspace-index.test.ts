@@ -34,11 +34,13 @@ suite("Persistent workspace intelligence index", () => {
     fs.writeFileSync(path.join(root, "large.txt"), "x".repeat(1_100_000))
     fs.writeFileSync(path.join(storage, "twinny-state.sqlite"), "durable TODO database sentinel")
     originalFolders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ uri: folder.uri, name: folder.name }))
+    const repositoryRoot = vscode.Uri.file(path.resolve(__dirname, "../../.."))
     const changed = vscode.workspace.updateWorkspaceFolders(
       0,
       originalFolders.length,
       { uri: vscode.Uri.file(root), name: "index-main" },
-      { uri: vscode.Uri.file(secondRoot), name: "index-secondary" }
+      { uri: vscode.Uri.file(secondRoot), name: "index-secondary" },
+      { uri: repositoryRoot, name: "twinny-repository" }
     )
     assert.equal(changed, true)
   })
@@ -55,16 +57,40 @@ suite("Persistent workspace intelligence index", () => {
   })
 
   test("indexes multiple roots, labels skips, finds read_file, and keeps explicit path searches path-only", async function () {
-    this.timeout(30000)
-    index = new WorkspaceIntelligenceIndex(vscode.Uri.file(storage), path.resolve(__dirname, "../../.."))
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(vscode.Uri.file(storage))
     await index.rebuild()
     const state = index.snapshot
     assert.equal(state.status, "ready")
     assert.ok(state.filesIndexed >= 2)
     assert.ok(state.filesSkipped >= 1, "oversized file is explicitly skipped")
     assert.equal(state.filesPending, 0)
+    assert.equal(state.queueDepth, 0)
+    assert.equal(state.activeWorkers, 0)
+    assert.equal(state.discoveryComplete, true)
+    assert.equal(state.symbolProviderCalls, 0, "initial indexing must not request language-service symbols")
+    assert.ok(state.peakSourceBytes <= 2 * 1_048_576, "file buffers must be bounded by two workers and the configured file size")
+    assert.ok(state.storageBytes > 0, "database size comes from the actual SQLite files")
+    console.log("[workspace-index-measurement] " + JSON.stringify({
+      filesDiscovered: state.filesDiscovered,
+      filesIndexed: state.filesIndexed,
+      filesSkipped: state.filesSkipped,
+      filesFailed: state.filesFailed,
+      durationMs: state.lastIndexDurationMs,
+      databaseBytes: state.storageBytes,
+      peakFileBufferBytes: state.peakSourceBytes,
+      sqliteCacheLimitBytes: state.sqliteCacheLimitBytes,
+      symbolsIndexed: state.symbolsIndexed,
+      symbolProviderCalls: state.symbolProviderCalls
+    }))
+    const synchronizedAt = state.lastSynchronized
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    assert.equal(index.snapshot.lastSynchronized, synchronizedAt, "idle indexes must not schedule recurring scans")
 
     const literal = await index.search({ query: "read_file", mode: "literal" }, root)
+    const repositoryUri = vscode.Uri.file(path.resolve(__dirname, "../../.."))
+    const nativeTool = await index.search({ query: "read_file", mode: "literal", limit: 100 }, repositoryUri.toString())
+    assert.ok(nativeTool.results.some((hit) => hit.path.endsWith("src/extension/tools/workspace.ts")), "real repository search must locate the native read_file implementation")
     assert.ok(literal.results.some((hit) => hit.path.endsWith("src/extension/tools/workspace.ts") && hit.category === "content" && hit.line && hit.column), JSON.stringify(literal))
     assert.ok((await index.search({ query: "workspace.ts", mode: "path" }, root)).total > 0)
     assert.ok((await index.search({ query: "index-main/src/extension/**/*.ts", mode: "path" }, root)).total > 0)
@@ -78,7 +104,7 @@ suite("Persistent workspace intelligence index", () => {
     assert.ok((await index.search({ query: "foo.bar", mode: "literal" }, secondRoot)).total > 0)
     assert.equal((await index.search({ query: "fooXbar", mode: "literal" }, secondRoot)).total, 0)
     assert.equal((await index.search({ query: "multiRootMarker", mode: "literal" }, root)).total, 0)
-    assert.equal((await index.search({ query: "privateCredential", mode: "literal" })).total, 0, ".gitignore files stay outside the index")
+    assert.equal((await index.search({ query: "privateCredential", mode: "literal" }, root)).total, 0, ".gitignore files stay outside the index")
 
     const tools = workspaceTools(root, [], {
       workspaceSearch: index,
@@ -147,7 +173,7 @@ suite("Persistent workspace intelligence index", () => {
 
     const lastSync = index.snapshot.lastSynchronized
     index.dispose()
-    index = new WorkspaceIntelligenceIndex(vscode.Uri.file(storage), path.resolve(__dirname, "../../.."))
+    index = new WorkspaceIntelligenceIndex(vscode.Uri.file(storage))
     const restored = await index.search({ query: "read_file_dirty", mode: "literal" }, root)
     assert.ok(restored.total > 0)
     assert.equal(index.snapshot.lastSynchronized, lastSync)
@@ -172,11 +198,45 @@ suite("Persistent workspace intelligence index", () => {
       assert.match(tooltip(), /Workspace index: ready/)
       assert.match(tooltip(), /Auto-suggest is (on|off)/)
       assert.ok(tooltip().includes(`${index.snapshot.filesIndexed} files indexed`))
+      assert.match(tooltip(), /last sync /)
+      const displayedSync = index.snapshot.lastSynchronized
+      assert.ok(displayedSync)
+      assert.ok(!tooltip().includes(displayedSync))
 
+      let stateChanges = 0
+      const stateSubscription = index.onDidChange(() => stateChanges++)
       await index.pause()
       await new Promise((resolve) => setTimeout(resolve, 350))
       assert.match(tooltip(), /Workspace index: paused/)
       assert.ok(item.text.includes("debug-pause"))
+      const changesAfterPausing = stateChanges
+      await index.pause()
+      assert.equal(stateChanges, changesAfterPausing, "unchanged index state should not refresh the status item")
+      stateSubscription.dispose()
+    const waitForState = (predicate: (state: WorkspaceIntelligenceIndex["snapshot"]) => boolean, description: string) => new Promise<void>((resolve, reject) => {
+      const finish = (error?: Error) => {
+        clearTimeout(timeout)
+        subscription.dispose()
+        if (error) reject(error)
+        else resolve()
+      }
+      const subscription = index.onDidChange((current) => {
+        if (predicate(current)) finish()
+      })
+      const timeout = setTimeout(() => finish(new Error(`Timed out waiting for ${description}`)), 15000)
+      if (predicate(index.snapshot)) finish()
+    })
+    const scanStarted = waitForState((current) => current.status === "scanning" || current.status === "indexing", "scan start")
+    await index.pause()
+    await index.resume()
+    await scanStarted
+    const scanStopped = waitForState((current) => current.status === "paused" && current.activeWorkers === 0 && current.activeSourceBytes === 0, "cancelled workers to stop")
+    await index.pause()
+    await scanStopped
+    assert.equal(index.snapshot.queueDepth, 0, "pause clears discovered work immediately")
+    const resumed = waitForState((current) => current.status === "ready" && current.discoveryComplete, "resumed scan completion")
+    await index.resume()
+    await resumed
     } finally {
       statusBar.dispose()
     }
