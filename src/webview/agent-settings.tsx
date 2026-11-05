@@ -5,14 +5,25 @@ import cx from "classnames"
 
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
 import { AGENT_STEP_PRESETS, DEFAULT_AGENT_STEPS, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../common/constants"
+import {
+  FEEDBACK_ENABLED_KEY,
+  PROMPT_COMPILER_ENABLED_KEY,
+  PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY,
+  PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY,
+  PROMPT_COMPILER_MAX_TURNS_KEY,
+  PROMPT_COMPILER_TRACE_KEY
+} from "../common/feedback-settings"
 import type { AgentRegistryRequest, PromptInstructionSnapshot, PromptInstructionsResponse } from "../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../common/team"
 
 import { StorageType, useStorageContext } from "./hooks/useStorageContext"
 import { bridge, emit, useServerEvent } from "./messaging"
+import { isMacPlatform } from "./prompt-compiler-draft"
 
 import styles from "./styles/agent-settings.module.css"
 import { ToolPicker } from "./tool-picker";
+
+const IS_MAC = isMacPlatform(typeof navigator === "undefined" ? undefined : navigator.platform || navigator.userAgent)
 
 /** Steps a reply may take, offered as presets; `DEFAULT_AGENT_STEPS` is the default. */
 export const STEP_PRESETS = AGENT_STEP_PRESETS
@@ -315,7 +326,7 @@ type PromptRoute = "chat" | "intent"
 
 const promptConfigKeys = {
   chat: { mode: "chatBaseInstructionsMode", file: "chatBaseInstructionsFile" },
-  intent: { mode: "intentBaseInstructionsMode", file: "intentBaseInstructionsFile" }
+  intent: { mode: PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY, file: PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY }
 } as const
 
 const PromptInstructionsPanel = ({ agentSelection }: { agentSelection: AgentSelection }) => {
@@ -441,7 +452,7 @@ const PromptInstructionsPanel = ({ agentSelection }: { agentSelection: AgentSele
     <section className={styles.promptInstructions} aria-label="Base instructions">
       <div className={styles.agentsHeading}><strong>Base Instructions</strong></div>
       {routePanel("chat", "Chat Base Instructions", inspection?.chat)}
-      {routePanel("intent", "Intent Compiler Base Instructions", inspection?.intent)}
+      {routePanel("intent", "Prompt Compiler Base Instructions", inspection?.intent)}
       {error && <div className={styles.agentError} role="alert">{error}</div>}
     </section>
   )
@@ -472,10 +483,10 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
   const [maxSteps, setMaxSteps] = useSetting<number>("chatToolsMaxSteps", DEFAULT_AGENT_STEPS)
   const [maxReadLines, setMaxReadLines] = useSetting<number>("chatToolsMaxReadLines", 1000)
   const [maxResultChars, setMaxResultChars] = useSetting<number>("chatToolsMaxResultChars", 100000)
-  const [intentCompilerEnabled, setIntentCompilerEnabled] = useSetting<boolean>("chatToolsIntentCompilerEnabled", false)
-  const [intentCompilerMode, setIntentCompilerMode] = useSetting<string>("chatToolsIntentCompilerMode", "ask")
-  const [intentCompilerMaxTurns, setIntentCompilerMaxTurns] = useSetting<number>("chatToolsIntentCompilerMaxTurns", 3)
-  const [intentCompilerTrace, setIntentCompilerTrace] = useSetting<boolean>("chatToolsIntentCompilerTrace", false)
+  const [feedbackEnabled, setFeedbackEnabled] = useSetting<boolean>(FEEDBACK_ENABLED_KEY, true)
+  const [promptCompilerEnabled, setPromptCompilerEnabled] = useSetting<boolean>(PROMPT_COMPILER_ENABLED_KEY, false)
+  const [promptCompilerMaxTurns, setPromptCompilerMaxTurns] = useSetting<number>(PROMPT_COMPILER_MAX_TURNS_KEY, 3)
+  const [promptCompilerTrace, setPromptCompilerTrace] = useSetting<boolean>(PROMPT_COMPILER_TRACE_KEY, false)
   const [mcpNeverAskAgain, setMcpNeverAskAgain] = useSetting<boolean>("mcpNeverAskAgain", false)
   const { context: always, setContext: setAlways } = useStorageContext<string[]>(
     StorageType.Global,
@@ -490,15 +501,9 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
 
   // Escape or a click elsewhere puts it away.
   useServerEvent(EVENT_NAME.twinnyConfigValueChanged, ({ key, value }) => {
-    if (key === "chatToolsIntentCompilerEnabled" && typeof value === "boolean") {
-      setIntentCompilerEnabled(value)
-    }
-    if (key === "chatToolsIntentCompilerMode" && typeof value === "string") {
-      setIntentCompilerMode(value)
-    }
-    if (key === "chatToolsIntentCompilerTrace" && typeof value === "boolean") {
-      setIntentCompilerTrace(value)
-    }
+    if (key === FEEDBACK_ENABLED_KEY && typeof value === "boolean") setFeedbackEnabled(value)
+    if (key === PROMPT_COMPILER_ENABLED_KEY && typeof value === "boolean") setPromptCompilerEnabled(value)
+    if (key === PROMPT_COMPILER_TRACE_KEY && typeof value === "boolean") setPromptCompilerTrace(value)
     if (key === "mcpNeverAskAgain" && typeof value === "boolean") {
       setMcpNeverAskAgain(value)
     }
@@ -551,45 +556,44 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
         <summary>Agents</summary>
         <AgentRegistryPanel />
       </details>
-      <Choices
-        label="Intent compiler"
-        value={intentCompilerEnabled ? intentCompilerMode : "always-original"}
-        onChange={(value) => {
-          if (value === "always-original") {
-            setIntentCompilerEnabled(false)
-            setIntentCompilerMode("always-original")
-            return
-          }
-          setIntentCompilerEnabled(true)
-          setIntentCompilerMode(value)
-        }}
-        choices={[
-          { value: "always-original", label: "Always original", title: "Run the original request and skip the compiler." },
-          { value: "ask", label: "Ask each time", title: "Refine, then review and choose before execution." },
-          { value: "always-refined", label: "Always use refined", title: "Automatically execute the refined prompt when the proposal stays in scope." }
-        ]}
-      />
+      <label className={styles.row}>
+        <span className={styles.label}>Feedback</span>
+        <input
+          type="checkbox"
+          checked={feedbackEnabled}
+          title="Plan TODOs for agent tasks, track their progress and evaluate completion. Independent of the Prompt Compiler."
+          onChange={(event) => setFeedbackEnabled(event.target.checked)}
+        />
+      </label>
+      <label className={styles.row}>
+        <span className={styles.label}>Prompt Compiler</span>
+        <input
+          type="checkbox"
+          checked={promptCompilerEnabled}
+          title={`Make ${IS_MAC ? "⌘" : "Ctrl"}+Click on Send compile the draft into the composer. It never runs on its own and never sends.`}
+          onChange={(event) => setPromptCompilerEnabled(event.target.checked)}
+        />
+      </label>
       <NumberSetting
-        label="Max intent turns"
-        value={intentCompilerMaxTurns}
+        label="Prompt Compiler history"
+        value={promptCompilerMaxTurns}
         min={0}
         max={10}
         step={1}
         unit="turns"
-        title="How many previous prompt/response turns to include as context when refining a new request."
-        onChange={setIntentCompilerMaxTurns}
-        />
-      <label className={styles.row} aria-label="Trace intent compiler requests">
-      <ToolPicker />
-        
-        <span className={styles.label}>Trace intent compiler requests</span>
+        title="How many previous prompt/response turns the Prompt Compiler sees when rewriting a draft."
+        onChange={setPromptCompilerMaxTurns}
+      />
+      <label className={styles.row}>
+        <span className={styles.label}>Trace Prompt Compiler requests</span>
         <input
           type="checkbox"
-          checked={intentCompilerTrace}
-          title="Write a local raw request/response trace for the Intent Compiler. Disabled by default and may include private conversation content."
-          onChange={(event) => setIntentCompilerTrace(event.target.checked)}
+          checked={promptCompilerTrace}
+          title="Write a local raw request/response trace for the Prompt Compiler. Disabled by default and may include private conversation content."
+          onChange={(event) => setPromptCompilerTrace(event.target.checked)}
         />
       </label>
+      <ToolPicker />
       <Choices
         label={t("agent-settings-edits")}
         value={team?.edits === "review" ? "review" : edits}

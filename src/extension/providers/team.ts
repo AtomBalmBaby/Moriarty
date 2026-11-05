@@ -81,7 +81,7 @@ const CAPABILITY = {
   fim: "fim",
   embedding: "embeddings"
 } as const
-const LABELS = { chat: "Chat", intent: "Intent", fim: "Autocomplete", embedding: "Embeddings" }
+const LABELS = { chat: "Chat", intent: "Feedback", fim: "Autocomplete", embedding: "Embeddings" }
 
 const roleSet = (team: { defaults?: Partial<Record<string, string>> }) => {
   const roles = [...DEFAULT_ROLES] as ProviderType[]

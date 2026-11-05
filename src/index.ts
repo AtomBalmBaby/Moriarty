@@ -57,6 +57,7 @@ import { ProviderStore } from "./extension/providers/store"
 import { teamSession } from "./extension/providers/team"
 import { generateCommitMessage } from "./extension/review/commit-message"
 import { SessionManager } from "./extension/session-manager"
+import { migrateFeedbackSettings } from "./extension/settings-migration"
 import { TwinnyStatusBar } from "./extension/status-bar"
 import { TeamPlugins } from "./extension/team/plugins-page"
 import { TeamShare } from "./extension/team/share"
@@ -220,6 +221,7 @@ export async function activate(context: ExtensionContext) {
     return algorithm
   })
   setContext(context)
+  void migrateFeedbackSettings().catch((error) => logger.warn("Feedback settings migration failed: " + messageOf(error)))
   const store = new ProviderStore(context)
   try {
     await applyDevelopmentProviders(context, store)

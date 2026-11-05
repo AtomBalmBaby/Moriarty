@@ -386,17 +386,24 @@ export interface NewDocumentRequest {
   language?: string
 }
 
-export interface IntentCompilerResult {
-  objective: string
+/** An explicit, user-requested rewrite of the composer draft. */
+export interface PromptCompileRequest {
+  /** Chosen by the webview; cancels and late answers are matched on it. */
+  requestId: string
   prompt: string
-  constraints: string[]
-  exclusions: string[]
-  strategy: string
-  verification: string[]
-  assumptions: string[]
-  plan: import("../types/todo").IntentTaskPlan
-  originalPrompt?: string
+  history?: ChatCompletionMessage[]
+  conversationId?: string
 }
+
+/**
+ * The compiler's answer. It only ever proposes text for the composer; it
+ * never sends a message, plans TODOs or changes feedback state.
+ */
+export type PromptCompileResult =
+  | { requestId: string; status: "compiled"; prompt: string }
+  | { requestId: string; status: "failed"; error: string }
+  | { requestId: string; status: "cancelled" }
+  | { requestId: string; status: "disabled" }
 
 /* -------------------------------------------------------------------------- */
 /*  webview  ->  extension                                                    */
@@ -414,7 +421,8 @@ export interface ClientEvents {
   [EVENT_NAME.twinnyAgentRegistry]: Channel<AgentRegistryRequest, AgentProfileSummary[]>
   [EVENT_NAME.twinnyPromptInstructions]: Channel<PromptInstructionsRequest, PromptInstructionsResponse>
   [EVENT_NAME.twinnyChatMessage]: Channel<ChatRequest>
-  [EVENT_NAME.twinnyCompileIntent]: Channel<{ prompt: string; history?: ChatCompletionMessage[]; maxLevels?: number; conversationId?: string }, IntentCompilerResult | undefined>
+  [EVENT_NAME.twinnyCompilePrompt]: Channel<PromptCompileRequest, PromptCompileResult>
+  [EVENT_NAME.twinnyCancelPromptCompile]: Channel<{ requestId: string }>
   [EVENT_NAME.twinnyClickSuggestion]: Channel<string>
   /**
    * The rest of the message being typed, as the chat model guesses it from

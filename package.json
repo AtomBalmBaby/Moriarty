@@ -777,30 +777,103 @@
           "default": "",
           "markdownDescription": "Path to the custom Markdown file used when Chat Base Instructions is set to Custom Markdown File."
         },
-        "twinny.intentBaseInstructionsMode": {
+        "twinny.feedback.enabled": {
+          "order": 20,
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable **Feedback**: Twinny plans TODOs from your agent requests, tracks task progress and tool evidence, independently evaluates completed work and reconciles what remains. Works with ordinary and compiled prompts alike and never depends on the Prompt Compiler. Replaces `#twinny.chatToolsFeedbackEvaluatorEnabled#`."
+        },
+        "twinny.feedback.provider": {
+          "order": 20,
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Provider used by Feedback for TODO planning and evaluation, given as a provider ID or label from Twinny's providers panel. Leave empty to use the provider selected for **Feedback** in the providers panel. An unknown provider is reported as an error; Twinny never switches to another provider on its own."
+        },
+        "twinny.feedback.model": {
+          "order": 20,
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model used by Feedback. Leave empty to use the model configured on the Feedback provider."
+        },
+        "twinny.promptCompiler.enabled": {
+          "order": 20,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Make the **Prompt Compiler** available. When enabled, Ctrl+Click (Cmd+Click on macOS) the Send button to rewrite the composer draft into a clearer prompt. The result replaces the draft for you to review, edit, discard or send; it is never sent automatically, and a plain Send always sends your text as written. When disabled, Ctrl/Cmd+Click sends normally. Replaces `#twinny.chatToolsIntentCompilerEnabled#`."
+        },
+        "twinny.promptCompiler.provider": {
+          "order": 20,
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Provider used by the Prompt Compiler, given as a provider ID or label from Twinny's providers panel. Leave empty to use the provider selected for **Feedback** in the providers panel. Compiler failures never affect Feedback or TODOs."
+        },
+        "twinny.promptCompiler.model": {
+          "order": 20,
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model used by the Prompt Compiler. Leave empty to use the model configured on the Prompt Compiler's provider."
+        },
+        "twinny.promptCompiler.maxTurns": {
+          "order": 20,
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 3,
+          "markdownDescription": "How many previous prompt/response turns the Prompt Compiler may read as context when rewriting a draft. Set to `0` to use only the draft."
+        },
+        "twinny.promptCompiler.trace": {
+          "order": 20,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Write the raw Prompt Compiler request and provider response to a local trace file under the extension storage folder for debugging. Disabled by default; the file may contain workspace or conversation content."
+        },
+        "twinny.promptCompiler.baseInstructionsMode": {
           "order": 20,
           "type": "string",
           "enum": ["default", "custom", "none"],
           "default": "default",
-          "markdownDescription": "Select the optional Intent Compiler base instructions independently of chat instructions. The compiler's JSON protocol remains enforced by Twinny when this is None or customized."
+          "markdownDescription": "Base instructions for the Prompt Compiler, independent of chat instructions. Twinny's response format remains enforced when this is None or customized."
         },
-        "twinny.intentBaseInstructionsFile": {
+        "twinny.promptCompiler.baseInstructionsFile": {
           "order": 20,
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the custom Markdown file used when Intent Compiler Base Instructions is set to Custom Markdown File."
-        },
-        "twinny.chatToolsIntentCompilerEnabled": {
-          "order": 20,
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Before agent-mode execution, optionally refine the user's request into a clearer execution prompt. The original request remains authoritative and is kept for review or comparison. This adds one side-effect-free inference request per eligible agent turn."
+          "markdownDescription": "Path to the custom Markdown file used when Prompt Compiler base instructions are set to `custom`."
         },
         "twinny.chatToolsFeedbackEvaluatorEnabled": {
-          "order": 21,
           "type": "boolean",
           "default": true,
-          "markdownDescription": "After an agent turn has persisted its TODO claims and tool results, ask the configured Intent provider to independently review eligible tasks. Disable to leave TODOs in review until manually retried."
+          "markdownDeprecationMessage": "Replaced by `#twinny.feedback.enabled#`. An explicitly set value is still honoured until the new setting is set."
+        },
+        "twinny.chatToolsIntentCompilerEnabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDeprecationMessage": "Replaced by `#twinny.promptCompiler.enabled#`, which only makes the compiler available on Ctrl/Cmd+Click Send."
+        },
+        "twinny.chatToolsIntentCompilerMode": {
+          "type": "string",
+          "default": "ask",
+          "markdownDeprecationMessage": "Retired and ignored. The Prompt Compiler never runs automatically; Ctrl/Cmd+Click Send compiles the draft into the composer without sending it."
+        },
+        "twinny.chatToolsIntentCompilerMaxTurns": {
+          "type": "integer",
+          "default": 3,
+          "markdownDeprecationMessage": "Replaced by `#twinny.promptCompiler.maxTurns#`."
+        },
+        "twinny.chatToolsIntentCompilerTrace": {
+          "type": "boolean",
+          "default": false,
+          "markdownDeprecationMessage": "Replaced by `#twinny.promptCompiler.trace#`."
+        },
+        "twinny.intentBaseInstructionsMode": {
+          "type": "string",
+          "default": "default",
+          "markdownDeprecationMessage": "Replaced by `#twinny.promptCompiler.baseInstructionsMode#`."
+        },
+        "twinny.intentBaseInstructionsFile": {
+          "type": "string",
+          "default": "",
+          "markdownDeprecationMessage": "Replaced by `#twinny.promptCompiler.baseInstructionsFile#`."
         },
         "twinny.chatToolsAdaptiveExposureEnabled": {
           "order": 21,
@@ -814,7 +887,7 @@
           "default": 12,
           "minimum": 1,
           "maximum": 20,
-          "markdownDescription": "Maximum independent reconciliation and automatic continuation turns for one intent execution."
+          "markdownDescription": "Maximum Feedback reconciliation and automatic continuation turns for one agent task."
         },
         "twinny.chatToolsReconciliationMaxNoProgressTurns": {
           "order": 23,
@@ -839,36 +912,6 @@
           "minimum": 20,
           "maximum": 2000,
           "markdownDescription": "Cumulative new errors threshold used with a single-edit increase of at least eight errors."
-        },
-        "twinny.chatToolsIntentCompilerMode": {
-          "order": 20,
-          "type": "string",
-          "enum": [
-            "ask",
-            "always-refined",
-            "always-original"
-          ],
-          "enumDescriptions": [
-            "Ask for approval before executing the refined prompt.",
-            "Refine automatically when the proposal remains within scope.",
-            "Run the original request with no refinement inference."
-          ],
-          "default": "ask",
-          "markdownDescription": "How Twinny handles the intent compiler. `ask` shows a review panel; `always-refined` executes the refined prompt automatically; `always-original` disables the compiler for this request."
-        },
-        "twinny.chatToolsIntentCompilerMaxTurns": {
-          "order": 20,
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 10,
-          "default": 3,
-          "markdownDescription": "How many previous prompt/response turns Twinny may use as context when refining a new agent request. Set to `0` to ignore prior turns and refine only from the current prompt."
-        },
-        "twinny.chatToolsIntentCompilerTrace": {
-          "order": 20,
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Write the exact raw outbound Intent Compiler request and provider response to a local trace file under the extension storage folder for debugging. Disabled by default; the file may contain workspace or conversation content."
         },
         "twinny.chatToolsEdits": {
           "order": 20,

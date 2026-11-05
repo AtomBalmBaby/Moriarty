@@ -2,6 +2,11 @@ import { createHash } from "crypto"
 import * as path from "path"
 import { ExtensionContext, window, workspace } from "vscode"
 
+import {
+  PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY,
+  PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY,
+  readSettingWithLegacy
+} from "../../common/feedback-settings"
 import { logger } from "../../common/logger"
 import { resolveMarkdownInstructionSource } from "../../common/prompt-instructions"
 
@@ -20,7 +25,7 @@ export interface ResolvedInstructions {
 
 const ROUTES: Record<InstructionRoute, { modeKey: string; fileKey: string; bundledFile: string }> = {
   chat: { modeKey: "chatBaseInstructionsMode", fileKey: "chatBaseInstructionsFile", bundledFile: "chat-base.default.md" },
-  intent: { modeKey: "intentBaseInstructionsMode", fileKey: "intentBaseInstructionsFile", bundledFile: "intent-compiler-base.default.md" }
+  intent: { modeKey: PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY, fileKey: PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY, bundledFile: "intent-compiler-base.default.md" }
 }
 
 const hashContent = (content: string) => createHash("sha256").update(content).digest("hex")
@@ -38,14 +43,15 @@ export class PromptInstructionResolver {
   public async resolve(route: InstructionRoute): Promise<ResolvedInstructions> {
     const config = workspace.getConfiguration("twinny")
     const setting = ROUTES[route]
-    const configuredMode = config.get<unknown>(setting.modeKey, "default")
+    const configuredMode = readSettingWithLegacy(config, setting.modeKey) ?? "default"
     const mode = isMode(configuredMode) ? configuredMode : "default"
-    const file = config.get<string>(setting.fileKey)
+    const configuredFile = readSettingWithLegacy(config, setting.fileKey)
+    const file = typeof configuredFile === "string" ? configuredFile : undefined
 
     const bundledFile = path.join(this._context.extensionUri.fsPath, "resources", "prompts", setting.bundledFile)
     const selection = await resolveMarkdownInstructionSource(route, mode, file, bundledFile)
     const invalidModeWarning = configuredMode !== mode
-      ? "The configured " + route + " base-instructions mode is invalid. The built-in default is being used."
+      ? "The configured " + (route === "intent" ? "Prompt Compiler" : route) + " base-instructions mode is invalid. The built-in default is being used."
       : undefined
     const warning = selection.warning ?? invalidModeWarning
     if (warning) this.warnOnce(route + ":" + (file ?? "mode") + ":" + warning, warning)

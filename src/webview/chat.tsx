@@ -13,7 +13,9 @@ import { v4 as uuidv4 } from "uuid"
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
 import { nextAgentSelection, withAgentSelection } from "../common/agents"
 import { ASSISTANT, EVENT_NAME, USER } from "../common/constants"
+import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
+import type { PromptCompileResult } from "../common/messaging/protocol"
 import {
   AnyContextItem,
   ChatCompletionMessage,
@@ -41,6 +43,13 @@ import { GhostText } from "./ghost-text"
 import { createCustomImageExtension } from "./image-extension"
 import MessageItem from "./message-item"
 import { bridge, emit, useServerEvent } from "./messaging"
+import {
+  decideCompiledDraft,
+  isMacPlatform,
+  PendingCompilation,
+  sendButtonAction,
+  textToComposerHtml
+} from "./prompt-compiler-draft"
 import { Shortcuts } from "./shortcuts"
 import { Suggestions } from "./suggestions"
 import { TodoPanel } from "./todo-panel"
@@ -49,6 +58,10 @@ import { conversationMarkdown } from "./transcript"
 import { CustomKeyMap, getThinkingMessage } from "./utils"
 
 import styles from "./styles/chat.module.css"
+
+const IS_MAC = isMacPlatform(typeof navigator === "undefined" ? undefined : navigator.platform || navigator.userAgent)
+/** A little longer than the extension's own compiler timeout, which answers first. */
+const PROMPT_COMPILE_TIMEOUT_MS = 130_000
 
 const COMPOSER_MIN_HEIGHT = 44
 const COMPOSER_HEIGHT_KEY = "twinny.composerHeight"
@@ -89,19 +102,6 @@ interface QueuedMessage {
    * its next step; sent as a turn of its own if the reply ends first.
    */
   steer?: boolean
-}
-
-interface IntentCompilerReview {
-  objective: string
-  prompt: string
-  constraints: string[]
-  exclusions: string[]
-  strategy?: string
-  verification: string[]
-  assumptions: string[]
-  originalPrompt: string
-  waiting?: boolean
-  error?: string
 }
 
 /** A message's text with its line breaks, as the agent is handed it mid-reply. */
@@ -164,58 +164,28 @@ export const Chat = (props: ChatProps): JSX.Element => {
   agentModeRef.current = agentMode
   const { autoRun, autoRunAvailable, toggleAutoRun, setAutoRun } = useAutoRun(teamAgentRules)
   const [agentSettingsOpen, setAgentSettingsOpen] = useState(false)
-  const [intentCompilerEnabled, setIntentCompilerEnabled] = useState(false)
-  const [intentCompilerMode, setIntentCompilerMode] = useState("ask")
-  const [intentCompilerMaxTurns, setIntentCompilerMaxTurns] = useState(3)
-  const syncIntentCompilerSettings = useCallback(async () => {
-    try {
-      const enabled = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
-        key: "chatToolsIntentCompilerEnabled"
-      })
-      const mode = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
-        key: "chatToolsIntentCompilerMode"
-      })
-      const maxTurns = await bridge.request(EVENT_NAME.twinnyGetConfigValue, {
-        key: "chatToolsIntentCompilerMaxTurns"
-      })
-      if (typeof enabled?.value === "boolean") setIntentCompilerEnabled(enabled.value)
-      if (typeof mode?.value === "string") setIntentCompilerMode(mode.value)
-      if (typeof maxTurns?.value === "number") setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(maxTurns.value))))
-      else {
-        const legacyMaxTurns = await bridge
-          .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMaxLevels" })
-          .catch(() => undefined)
-        if (typeof legacyMaxTurns?.value === "number") {
-          setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(legacyMaxTurns.value))))
-        }
-      }
-    } catch {
-      // Keep the current UI state when the config cannot be read.
-    }
+  const [promptCompilerEnabled, setPromptCompilerEnabled] = useState(false)
+  const promptCompilerEnabledRef = useRef(false)
+  promptCompilerEnabledRef.current = promptCompilerEnabled
+  useEffect(() => {
+    bridge
+      .request(EVENT_NAME.twinnyGetConfigValue, { key: PROMPT_COMPILER_ENABLED_KEY })
+      .then((answer) => setPromptCompilerEnabled(answer?.value === true))
+      .catch(() => undefined)
   }, [])
   useServerEvent(EVENT_NAME.twinnyConfigValueChanged, ({ key, value }) => {
-    if (key === "chatToolsIntentCompilerEnabled" && typeof value === "boolean") {
-      setIntentCompilerEnabled(value)
-    }
-    if (key === "chatToolsIntentCompilerMode" && typeof value === "string") {
-      setIntentCompilerMode(value)
-    }
-    if (key === "chatToolsIntentCompilerMaxTurns" && typeof value === "number") {
-      setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(value))))
-    }
-    if (key === "chatToolsIntentCompilerMaxLevels" && typeof value === "number") {
-      setIntentCompilerMaxTurns(Math.max(0, Math.min(10, Math.round(value))))
-    }
+    if (key === PROMPT_COMPILER_ENABLED_KEY && typeof value === "boolean") setPromptCompilerEnabled(value)
   })
-  const [intentCompilerReview, setIntentCompilerReview] = useState<{
-    originalPrompt: string
-    draft: string
-    review: IntentCompilerReview
-    message: QueuedMessage
-    rememberChoice: boolean
-    waiting?: boolean
-    error?: string
-  } | null>(null)
+  /** The explicit compilation of the draft, and what came of it. */
+  const [compileState, setCompileState] = useState<
+    | { status: "running"; requestId: string }
+    | { status: "offer"; requestId: string; prompt: string }
+    | { status: "error"; message: string }
+    | null
+  >(null)
+  const pendingCompileRef = useRef<PendingCompilation | null>(null)
+  /** Bumped by every change to the composer, so a late result never overwrites newer typing. */
+  const composerRevisionRef = useRef(0)
   const closeAgentSettings = useCallback(() => setAgentSettingsOpen(false), [])
   const agentMenuOptions = useMemo(() => [
     { value: "off" as AgentSelection, label: "Agent off" },
@@ -322,16 +292,17 @@ export const Chat = (props: ChatProps): JSX.Element => {
     emit(EVENT_NAME.twinnyNotification, "The selected agent is unavailable or disabled. Agent selection was reset to Agent off.")
   }, [agentProfiles, agentProfilesLoaded, setAgentSelection, storedAgentSelection])
 
+  // A compilation belongs to the conversation it started in.
+  const conversationIdRef = useRef(conversation?.id)
+  conversationIdRef.current = conversation?.id
   useEffect(() => {
-    void syncIntentCompilerSettings()
-  }, [syncIntentCompilerSettings])
-
-  useEffect(() => {
-    setIntentCompilerReview(null)
+    const pending = pendingCompileRef.current
+    if (pending) emit(EVENT_NAME.twinnyCancelPromptCompile, { requestId: pending.requestId })
+    pendingCompileRef.current = null
+    setCompileState(null)
   }, [conversation?.id])
 
   const chatRef = useRef<HTMLTextAreaElement>(null)
-  const intentReviewTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const editorWrapRef = useRef<HTMLDivElement>(null)
   const resizeRef = useRef<{ startY: number; startHeight: number } | null>(null)
   // Sent prompts, oldest first, recalled with the arrow keys. `recallIndex`
@@ -824,8 +795,9 @@ export const Chat = (props: ChatProps): JSX.Element => {
       }
     }
 
-    return completed.slice(-Math.max(0, Math.round(intentCompilerMaxTurns)) * 2)
-  }, [conversation?.messages, messages, intentCompilerMaxTurns])
+    // The extension trims this to twinny.promptCompiler.maxTurns.
+    return completed.slice(-20)
+  }, [conversation?.messages, messages])
 
   /** Sends the composer's message, or queues it while a reply is running. */
   const handleSubmitForm = useCallback(async () => {
@@ -855,6 +827,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
     imagesRef.current = []
     clearEditor()
     rememberPrompt(html)
+    // Sending takes the draft as written; a compilation of it is moot.
+    if (pendingCompileRef.current) emit(EVENT_NAME.twinnyCancelPromptCompile, { requestId: pendingCompileRef.current.requestId })
+    pendingCompileRef.current = null
+    setCompileState(null)
 
     if (generatingRef.current) {
       // In agent mode the model can read it between steps; one that brings
@@ -865,104 +841,100 @@ export const Chat = (props: ChatProps): JSX.Element => {
       return
     }
 
-    const currentIntentCompilerEnabled =
-      intentCompilerEnabled ||
-      (await bridge
-        .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerEnabled" })
-        .then((answer) => typeof answer?.value === "boolean" ? answer.value : false)
-        .catch(() => false))
-    const currentIntentCompilerMode =
-      intentCompilerMode ||
-      (await bridge
-        .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMode" })
-        .then((answer) => (typeof answer?.value === "string" ? answer.value : "ask"))
-        .catch(() => "ask"))
-    const currentIntentCompilerMaxTurns =
-      typeof intentCompilerMaxTurns === "number"
-        ? intentCompilerMaxTurns
-        : await bridge
-            .request(EVENT_NAME.twinnyGetConfigValue, { key: "chatToolsIntentCompilerMaxTurns" })
-            .then((answer) => (typeof answer?.value === "number" ? answer.value : 3))
-            .catch(() => 3)
+    sendRef.current(message)
+  }, [agentMode, chatDisabled])
 
-    if (agentMode && currentIntentCompilerEnabled && currentIntentCompilerMode !== "always-original") {
-      setIntentCompilerReview({
-        originalPrompt: message.text,
-        draft: message.text,
-        review: {
-          objective: "Refining your request…",
-          prompt: message.text,
-          constraints: [],
-          exclusions: [],
-          verification: ["Waiting for the compiler to return a refined prompt."],
-          assumptions: ["Twinny is checking whether a clearer execution prompt is needed."],
-          originalPrompt: message.text
-        },
-        message: { ...message, originalPrompt: message.text },
-        rememberChoice: false,
-        waiting: true
-      })
+  const resolveCompilerHistoryRef = useRef(resolveCompilerHistory)
+  resolveCompilerHistoryRef.current = resolveCompilerHistory
+  const composerText = () => editorRef.current?.getText({ blockSeparator: "\n" }).trim() ?? ""
 
-      const review = await bridge
-        .request(EVENT_NAME.twinnyCompileIntent, {
-          prompt: message.text,
-          history: resolveCompilerHistory(),
-          maxLevels: Math.max(0, Math.round(currentIntentCompilerMaxTurns)),
-          conversationId: message.conversationId
-        })
-        .catch(() => undefined)
+  /** Replaces the draft with compiled text the user can still edit. */
+  const replaceComposer = useCallback((prompt: string) => {
+    const current = editorRef.current
+    if (!current) return
+    current.commands.setContent(textToComposerHtml(prompt), true)
+    current.commands.focus("end")
+  }, [])
 
-      if (review && review.prompt && review.prompt.trim() !== message.text.trim()) {
-        if (currentIntentCompilerMode === "always-refined") {
-          setIntentCompilerReview(null)
-          sendRef.current({
-            ...message,
-            originalPrompt: message.text,
-            input: review.prompt,
-            prompt: review.prompt,
-            text: review.prompt,
-            html: review.prompt
-          })
-          return
-        }
-        setIntentCompilerReview({
-          originalPrompt: message.text,
-          draft: review.prompt,
-          review: {
-            ...review,
-            originalPrompt: review.originalPrompt ?? message.text,
-            constraints: review.constraints ?? [],
-            exclusions: review.exclusions ?? [],
-            verification: review.verification ?? [],
-            assumptions: review.assumptions ?? []
-          },
-          message: { ...message, originalPrompt: message.text },
-          rememberChoice: false
-        })
-        return
+  /**
+   * Ctrl/Cmd+Click Send: compiles the draft into the composer. Nothing is
+   * sent, and the result only replaces a draft nobody has touched since.
+   */
+  const handleCompileDraft = useCallback(async () => {
+    if (pendingCompileRef.current) return
+    const draft = composerText()
+    if (!draft) return
+    const pending: PendingCompilation = {
+      requestId: uuidv4(),
+      conversationId: conversationIdRef.current,
+      revision: composerRevisionRef.current,
+      draft
+    }
+    pendingCompileRef.current = pending
+    setCompileState({ status: "running", requestId: pending.requestId })
+    let result: PromptCompileResult
+    try {
+      result = await bridge.request(EVENT_NAME.twinnyCompilePrompt, {
+        requestId: pending.requestId,
+        prompt: draft,
+        history: resolveCompilerHistoryRef.current(),
+        conversationId: pending.conversationId
+      }, { timeoutMs: PROMPT_COMPILE_TIMEOUT_MS })
+    } catch (error) {
+      emit(EVENT_NAME.twinnyCancelPromptCompile, { requestId: pending.requestId })
+      result = { requestId: pending.requestId, status: "failed", error: error instanceof Error ? error.message : String(error) }
+    }
+    const latestRequestId = pendingCompileRef.current?.requestId
+    if (latestRequestId === pending.requestId) pendingCompileRef.current = null
+    const decision = decideCompiledDraft(pending, {
+      latestRequestId,
+      conversationId: conversationIdRef.current,
+      revision: composerRevisionRef.current,
+      text: composerText()
+    })
+    // Sent, cancelled or replaced meanwhile: whatever replaced it owns the notice.
+    if (decision.action === "discard" && decision.reason === "superseded") return
+    if (result.status === "compiled") {
+      if (decision.action === "apply") {
+        replaceComposer(result.prompt)
+        setCompileState(null)
+      } else if (decision.action === "offer") {
+        setCompileState({ status: "offer", requestId: pending.requestId, prompt: result.prompt })
+      } else {
+        setCompileState(null)
       }
-
-      setIntentCompilerReview({
-        originalPrompt: message.text,
-        draft: message.text,
-        review: {
-          objective: review && review.prompt ? "The compiler kept the original request." : "The compiler did not return a usable refinement.",
-          prompt: message.text,
-          constraints: [],
-          exclusions: [],
-          verification: ["Run the original request, or edit the draft before executing."],
-          assumptions: [review ? "The model returned no material change to the request." : "The compiler timed out or failed to return valid JSON."],
-          originalPrompt: message.text
-        },
-        message: { ...message, originalPrompt: message.text },
-        rememberChoice: false,
-        error: review ? "The compiler kept the original wording, so Twinny is offering the original request instead." : "The compiler timed out or returned an invalid result. You can run the original request or edit the prompt before sending."
-      })
       return
     }
+    if (result.status === "failed") setCompileState({ status: "error", message: result.error })
+    else if (result.status === "disabled") setCompileState({ status: "error", message: t("prompt-compiler-disabled") })
+    else setCompileState(null)
+    editorRef.current?.commands.focus()
+  }, [replaceComposer, t])
 
-    sendRef.current(message)
-  }, [agentMode, chatDisabled, intentCompilerEnabled, intentCompilerMode])
+  const cancelCompile = useCallback(() => {
+    const pending = pendingCompileRef.current
+    if (pending) emit(EVENT_NAME.twinnyCancelPromptCompile, { requestId: pending.requestId })
+    pendingCompileRef.current = null
+    setCompileState(null)
+    editorRef.current?.commands.focus()
+  }, [])
+
+  /** The Send button: a plain click sends; the modifier gesture compiles when enabled. */
+  const handleSendClick = useCallback((event: React.MouseEvent) => {
+    const action = sendButtonAction(event, {
+      mac: IS_MAC,
+      compilerEnabled: promptCompilerEnabledRef.current,
+      compiling: !!pendingCompileRef.current
+    })
+    if (action === "ignore") return
+    if (action === "compile") {
+      event.preventDefault()
+      event.stopPropagation()
+      void handleCompileDraft()
+      return
+    }
+    void handleSubmitForm()
+  }, [handleCompileDraft, handleSubmitForm])
 
   /*
    * A stopped reply is picked up by asking for the rest. The transcript
@@ -1161,6 +1133,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
       ],
       // Typing into a recalled prompt makes it the draft.
       onUpdate: () => {
+        composerRevisionRef.current++
         recallIndexRef.current = -1
         lastEscapeRef.current = 0
         if (showShortcutsRef.current) setShortcuts(false)
@@ -1463,79 +1436,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         )}
         <TodoPanel conversationId={conversation?.id} />
         <div className={styles.transcript}>
-          {intentCompilerReview ? (
-            <div className={styles.intentReviewPanel}>
-              <div className={styles.intentReviewHead}>
-                {intentCompilerReview.waiting
-                  ? "Refining your request…"
-                  : "I refined your request. Does this capture your intent?"}
-              </div>
-              {!!intentCompilerReview.error && (
-                <div className={styles.intentReviewSummary}>
-                  <span className={styles.intentLabel}>Status</span>
-                  <div>{intentCompilerReview.error}</div>
-                </div>
-              )}
-              <div className={styles.intentReviewSection}>
-                <textarea
-                  ref={intentReviewTextareaRef}
-                  value={intentCompilerReview.draft}
-                  onChange={(event) =>
-                    setIntentCompilerReview((current) =>
-                      current ? { ...current, draft: event.target.value } : current
-                    )
-                  }
-                  className={styles.intentReviewTextarea}
-                  disabled={intentCompilerReview.waiting}
-                />
-              </div>
-              <div className={styles.intentReviewActions}>
-                <VSCodeButton disabled={intentCompilerReview.waiting} onClick={() => {
-                    const next = {
-                      ...intentCompilerReview.message,
-                      input: intentCompilerReview.draft,
-                      prompt: intentCompilerReview.draft,
-                      text: intentCompilerReview.draft,
-                      html: intentCompilerReview.draft,
-                      originalPrompt: intentCompilerReview.originalPrompt
-                    }
-                    setIntentCompilerReview(null)
-                    if (intentCompilerReview.rememberChoice) {
-                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerEnabled", value: true })
-                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerMode", value: "always-refined" })
-                    }
-                    sendRef.current(next)
-                }}>{intentCompilerReview.waiting ? "Waiting…" : "Run Refined"}</VSCodeButton>
-                <VSCodeButton appearance="secondary" onClick={() => {
-                    const next = {
-                      ...intentCompilerReview.message,
-                      input: intentCompilerReview.originalPrompt,
-                      prompt: intentCompilerReview.originalPrompt,
-                      text: intentCompilerReview.originalPrompt,
-                      html: intentCompilerReview.originalPrompt,
-                      originalPrompt: intentCompilerReview.originalPrompt
-                    }
-                    setIntentCompilerReview(null)
-                    if (intentCompilerReview.rememberChoice) {
-                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerEnabled", value: true })
-                      emit(EVENT_NAME.twinnySetConfigValue, { key: "chatToolsIntentCompilerMode", value: "always-original" })
-                    }
-                    sendRef.current(next)
-                }}>Run Original</VSCodeButton>
-                <VSCodeButton appearance="secondary" disabled={intentCompilerReview.waiting} onClick={() => intentReviewTextareaRef.current?.focus()}>
-                  Edit Refined
-                </VSCodeButton>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={intentCompilerReview.rememberChoice}
-                    onChange={(event) => setIntentCompilerReview((current) => current ? { ...current, rememberChoice: event.target.checked } : current)}
-                  />
-                  Always choose this option
-                </label>
-              </div>
-            </div>
-          ) : messages.length === 0 ? (
+          {messages.length === 0 ? (
             <EmptyChat />
           ) : (
             <Virtuoso
@@ -1625,6 +1526,40 @@ export const Chat = (props: ChatProps): JSX.Element => {
           >
             <span className={styles.resizeGrip} />
           </div>
+          {compileState && (
+            <div className={styles.compileNotice} role="status" aria-live="polite">
+              {compileState.status === "running" && (
+                <>
+                  <span className="codicon codicon-loading codicon-modifier-spin" aria-hidden="true" />
+                  <span className={styles.compileNoticeText}>{t("prompt-compiler-running")}</span>
+                  <button type="button" className={styles.compileNoticeAction} onClick={cancelCompile}>{t("prompt-compiler-cancel")}</button>
+                </>
+              )}
+              {compileState.status === "offer" && (
+                <>
+                  <span className={styles.compileNoticeText}>{t("prompt-compiler-edited")}</span>
+                  <button
+                    type="button"
+                    className={styles.compileNoticeAction}
+                    onClick={() => {
+                      replaceComposer(compileState.prompt)
+                      setCompileState(null)
+                    }}
+                  >
+                    {t("prompt-compiler-apply")}
+                  </button>
+                  <button type="button" className={styles.compileNoticeAction} onClick={cancelCompile}>{t("prompt-compiler-discard")}</button>
+                </>
+              )}
+              {compileState.status === "error" && (
+                <>
+                  <span className="codicon codicon-error" aria-hidden="true" />
+                  <span className={styles.compileNoticeText}>{compileState.message}</span>
+                  <button type="button" className={styles.compileNoticeAction} onClick={cancelCompile}>{t("prompt-compiler-dismiss")}</button>
+                </>
+              )}
+            </div>
+          )}
           <form onDrop={handleDrop} onPaste={handlePaste}>
             <div
               className={cx(styles.chatBox, {
@@ -1778,8 +1713,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
                     appearance="icon"
                     role="button"
                     disabled={chatDisabled}
-                    onClick={handleSubmitForm}
-                    title={t("send")}
+                    onClick={handleSendClick}
+                    title={promptCompilerEnabled ? t("send-compile-hint", { gesture: IS_MAC ? "⌘" : "Ctrl" }) : t("send")}
+                    aria-label={t("send")}
+                    aria-busy={compileState?.status === "running"}
                   >
                     <span className="codicon codicon-send"></span>
                   </VSCodeButton>

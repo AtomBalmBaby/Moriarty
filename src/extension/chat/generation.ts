@@ -126,7 +126,7 @@ export class ChatGeneration {
     const endpoint = provider.apiHostname
       ? `${provider.apiProtocol ?? "http"}://${provider.apiHostname}${provider.apiPort ? `:${provider.apiPort}` : ""}${provider.apiPath ?? ""}`
       : "sdk-managed"
-    const trace = createInferenceTrace({ provider: provider.provider, endpoint })
+    const trace = createInferenceTrace({ operationKind: "chat", provider: provider.provider, endpoint })
     this._trace = trace
     let operationState = "completed"
     inferenceEvent("operation.started", {

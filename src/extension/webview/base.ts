@@ -10,6 +10,7 @@ import {
   TWINNY_COMMAND_NAME,
   WORKSPACE_STORAGE_KEY
 } from "../../common/constants"
+import { FEEDBACK_ENABLED_KEY, isFeedbackEnabled, isPromptCompilerEnabled, PROMPT_COMPILER_ENABLED_KEY, readSettingWithLegacy } from "../../common/feedback-settings"
 import { logger } from "../../common/logger"
 import {
   ContextValue,
@@ -309,8 +310,11 @@ export class BaseProvider {
         this.bridge?.emit(TODO_EVENT_NAME.changed, snapshot)
         return snapshot
       },
-      [EVENT_NAME.twinnyCompileIntent]: async ({ prompt, history, maxLevels, conversationId }) =>
-        (await this.chat?.compileIntent(prompt, history, maxLevels, conversationId)) ?? undefined,
+      [EVENT_NAME.twinnyCompilePrompt]: async (request) =>
+        this.chat
+          ? this.chat.compilePrompt(request)
+          : { requestId: request.requestId, status: "failed", error: "The chat is not ready." },
+      [EVENT_NAME.twinnyCancelPromptCompile]: ({ requestId }) => this.chat?.cancelPromptCompile(requestId),
       [EVENT_NAME.twinnyClickSuggestion]: (template) =>
         void vscode.commands.executeCommand(
           TWINNY_COMMAND_NAME.templateCompletion,
@@ -323,7 +327,7 @@ export class BaseProvider {
         this._fileTreeProvider.getAllFiles(),
       [EVENT_NAME.twinnyGetConfigValue]: ({ key }) => ({
         key,
-        value: vscode.workspace.getConfiguration("twinny").get(key)
+        value: readSettingWithLegacy(vscode.workspace.getConfiguration("twinny"), key)
       }),
       [EVENT_NAME.twinnyGetContextItems]: () =>
         this.broadcastContextItems(this.readContextItems()),
@@ -363,8 +367,9 @@ export class BaseProvider {
       [EVENT_NAME.twinnySendTheme]: () => getTheme(),
       [EVENT_NAME.twinnySetConfigValue]: async ({ key, value }) => {
         const configuration = vscode.workspace.getConfiguration("twinny")
-        const instructionSetting = key.startsWith("chatBaseInstructions") || key.startsWith("intentBaseInstructions")
-        const scope = key === "agents" || instructionSetting ? configuration.inspect(key) : undefined
+        // Written where the user already set it, so a workspace value is not left overriding the change.
+        const scopedSetting = key.startsWith("chatBaseInstructions") || key.startsWith("promptCompiler.") || key.startsWith("feedback.")
+        const scope = key === "agents" || scopedSetting ? configuration.inspect(key) : undefined
         const target = scope?.workspaceFolderValue !== undefined
           ? vscode.ConfigurationTarget.WorkspaceFolder
           : scope?.workspaceValue !== undefined
@@ -400,6 +405,13 @@ export class BaseProvider {
         )
       }),
       vscode.workspace.onDidChangeConfiguration((event) => {
+        // Edits made in VS Code's Settings reach the composer without a reload.
+        for (const key of [PROMPT_COMPILER_ENABLED_KEY, FEEDBACK_ENABLED_KEY]) {
+          if (!event.affectsConfiguration("twinny." + key)) continue
+          const configuration = vscode.workspace.getConfiguration("twinny")
+          const value = key === PROMPT_COMPILER_ENABLED_KEY ? isPromptCompilerEnabled(configuration) : isFeedbackEnabled(configuration)
+          bridge.emit(EVENT_NAME.twinnyConfigValueChanged, { key, value })
+        }
         // A new locale remounts the whole webview, so only a change to it is sent.
         if (!event.affectsConfiguration("twinny.locale")) return
         bridge.emit(EVENT_NAME.twinnySetLocale, this.getLocale())

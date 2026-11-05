@@ -59,16 +59,17 @@ class WebviewBridge {
   ): Promise<ReplyOf<K>>
   public request<K extends RequestableEvent>(
     type: K,
-    payload: PayloadOf<K>
+    payload: PayloadOf<K>,
+    options?: { timeoutMs?: number }
   ): Promise<ReplyOf<K>>
-  public request(type: string, payload?: unknown): Promise<unknown> {
+  public request(type: string, payload?: unknown, options?: { timeoutMs?: number }): Promise<unknown> {
     const id = `${type}:${this._nextId++}`
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(id)
         reject(new Error(`Timed out waiting for a reply to "${type}"`))
-      }, REQUEST_TIMEOUT_MS)
+      }, options?.timeoutMs ?? REQUEST_TIMEOUT_MS)
 
       this._pending.set(id, { resolve, reject, timer })
       this._vscode.postMessage({ type, id, data: payload } satisfies Envelope)

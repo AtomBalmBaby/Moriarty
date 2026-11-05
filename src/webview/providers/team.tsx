@@ -9,7 +9,7 @@ import { bridge, emit } from "../messaging"
 
 import styles from "../styles/providers.module.css"
 
-const LABELS = { chat: "Chat", intent: "Intent", fim: "Autocomplete", embedding: "Embeddings" }
+const LABELS = { chat: "Chat", intent: "Feedback", fim: "Autocomplete", embedding: "Embeddings" }
 
 /** The same lines the extension enforces, worded for the person agreeing to them. */
 export const policyLines = (policy: TeamPolicy): string[] => {

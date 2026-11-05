@@ -73,7 +73,7 @@ const chatGPTPlanRequestsFor = (context: ExtensionContext) => {
   return created
 }
 
-const TEAM_FEATURE_LABEL: Record<ProviderType, string> = { chat: "chat", intent: "intent", fim: "autocomplete", embedding: "embeddings" }
+const TEAM_FEATURE_LABEL: Record<ProviderType, string> = { chat: "chat", intent: "feedback", fim: "autocomplete", embedding: "embeddings" }
 
 export class ProviderManager {
   private readonly _store: ProviderStore

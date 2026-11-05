@@ -7,53 +7,71 @@ import * as vscode from "vscode"
 import {
   ACTIVE_CHAT_PROVIDER_STORAGE_KEY,
   ACTIVE_INTENT_PROVIDER_STORAGE_KEY,
-  TODO_EVENT_NAME
+  EVENT_NAME,
+  TODO_EVENT_NAME,
+  USER
 } from "../../common/constants"
+import {
+  FEEDBACK_ENABLED_KEY,
+  FEEDBACK_PROVIDER_KEY,
+  isFeedbackEnabled,
+  isPromptCompilerEnabled,
+  PROMPT_COMPILER_ENABLED_KEY,
+  PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY,
+  PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY,
+  PROMPT_COMPILER_MAX_TURNS_KEY,
+  PROMPT_COMPILER_PROVIDER_KEY,
+  PROMPT_COMPILER_TRACE_KEY
+} from "../../common/feedback-settings"
 import { ChatCompletionMessage } from "../../common/types"
-import { Chat, parseIntentCompilerResponse, summarizeIntentHistory } from "../../extension/chat/index"
+import type { FeedbackPlanner } from "../../extension/chat/feedback-planner"
+import { Chat, summarizeIntentHistory } from "../../extension/chat/index"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
 import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
 
-const makeBridge = () => ({
-  emit: () => undefined,
+const makeBridge = (emitted: Array<{ event: string; data: unknown }> = []) => ({
+  emit: (event: string, data: unknown) => emitted.push({ event, data }),
   request: async () => undefined,
+  handle: () => undefined,
   on: () => undefined,
   once: () => undefined,
   off: () => undefined,
   dispose: () => undefined
 }) as unknown as ExtensionBridge
 
-class ScriptedCompilerModel implements InferenceProvider {
-  public readonly id = "scripted-intent-compiler"
+const COMPILED = "Review the parser, make the smallest safe fix, then run its focused test."
+const PLAN = {
+  planId: "parser-plan",
+  version: 1,
+  revision: 1,
+  goal: "Make parser behavior reliable",
+  constraints: ["Preserve public API"],
+  tasks: [
+    { id: "inspect-parser", title: "Inspect parser", description: "Inspect parser behavior", acceptanceCriteria: ["Identify faulty branch"], dependencies: [] },
+    { id: "fix-parser", title: "Fix parser", description: "Correct faulty branch", acceptanceCriteria: ["Regression test passes"], dependencies: ["inspect-parser"] },
+    { id: "verify-parser", title: "Verify parser", description: "Run focused tests", acceptanceCriteria: ["Focused tests pass"], dependencies: ["fix-parser"] }
+  ]
+}
+
+/** Answers as the Prompt Compiler or as Feedback, from the protocol in its system prompt. */
+class ScriptedRoleModel implements InferenceProvider {
+  public readonly id = "scripted-role-model"
   public requests: ChatRequest[] = []
-  public output?: string
+  public compilerOutput?: string
+  public feedbackOutput?: string
+  public failWith?: Error
 
   async *chat(request: ChatRequest) {
     this.requests.push(structuredClone(request))
-    const payload = {
-      objective: "Refine the request for execution.",
-      prompt: "Review the file and make the smallest safe implementation change, then validate with a focused test.",
-      constraints: ["Preserve existing behavior"],
-      exclusions: ["Do not add unrelated features"],
-      strategy: "Read the focused files, patch, then run the relevant test.",
-      verification: ["Run the relevant test or validation command"],
-      assumptions: ["The user intends a minimal, safe change."],
-      plan: {
-        planId: "parser-plan",
-        version: 1,
-        revision: 1,
-        goal: "Make parser behavior reliable",
-        constraints: ["Preserve public API"],
-        tasks: [
-          { id: "inspect-parser", title: "Inspect parser", description: "Inspect parser behavior", acceptanceCriteria: ["Identify faulty branch"], dependencies: [] },
-          { id: "fix-parser", title: "Fix parser", description: "Correct faulty branch", acceptanceCriteria: ["Regression test passes"], dependencies: ["inspect-parser"] },
-          { id: "verify-parser", title: "Verify parser", description: "Run focused tests", acceptanceCriteria: ["Focused tests pass"], dependencies: ["fix-parser"] }
-        ]
-      }
+    if (this.failWith) throw this.failWith
+    const system = String(request.messages[0]?.content ?? "")
+    yield {
+      content: /track \(boolean\)/.test(system)
+        ? this.feedbackOutput ?? JSON.stringify({ track: true, plan: PLAN })
+        : this.compilerOutput ?? JSON.stringify({ prompt: COMPILED })
     }
-    yield { content: this.output ?? JSON.stringify(payload) }
   }
 
   capabilities() {
@@ -61,200 +79,265 @@ class ScriptedCompilerModel implements InferenceProvider {
   }
 }
 
-suite("Intent compiler", () => {
-  test("parses a structured compiler response", () => {
-    const parsed = parseIntentCompilerResponse(`{
-      "objective": "Refine the request for execution.",
-      "prompt": "Review the file and make the smallest safe implementation change, then validate with a focused test.",
-      "constraints": ["Preserve existing behavior"],
-      "exclusions": ["Do not add unrelated features"],
-      "strategy": "Read the focused files, patch, then run the relevant test.",
-      "verification": ["Run the relevant test or validation command"],
-      "assumptions": ["The user intends a minimal, safe change."],
-      "plan": {"planId":"parser-plan","version":1,"revision":1,"goal":"Make parser behavior reliable","constraints":[],"tasks":[{"id":"inspect-parser","title":"Inspect parser","description":"Inspect parser behavior","acceptanceCriteria":["Identify faulty branch"],"dependencies":[]}]}
-    }`)
+const roleProvider = {
+  id: "scripted-feedback-provider",
+  label: "Scripted feedback",
+  modelName: "scripted-role-model",
+  provider: "scripted-role-model",
+  type: "intent" as const
+}
 
-    assert.ok(parsed)
-    assert.strictEqual(parsed?.objective, "Refine the request for execution.")
-    assert.strictEqual(parsed?.prompt.includes("smallest safe implementation change"), true)
-    assert.deepStrictEqual(parsed?.constraints, ["Preserve existing behavior"])
+const makeContext = (extra: Record<string, unknown> = {}, globals: Record<string, unknown> = { [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: roleProvider }) => ({
+  extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+  globalState: { get: (key: string) => globals[key], update: async () => undefined },
+  workspaceState: { get: () => undefined, update: async () => undefined },
+  subscriptions: [],
+  ...extra
+}) as unknown as vscode.ExtensionContext
+
+const SETTING_KEYS = [
+  FEEDBACK_ENABLED_KEY,
+  FEEDBACK_PROVIDER_KEY,
+  PROMPT_COMPILER_ENABLED_KEY,
+  PROMPT_COMPILER_PROVIDER_KEY,
+  PROMPT_COMPILER_MAX_TURNS_KEY,
+  PROMPT_COMPILER_TRACE_KEY,
+  PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY,
+  PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY,
+  "chatToolsIntentCompilerEnabled",
+  "chatToolsIntentCompilerMode",
+  "chatToolsFeedbackEvaluatorEnabled",
+  "chatBaseInstructionsMode",
+  "chatBaseInstructionsFile"
+]
+
+const resetSettings = async () => {
+  const settings = vscode.workspace.getConfiguration("twinny")
+  for (const key of SETTING_KEYS) await settings.update(key, undefined, vscode.ConfigurationTarget.Global)
+}
+
+const setSetting = (key: string, value: unknown) =>
+  vscode.workspace.getConfiguration("twinny").update(key, value, vscode.ConfigurationTarget.Global)
+
+const feedbackPlanner = (chat: Chat) => (chat as unknown as { _feedbackPlanner: FeedbackPlanner })._feedbackPlanner
+
+suite("Prompt Compiler and Feedback", () => {
+  let model: ScriptedRoleModel
+
+  setup(async () => {
+    await resetSettings()
+    model = new ScriptedRoleModel()
+    providerRegistry.register("scripted-role-model", { id: "scripted-role-model", create: () => model })
   })
 
-  test("rejects malformed compiler output", () => {
-    assert.strictEqual(parseIntentCompilerResponse("not valid json"), undefined)
-  })
+  teardown(resetSettings)
 
-  test("rejects compiler JSON that violates the required protocol shape", () => {
-    assert.strictEqual(parseIntentCompilerResponse(JSON.stringify({ objective: "Goal", prompt: "Do it" })), undefined)
-    assert.strictEqual(parseIntentCompilerResponse(JSON.stringify({
-      objective: "Goal", prompt: "Do it", constraints: [], exclusions: [], strategy: "", verification: [], assumptions: [], extra: true
-    })), undefined)
-  })
-
-  test("skips compile when the setting is disabled or set to always original", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    await settings.update("chatToolsIntentCompilerEnabled", false, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-original", vscode.ConfigurationTarget.Global)
-
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: { get: () => undefined, update: async () => undefined },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
-    const result = await chat.compileIntent("Fix the bug in the parser.")
-    assert.strictEqual(result, undefined)
-    chat.dispose()
-  })
-
-  test("compilation synchronizes a structured plan into the real chat-scoped TODO repository", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    const previousEnabled = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
-    const previousMode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
-    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
-    await settings.update("chatToolsFeedbackEvaluatorEnabled", false, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-    const provider = {
-      id: "scripted-intent-provider",
-      label: "Scripted compiler",
-      modelName: "scripted-intent-model",
-      provider: "scripted-intent-compiler",
-      type: "intent" as const
+  test("the compiler is a disabled capability by default and never calls a provider then", async () => {
+    const chat = new Chat(new GenerationTracker(), undefined, makeContext(), makeBridge(), undefined)
+    try {
+      assert.equal(isPromptCompilerEnabled(vscode.workspace.getConfiguration("twinny")), false)
+      const result = await chat.compilePrompt({ requestId: "disabled-1", prompt: "Fix the parser." })
+      assert.equal(result.status, "disabled")
+      assert.deepEqual(model.requests, [])
+    } finally {
+      chat.dispose()
     }
-    const model = new ScriptedCompilerModel()
-    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: { get: (key: string) => key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY ? provider : undefined, update: async () => undefined },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-intent-sync-"))
+  })
+
+  test("a legacy automatic mode alone does not enable compilation; a legacy enable flag does", async () => {
+    const settings = () => vscode.workspace.getConfiguration("twinny")
+    await setSetting("chatToolsIntentCompilerMode", "always-refined")
+    assert.equal(isPromptCompilerEnabled(settings()), false)
+    await setSetting("chatToolsIntentCompilerEnabled", true)
+    assert.equal(isPromptCompilerEnabled(settings()), true)
+    await setSetting(PROMPT_COMPILER_ENABLED_KEY, false)
+    assert.equal(isPromptCompilerEnabled(settings()), false, "the new key wins over its legacy value")
+    await setSetting("chatToolsFeedbackEvaluatorEnabled", false)
+    assert.equal(isFeedbackEnabled(settings()), false)
+    await setSetting(FEEDBACK_ENABLED_KEY, true)
+    assert.equal(isFeedbackEnabled(settings()), true)
+  })
+
+  test("compiling returns only text for the composer: it creates no TODOs and sends no chat", async () => {
+    await setSetting(PROMPT_COMPILER_ENABLED_KEY, true)
+    const chatModel = new ScriptedRoleModel()
+    providerRegistry.register("scripted-chat-executor", { id: "scripted-chat-executor", create: () => chatModel })
+    const chatProvider = { ...roleProvider, id: "chat-provider", modelName: "chat-model", provider: "scripted-chat-executor", type: "chat" as const }
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-compile-only-"))
+    const context = makeContext({}, { [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: roleProvider, [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: chatProvider })
     const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
-    const emitted: string[] = []
-    const bridge = { ...makeBridge(), emit: (event: string) => emitted.push(event) } as unknown as ExtensionBridge
-    const chat = new Chat(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
+    const emitted: Array<{ event: string; data: unknown }> = []
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
     const scope = {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-      conversationId: "intent-sync-chat"
+      conversationId: "compile-only-chat"
     }
     try {
-      const first = await chat.compileIntent("Fix the parser.", [], undefined, scope.conversationId)
-      assert.ok(first?.plan)
-      const firstList = await repository.getList(scope)
-      assert.equal(firstList.items.filter((item) => item.source === "intent_compiler").length, 3)
-      assert.ok(emitted.includes(TODO_EVENT_NAME.changed))
-      assert.deepEqual(firstList.items.map((item) => item.title), ["Inspect parser", "Fix parser", "Verify parser"])
-      assert.equal((await repository.getIntentResult(scope) as { originalPrompt?: string } | undefined)?.originalPrompt, "Fix the parser.")
-
-      await chat.compileIntent("Fix the parser.", [], undefined, scope.conversationId)
-      const repeated = await repository.getList(scope)
-      assert.equal(repeated.id, firstList.id)
-      assert.equal(repeated.items.length, 3)
-      assert.equal(repeated.items.filter((item) => item.source === "intent_compiler").length, 3)
-      assert.ok(model.requests[1].messages.some((message) => typeof message.content === "string" && message.content.includes("Existing native TODO plan")))
-      assert.ok(first?.plan.tasks.every((task) => task.acceptanceCriteria.length > 0))
-
-      model.output = "malformed compiler output"
-      assert.equal(await chat.compileIntent("Keep the existing TODOs.", [], undefined, scope.conversationId), undefined)
-      assert.deepEqual(await repository.getList(scope), repeated)
+      const result = await chat.compilePrompt({ requestId: "compile-1", prompt: "Fix the parser.", conversationId: scope.conversationId })
+      assert.deepEqual(result, { requestId: "compile-1", status: "compiled", prompt: COMPILED })
+      assert.equal(model.requests.length, 1, "compiled exactly once")
+      assert.equal(model.requests[0].model, "scripted-role-model")
+      assert.deepEqual(chatModel.requests, [])
+      assert.equal((await repository.getList(scope)).items.length, 0)
+      assert.ok(!emitted.some(({ event }) => event === TODO_EVENT_NAME.changed))
     } finally {
       chat.dispose()
       await fs.rm(root, { recursive: true, force: true })
-      await settings.update("chatToolsIntentCompilerEnabled", previousEnabled, vscode.ConfigurationTarget.Global)
-      await settings.update("chatToolsIntentCompilerMode", previousMode, vscode.ConfigurationTarget.Global)
-      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
     }
   })
 
-  test("compilation independently resolves default, custom, and None instructions while enforcing JSON", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-    await settings.update("intentBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
-    await settings.update("intentBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
-    await settings.update("chatBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
+  test("a compiler failure is reported on its own and leaves Feedback working", async () => {
+    await setSetting(PROMPT_COMPILER_ENABLED_KEY, true)
+    await setSetting(PROMPT_COMPILER_PROVIDER_KEY, "missing-compiler-provider")
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-compile-isolation-"))
+    const context = makeContext()
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined, undefined, repository)
+    const scope = { projectFingerprint: "isolation-project", conversationId: "isolation-chat" }
+    try {
+      const compiled = await chat.compilePrompt({ requestId: "compile-missing", prompt: "Fix the parser." })
+      assert.equal(compiled.status, "failed")
+      assert.match(compiled.status === "failed" ? compiled.error : "", /missing-compiler-provider/)
+      assert.deepEqual(model.requests, [], "no silent fallback to another provider")
 
-    const provider = {
-      id: "scripted-intent-provider",
-      label: "Scripted compiler",
-      modelName: "scripted-intent-model",
-      provider: "scripted-intent-compiler",
-      type: "intent" as const
+      const planned = await feedbackPlanner(chat).start(scope, "Fix the parser.")
+      assert.equal(planned.status, "planned")
+      assert.equal((await repository.getList(scope)).items.length, 3)
+    } finally {
+      chat.dispose()
+      await fs.rm(root, { recursive: true, force: true })
     }
-    const model = new ScriptedCompilerModel()
-    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
+  })
 
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: {
-        get: (key: string) => {
-          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
-          return undefined
-        },
-        update: async () => undefined
-      },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
+  test("Feedback plans TODOs for an ordinary prompt with the compiler disabled, without duplicates", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-plan-"))
+    const context = makeContext()
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const emitted: Array<{ event: string; data: unknown }> = []
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
+    const scope = { projectFingerprint: "feedback-project", conversationId: "feedback-chat" }
+    try {
+      assert.equal(isPromptCompilerEnabled(vscode.workspace.getConfiguration("twinny")), false)
+      const first = await feedbackPlanner(chat).start(scope, "Fix the parser.")
+      assert.equal(first.status, "planned")
+      const list = await repository.getList(scope)
+      assert.deepEqual(list.items.map((item) => item.title), ["Inspect parser", "Fix parser", "Verify parser"])
+      assert.ok(emitted.some(({ event }) => event === TODO_EVENT_NAME.changed))
 
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-intent-instructions-"))
+      assert.equal((await feedbackPlanner(chat).start(scope, "Fix the parser.")).status, "planned")
+      const repeated = await repository.getList(scope)
+      assert.equal(repeated.id, list.id)
+      assert.equal(repeated.items.length, 3)
+      assert.ok(String(model.requests[1].messages[1]?.content ?? "").includes("parser-plan"), "the existing plan is offered for revision")
+
+      model.feedbackOutput = "not json"
+      const failed = await feedbackPlanner(chat).start(scope, "Keep the plan.")
+      assert.equal(failed.status, "failed")
+      assert.deepEqual((await repository.getList(scope)).items.map((item) => item.id), repeated.items.map((item) => item.id))
+      assert.ok(emitted.some(({ event, data }) => event === EVENT_NAME.twinnyNotification && /Feedback/.test(String(data))))
+    } finally {
+      chat.dispose()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("an ordinary chat with agent mode off still gets Feedback TODOs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-agent-off-"))
+    const context = makeContext({}, { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: roleProvider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: roleProvider })
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const emitted: Array<{ event: string; data: unknown }> = []
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
+    try {
+      await chat.completion([{ role: USER, content: "Fix the parser." }], [], "off", "agent-off-chat")
+      await feedbackPlanner(chat).pending()
+      const changed = emitted.filter(({ event }) => event === TODO_EVENT_NAME.changed).map(({ data }) => data as { conversationId: string; items: unknown[] })
+      assert.ok(changed.some((snapshot) => snapshot.conversationId === "agent-off-chat" && snapshot.items.length === 3))
+      const chatRequest = model.requests.find((request) => !/track \(boolean\)/.test(String(request.messages[0]?.content ?? "")))
+      assert.ok(chatRequest, "the chat turn reached the model")
+      assert.ok(String(chatRequest.messages[0]?.content ?? "").includes("twinny_active_intent_task"), "the first model call already sees the plan")
+    } finally {
+      chat.dispose()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("Feedback disabled plans nothing and calls no provider", async () => {
+    await setSetting(FEEDBACK_ENABLED_KEY, false)
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-off-"))
+    const context = makeContext()
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined, undefined, repository)
+    try {
+      assert.equal((await feedbackPlanner(chat).start({ projectFingerprint: "p", conversationId: "c" }, "Fix it.")).status, "disabled")
+      assert.deepEqual(model.requests, [])
+    } finally {
+      chat.dispose()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a Feedback provider error is visible and does not masquerade as an empty plan", async () => {
+    model.failWith = Object.assign(new Error("401 Unauthorized"), { status: 401 })
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-auth-"))
+    const context = makeContext()
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const emitted: Array<{ event: string; data: unknown }> = []
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
+    try {
+      const outcome = await feedbackPlanner(chat).start({ projectFingerprint: "p", conversationId: "auth" }, "Fix it.")
+      assert.equal(outcome.status, "failed")
+      assert.match(outcome.error ?? "", /Feedback \(Scripted feedback\)/)
+      assert.ok(emitted.some(({ event }) => event === EVENT_NAME.twinnyNotification))
+      assert.equal(model.requests.length, 1, "no retry loop")
+    } finally {
+      chat.dispose()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("compilation resolves default, custom, and None instructions while enforcing JSON", async () => {
+    await setSetting(PROMPT_COMPILER_ENABLED_KEY, true)
+    const chat = new Chat(new GenerationTracker(), undefined, makeContext(), makeBridge(), undefined)
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-compiler-instructions-"))
     const customFile = path.join(root, "compiler.md")
     try {
-      const result = await chat.compileIntent("Fix the bug in the parser.")
-      assert.ok(result)
-      assert.strictEqual(result?.objective.includes("Refine the request"), true)
-      assert.match(result?.prompt ?? "", /smallest safe implementation change/)
+      await chat.compilePrompt({ requestId: "instr-default", prompt: "Fix the bug in the parser." })
       let system = String(model.requests[0].messages[0]?.content ?? "")
       assert.match(system, /Refine a user request for a coding agent without changing its intent/)
       assert.match(system, /Return exactly one valid JSON object/)
       assert.doesNotMatch(system, /You are a helpful, respectful and honest coding assistant/)
 
       await fs.writeFile(customFile, "Compiler-only custom instructions")
-      await settings.update("intentBaseInstructionsFile", customFile, vscode.ConfigurationTarget.Global)
-      await settings.update("intentBaseInstructionsMode", "custom", vscode.ConfigurationTarget.Global)
-      await chat.compileIntent("Use the custom compiler profile.")
+      await setSetting(PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY, customFile)
+      await setSetting(PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY, "custom")
+      await chat.compilePrompt({ requestId: "instr-custom", prompt: "Use the custom compiler profile." })
       system = String(model.requests[1].messages[0]?.content ?? "")
       assert.match(system, /Compiler-only custom instructions/)
       assert.doesNotMatch(system, /Refine a user request for a coding agent/)
       assert.match(system, /Return exactly one valid JSON object/)
 
-      await settings.update("intentBaseInstructionsMode", "none", vscode.ConfigurationTarget.Global)
-      await chat.compileIntent("Run with no optional compiler instructions.")
+      await setSetting(PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY, "none")
+      await chat.compilePrompt({ requestId: "instr-none", prompt: "Run with no optional compiler instructions." })
       system = String(model.requests[2].messages[0]?.content ?? "")
       assert.doesNotMatch(system, /Compiler-only custom instructions/)
       assert.match(system, /Return exactly one valid JSON object/)
     } finally {
-      await settings.update("intentBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
-      await settings.update("intentBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
-      await settings.update("chatBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
       await fs.rm(root, { recursive: true, force: true })
       chat.dispose()
     }
   })
 
   test("chat effective prompt preview uses only chat instructions", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-chat-instructions-"))
     const chatFile = path.join(root, "chat.md")
-    const intentFile = path.join(root, "intent.md")
+    const compilerFile = path.join(root, "compiler.md")
     await fs.writeFile(chatFile, "Chat-only base instructions")
-    await fs.writeFile(intentFile, "Compiler-only base instructions")
-    await settings.update("chatBaseInstructionsFile", chatFile, vscode.ConfigurationTarget.Global)
-    await settings.update("chatBaseInstructionsMode", "custom", vscode.ConfigurationTarget.Global)
-    await settings.update("intentBaseInstructionsFile", intentFile, vscode.ConfigurationTarget.Global)
-    await settings.update("intentBaseInstructionsMode", "custom", vscode.ConfigurationTarget.Global)
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: { get: () => undefined, update: async () => undefined },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
+    await fs.writeFile(compilerFile, "Compiler-only base instructions")
+    await setSetting("chatBaseInstructionsFile", chatFile)
+    await setSetting("chatBaseInstructionsMode", "custom")
+    await setSetting(PROMPT_COMPILER_INSTRUCTIONS_FILE_KEY, compilerFile)
+    await setSetting(PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY, "custom")
+    const chat = new Chat(new GenerationTracker(), undefined, makeContext({}, {}), makeBridge(), undefined)
     try {
       const preview = await chat.previewPromptInstructions("off")
       assert.match(preview.chatEffective, /Chat-only base instructions/)
@@ -262,186 +345,69 @@ suite("Intent compiler", () => {
       assert.match(preview.intentEffective, /Compiler-only base instructions/)
       assert.doesNotMatch(preview.intentEffective, /Chat-only base instructions/)
 
-      await settings.update("chatBaseInstructionsMode", "none", vscode.ConfigurationTarget.Global)
+      await setSetting("chatBaseInstructionsMode", "none")
       const nonePreview = await chat.previewPromptInstructions("off")
       assert.equal(nonePreview.chat.mode, "none")
       assert.doesNotMatch(nonePreview.chatEffective, /Chat-only base instructions/)
       assert.match(nonePreview.intentEffective, /Compiler-only base instructions/)
     } finally {
-      await settings.update("chatBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
-      await settings.update("chatBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
-      await settings.update("intentBaseInstructionsMode", "default", vscode.ConfigurationTarget.Global)
-      await settings.update("intentBaseInstructionsFile", "", vscode.ConfigurationTarget.Global)
       await fs.rm(root, { recursive: true, force: true })
       chat.dispose()
     }
   })
 
-  test("uses the selected intent provider for compilation and keeps chat execution independent", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-
-    const intentProvider = {
-      id: "intent-provider-a",
-      label: "Intent Provider A",
-      modelName: "intent-model-a",
-      provider: "scripted-intent-compiler",
-      type: "intent" as const,
-      apiHostname: "intent.example.test",
-      apiPort: 8080,
-      apiProtocol: "https",
-      apiPath: "/v1"
+  test("legacy base-instruction settings are still honored", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-legacy-instructions-"))
+    const compilerFile = path.join(root, "compiler.md")
+    await fs.writeFile(compilerFile, "Legacy compiler instructions")
+    await setSetting("intentBaseInstructionsFile", compilerFile)
+    await setSetting("intentBaseInstructionsMode", "custom")
+    const chat = new Chat(new GenerationTracker(), undefined, makeContext({}, {}), makeBridge(), undefined)
+    try {
+      const preview = await chat.previewPromptInstructions("off")
+      assert.match(preview.intentEffective, /Legacy compiler instructions/)
+    } finally {
+      await setSetting("intentBaseInstructionsFile", undefined)
+      await setSetting("intentBaseInstructionsMode", undefined)
+      await fs.rm(root, { recursive: true, force: true })
+      chat.dispose()
     }
-    const chatProvider = {
-      id: "chat-provider-b",
-      label: "Chat Provider B",
-      modelName: "chat-model-b",
-      provider: "scripted-chat-executor",
-      type: "chat" as const,
-      apiHostname: "chat.example.test",
-      apiPort: 9090,
-      apiProtocol: "https",
-      apiPath: "/v1"
-    }
-    const intentModel = new ScriptedCompilerModel()
-    const chatModel = new ScriptedCompilerModel()
-    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => intentModel })
-    providerRegistry.register("scripted-chat-executor", { id: "scripted-chat-executor", create: () => chatModel })
-
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: {
-        get: (key: string) => {
-          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return intentProvider
-          if (key === ACTIVE_CHAT_PROVIDER_STORAGE_KEY) return chatProvider
-          return undefined
-        },
-        update: async () => undefined
-      },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
-    assert.strictEqual(chat.getIntentProvider()?.modelName, "intent-model-a")
-    assert.strictEqual(chat.getProvider()?.modelName, "chat-model-b")
-
-    const result = await chat.compileIntent("Fix the parser.")
-    assert.ok(result)
-    assert.deepStrictEqual(intentModel.requests.map((request) => request.model), ["intent-model-a"])
-    assert.deepStrictEqual(chatModel.requests, [])
-    chat.dispose()
   })
 
-  test("includes prior prompt/response history in the compiler request", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMaxTurns", 2, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerTrace", false, vscode.ConfigurationTarget.Global)
-
-    const provider = {
-      id: "scripted-intent-provider",
-      label: "Scripted compiler",
-      modelName: "scripted-intent-model",
-      provider: "scripted-intent-compiler",
-      type: "intent" as const
-    }
-    const model = new ScriptedCompilerModel()
-    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
-
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: {
-        get: (key: string) => {
-          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
-          return undefined
-        },
-        update: async () => undefined
-      },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
+  test("includes bounded prior prompt/response history as context only", async () => {
+    await setSetting(PROMPT_COMPILER_ENABLED_KEY, true)
+    await setSetting(PROMPT_COMPILER_MAX_TURNS_KEY, 1)
+    const chat = new Chat(new GenerationTracker(), undefined, makeContext(), makeBridge(), undefined)
     const history: ChatCompletionMessage[] = [
       { role: "user", content: "First task prompt" },
       { role: "assistant", content: "First task response" },
       { role: "user", content: "Second task prompt" },
       { role: "assistant", content: "Second task response" }
     ]
-
-    await chat.compileIntent("Fix the bug in the parser.", history, 2)
-    assert.ok(model.requests.length > 0)
-    assert.match(String(model.requests[0].messages[1]?.content ?? ""), /Historical prior prompt\/response turns/)
-    assert.match(String(model.requests[0].messages[1]?.content ?? ""), /Second task prompt/)
-    chat.dispose()
+    try {
+      await chat.compilePrompt({ requestId: "history-1", prompt: "Fix the bug in the parser.", history })
+      const user = String(model.requests[0].messages[1]?.content ?? "")
+      assert.match(user, /Historical prior prompt\/response turns/)
+      assert.match(user, /Second task prompt/)
+      assert.doesNotMatch(user, /First task prompt/, "maxTurns bounds the history")
+      assert.match(user, /Current draft:\nFix the bug in the parser\./)
+    } finally {
+      chat.dispose()
+    }
   })
 
   test("uses the selected execution prompt when a refined prompt differs from the original user wording", () => {
     const history: ChatCompletionMessage[] = [
-      {
-        role: "user",
-        content: "Original user wording",
-        originalPrompt: "Original user wording",
-        prompt: "Refined execution prompt"
-      },
+      { role: "user", content: "Original user wording", originalPrompt: "Original user wording", prompt: "Refined execution prompt" },
       { role: "assistant", content: "Final response" }
     ]
-
     const summary = summarizeIntentHistory(history, 1)
     assert.strictEqual(summary.pairs.length, 1)
     assert.strictEqual(summary.pairs[0].prompt, "Refined execution prompt")
     assert.strictEqual(summary.pairs[0].response, "Final response")
   })
 
-  test("keeps earlier user restrictions in historical context instead of active task policy", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-
-    const provider = {
-      id: "scripted-intent-provider",
-      label: "Scripted compiler",
-      modelName: "scripted-intent-model",
-      provider: "scripted-intent-compiler",
-      type: "intent" as const
-    }
-    const model = new ScriptedCompilerModel()
-    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
-
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: {
-        get: (key: string) => {
-          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
-          return undefined
-        },
-        update: async () => undefined
-      },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
-    const systemPrompt = await (chat as unknown as { _context: { systemPrompt: () => Promise<string> } })._context.systemPrompt()
-    assert.match(systemPrompt, /historical context only/i)
-    assert.match(systemPrompt, /current user request/i)
-
-    await chat.compileIntent("Fix the confirmed inconsistencies in the file.", [
-      { role: "user", content: "Audit the file. Do not modify files." },
-      { role: "assistant", content: "I audited the file and found inconsistencies." },
-      { role: "user", content: "Fix the confirmed inconsistencies in the file." },
-      { role: "assistant", content: "I found the issues and can fix them." }
-    ], 2)
-
-    assert.ok(model.requests.length > 0)
-    assert.match(String(model.requests[0].messages[0]?.content ?? ""), /historical context only/i)
-    chat.dispose()
-  })
-
-  test("summarizes only completed history pairs for intent compiler diagnostics", () => {
+  test("summarizes only completed history pairs", () => {
     const history: ChatCompletionMessage[] = [
       { role: "user", content: "First task prompt" },
       { role: "assistant", content: "First task response" },
@@ -449,121 +415,39 @@ suite("Intent compiler", () => {
       { role: "assistant", content: "Second task response" },
       { role: "user", content: "Current prompt in progress" }
     ]
-
     const summary = summarizeIntentHistory(history, 2)
     assert.strictEqual(summary.maxLevels, 2)
     assert.strictEqual(summary.pairs.length, 2)
     assert.strictEqual(summary.pairs[0].promptLength, "First task prompt".length)
-    assert.strictEqual(summary.pairs[1].promptLength, "Second task prompt".length)
     assert.strictEqual(summary.pairs[1].responseLength, "Second task response".length)
   })
 
-  test("trace mode is off by default and writes a raw request body for intent compiler requests", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    const traceOff = settings.get<boolean>("chatToolsIntentCompilerTrace", false)
-    assert.strictEqual(traceOff, false)
+  test("trace mode is off by default and writes one credential-free trace per request when on", async () => {
+    assert.strictEqual(vscode.workspace.getConfiguration("twinny").get<boolean>(PROMPT_COMPILER_TRACE_KEY), false)
+    await setSetting(PROMPT_COMPILER_ENABLED_KEY, true)
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-compiler-trace-"))
+    const chat = new Chat(new GenerationTracker(), undefined, makeContext({ globalStorageUri: { fsPath: temp }, storageUri: { fsPath: temp } }), makeBridge(), undefined)
+    const traceDir = path.join(temp, "prompt-compiler-traces")
+    try {
+      await chat.compilePrompt({ requestId: "trace-off", prompt: "No trace." })
+      await assert.rejects(fs.readdir(traceDir))
 
-    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerTrace", true, vscode.ConfigurationTarget.Global)
-
-    const temp = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-intent-trace-"))
-    const provider = {
-      id: "scripted-intent-provider",
-      label: "Scripted compiler",
-      modelName: "scripted-intent-model",
-      provider: "scripted-intent-compiler",
-      type: "intent" as const
+      await setSetting(PROMPT_COMPILER_TRACE_KEY, true)
+      await chat.compilePrompt({ requestId: "trace-1", prompt: "Fix the parser.", history: [{ role: "user", content: "First task prompt" }, { role: "assistant", content: "First task response" }] })
+      await chat.compilePrompt({ requestId: "trace-2", prompt: "Fix the parser again." })
+      const files = await fs.readdir(traceDir)
+      assert.strictEqual(files.length, 2)
+      const traces = await Promise.all(files.map(async (file) => JSON.parse(await fs.readFile(path.join(traceDir, file), "utf8"))))
+      assert.deepEqual(traces.map((trace) => trace.requestId).sort(), ["trace-1", "trace-2"])
+      for (const trace of traces) {
+        assert.equal(trace.provider.modelName, "scripted-role-model")
+        assert.match(trace.request.user, /Fix the parser/)
+        assert.match(trace.response, /"prompt"/)
+        assert.doesNotMatch(JSON.stringify(trace), /api[_-]?key|Bearer\s+[A-Za-z0-9._~+/=-]+/i)
+      }
+    } finally {
+      chat.dispose()
+      await fs.rm(temp, { recursive: true, force: true })
     }
-    const model = new ScriptedCompilerModel()
-    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
-
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: {
-        get: (key: string) => {
-          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
-          return undefined
-        },
-        update: async () => undefined
-      },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      globalStorageUri: { fsPath: temp },
-      storageUri: { fsPath: temp },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
-    const history: ChatCompletionMessage[] = [
-      { role: "user", content: "First task prompt" },
-      { role: "assistant", content: "First task response" }
-    ]
-
-    const result = await chat.compileIntent("Fix the parser.", history, 1)
-    assert.ok(result)
-    const traceDir = path.join(temp, "intent-compiler-traces")
-    const files = await fs.readdir(traceDir)
-    assert.strictEqual(files.length, 1)
-
-    const traceText = await fs.readFile(path.join(traceDir, files[0]), "utf8")
-    const trace = JSON.parse(traceText)
-    assert.ok(trace.requestId)
-    assert.ok(/"model":\s*"scripted-intent-model"/.test(trace.requestBody))
-    assert.ok(trace.requestBody.includes("Fix the parser."))
-    assert.ok(trace.response.includes("Refine the request for execution."))
-    assert.strictEqual(trace.historySummary.selectedPairs[0].prompt, "First task prompt")
-    assert.match(trace.requestBody, /"role":\s*"user"/)
-    assert.doesNotMatch(JSON.stringify(trace), /api[_-]?key|token|secret|password/i)
-    assert.doesNotMatch(JSON.stringify(trace), /Bearer\s+[A-Za-z0-9._~+/=-]+/)
-
-    chat.dispose()
-    await settings.update("chatToolsIntentCompilerTrace", false, vscode.ConfigurationTarget.Global)
-  })
-
-  test("writes separate traces for separate intent-compiler requests", async () => {
-    const settings = vscode.workspace.getConfiguration("twinny")
-    await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "always-refined", vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerTrace", true, vscode.ConfigurationTarget.Global)
-
-    const temp = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-intent-trace-multi-"))
-    const provider = {
-      id: "scripted-intent-provider",
-      label: "Scripted compiler",
-      modelName: "scripted-intent-model",
-      provider: "scripted-intent-compiler",
-      type: "intent" as const
-    }
-    const model = new ScriptedCompilerModel()
-    providerRegistry.register("scripted-intent-compiler", { id: "scripted-intent-compiler", create: () => model })
-
-    const context = {
-      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
-      globalState: {
-        get: (key: string) => {
-          if (key === ACTIVE_INTENT_PROVIDER_STORAGE_KEY) return provider
-          return undefined
-        },
-        update: async () => undefined
-      },
-      workspaceState: { get: () => undefined, update: async () => undefined },
-      globalStorageUri: { fsPath: temp },
-      storageUri: { fsPath: temp },
-      subscriptions: []
-    } as unknown as vscode.ExtensionContext
-
-    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined)
-    await chat.compileIntent("Fix the parser.", [], 0)
-    await chat.compileIntent("Fix the parser again.", [], 0)
-
-    const traceDir = path.join(temp, "intent-compiler-traces")
-    const files = await fs.readdir(traceDir)
-    assert.strictEqual(files.length, 2)
-    const traces = await Promise.all(files.map(async (file) => JSON.parse(await fs.readFile(path.join(traceDir, file), "utf8"))))
-    assert.notStrictEqual(traces[0].requestId, traces[1].requestId)
-    assert.notStrictEqual(traces[0].requestBody, traces[1].requestBody)
-
-    chat.dispose()
-    await settings.update("chatToolsIntentCompilerTrace", false, vscode.ConfigurationTarget.Global)
   })
 })

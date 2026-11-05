@@ -1,8 +1,7 @@
 /*
- * A transcript, not a chat of bubbles: the user's turn carries a rule down
- * its left edge, the reply runs flush beneath it, and whitespace does the
- * rest. Who said what is plain from the shape, so the names are for screen
- * readers.
+ * A transcript, not a chat of bubbles: both turns sit flush on the same
+ * edge, and whitespace does the separating. Who said what is plain from the
+ * shape, so the names are for screen readers.
  */
 .message {
   position: relative;
@@ -16,17 +15,11 @@
   margin-top: 8px;
   padding-top: 8px;
   padding-bottom: 8px;
-  padding-left: calc(var(--tw-pad) + var(--tw-gutter));
 }
 
-.userMessage::before {
-  content: "";
-  position: absolute;
-  top: 8px;
-  bottom: 8px;
-  left: var(--tw-pad);
-  width: 2px;
-  background: var(--tw-fg-faint);
+/* The user's words are shown as typed: their spaces, indentation and blank lines are kept. */
+.userMessage .messageContent {
+  white-space: pre-wrap;
 }
 
 /* On the user's turn, the actions sit just above its first line rather than over the words. */

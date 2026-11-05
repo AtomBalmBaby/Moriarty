@@ -28,7 +28,7 @@ class ScriptedModel implements InferenceProvider {
   public readonly id = "scripted-agent"
   public requests: ChatRequest[] = []
 
-  constructor(private readonly _replies: string[]) {}
+  constructor(private readonly _replies: string[], private readonly _planReply?: string) {}
 
   capabilities() {
     return ["chat" as const]
@@ -36,9 +36,12 @@ class ScriptedModel implements InferenceProvider {
 
   async *chat(request: ChatRequest) {
     this.requests.push(structuredClone(request))
-    const reply = this._replies.shift() ?? "Done."
+    const system = String(request.messages[0]?.content ?? "")
+    const planning = this._planReply !== undefined && /track \(boolean\)/.test(system)
+    const reply = planning ? this._planReply! : this._replies.shift() ?? "Done."
     for (let i = 0; i < reply.length; i += 9) yield { content: reply.slice(i, i + 9) }
   }
+
 }
 
 const provider: TwinnyProvider = {
@@ -135,10 +138,8 @@ suite("Agent reply, end to end", function () {
 
   test("chat remains responsive and does not invoke review when automatic feedback is disabled", async () => {
     const settings = vscode.workspace.getConfiguration("twinny")
-    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
-    const previousCompiler = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
-    await settings.update("chatToolsFeedbackEvaluatorEnabled", false, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerEnabled", false, vscode.ConfigurationTarget.Global)
+    const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
+    await settings.update("feedback.enabled", false, vscode.ConfigurationTarget.Global)
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-feedback-disabled-"))
     const chatModel = new ScriptedModel(["The chat is still working."])
     const evaluatorModel = new ScriptedModel(["{ malformed }"])
@@ -173,18 +174,13 @@ suite("Agent reply, end to end", function () {
     } finally {
       chat.dispose()
       fs.rmSync(directory, { recursive: true, force: true })
-      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
-      await settings.update("chatToolsIntentCompilerEnabled", previousCompiler, vscode.ConfigurationTarget.Global)
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
     }
   })
 
   test("the implementing chat receives only its bounded active intent-task projection", async () => {
     const settings = vscode.workspace.getConfiguration("twinny")
-    const previousEnabled = settings.get<boolean>("chatToolsIntentCompilerEnabled", false)
-    const previousMode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
-    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
-    await settings.update("chatToolsFeedbackEvaluatorEnabled", false, vscode.ConfigurationTarget.Global)
-    await settings.update("chatToolsIntentCompilerMode", "ask", vscode.ConfigurationTarget.Global)
+    const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-task-context-"))
     const model = new ScriptedModel(["Done.", "Done."])
     providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
@@ -218,12 +214,13 @@ suite("Agent reply, end to end", function () {
     await repository.synchronizeIntentPlan(scope, plan, { prompt: "Implement the feature", plan })
     const chat = new Chat(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
     try {
-      await settings.update("chatToolsIntentCompilerEnabled", false, vscode.ConfigurationTarget.Global)
+      await settings.update("feedback.enabled", false, vscode.ConfigurationTarget.Global)
       await chat.completion([{ role: "user", content: "Implement it." }], [], "off", scope.conversationId)
       const disabledSystem = String(model.requests[0].messages[0]?.content ?? "")
       assert.doesNotMatch(disabledSystem, /twinny_active_intent_task/)
 
-      await settings.update("chatToolsIntentCompilerEnabled", true, vscode.ConfigurationTarget.Global)
+      // Feedback, not the Prompt Compiler, decides whether the active task is projected.
+      await settings.update("feedback.enabled", true, vscode.ConfigurationTarget.Global)
       await chat.completion([{ role: "user", content: "Continue implementing it." }], [], "off", scope.conversationId)
       const enabledSystem = String(model.requests[1].messages[0]?.content ?? "")
       const taskProjection = enabledSystem.slice(enabledSystem.indexOf("Active task from Twinny's native TODO plan"))
@@ -235,17 +232,15 @@ suite("Agent reply, end to end", function () {
       assert.match(enabledSystem, /You are a helpful, respectful and honest coding assistant/)
     } finally {
       chat.dispose()
-      await settings.update("chatToolsIntentCompilerEnabled", previousEnabled, vscode.ConfigurationTarget.Global)
-      await settings.update("chatToolsIntentCompilerMode", previousMode, vscode.ConfigurationTarget.Global)
-      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
       fs.rmSync(directory, { recursive: true, force: true })
     }
   })
 
   test("an incomplete implementation report automatically dispatches a corrective turn", async () => {
     const settings = vscode.workspace.getConfiguration("twinny")
-    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
-    await settings.update("chatToolsFeedbackEvaluatorEnabled", true, vscode.ConfigurationTarget.Global)
+    const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
+    await settings.update("feedback.enabled", true, vscode.ConfigurationTarget.Global)
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-reconcile-continuation-"))
     const chatModel = new ScriptedModel(["Implementation report: all requested work is complete.", "I will now inspect and implement the requested changes."])
     const criterion = "The existing TODO panel is updated."
@@ -259,7 +254,7 @@ suite("Agent reply, end to end", function () {
       explanation: decision === "revise" ? "The requested implementation is not present." : "Execution stopped for this deterministic integration test.",
       scores: { completion: 0, correctness: 0, alignment: 0 }
     })
-    const evaluatorModel = new ScriptedModel([evaluation("revise"), evaluation("blocked")])
+    const evaluatorModel = new ScriptedModel([evaluation("revise"), evaluation("blocked")], JSON.stringify({ track: false }))
     const agentProvider = { ...provider, id: "reconciliation-agent", provider: "reconciliation-agent" }
     const evaluatorProvider: TwinnyProvider = { ...provider, id: "reconciliation-evaluator", provider: "reconciliation-evaluator", type: "intent" }
     providerRegistry.register("reconciliation-agent", { id: "reconciliation-agent", create: () => chatModel })
@@ -300,7 +295,7 @@ suite("Agent reply, end to end", function () {
     try {
       await chat.completion([{ role: "user", content: goal }], [], "off", scope.conversationId)
       assert.equal(chatModel.requests.length, 2, "the same user request must cause an automatic second agent turn")
-      assert.equal(evaluatorModel.requests.length, 2, "each implementing turn must receive independent evaluation")
+      assert.equal(evaluatorModel.requests.filter((request) => !/track \(boolean\)/.test(String(request.messages[0]?.content ?? ""))).length, 2, "each implementing turn must receive independent evaluation")
       const continuation = chatModel.requests[1].messages.map((message) => String(message.content ?? "")).join("\n")
       assert.match(continuation, /Implement the requested TODO panel improvements/)
       assert.match(continuation, /Modify the existing component; do not delete it/)
@@ -309,7 +304,7 @@ suite("Agent reply, end to end", function () {
     } finally {
       chat.dispose()
       fs.rmSync(directory, { recursive: true, force: true })
-      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
     }
   })
 
@@ -347,8 +342,8 @@ suite("Agent reply, end to end", function () {
     fs.writeFileSync(file, "export const TodoPanel = () => <div />\n")
     const closeWorkspace = await openWorkspace(root)
     const settings = vscode.workspace.getConfiguration("twinny")
-    const previousFeedback = settings.get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
-    await settings.update("chatToolsFeedbackEvaluatorEnabled", true, vscode.ConfigurationTarget.Global)
+    const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
+    await settings.update("feedback.enabled", true, vscode.ConfigurationTarget.Global)
     const criterion = "The existing TODO panel remains and is updated."
     const review = (decision: "revise" | "blocked") => JSON.stringify({
       schemaVersion: 1,
@@ -364,7 +359,8 @@ suite("Agent reply, end to end", function () {
       call("delete_file", { path: "src/webview/todo-panel.tsx" }),
       "The attempted deletion was rejected; I will continue safely."
     ])
-    const evaluatorModel = new ScriptedModel([review("revise"), review("blocked")])
+    // Feedback plans for every ordinary send; the existing plan already covers this request.
+    const evaluatorModel = new ScriptedModel([JSON.stringify({ track: false, plan: null }), review("revise"), review("blocked")])
     const agentProvider = { ...provider, id: "destructive-recovery-agent", provider: "destructive-recovery-agent" }
     const evaluatorProvider: TwinnyProvider = { ...provider, id: "destructive-recovery-evaluator", provider: "destructive-recovery-evaluator", type: "intent" }
     providerRegistry.register("destructive-recovery-agent", { id: "destructive-recovery-agent", create: () => agentModel })
@@ -401,7 +397,8 @@ suite("Agent reply, end to end", function () {
     try {
       await chat.completion([{ role: "user", content: goal }], [], "off", scope.conversationId)
       assert.equal(fs.readFileSync(file, "utf8"), "export const TodoPanel = () => <div />\n")
-      assert.equal(evaluatorModel.requests.length, 2)
+      assert.equal(evaluatorModel.requests.length, 3, "one Feedback plan request and two reviews")
+      assert.match(JSON.stringify(evaluatorModel.requests[0].messages), /Existing TODO plan/)
       assert.ok(agentModel.requests.length >= 3, "the delete call, its result, and an automatic corrective turn must reach the implementing provider")
       assert.match(JSON.stringify(agentModel.requests[1].messages.at(-1)?.content), /Not deleted:.*conflicts/i)
       const continuation = agentModel.requests.slice(2).flatMap((request) => request.messages).map((message) => String(message.content ?? "")).join("\n")
@@ -410,7 +407,7 @@ suite("Agent reply, end to end", function () {
     } finally {
       chat.dispose()
       await closeWorkspace()
-      await settings.update("chatToolsFeedbackEvaluatorEnabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
       fs.rmSync(root, { recursive: true, force: true })
     }
   })

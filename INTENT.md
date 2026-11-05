@@ -1,5 +1,12 @@
 # Twinny Intent Compiler: Architectural Design Contract
 
+> **Current behavior (supersedes the execution flow below).** The Intent system is now two independent capabilities:
+>
+> - **Feedback** (`twinny.feedback.enabled`, `.provider`, `.model`) plans TODOs from each ordinary agent request, tracks progress through the tool loop, and evaluates completion. It does not depend on prompt compilation.
+> - **Prompt Compiler** (`twinny.promptCompiler.enabled`, `.provider`, `.model`, `.maxTurns`, `.trace`, `.baseInstructionsMode`, `.baseInstructionsFile`) is a capability toggle. It runs only when the user Ctrl+Clicks Send (Command+Click on macOS), replaces the composer draft with the compiled prompt, and never sends it. A plain Send always submits the draft unchanged, and there is no review dialog.
+>
+> Both roles default to the provider selected as **Feedback** (formerly "Intent") in the providers panel. A `*.provider` setting can name another provider by ID or label. If that provider is missing, Twinny reports an error and does not fall back. Legacy `twinny.chatToolsIntentCompiler*`, `twinny.chatToolsFeedbackEvaluatorEnabled` and `twinny.intentBaseInstructions*` values are migrated to the new keys. `twinny.chatToolsIntentCompilerMode` is retired and ignored, so no setting can make compilation automatic.
+
 **Status:** Design reference and acceptance contract  
 **Scope:** Independent Intent Compiler provider role, its configuration and resolution, team integration, discovery, execution, and regression tests.  
 **Principle:** **Intent is a first-class provider role, not another name for Chat.**

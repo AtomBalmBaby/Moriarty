@@ -9,6 +9,8 @@ export interface MarkdownInstructionSource {
   warning?: string
 }
 
+const routeLabel = (route: PromptInstructionRoute) => route === "intent" ? "Prompt Compiler" : route
+
 export const resolveMarkdownInstructionSource = async (
   route: PromptInstructionRoute,
   mode: PromptInstructionMode,
@@ -21,7 +23,7 @@ export const resolveMarkdownInstructionSource = async (
       return {
         content: await fs.readFile(bundledFile, "utf8"),
         source: bundledFile,
-        warning: "Custom " + route + " base instructions are selected, but no Markdown file is configured. The built-in default is being used."
+        warning: "Custom " + routeLabel(route) + " base instructions are selected, but no Markdown file is configured. The built-in default is being used."
       }
     }
     try {
@@ -31,7 +33,7 @@ export const resolveMarkdownInstructionSource = async (
       return {
         content: await fs.readFile(bundledFile, "utf8"),
         source: bundledFile,
-        warning: "Could not read the " + route + " base-instructions file \"" + file + "\": " + detail + ". The built-in default is being used."
+        warning: "Could not read the " + routeLabel(route) + " base-instructions file \"" + file + "\": " + detail + ". The built-in default is being used."
       }
     }
   }

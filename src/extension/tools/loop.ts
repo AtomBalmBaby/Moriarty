@@ -522,6 +522,7 @@ class ToolLoop {
             signal: stepAbort.signal,
             trace: {
               operationId,
+              operationKind: "tool_loop",
               requestId,
               parentRequestId: options?.trace?.requestId,
               toolLoopStep: step + 1,

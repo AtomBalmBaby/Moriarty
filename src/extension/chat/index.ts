@@ -19,8 +19,18 @@ import {
   USER,
   WEBUI_TABS
 } from "../../common/constants"
+import {
+  feedbackProviderSelection,
+  findProviderBySelection,
+  isFeedbackEnabled,
+  isPromptCompilerEnabled,
+  isPromptCompilerTraceEnabled,
+  promptCompilerMaxTurns,
+  promptCompilerProviderSelection,
+  RoleSelection
+} from "../../common/feedback-settings"
 import { formatCount, logger, redact } from "../../common/logger"
-import type { ComposerTurn, ToolInventoryItem } from "../../common/messaging/protocol"
+import type { ComposerTurn, PromptCompileRequest, PromptCompileResult, ToolInventoryItem } from "../../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
 import { kebabToSentence } from "../../common/text"
@@ -48,10 +58,11 @@ import {
 import { ExtensionBridge } from "../messaging/bridge"
 import { PromptInstructionResolver } from "../prompts/instructions"
 import { Base } from "../providers/base"
+import { resolveProviderEndpoint } from "../providers/endpoint"
 import { describeProviderError, stripThinking } from "../providers/errors"
+import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { evaluateTodoReview, feedbackContext, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
-import { validateIntentTaskPlan } from "../todos/intent-plan"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { TodoEvaluation, TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
@@ -67,10 +78,13 @@ import { getLanguage } from "../utils"
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
 import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, requiresWorkspaceChanges } from "./execution-reconciliation"
+import { FeedbackPlanner, type FeedbackPlanOutcome } from "./feedback-planner"
 import { ChatGeneration } from "./generation"
 import { McpHost } from "./mcp-host"
+import { PROMPT_COMPILER_PROTOCOL, PromptCompiler, PromptCompilerTraceRecord } from "./prompt-compiler"
 import { ChangeStore, ReplyChanges, viewOf } from "./reply-changes"
 import { ReplyChangesEditor } from "./reply-changes-editor"
+import type { RoleResolution } from "./role-inference"
 import { DiagnosticRegressionMonitor, SafeEditCheckpoints } from "./safe-edit-recovery"
 import {
   ChatCommandMode,
@@ -97,6 +111,16 @@ const mcpAllowed = (team: TeamAgentPolicy | undefined) => team?.commands !== "of
 
 /** How long an agent reply waits for the team's policy to be re-read. */
 const POLICY_REFRESH_WAIT_MS = 1500
+/** How long a new message waits for its Feedback plan before the first model call. */
+const FEEDBACK_PLAN_WAIT_MS = 20_000
+const settleWithin = <T>(promise: Promise<T>, ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    void promise.finally(() => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
 /** The steps an agent reply may take, as `twinny.chatToolsMaxSteps` may set them. */
 const MIN_STEPS_SETTING = 4
 const MAX_STEPS_SETTING = 100
@@ -106,31 +130,9 @@ const MAX_READ_LINES = 5000
 const DEFAULT_RESULT_CHARS = 100_000
 const MIN_RESULT_CHARS = 10_000
 const MAX_RESULT_CHARS = 200_000
-const INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxTurns"
-const LEGACY_INTENT_COMPILER_MAX_TURNS_KEY = "chatToolsIntentCompilerMaxLevels"
-const INTENT_COMPILER_PROTOCOL = "Return exactly one valid JSON object, with no prose or Markdown fences, using required fields objective (string), prompt (string), constraints (string[]), exclusions (string[]), strategy (string), verification (string[]), assumptions (string[]), and plan. plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, acceptanceCriteria: string[], dependencies: string[]}]}. Include 1-100 ordered tasks, stable planId and task IDs, and no unknown or cyclic dependencies. On re-planning, preserve the existing planId and task IDs, increment revision when definitions change, and do not reset task progress. Every field is required. Do not add other top-level keys. Return this JSON even when the provider does not support structured output."
-
 const clampNumericSetting = (value: number | undefined, min: number, max: number, fallback: number) => {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback
   return Math.min(max, Math.max(min, Math.round(value)))
-}
-
-const getIntentCompilerMaxTurns = (settings: ReturnType<typeof workspace.getConfiguration>, fallback = 3) => {
-  const configuredValue = settings.get<number>(INTENT_COMPILER_MAX_TURNS_KEY)
-  if (typeof configuredValue === "number" && Number.isFinite(configuredValue)) {
-    return clampNumericSetting(configuredValue, 0, 10, fallback)
-  }
-  const legacyValue = settings.get<number>(LEGACY_INTENT_COMPILER_MAX_TURNS_KEY)
-  if (typeof legacyValue === "number" && Number.isFinite(legacyValue)) {
-    return clampNumericSetting(legacyValue, 0, 10, fallback)
-  }
-  return fallback
-}
-
-const ensureStringList = (value: unknown): string[] => {
-  if (Array.isArray(value)) return value.map((entry) => String(entry).trim()).filter(Boolean)
-  if (typeof value === "string" && value.trim()) return [value.trim()]
-  return []
 }
 
 const normalizeText = (value: unknown): string => {
@@ -238,142 +240,40 @@ const previousPromptHistory = (
     .join("\n\n")}`
 }
 
-export const parseIntentCompilerResponse = (output: string | undefined) => {
-  if (!output?.trim()) return undefined
-  const text = stripThinking(output).trim()
-  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  const candidate = match ? match[1] : text
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(candidate)
-  } catch {
-    const start = candidate.indexOf("{")
-    const end = candidate.lastIndexOf("}")
-    if (start === -1 || end === -1 || end <= start) {
-      logger.warn("[Intent] Compiler response is not valid JSON; return the required structured task plan.")
-      return undefined
-    }
-    try {
-      parsed = JSON.parse(candidate.slice(start, end + 1))
-    } catch {
-      logger.warn("[Intent] Compiler response is malformed JSON; return one complete JSON object containing the required task plan.")
-      return undefined
-    }
-  }
-  if (!parsed || typeof parsed !== "object") {
-    logger.warn("[Intent] Compiler response must be a JSON object with the required task plan.")
-    return undefined
-  }
-  const details = parsed as Record<string, unknown>
-  const expectedKeys = ["objective", "prompt", "constraints", "exclusions", "strategy", "verification", "assumptions", "plan"]
-  const missing = expectedKeys.filter((key) => !Object.prototype.hasOwnProperty.call(details, key))
-  const unexpected = Object.keys(details).filter((key) => !expectedKeys.includes(key))
-  if (missing.length || unexpected.length) {
-    logger.warn("[Intent] Invalid compiler response shape: " + [missing.length ? "missing " + missing.join(", ") : "", unexpected.length ? "unexpected " + unexpected.join(", ") : ""].filter(Boolean).join("; "))
-    return undefined
-  }
-  if (typeof details.objective !== "string" || typeof details.prompt !== "string" || typeof details.strategy !== "string") {
-    logger.warn("[Intent] Compiler objective, prompt, and strategy must be strings.")
-    return undefined
-  }
-  const lists = [details.constraints, details.exclusions, details.verification, details.assumptions]
-  if (!lists.every((value) => Array.isArray(value) && value.every((entry) => typeof entry === "string"))) {
-    logger.warn("[Intent] Compiler constraints, exclusions, verification, and assumptions must be string arrays.")
-    return undefined
-  }
-  const objective = details.objective.trim()
-  const prompt = details.prompt.trim()
-  if (!objective || !prompt) {
-    logger.warn("[Intent] Compiler objective and prompt must not be empty.")
-    return undefined
-  }
-  const validation = validateIntentTaskPlan(details.plan)
-  if (!validation.plan) {
-    logger.warn(`[Intent] Invalid task plan: ${validation.diagnostic ?? "plan validation failed"}`)
-    return undefined
-  }
-  return {
-    objective,
-    prompt,
-    constraints: ensureStringList(details.constraints),
-    exclusions: ensureStringList(details.exclusions),
-    strategy: details.strategy.trim(),
-    verification: ensureStringList(details.verification),
-    assumptions: ensureStringList(details.assumptions),
-    plan: validation.plan
-  }
-}
-const writeIntentTrace = async ({
-  context,
-  provider,
-  request,
-  history,
-  maxLevels,
-  instructions,
-  prompt,
-  response,
-  requestId
-}: {
-  context?: ExtensionContext
-  provider: { id?: string; label?: string; modelName?: string; provider?: string }
-  request: { model: string; messages: ChatCompletionMessage[] }
-  history: ChatCompletionMessage[]
-  maxLevels: number
-  instructions: { mode: string; source?: string; hash: string }
-  prompt: string
-  response: string | undefined
-  requestId: string
-}) => {
-  const settings = workspace.getConfiguration("twinny")
-  if (!settings.get<boolean>("chatToolsIntentCompilerTrace", false)) return undefined
-
+const writePromptCompilerTrace = async (
+  context: ExtensionContext | undefined,
+  record: PromptCompilerTraceRecord & { history: ChatCompletionMessage[]; maxTurns: number; instructions: { mode: string; source?: string; hash: string } }
+) => {
   const storageDir = (context?.globalStorageUri ?? context?.storageUri)?.fsPath ?? os.tmpdir()
-  const traceDir = path.join(storageDir, "intent-compiler-traces")
+  const traceDir = path.join(storageDir, "prompt-compiler-traces")
   await fs.mkdir(traceDir, { recursive: true })
-
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
-  const tracePath = path.join(traceDir, `intent-${timestamp}-${requestId.slice(0, 8)}.json`)
-  const historySummary = summarizeIntentHistory(history, maxLevels)
-
+  const tracePath = path.join(traceDir, `prompt-compiler-${timestamp}-${record.requestId.replace(/[^A-Za-z0-9-]/g, "").slice(0, 16)}.json`)
+  const historySummary = summarizeIntentHistory(record.history, record.maxTurns)
   const trace = {
-    requestId,
+    requestId: record.requestId,
+    operationId: record.operationId,
     timestamp: new Date().toISOString(),
-    provider: {
-      id: provider.id ?? "unknown",
-      label: provider.label,
-      modelName: provider.modelName,
-      provider: provider.provider ?? provider.id
-    },
-    compiler: {
-      mode: settings.get<string>("chatToolsIntentCompilerMode", "ask"),
-      enabled: settings.get<boolean>("chatToolsIntentCompilerEnabled", false),
-      maxLevels,
-      baseInstructions: instructions
-    },
+    provider: { provider: record.provider, modelName: record.model },
+    compiler: { maxTurns: record.maxTurns, baseInstructions: record.instructions },
     historySummary: {
-      totalMessages: history.length,
+      totalMessages: record.history.length,
       selectedPairs: historySummary.pairs.map((pair, index) => ({
         ordinal: index + 1,
         status: pair.status,
         userId: pair.userId ?? "n/a",
         assistantId: pair.assistantId ?? "n/a",
         promptLength: pair.promptLength,
-        responseLength: pair.responseLength,
-        prompt: pair.prompt,
-        response: pair.response
+        responseLength: pair.responseLength
       }))
     },
-    currentPrompt: prompt,
-    request,
-    requestBody: JSON.stringify(request, null, 2),
-    response: response ?? null,
-    responseLength: response?.length ?? 0
+    request: { system: record.system, user: record.user },
+    response: record.response ?? null,
+    responseLength: record.response?.length ?? 0
   }
-
   await fs.writeFile(tracePath, `${JSON.stringify(trace, null, 2)}\n`, "utf8")
-  logger.info(`[Intent] Trace requestId=${requestId} file=${tracePath}`)
-  logger.debug(`[Intent] Trace requestId=${requestId} file=${tracePath}`)
-  logger.warn("[Intent] Trace mode writes raw request and response bodies to local files; disable it after debugging.")
+  logger.info(`[PromptCompiler] Trace requestId=${record.requestId} file=${tracePath}`)
+  logger.warn("[PromptCompiler] Trace mode writes raw request and response bodies to local files; disable it after debugging.")
   return tracePath
 }
 
@@ -428,6 +328,10 @@ export class Chat extends Base {
   private readonly _promptInstructions: PromptInstructionResolver
   private readonly _todoRepository?: TodoRepository
   private _activeConversationId?: string
+  /** Explicit draft rewriting; independent of Feedback and of sending. */
+  private readonly _promptCompiler: PromptCompiler
+  /** TODO planning on the Feedback provider, alongside each agent turn. */
+  private readonly _feedbackPlanner: FeedbackPlanner
 
   constructor(
     generations: GenerationTracker,
@@ -449,6 +353,17 @@ export class Chat extends Base {
     this._agents = agents
     this._workspaceSearch = workspaceSearch
     this._steps = new ToolSteps((steps) => bridge.emit(EVENT_NAME.twinnyToolSteps, steps))
+    this._promptCompiler = new PromptCompiler({
+      enabled: () => isPromptCompilerEnabled(workspace.getConfiguration("twinny")),
+      resolve: () => this.roleResolution("Prompt Compiler", promptCompilerProviderSelection(workspace.getConfiguration("twinny")))
+    })
+    this._feedbackPlanner = new FeedbackPlanner({
+      enabled: () => isFeedbackEnabled(workspace.getConfiguration("twinny")),
+      resolve: () => this.roleResolution("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny"))),
+      repository: () => this._todoRepository,
+      onSnapshot: (snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot),
+      onFailure: (message) => this._bridge.emit(EVENT_NAME.twinnyNotification, message)
+    })
 
     // Initialize generation and context
     this._generation = new ChatGeneration(bridge, generations)
@@ -525,6 +440,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   
   public abort = () => {
     this._steps.cancelWaiting()
+    this._feedbackPlanner.cancel("user")
     this._executionAbort?.abort()
     this._activeExecution?.cancel()
     this._generation.abort()
@@ -533,6 +449,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   /** Stop every chat request, including background titles and draft hints. */
   public abortAll = () => {
     this.abort()
+    this._promptCompiler.cancelAll("host")
     this._suggestion?.abort()
     for (const run of [...this._backgroundRuns]) run.abort()
   }
@@ -642,103 +559,109 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
   public resetConversation() {
     this._conversation = []
+    this._feedbackPlanner.cancel("conversation-changed")
   }
 
   /**
-   * Refine a prompt before the agent executes it, without changing the
-   * user's original intent.
+   * Feedback plans TODOs from the user's own message, whether or not it was
+   * compiled, on its own provider and alongside the reply. Continue turns
+   * (whose hidden prompt differs from what is shown) keep the plan they
+   * continue.
    */
-  public async compileIntent(
-    prompt: string,
-    history: ChatCompletionMessage[] = [],
-    maxTurns?: number,
-    conversationId?: string
-  ) {
-    if (conversationId) this._activeConversationId = conversationId
-    const provider = this.getIntentProvider()
-    if (!provider) return undefined
-    const settings = workspace.getConfiguration("twinny")
-    if (!settings.get<boolean>("chatToolsIntentCompilerEnabled", false)) return undefined
-    const mode = settings.get<string>("chatToolsIntentCompilerMode", "ask")
-    if (mode === "always-original") return undefined
-    const trimmed = prompt.trim()
-    if (!trimmed) return undefined
-    const limit = clampNumericSetting(
-      typeof maxTurns === "number" ? maxTurns : getIntentCompilerMaxTurns(settings, 3),
-      0,
-      10,
-      3
-    )
-    const priorHistory = previousPromptHistory(history, limit)
-    const resolvedInstructions = await this._promptInstructions.resolve("intent")
-    const systemPrompt = [resolvedInstructions.content.trim(), INTENT_COMPILER_PROTOCOL].filter(Boolean).join("\n\n")
-    logger.debug("[Prompt] intent mode=" + resolvedInstructions.mode + " agent=none order=" + [resolvedInstructions.content.trim() ? "intent-base" : "", "compiler-input", "compiler-protocol"].filter(Boolean).join(","))
-    const userPrompt = priorHistory ? `${priorHistory}\n\nCurrent request:\n${trimmed}` : trimmed
-    const todoScope = this.activeTodoScope()
-    const historySummary = summarizeIntentHistory(history, limit)
-    logger.debug(`[Intent] Maximum levels: ${limit}`)
-    logger.debug(`[Intent] Completed history pairs found: ${historySummary.pairs.length}`)
-    historySummary.pairs.forEach((pair, index) => {
-      logger.debug(`[Intent] Included pair ${index + 1}: status=${pair.status} userId=${pair.userId ?? "n/a"} assistantId=${pair.assistantId ?? "n/a"} origin=user->assistant`)
-      logger.debug(`[Intent]   User prompt: ${pair.promptLength} characters`)
-      logger.debug(`[Intent]   Final response: ${pair.responseLength} characters`)
-    })
-    logger.debug(`[Intent] Current prompt: ${trimmed.length} characters`)
-    try {
-      const previousPlan = this._todoRepository && todoScope ? await this._todoRepository.getIntentTaskPlan(todoScope) : undefined
-      const compilerInput = previousPlan
-        ? `${userPrompt}\n\nExisting native TODO plan to revise (preserve its planId and unchanged task IDs; increase revision only for changed definitions):\n${JSON.stringify(previousPlan)}`
-        : userPrompt
-      const request = {
+  private startFeedbackPlanning(messages: ChatCompletionMessage[]): Promise<FeedbackPlanOutcome> | undefined {
+    const scope = this.activeTodoScope()
+    const latest = messages.at(-1)
+    if (!scope || latest?.role !== USER) return undefined
+    if (typeof latest.prompt === "string" && latest.prompt !== latest.content) return undefined
+    const text = (typeof latest.content === "string" ? latest.content : normalizeText(latest.content))
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .trim()
+    if (!text) return undefined
+    return this._feedbackPlanner.start(scope, text)
+  }
+
+  /**
+   * The provider a role runs on: the one its setting names (by ID or
+   * label), else the active Feedback provider chosen in the providers
+   * panel. A named provider that cannot be found is an error, never a
+   * silent switch to another one.
+   */
+  private async roleProvider(role: "Feedback" | "Prompt Compiler", selection: RoleSelection): Promise<{ provider?: TwinnyProvider; error?: string }> {
+    let provider: TwinnyProvider | undefined
+    if (selection.provider) {
+      const providers = Object.values(await new ProviderStore(this._extensionContext).getProviders())
+      provider = resolveProviderEndpoint(findProviderBySelection(providers, selection.provider))
+      if (!provider) return { error: `${role} provider "${selection.provider}" is not configured. Choose an existing provider ID or label, or clear the setting.` }
+    } else {
+      provider = this.getIntentProvider()
+      if (!provider) return { error: `${role} has no provider. Select a Feedback provider in Twinny's providers panel or set the ${role === "Feedback" ? "twinny.feedback.provider" : "twinny.promptCompiler.provider"} setting.` }
+    }
+    return { provider: selection.model ? { ...provider, modelName: selection.model } : provider }
+  }
+
+  private async roleResolution(role: "Feedback" | "Prompt Compiler", selection: RoleSelection): Promise<RoleResolution> {
+    const { provider, error } = await this.roleProvider(role, selection)
+    if (!provider) return { ok: false, error: error ?? `${role} has no provider.` }
+    return {
+      ok: true,
+      endpoint: {
+        provider: provider.provider,
         model: provider.modelName,
-        messages: [
-          { role: SYSTEM, content: systemPrompt },
-          { role: USER, content: compilerInput }
-        ] as ChatCompletionMessage[]
-      }
-      const traceEnabled = settings.get<boolean>("chatToolsIntentCompilerTrace", false)
-      const requestId = traceEnabled ? randomUUID() : "n/a"
-      if (traceEnabled) logger.warn("[Intent] Trace mode enabled: raw provider request and response bodies are being written to local files.")
-      logger.debug(`[Intent] Provider request assembled requestId=${requestId} model=${provider.modelName}`)
-      const content = await readText(
-        resolveInferenceProvider(provider).chat(request, { signal: undefined })
-      )
-      if (traceEnabled) {
-        await writeIntentTrace({
-          context: this.context,
-          provider,
-          request,
-          history,
-          maxLevels: limit,
-          instructions: { mode: resolvedInstructions.mode, source: resolvedInstructions.source, hash: resolvedInstructions.hash },
-          prompt: trimmed,
-          response: content,
-          requestId
-        })
-      }
-      const result = parseIntentCompilerResponse(content)
-      if (!result) {
-        logger.warn("[Intent] Compiler response did not contain a complete valid plan; stored TODOs were not changed")
-        return undefined
-      }
-      const compiledResult = { ...result, originalPrompt: trimmed }
-      if (this._todoRepository && todoScope) {
-        try {
-          const snapshot = await this._todoRepository.synchronizeIntentPlan(todoScope, result.plan, compiledResult)
-          this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
-        } catch (error) {
-          logger.warn(`[Intent] Plan synchronization failed for conversation ${todoScope.conversationId}: ${error instanceof Error ? error.message : String(error)}`)
-          this._bridge.emit(EVENT_NAME.twinnyNotification, `Intent plan was not synchronized: ${error instanceof Error ? error.message : String(error)}`)
-          return undefined
+        label: provider.label,
+        infer: async ({ system, user }, { signal, trace }) => {
+          try {
+            return await readText(resolveInferenceProvider(provider).chat({
+              model: provider.modelName,
+              messages: [
+                ...(system ? [{ role: SYSTEM, content: system }] : []),
+                { role: USER, content: user }
+              ] as ChatCompletionMessage[]
+            }, { signal, trace }))
+          } catch (failure) {
+            if (isCancelled(failure)) throw failure
+            throw new Error(`${role} (${provider.label}): ${describeProviderError(failure, provider)}`)
+          }
         }
       }
-      return compiledResult
-    } catch (error) {
-      if (!isCancelled(error)) {
-        logger.warn(`Chat compiler · ${describeProviderError(error, provider)}`)
-      }
-      return undefined
     }
+  }
+
+  /**
+   * Rewrites a composer draft on explicit request (Ctrl/Cmd+Click Send).
+   * Returns text for the composer only: nothing is sent, and TODOs and
+   * feedback are untouched.
+   */
+  public async compilePrompt(request: PromptCompileRequest): Promise<PromptCompileResult> {
+    const settings = workspace.getConfiguration("twinny")
+    const limit = promptCompilerMaxTurns(settings, 3)
+    const history = request.history ?? []
+    const historySummary = summarizeIntentHistory(history, limit)
+    logger.debug(`[PromptCompiler] requestId=${request.requestId} historyPairs=${historySummary.pairs.length} maxTurns=${limit} draftChars=${request.prompt.trim().length}`)
+    let instructions: { mode: string; source?: string; hash: string } = { mode: "default", hash: "" }
+    return this._promptCompiler.compile({
+      requestId: request.requestId,
+      prompt: request.prompt,
+      history: previousPromptHistory(history, limit)
+    }, {
+      systemPrompt: async () => {
+        const resolved = await this._promptInstructions.resolve("intent")
+        instructions = { mode: resolved.mode, source: resolved.source, hash: resolved.hash }
+        logger.debug("[Prompt] prompt-compiler mode=" + resolved.mode + " order=" + [resolved.content.trim() ? "compiler-base" : "", "compiler-input", "compiler-protocol"].filter(Boolean).join(","))
+        return [resolved.content.trim(), PROMPT_COMPILER_PROTOCOL].filter(Boolean).join("\n\n")
+      },
+      trace: isPromptCompilerTraceEnabled(settings)
+        ? async (record) => { await writePromptCompilerTrace(this.context, { ...record, history, maxTurns: limit, instructions }) }
+        : undefined
+    })
+  }
+
+  public cancelPromptCompile(requestId: string) {
+    this._promptCompiler.cancel(requestId, "user")
   }
 
   public async previewPromptInstructions(agentSelection: AgentSelection = "off") {
@@ -758,7 +681,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       chat,
       intent,
       chatEffective,
-      intentEffective: [intent.content.trim(), INTENT_COMPILER_PROTOCOL].filter(Boolean).join("\n\n"),
+      intentEffective: [intent.content.trim(), PROMPT_COMPILER_PROTOCOL].filter(Boolean).join("\n\n"),
       agentId: agent?.summary.id ?? (agentSelection === "default" ? "default" : undefined),
       agentWarning: agentSelection !== "off" && agentSelection !== "default" && !agent
         ? "The selected agent profile " + agentSelection + " is unavailable."
@@ -858,6 +781,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (this._missingMcpCapabilities.length) {
         this._bridge.emit(EVENT_NAME.twinnyNotification, `Agent MCP capabilities unavailable: ${this._missingMcpCapabilities.join(", ")}`)
       }
+      // The first model call must see the plan for this message, so planning
+      // is awaited here with a bound; a slower plan still reconciles after the reply.
+      if (isFeedbackEnabled(workspace.getConfiguration("twinny"))) {
+        const planning = this.startFeedbackPlanning(messages)
+        if (planning) await settleWithin(planning, FEEDBACK_PLAN_WAIT_MS)
+      }
       this._conversation = await buildChatTurn(messages, {
         systemPrompt: async () => {
           const snapshot = await this._context.systemPromptSnapshot()
@@ -891,20 +820,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       })
     } finally {
       this._preparing = false
-    }
-    const mode = workspace.getConfiguration("twinny").get<string>("chatToolsIntentCompilerMode", "ask")
-    if (mode === "always-refined") {
-      const latest = this._conversation.at(-1)
-      const prompt = typeof latest?.content === "string" ? latest.content.trim() : ""
-      if (prompt) {
-        const refined = await this.compileIntent(prompt)
-        if (refined) {
-          if (latest?.role === USER) {
-            latest.prompt = prompt
-            latest.content = refined.prompt
-          }
-        }
-      }
     }
     return this.run(provider, "", view)
   }
@@ -1192,12 +1107,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (itemId) throw new Error("This TODO is not awaiting evaluation")
       return []
     }
-    const provider = this.getIntentProvider()
+    const { provider, error: providerError } = await this.roleProvider("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny")))
     if (!provider) {
-      logger.warn("Feedback evaluator is unavailable: configure an active Intent provider to review in-review TODOs")
-      if (itemId || options.strict) throw new Error("Configure an active Intent provider before retrying TODO evaluation")
+      const message = "Feedback evaluation is unavailable: " + (providerError ?? "no Feedback provider is configured.")
+      logger.warn(message)
+      if (itemId || options.strict) throw new Error(message)
+      this._bridge.emit(EVENT_NAME.twinnyNotification, message)
       return []
     }
+    let providerFailure: string | undefined
     const evaluations = await Promise.all(candidates.map(async (review) => {
       try {
         const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async (correction) => {
@@ -1221,9 +1139,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
                 { role: SYSTEM, content: todoReviewSystemPrompt },
                 { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse) + (correction ? "\n\nCorrection required: " + correction : "") }
               ] as ChatCompletionMessage[]
-            }, { signal: controller.signal })), timedOut])
+            }, { signal: controller.signal, trace: { operationId: `feedback-evaluation-${randomUUID()}`, operationKind: "feedback", requestId: `request-${randomUUID()}`, provider: provider.provider } })), timedOut])
             } catch (error) {
-              throw new TodoEvaluationProviderError(redact(error instanceof Error ? error.message : String(error)))
+              throw new TodoEvaluationProviderError(redact(isCancelled(error) ? "Feedback evaluation was cancelled" : describeProviderError(error, provider)))
             }
           } finally {
             clearTimeout(timeout!)
@@ -1241,9 +1159,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       } catch (error) {
         logger.warn("Feedback evaluation failed for TODO " + review.task.id + " (" + (error instanceof TodoEvaluationProviderError ? "provider" : "validation/parsing") + "): " + redact(error instanceof Error ? error.message : String(error)))
         if (itemId || options.strict) throw error
+        if (error instanceof TodoEvaluationProviderError && !options.signal?.aborted) providerFailure ??= error.message
         return undefined
       }
     }))
+    if (providerFailure) this._bridge.emit(EVENT_NAME.twinnyNotification, "Feedback evaluation failed (" + provider.label + "): " + providerFailure)
     return evaluations.filter((evaluation): evaluation is TodoEvaluation => !!evaluation)
   }
 
@@ -1419,13 +1339,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   }
 
   private async activeIntentTaskProjection(): Promise<string> {
-    const settings = workspace.getConfiguration("twinny")
-    const compilerDisabled = !settings.get<boolean>("chatToolsIntentCompilerEnabled", false) || settings.get<string>("chatToolsIntentCompilerMode", "ask") === "always-original"
+    if (!isFeedbackEnabled(workspace.getConfiguration("twinny"))) return ""
     const scope = this.activeTodoScope()
     if (!scope || !this._todoRepository) return ""
     try {
       const active = await this._todoRepository.getActiveIntentContext(scope)
-      if (!active || (compilerDisabled && active.lastEvaluation?.decision !== "revise")) return ""
+      if (!active) return ""
       const clip = (value: string, limit: number) => value.length > limit ? value.slice(0, limit - 1) + "…" : value
       const projection = {
         type: "twinny_active_intent_task",
@@ -1591,10 +1510,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         { role: ASSISTANT, content: reply }
       ]
     }
-    const feedbackEnabled = workspace.getConfiguration("twinny").get<boolean>("chatToolsFeedbackEvaluatorEnabled", true)
+    const feedbackEnabled = isFeedbackEnabled(workspace.getConfiguration("twinny"))
     if (this.cancelled) execution.cancel()
-    if (reply !== undefined && !this.cancelled && feedbackEnabled && todoScope && intentAtStart) {
-      const continuation = await this.reconcileIntentTurn(todoScope, intentAtStart, reply, changed, view, execution, recoveryNotice)
+    let intentForTurn = intentAtStart
+    // A plan started with this message is written alongside the reply; it
+    // is awaited (bounded, and cancelled with the turn) before reconciling.
+    if (!intentForTurn && reply !== undefined && !this.cancelled && feedbackEnabled && todoScope && this._todoRepository) {
+      const planning = this._feedbackPlanner.pending()
+      if (planning) {
+        const outcome = await planning
+        logger.debug("[Feedback] plan outcome for this turn: " + outcome.status)
+        if (outcome.status === "planned" && !this.cancelled) {
+          intentForTurn = await this._todoRepository.getActiveIntentContext(todoScope)
+        }
+      }
+    }
+    if (reply !== undefined && !this.cancelled && feedbackEnabled && todoScope && intentForTurn) {
+      const continuation = await this.reconcileIntentTurn(todoScope, intentForTurn, reply, changed, view, execution, recoveryNotice)
       if (continuation && execution.claimContinuation() && !this.cancelled) {
         this._conversation = [...this._conversation, { role: USER, content: continuation }]
         logger.info("[Execution] continuing automatically after independent reconciliation")

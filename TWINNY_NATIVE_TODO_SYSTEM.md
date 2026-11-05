@@ -321,6 +321,8 @@ These IDs are illustrative and need not match Twinny's current format.
 
 ## 8. Integrating with the Intent Compiler and evaluator
 
+> **Current behavior:** TODO plans now come from **Feedback** (`twinny.feedback.*`) on every ordinary agent request, independently of the explicitly invoked Prompt Compiler (`twinny.promptCompiler.*`). See [INTENT.md](INTENT.md).
+
 **Stage 1:** Native TODOs work with no intent compiler, no Cerebras, and no external TODO MCP.
 
 **Stage 2:** An intent compiler creates or revises tasks using stable IDs and acceptance criteria. Plan reconciliation compares an incoming proposal to the existing list and performs targeted updates, not wholesale deletion/recreation.

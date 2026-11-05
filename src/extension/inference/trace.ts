@@ -2,8 +2,17 @@ import { randomUUID } from "crypto"
 
 import { logger } from "../../common/logger"
 
+/** What started an inference operation, as logged with each request. */
+export type InferenceOperationKind =
+  | "chat"
+  | "tool_loop"
+  | "feedback"
+  | "prompt_compiler"
+  | (string & {})
+
 export interface InferenceTraceContext {
   operationId: string
+  operationKind?: InferenceOperationKind
   requestId: string
   parentRequestId?: string
   toolLoopStep?: number
@@ -29,6 +38,7 @@ export const createInferenceTrace = (
 ): InferenceTraceContext => ({
   operationId: trace?.operationId ?? `operation-${randomUUID()}`,
   requestId: trace?.requestId ?? `request-${randomUUID()}`,
+  ...(trace?.operationKind ? { operationKind: trace.operationKind } : {}),
   ...(trace?.parentRequestId ? { parentRequestId: trace.parentRequestId } : {}),
   ...(trace?.toolLoopStep === undefined
     ? {}
@@ -227,6 +237,7 @@ export const startInferenceRequest = (
   activeRequests.set(key, request)
   inferenceEvent("request.started", {
     operation_id: trace.operationId,
+    operation_kind: trace.operationKind,
     request_id: trace.requestId,
     parent_request_id: trace.parentRequestId,
     tool_loop_step: trace.toolLoopStep,
