@@ -22,6 +22,7 @@ export async function* abortable<T>(
     yield* source
     return
   }
+  if (signal.aborted) throw cancelled(signal.reason)
   const iterator = source[Symbol.asyncIterator]()
   let onAbort = () => undefined as void
   const aborted = new Promise<never>((_, reject) => {

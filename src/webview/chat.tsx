@@ -13,6 +13,7 @@ import { v4 as uuidv4 } from "uuid"
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
 import { nextAgentSelection, withAgentSelection } from "../common/agents"
 import { ASSISTANT, EVENT_NAME, USER } from "../common/constants"
+import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
 import {
   AnyContextItem,
   ChatCompletionMessage,
@@ -440,15 +441,15 @@ export const Chat = (props: ChatProps): JSX.Element => {
     }, 1000)
   })
 
-  useServerEvent(EVENT_NAME.twinnyStopGeneration, () => {
+  useServerEvent(EVENT_NAME.twinnyStopGeneration, (stop) => {
     setIsLoading(false)
     setCompletion(null)
     stopRef.current = false
     generatingRef.current = false
-    const stopped = userStoppedRef.current
+    const stoppedByUser = userStoppedRef.current
     userStoppedRef.current = false
     const [next, ...rest] = queuedRef.current
-    if (next && !stopped) {
+    if (next && shouldResumeQueuedChat(stoppedByUser, stop?.cancelled === true)) {
       updateQueue(rest)
       // After this event's own state updates, so the reply is in the transcript first.
       setTimeout(() => sendRef.current(next), 0)
@@ -489,7 +490,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
   const handleStopGeneration = useCallback(() => {
     userStoppedRef.current = true
-    emit(EVENT_NAME.twinnyStopGeneration)
+    emit(EVENT_NAME.twinnyStopGeneration, {})
   }, [])
 
   const handleRegenerateMessage = (
@@ -674,7 +675,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const stopIfGenerating = useCallback(() => {
     if (!generatingRef.current) return false
     userStoppedRef.current = true
-    emit(EVENT_NAME.twinnyStopGeneration)
+    emit(EVENT_NAME.twinnyStopGeneration, {})
     return true
   }, [])
 

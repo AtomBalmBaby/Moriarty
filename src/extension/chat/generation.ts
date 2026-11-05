@@ -1,8 +1,15 @@
 import { ASSISTANT, EVENT_NAME } from "../../common/constants"
 import { formatCount, logger } from "../../common/logger"
 import { ChatCompletionMessage, ReplyChangesView, ReplyMeta, TwinnyProvider } from "../../common/types"
-import { GenerationRun, GenerationTracker } from "../generations"
+import { GenerationRun, GenerationTracker, StopInitiator } from "../generations"
 import { ChatRequest, InferenceClient, isCancelled } from "../inference"
+import {
+  cancelInferenceOperation,
+  createInferenceTrace,
+  finishInferenceOperation,
+  inferenceEvent,
+  InferenceTraceContext
+} from "../inference/trace"
 import { ExtensionBridge } from "../messaging/bridge"
 import { describeProviderError, describeProviderErrorPlain, isAbortError } from "../providers/errors"
 
@@ -45,6 +52,7 @@ export interface ReplyExtras {
 export class ChatGeneration {
   private _run?: GenerationRun
   private _cancelled = false
+  private _trace?: InferenceTraceContext
   /** Runs stopped because the user left their conversation: what they wrote is not kept. */
   private readonly _discarded = new WeakSet<GenerationRun>()
   private readonly _stopSubscription: { dispose(): void }
@@ -55,7 +63,7 @@ export class ChatGeneration {
   ) {
     // The stop command reaches every chat, the panel's as well as the
     // sidebar's, and between the parts of a review as well as during one.
-    this._stopSubscription = _generations.onDidStop(() => this.abort())
+    this._stopSubscription = _generations.onDidStop((initiator) => this.abort(initiator))
   }
 
   public dispose() {
@@ -71,10 +79,19 @@ export class ChatGeneration {
     this._cancelled = false
   }
 
-  public abort() {
+  public abort(initiator: StopInitiator = "user") {
     this._cancelled = true
-    this._run?.abort()
-    this._bridge.emit(EVENT_NAME.twinnyStopGeneration)
+    if (this._trace) {
+      cancelInferenceOperation(this._trace, initiator, "generation-stopped")
+    }
+    this._run?.abort(new DOMException(
+      `Twinny ${initiator === "user" ? "user stop" : "host cancellation"}`,
+      "AbortError"
+    ))
+    this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {
+      cancelled: true,
+      cancellationReason: initiator
+    })
   }
 
   /** Whether a reply is being written now. */
@@ -106,6 +123,19 @@ export class ChatGeneration {
     if (this._cancelled) return ""
     const run = this._generations.start("chat")
     this._run = run
+    const endpoint = provider.apiHostname
+      ? `${provider.apiProtocol ?? "http"}://${provider.apiHostname}${provider.apiPort ? `:${provider.apiPort}` : ""}${provider.apiPath ?? ""}`
+      : "sdk-managed"
+    const trace = createInferenceTrace({ provider: provider.provider, endpoint })
+    this._trace = trace
+    let operationState = "completed"
+    inferenceEvent("operation.started", {
+      operation_id: trace.operationId,
+      provider: provider.provider,
+      endpoint,
+      model: provider.modelName,
+      kind: "chat"
+    })
     let text = prefix
     let streamChunks = 0
     let streamedContentChars = 0
@@ -125,6 +155,7 @@ export class ChatGeneration {
     try {
       const chunks = inference.chat(request, {
         signal: run.signal,
+        trace,
         onBackend: (name) => {
           meta.provider = name
         },
@@ -176,7 +207,8 @@ export class ChatGeneration {
       if (reply || extras.keepEmpty?.()) this.addMessage(reply, finish(), extras.toolNotes?.(), extras.changes?.())
       return reply
     } catch (error) {
-      run.abort()
+      operationState = run.signal.aborted ? "cancelled" : "failed"
+      run.finish()
       // Keep whatever streamed before the failure; it is still useful.
       // A bare heading is not.
       const partial = text.trim() === prefix.trim() ? "" : text.trim()
@@ -187,8 +219,14 @@ export class ChatGeneration {
       return partial
     } finally {
       run.finish()
+      finishInferenceOperation(trace, operationState, {
+        duration_ms: Date.now() - started,
+        provider: provider.provider,
+        model: provider.modelName
+      })
+      if (this._trace === trace) this._trace = undefined
       if (this._run === run) this._run = undefined
-      this._bridge.emit(EVENT_NAME.twinnyStopGeneration)
+      this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {})
     }
   }
 

@@ -12,8 +12,17 @@ import {
 } from "fluency.js/dist/chat"
 
 import { API_PROVIDERS } from "../../../common/constants"
-import { isOpenAICompatibleProvider } from "../../../common/provider-validation"
+import {
+  getProviderOrigin,
+  isOpenAICompatibleProvider
+} from "../../../common/provider-validation"
 import { TwinnyProvider } from "../../../common/types"
+import {
+  activeInferenceRequestSnapshot,
+  createInferenceAttemptId,
+  createInferenceTrace,
+  inferenceEvent
+} from "../trace"
 import {
   ChatChunk,
   ChatFinishReason,
@@ -25,7 +34,7 @@ import {
 } from "../types"
 
 import { StreamResponse, usageFromResponse } from "./fim-dialects"
-import { logRequest } from "./json-stream"
+import { logRequest, streamJsonLines } from "./json-stream"
 
 /** fluency.js routes every local server through its OpenAI-compatible client. */
 export const getFluencyProvider = (provider: TwinnyProvider): LLMProvider =>
@@ -37,7 +46,9 @@ export const getFluencyProvider = (provider: TwinnyProvider): LLMProvider =>
 export const supportsStreaming = (provider: TwinnyProvider): boolean => {
   const entry = catalogue[provider.provider as keyof typeof catalogue]
   const streaming = entry?.supportsStreaming
-  return Array.isArray(streaming) ? streaming.includes(provider.modelName) : true
+  return Array.isArray(streaming)
+    ? streaming.includes(provider.modelName)
+    : true
 }
 
 /**
@@ -52,8 +63,16 @@ export const flattenTextContent = (messages: ChatMessage[]): ChatMessage[] =>
     const content = message.content as unknown
     if (!Array.isArray(content) || !content.length) return message
     const parts = content as Array<{ type?: string; text?: string }>
-    if (!parts.every((part) => part && part.type === "text" && typeof part.text === "string")) return message
-    return { ...message, content: parts.map((part) => part.text).join("\n") } as ChatMessage
+    if (
+      !parts.every(
+        (part) => part && part.type === "text" && typeof part.text === "string"
+      )
+    )
+      return message
+    return {
+      ...message,
+      content: parts.map((part) => part.text).join("\n")
+    } as ChatMessage
   })
 
 /**
@@ -66,12 +85,17 @@ export const flattenTextContent = (messages: ChatMessage[]): ChatMessage[] =>
  */
 export const parsableToolArguments = (messages: ChatMessage[]): ChatMessage[] =>
   messages.map((message) => {
-    const calls = (message as { tool_calls?: Array<{ function?: { arguments?: unknown } }> }).tool_calls
+    const calls = (
+      message as { tool_calls?: Array<{ function?: { arguments?: unknown } }> }
+    ).tool_calls
     if (!Array.isArray(calls) || !calls.length) return message
     return {
       ...message,
       tool_calls: calls.map((call) => {
-        const raw = typeof call.function?.arguments === "string" ? call.function.arguments.trim() : ""
+        const raw =
+          typeof call.function?.arguments === "string"
+            ? call.function.arguments.trim()
+            : ""
         let args = "{}"
         if (raw) {
           try {
@@ -86,21 +110,40 @@ export const parsableToolArguments = (messages: ChatMessage[]): ChatMessage[] =>
     } as ChatMessage
   })
 
-type ChatParameters = Pick<ChatRequest, "maxTokens" | "temperature" | "think" | "tools" | "reasoningEffort">
+type ChatParameters = Pick<
+  ChatRequest,
+  "maxTokens" | "temperature" | "think" | "tools" | "reasoningEffort"
+>
 
-const llamaCppSchema = (schema: Record<string, unknown>): Record<string, unknown> => {
+const llamaCppSchema = (
+  schema: Record<string, unknown>
+): Record<string, unknown> => {
   const compatible: Record<string, unknown> = {}
   const type = schema.type
   if (typeof type === "string") compatible.type = type
   else if (Array.isArray(type)) {
-    const types = type.filter((value): value is string => typeof value === "string")
+    const types = type.filter(
+      (value): value is string => typeof value === "string"
+    )
     if (types.length === 1) compatible.type = types[0]
   }
-  const description = typeof schema.description === "string" ? schema.description : ""
-  const allowedValues = Array.isArray(schema.enum) ? schema.enum.filter((value): value is string => typeof value === "string") : []
-  const enumDescription = allowedValues.length ? `Allowed values: ${allowedValues.join(", ")}.` : ""
-  if (description || enumDescription) compatible.description = [description, enumDescription].filter(Boolean).join(" ")
-  if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+  const description =
+    typeof schema.description === "string" ? schema.description : ""
+  const allowedValues = Array.isArray(schema.enum)
+    ? schema.enum.filter((value): value is string => typeof value === "string")
+    : []
+  const enumDescription = allowedValues.length
+    ? `Allowed values: ${allowedValues.join(", ")}.`
+    : ""
+  if (description || enumDescription)
+    compatible.description = [description, enumDescription]
+      .filter(Boolean)
+      .join(" ")
+  if (
+    schema.properties &&
+    typeof schema.properties === "object" &&
+    !Array.isArray(schema.properties)
+  ) {
     compatible.properties = Object.fromEntries(
       Object.entries(schema.properties).map(([name, property]) => [
         name,
@@ -111,9 +154,15 @@ const llamaCppSchema = (schema: Record<string, unknown>): Record<string, unknown
     )
   }
   if (Array.isArray(schema.required)) {
-    compatible.required = schema.required.filter((value): value is string => typeof value === "string")
+    compatible.required = schema.required.filter(
+      (value): value is string => typeof value === "string"
+    )
   }
-  if (schema.items && typeof schema.items === "object" && !Array.isArray(schema.items)) {
+  if (
+    schema.items &&
+    typeof schema.items === "object" &&
+    !Array.isArray(schema.items)
+  ) {
     compatible.items = llamaCppSchema(schema.items as Record<string, unknown>)
   }
   return compatible
@@ -122,15 +171,25 @@ const llamaCppSchema = (schema: Record<string, unknown>): Record<string, unknown
 const DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 
 const requiresCompatibilitySystemMessage = (provider: TwinnyProvider) =>
-  [API_PROVIDERS.LlamaCpp, API_PROVIDERS.OpenAICompatible].includes(provider.provider)
+  [API_PROVIDERS.LlamaCpp, API_PROVIDERS.OpenAICompatible].includes(
+    provider.provider
+  )
 
-const maybeWithSystemMessage = (provider: TwinnyProvider, messages: ChatMessage[]): ChatMessage[] => {
+const maybeWithSystemMessage = (
+  provider: TwinnyProvider,
+  messages: ChatMessage[]
+): ChatMessage[] => {
   if (!requiresCompatibilitySystemMessage(provider)) return messages
   if (messages.some((message) => message.role === "system")) return messages
-  return [{ role: "system", content: DEFAULT_SYSTEM_MESSAGE } as ChatMessage, ...messages]
+  return [
+    { role: "system", content: DEFAULT_SYSTEM_MESSAGE } as ChatMessage,
+    ...messages
+  ]
 }
 
-const ensureContentForCompatibility = (messages: ChatMessage[]): ChatMessage[] =>
+const ensureContentForCompatibility = (
+  messages: ChatMessage[]
+): ChatMessage[] =>
   messages.map((message) => {
     const copy = { ...message } as ChatMessage
     if (copy.content === null || copy.content === undefined) {
@@ -139,11 +198,19 @@ const ensureContentForCompatibility = (messages: ChatMessage[]): ChatMessage[] =
     return copy
   })
 
-const withReasoningHistory = (provider: TwinnyProvider, messages: ChatMessage[]): ChatMessage[] =>
+const withReasoningHistory = (
+  provider: TwinnyProvider,
+  messages: ChatMessage[]
+): ChatMessage[] =>
   messages.map((message): ChatMessage => {
     if (message.role !== "assistant") return message
     const reasoning = (message as { reasoning?: unknown }).reasoning
-    if (typeof reasoning !== "string" || !reasoning || !requiresCompatibilitySystemMessage(provider)) return message
+    if (
+      typeof reasoning !== "string" ||
+      !reasoning ||
+      !requiresCompatibilitySystemMessage(provider)
+    )
+      return message
     const rest = { ...message } as ChatMessage & { reasoning?: string }
     delete rest.reasoning
     return { ...rest, reasoning_content: reasoning } as ChatMessage
@@ -156,10 +223,17 @@ const withReasoningHistory = (provider: TwinnyProvider, messages: ChatMessage[])
  * checked against 0.33). Only Ollama gets it for now: OpenAI refuses
  * `none` for models that do not reason, and other servers vary.
  */
-const requestParameters = (provider: TwinnyProvider, request: ChatParameters) => ({
+const requestParameters = (
+  provider: TwinnyProvider,
+  request: ChatParameters
+) => ({
   ...(request.maxTokens !== undefined ? { max_tokens: request.maxTokens } : {}),
-  ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
-  ...(request.think === false && provider.provider === API_PROVIDERS.Ollama ? { reasoning_effort: "none" as const } : {}),
+  ...(request.temperature !== undefined
+    ? { temperature: request.temperature }
+    : {}),
+  ...(request.think === false && provider.provider === API_PROVIDERS.Ollama
+    ? { reasoning_effort: "none" as const }
+    : {}),
   ...(request.reasoningEffort && provider.provider === API_PROVIDERS.OpenAI
     ? { reasoning_effort: request.reasoningEffort }
     : {}),
@@ -170,7 +244,10 @@ const requestParameters = (provider: TwinnyProvider, request: ChatParameters) =>
           function: {
             name: tool.name,
             description: tool.description,
-            parameters: provider.provider === API_PROVIDERS.LlamaCpp ? llamaCppSchema(tool.parameters) : tool.parameters
+            parameters:
+              provider.provider === API_PROVIDERS.LlamaCpp
+                ? llamaCppSchema(tool.parameters)
+                : tool.parameters
           }
         }))
       }
@@ -198,7 +275,8 @@ const toolCallCollector = () => {
         const call = (calls[index] ??= { id: "", name: "", arguments: "" })
         if (delta.id) call.id = delta.id
         if (delta.function?.name) call.name += delta.function.name
-        if (delta.function?.arguments) call.arguments += delta.function.arguments
+        if (delta.function?.arguments)
+          call.arguments += delta.function.arguments
       }
     },
     take(): ChatToolCall[] | undefined {
@@ -213,19 +291,32 @@ const toolCallCollector = () => {
 
 /** The end of an answer, in the generic terms; a server that says nothing leaves it undefined. */
 const finishReasonOf = (reason: unknown): ChatFinishReason | undefined =>
-  reason === "length" ? "length" : typeof reason === "string" && reason ? "stop" : undefined
+  reason === "length"
+    ? "length"
+    : typeof reason === "string" && reason
+      ? "stop"
+      : undefined
 
 /** The thinking a reasoning model streams beside its answer, under whichever name the server uses. */
 const reasoningOf = (delta: unknown): string | undefined => {
   if (!delta || typeof delta !== "object") return undefined
-  const part = delta as { reasoning?: unknown; reasoning_content?: unknown; thinking?: unknown }
+  const part = delta as {
+    reasoning?: unknown
+    reasoning_content?: unknown
+    thinking?: unknown
+  }
   const text = part.reasoning ?? part.reasoning_content ?? part.thinking
   return typeof text === "string" && text ? text : undefined
 }
 
 /** One server, as far as what it accepts goes. */
 const serverKey = (provider: TwinnyProvider) =>
-  [provider.provider, provider.apiHostname ?? "", provider.apiPort ?? "", provider.apiPath ?? ""].join("|")
+  [
+    provider.provider,
+    provider.apiHostname ?? "",
+    provider.apiPort ?? "",
+    provider.apiPath ?? ""
+  ].join("|")
 
 /** Servers that turned `stream_options` down; it is not sent to them again. */
 const refusedStreamOptions = new Set<string>()
@@ -238,14 +329,209 @@ const refusedStreamOptions = new Set<string>()
  */
 const asksForUsage = (provider: TwinnyProvider) =>
   (provider.provider === API_PROVIDERS.OpenAI ||
-    (isOpenAICompatibleProvider(provider.provider) && provider.provider !== API_PROVIDERS.Qvac)) &&
+    (isOpenAICompatibleProvider(provider.provider) &&
+      provider.provider !== API_PROVIDERS.Qvac)) &&
   !refusedStreamOptions.has(serverKey(provider))
+
+const llamaCppChat = async function* (
+  config: TwinnyProvider,
+  request: ChatRequest,
+  options?: InferenceOptions
+): AsyncGenerator<ChatChunk> {
+  const trace = createInferenceTrace(options?.trace)
+  const origin = getProviderOrigin({
+    ...config,
+    apiHostname: config.apiHostname || "localhost"
+  })
+  const basePath = (config.apiPath ?? "").replace(/\/+$/, "")
+  const url = `${origin}${basePath}/chat/completions`
+  let attempt = 0
+
+  for (;;) {
+    if (options?.signal?.aborted) {
+      inferenceEvent(
+        "request.cancelled_before_dispatch",
+        {
+          operation_id: trace.operationId,
+          request_id: trace.requestId,
+          tool_loop_step: trace.toolLoopStep,
+          queued_requests: 0
+        },
+        "warn"
+      )
+      throw new DOMException("The request was cancelled.", "AbortError")
+    }
+    attempt += 1
+    const attemptId = createInferenceAttemptId()
+    const attemptTrace = { ...trace, attemptId }
+    const body = buildStreamingRequest(config, request.messages, request)
+    const wireBody = Object.fromEntries(
+      Object.entries(body).filter(([key]) => key !== "provider")
+    )
+    try {
+      const lines = streamJsonLines({
+        url,
+        headers: {
+          "Content-Type": "application/json",
+          ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {})
+        },
+        body: wireBody,
+        signal: options?.signal,
+        logBody: false,
+        trace: attemptTrace,
+        provider: config.provider,
+        model: config.modelName
+      })
+      const toolCalls = toolCallCollector()
+      for await (const part of lines) {
+        const choice = part.choices?.[0] as unknown as
+          | {
+              delta?: { content?: string; tool_calls?: unknown }
+              finish_reason?: unknown
+            }
+          | undefined
+        const delta = choice?.delta
+        toolCalls.add(delta?.tool_calls)
+        const reasoning = reasoningOf(delta)
+        const usage = usageFromResponse(part)
+        const finishReason = finishReasonOf(choice?.finish_reason)
+        const calls = finishReason ? toolCalls.take() : undefined
+        const extras = {
+          ...(reasoning ? { reasoning } : {}),
+          ...(finishReason ? { finishReason } : {}),
+          ...(calls ? { toolCalls: calls } : {})
+        }
+        if (usage) yield { content: delta?.content || "", usage, ...extras }
+        else if (delta?.content) yield { content: delta.content, ...extras }
+        else if (reasoning || finishReason) yield { content: "", ...extras }
+      }
+      const unfinished = toolCalls.take()
+      if (unfinished) yield { content: "", toolCalls: unfinished }
+      return
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (options?.signal?.aborted) {
+        throw error
+      }
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw error
+      }
+      if (
+        attempt === 1 &&
+        "stream_options" in body &&
+        /stream_options|include_usage/i.test(message)
+      ) {
+        refusedStreamOptions.add(serverKey(config))
+        inferenceEvent("http_attempt.retry_decision", {
+          operation_id: trace.operationId,
+          request_id: trace.requestId,
+          failed_attempt_id: attemptId,
+          next_attempt_number: attempt + 1,
+          reason: "stream-options-unsupported",
+          retry_bounded: true
+        })
+        continue
+      }
+      throw error
+    }
+  }
+}
 
 const usesTools = (messages: ChatMessage[], parameters: ChatParameters) =>
   !!parameters.tools?.length ||
   messages.some(
-    (message) => message.role === "tool" || !!(message as { tool_calls?: unknown[] }).tool_calls?.length
+    (message) =>
+      message.role === "tool" ||
+      !!(message as { tool_calls?: unknown[] }).tool_calls?.length
   )
+
+const startSdkAttempt = (
+  trace: ReturnType<typeof createInferenceTrace>,
+  config: TwinnyProvider,
+  request: ChatRequest,
+  attemptNumber: number,
+  signal?: AbortSignal
+) => {
+  const attemptId = createInferenceAttemptId()
+  const started = performance.now()
+  const endpoint = trace.endpoint ?? "sdk-managed"
+  inferenceEvent("provider_attempt.dispatched", {
+    operation_id: trace.operationId,
+    request_id: trace.requestId,
+    attempt_id: attemptId,
+    parent_request_id: trace.parentRequestId,
+    tool_loop_step: trace.toolLoopStep,
+    max_tool_loop_steps: trace.maxToolLoopSteps,
+    attempt_number: attemptNumber,
+    provider: config.provider,
+    endpoint,
+    transport: "provider-sdk",
+    attempt_scope:
+      "one-sdk-invocation; internal-http-retries-are-not-observable",
+    model: request.model,
+    dispatched_at: new Date().toISOString(),
+    active_requests: activeInferenceRequestSnapshot().length,
+    queued_requests: 0,
+    response_headers: "not-exposed-by-provider-sdk"
+  })
+  let terminal = false
+  let onAbort: () => void = () => undefined
+  const finish = (state: string, error?: unknown) => {
+    if (terminal) return
+    terminal = true
+    signal?.removeEventListener("abort", onAbort)
+    inferenceEvent(
+      "provider_attempt.terminal",
+      {
+        operation_id: trace.operationId,
+        request_id: trace.requestId,
+        attempt_id: attemptId,
+        parent_request_id: trace.parentRequestId,
+        tool_loop_step: trace.toolLoopStep,
+        max_tool_loop_steps: trace.maxToolLoopSteps,
+        attempt_number: attemptNumber,
+        provider: config.provider,
+        endpoint,
+        transport: "provider-sdk",
+        attempt_scope:
+          "one-sdk-invocation; internal-http-retries-are-not-observable",
+        state,
+        error_type:
+          error instanceof Error
+            ? error.name
+            : error === undefined
+              ? undefined
+              : typeof error,
+        duration_ms: Math.round(performance.now() - started),
+        active_requests: activeInferenceRequestSnapshot().length,
+        queued_requests: 0,
+        response_headers: "not-exposed-by-provider-sdk"
+      },
+      state === "failed" ? "warn" : "info"
+    )
+  }
+  onAbort = () => {
+    inferenceEvent(
+      "provider_attempt.cancellation_requested",
+      {
+        operation_id: trace.operationId,
+        request_id: trace.requestId,
+        attempt_id: attemptId,
+        cancellation_initiator: trace.cancellationInitiator ?? "unspecified",
+        transport_abort: "not-exposed-by-provider-sdk"
+      },
+      "warn"
+    )
+    finish("cancelled")
+  }
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener("abort", onAbort, { once: true })
+  return {
+    attemptId,
+    started,
+    finish
+  }
+}
 
 /**
  * A tool conversation sends its system prompt, its tool list and every
@@ -259,7 +545,9 @@ const usesTools = (messages: ChatMessage[], parameters: ChatParameters) =>
  */
 const withCacheBreakpoints = (messages: ChatMessage[]): ChatMessage[] => {
   const system = messages.findIndex((message) => message.role === "system")
-  const result = messages.map((message) => message.role as string).lastIndexOf("tool")
+  const result = messages
+    .map((message) => message.role as string)
+    .lastIndexOf("tool")
   if (system === -1 && result === -1) return messages
   return messages.map((message, index) =>
     index === system || index === result
@@ -286,14 +574,17 @@ export const buildStreamingRequest = (
   )
   return {
     messages:
-      provider.provider === API_PROVIDERS.Anthropic && usesTools(messages, parameters)
+      provider.provider === API_PROVIDERS.Anthropic &&
+      usesTools(messages, parameters)
         ? withCacheBreakpoints(prepared)
         : ensureContentForCompatibility(prepared),
     model: provider.modelName,
     stream: true,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     provider: getFluencyProvider(provider) as any,
-    ...(asksForUsage(provider) ? { stream_options: { include_usage: true } } : {}),
+    ...(asksForUsage(provider)
+      ? { stream_options: { include_usage: true } }
+      : {}),
     ...requestParameters(provider, parameters)
   } as CompletionStreaming<LLMProvider>
 }
@@ -314,7 +605,9 @@ export const buildBlockingRequest = (
   )
   const filtered = requiresCompatibilitySystemMessage(provider)
     ? ensureContentForCompatibility(prepared)
-    : ensureContentForCompatibility(prepared).filter((message) => message.role !== "system")
+    : ensureContentForCompatibility(prepared).filter(
+        (message) => message.role !== "system"
+      )
   return {
     messages: filtered,
     model: provider.modelName,
@@ -332,8 +625,7 @@ export const buildBlockingRequest = (
  */
 export const hostedTakesTools = (providerKind: string): boolean => {
   const entry = catalogue[providerKind as keyof typeof catalogue] as
-    | { supportsToolCalls?: boolean | readonly string[] }
-    | undefined
+    { supportsToolCalls?: boolean | readonly string[] } | undefined
   const tools = entry?.supportsToolCalls
   return tools === true || (Array.isArray(tools) && tools.length > 0)
 }
@@ -350,54 +642,210 @@ export async function* fluencyChat(
   options?: InferenceOptions
 ): AsyncGenerator<ChatChunk> {
   const messages = request.messages
+  if (config.provider === API_PROVIDERS.LlamaCpp) {
+    yield* llamaCppChat(config, request, options)
+    return
+  }
+  const trace = createInferenceTrace(options?.trace)
   if (supportsStreaming(config)) {
     const body = buildStreamingRequest(config, messages, request)
     logRequest(`${config.provider}/chat.completions (stream)`, body)
-    const parts = await client.chat.completions.create(body).catch((error: unknown) => {
+    let attemptNumber = 1
+    if (options?.signal?.aborted) {
+      throw new DOMException("The request was cancelled.", "AbortError")
+    }
+    let attempt = startSdkAttempt(
+      trace,
+      config,
+      request,
+      attemptNumber,
+      options?.signal
+    )
+    let parts: Awaited<ReturnType<typeof client.chat.completions.create>>
+    try {
+      parts = await client.chat.completions.create(body)
+    } catch (error) {
+      if (options?.signal?.aborted) {
+        attempt.finish("cancelled", error)
+        throw error
+      }
       // A strict server that does not know `stream_options` says so by
       // name; it is asked again without, and not asked for counts again.
       const asked = "stream_options" in body
-      if (!asked || !/stream_options|include_usage/i.test(error instanceof Error ? error.message : String(error))) {
+      if (
+        !asked ||
+        !/stream_options|include_usage/i.test(
+          error instanceof Error ? error.message : String(error)
+        )
+      ) {
+        attempt.finish(options?.signal?.aborted ? "cancelled" : "failed", error)
         throw error
       }
+      attempt.finish("retrying-compatibility", error)
       refusedStreamOptions.add(serverKey(config))
-      return client.chat.completions.create(buildStreamingRequest(config, messages, request))
-    })
-    const toolCalls = toolCallCollector()
-    for await (const part of parts) {
-      if (options?.signal?.aborted) break
-      const delta = part.choices[0]?.delta?.content
-      toolCalls.add((part.choices[0]?.delta as { tool_calls?: unknown } | undefined)?.tool_calls)
-      const reasoning = reasoningOf(part.choices[0]?.delta)
-      const usage = usageFromResponse(part as unknown as { usage?: StreamResponse["usage"] })
-      const finishReason = finishReasonOf(part.choices[0]?.finish_reason)
-      const calls = finishReason ? toolCalls.take() : undefined
-      const extras = {
-        ...(reasoning ? { reasoning } : {}),
-        ...(finishReason ? { finishReason } : {}),
-        ...(calls ? { toolCalls: calls } : {})
+      attemptNumber++
+      inferenceEvent("provider_attempt.retry_decision", {
+        operation_id: trace.operationId,
+        request_id: trace.requestId,
+        failed_attempt_id: attempt.attemptId,
+        next_attempt_number: attemptNumber,
+        reason: "stream-options-unsupported",
+        retry_bounded: true
+      })
+      if (options?.signal?.aborted) {
+        throw new DOMException("The request was cancelled.", "AbortError")
       }
-      if (usage) yield { content: delta || "", usage, ...extras }
-      else if (delta) yield { content: delta, ...extras }
-      else if (reasoning || finishReason) yield { content: "", ...extras }
+      attempt = startSdkAttempt(
+        trace,
+        config,
+        request,
+        attemptNumber,
+        options?.signal
+      )
+      try {
+        parts = await client.chat.completions.create(
+          buildStreamingRequest(config, messages, request)
+        )
+        if (options?.signal?.aborted) {
+          inferenceEvent(
+            "provider_attempt.late_response",
+            {
+              operation_id: trace.operationId,
+              request_id: trace.requestId,
+              attempt_id: attempt.attemptId,
+              reason: "cancelled-before-sdk-response"
+            },
+            "warn"
+          )
+          return
+        }
+      } catch (retryError) {
+        attempt.finish(
+          options?.signal?.aborted ? "cancelled" : "failed",
+          retryError
+        )
+        throw retryError
+      }
     }
-    // A server that ends the stream without a finish reason still made its calls.
-    const unfinished = toolCalls.take()
-    if (unfinished) yield { content: "", toolCalls: unfinished }
+    if (options?.signal?.aborted) {
+      inferenceEvent(
+        "provider_attempt.late_response",
+        {
+          operation_id: trace.operationId,
+          request_id: trace.requestId,
+          attempt_id: attempt.attemptId,
+          reason: "cancelled-before-sdk-response"
+        },
+        "warn"
+      )
+      attempt.finish("cancelled")
+      return
+    }
+    const toolCalls = toolCallCollector()
+    let firstChunk = true
+    let terminalState = "completed"
+    try {
+      for await (const part of parts) {
+        if (options?.signal?.aborted) {
+          inferenceEvent(
+            "provider_attempt.late_stream_chunk",
+            {
+              operation_id: trace.operationId,
+              request_id: trace.requestId,
+              attempt_id: attempt.attemptId,
+              reason: "cancelled"
+            },
+            "warn"
+          )
+          terminalState = "cancelled"
+          break
+        }
+        if (firstChunk) {
+          firstChunk = false
+          inferenceEvent("provider_attempt.first_chunk", {
+            operation_id: trace.operationId,
+            request_id: trace.requestId,
+            attempt_id: attempt.attemptId,
+            time_to_first_chunk_ms: Math.round(
+              performance.now() - attempt.started
+            )
+          })
+        }
+        const delta = part.choices[0]?.delta?.content
+        toolCalls.add(
+          (part.choices[0]?.delta as { tool_calls?: unknown } | undefined)
+            ?.tool_calls
+        )
+        const reasoning = reasoningOf(part.choices[0]?.delta)
+        const usage = usageFromResponse(
+          part as unknown as { usage?: StreamResponse["usage"] }
+        )
+        const finishReason = finishReasonOf(part.choices[0]?.finish_reason)
+        const calls = finishReason ? toolCalls.take() : undefined
+        const extras = {
+          ...(reasoning ? { reasoning } : {}),
+          ...(finishReason ? { finishReason } : {}),
+          ...(calls ? { toolCalls: calls } : {})
+        }
+        if (usage) yield { content: delta || "", usage, ...extras }
+        else if (delta) yield { content: delta, ...extras }
+        else if (reasoning || finishReason) yield { content: "", ...extras }
+      }
+      // A server that ends the stream without a finish reason still made its calls.
+      const unfinished = toolCalls.take()
+      if (unfinished) yield { content: "", toolCalls: unfinished }
+    } catch (error) {
+      terminalState = options?.signal?.aborted ? "cancelled" : "failed"
+      attempt.finish(terminalState, error)
+      throw error
+    } finally {
+      attempt.finish(terminalState)
+    }
     return
   }
   const body = buildBlockingRequest(config, messages, request)
   logRequest(`${config.provider}/chat.completions`, body)
-  const result = await client.chat.completions.create(body)
+  if (options?.signal?.aborted) {
+    throw new DOMException("The request was cancelled.", "AbortError")
+  }
+  const attempt = startSdkAttempt(trace, config, request, 1, options?.signal)
+  let result: Awaited<ReturnType<typeof client.chat.completions.create>>
+  try {
+    result = await client.chat.completions.create(body)
+    if (options?.signal?.aborted) {
+      inferenceEvent(
+        "provider_attempt.late_response",
+        {
+          operation_id: trace.operationId,
+          request_id: trace.requestId,
+          attempt_id: attempt.attemptId,
+          reason: "cancelled-before-sdk-response"
+        },
+        "warn"
+      )
+      attempt.finish("cancelled")
+      throw new DOMException("The request was cancelled.", "AbortError")
+    }
+    attempt.finish("completed")
+  } catch (error) {
+    attempt.finish(options?.signal?.aborted ? "cancelled" : "failed", error)
+    throw error
+  }
   const message = result.choices[0]?.message
   const content = message?.content
   const reasoning = reasoningOf(message)
-  const usage = usageFromResponse(result as unknown as { usage?: StreamResponse["usage"] })
+  const usage = usageFromResponse(
+    result as unknown as { usage?: StreamResponse["usage"] }
+  )
   const finishReason = finishReasonOf(result.choices[0]?.finish_reason)
   const toolCalls = toolCallCollector()
   toolCalls.add(
-    ((result.choices[0]?.message as { tool_calls?: ToolCallDelta[] } | undefined)?.tool_calls ?? [])
-      .map((call, index) => ({ ...call, index }))
+    (
+      (
+        result.choices[0]?.message as
+          { tool_calls?: ToolCallDelta[] } | undefined
+      )?.tool_calls ?? []
+    ).map((call, index) => ({ ...call, index }))
   )
   const calls = toolCalls.take()
   const extras = {
@@ -406,16 +854,17 @@ export async function* fluencyChat(
     ...(calls ? { toolCalls: calls } : {})
   }
   if (usage) yield { content: content || "", usage, ...extras }
-  else if (content || reasoning || finishReason || calls) yield { content: content || "", ...extras }
+  else if (content || reasoning || finishReason || calls)
+    yield { content: content || "", ...extras }
 }
 
 /** What fluency.js knows a hosted API serves, for the model dropdown. */
 export const hostedModels = (providerId: string): InferenceModel[] => {
   // The catalogue types `models` as a tuple per provider, or `true` for the
   // open-ended ones (OpenRouter); only the tuples are listable.
-  const entry = (
-    catalogue as unknown as Record<string, { models?: unknown }>
-  )[providerId]
+  const entry = (catalogue as unknown as Record<string, { models?: unknown }>)[
+    providerId
+  ]
   const names = Array.isArray(entry?.models)
     ? entry.models.filter((m): m is string => typeof m === "string")
     : []

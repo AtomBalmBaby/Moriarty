@@ -11,6 +11,7 @@ import { deadline } from "../../../common/deadline"
 import { getProviderOrigin } from "../../../common/provider-validation"
 import { TwinnyProvider } from "../../../common/types"
 import { p2pListingBase } from "../../p2p/endpoint"
+import { createInferenceTrace, startInferenceAttempt } from "../trace"
 import {
   ChatRequest,
   EmbeddingRequest,
@@ -126,7 +127,10 @@ export class HttpInferenceProvider implements InferenceProvider {
       url: this.url(),
       headers: this.headers(),
       body,
-      signal: options?.signal
+      signal: options?.signal,
+      trace: options?.trace,
+      provider: this._config.provider,
+      model: request.model
     })
     for await (const line of lines) {
       const text = getFimDataFromProvider(kind, line)
@@ -151,20 +155,39 @@ export class HttpInferenceProvider implements InferenceProvider {
     const url = this.url()
     const body = { model: request.model, input: request.input, stream: false }
     logRequest(url, body)
-    const response = await fetch(url, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify(body),
-      signal: options?.signal
+    const trace = createInferenceTrace(options?.trace)
+    const attempt = startInferenceAttempt(trace, {
+      provider: this._config.provider,
+      endpoint: url,
+      model: request.model
     })
-    if (!response.ok) throw await responseError(response)
-    const reply = await response.json()
-    const vectors = vectorsFromResponse(reply)
-    if (!vectors.length) {
-      throw new Error("The server answered but returned no embedding vector.")
+    let state = "failed"
+    let failure: unknown
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(body),
+        signal: options?.signal
+      })
+      attempt.response(response)
+      attempt.firstResponse()
+      if (!response.ok) throw await responseError(response)
+      const reply = await response.json()
+      const vectors = vectorsFromResponse(reply)
+      if (!vectors.length) {
+        throw new Error("The server answered but returned no embedding vector.")
+      }
+      const usage = usageFromEmbeddingResponse(reply)
+      state = "completed"
+      return usage ? { vectors, usage } : { vectors }
+    } catch (error) {
+      state = options?.signal?.aborted ? "cancelled" : "failed"
+      failure = error
+      throw error
+    } finally {
+      attempt.finish(state, failure)
     }
-    const usage = usageFromEmbeddingResponse(reply)
-    return usage ? { vectors, usage } : { vectors }
   }
 
   /**
@@ -189,7 +212,8 @@ export class HttpInferenceProvider implements InferenceProvider {
       }
     }
     const failure = attempts.find(
-      (attempt): attempt is PromiseRejectedResult => attempt.status === "rejected"
+      (attempt): attempt is PromiseRejectedResult =>
+        attempt.status === "rejected"
     )
     if (failure) throw failure.reason
     return []

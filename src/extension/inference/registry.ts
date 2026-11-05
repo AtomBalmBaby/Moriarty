@@ -18,6 +18,7 @@ import { HttpInferenceProvider } from "./adapters/http"
 import { InferenceError, toInferenceError, unsupportedCapability } from "./errors"
 import { SecretShieldMode, shieldClient, shouldShield } from "./shield"
 import { abortable } from "./stream"
+import { createInferenceTrace, inferenceEvent, startInferenceRequest } from "./trace"
 import {
   InferenceCapability,
   InferenceClient,
@@ -33,18 +34,43 @@ export interface InferenceAdapter {
 
 const guardedStream = <T>(
   provider: InferenceProvider,
-  run: (() => AsyncIterable<T>) | undefined,
+  run: ((options: InferenceOptions) => AsyncIterable<T>) | undefined,
   capability: InferenceCapability,
-  options?: InferenceOptions
+  options?: InferenceOptions,
+  model?: string
 ): AsyncIterable<T> => {
   if (!run || !provider.capabilities().includes(capability)) {
     throw unsupportedCapability(provider.id, capability)
   }
+  const trace = createInferenceTrace(options?.trace)
+  const tracedOptions = { ...options, trace }
   return (async function* () {
+    const finish = startInferenceRequest(trace, {
+      provider: trace.provider ?? provider.id,
+      endpoint: trace.endpoint ?? "sdk-managed",
+      model,
+      capability
+    }, options?.signal)
+    let state = "completed"
     try {
-      yield* abortable(run(), options?.signal)
+      if (options?.signal?.aborted) {
+        inferenceEvent("request.cancelled_before_dispatch", {
+          operation_id: trace.operationId,
+          request_id: trace.requestId,
+          provider: trace.provider ?? provider.id,
+          tool_loop_step: trace.toolLoopStep,
+          queued_requests: 0
+        }, "warn")
+        state = "cancelled"
+        throw options.signal.reason ?? new DOMException("The request was cancelled.", "AbortError")
+      }
+      yield* abortable(run(tracedOptions), options?.signal)
     } catch (error) {
+      state = options?.signal?.aborted ? "cancelled" : "failed"
+      finish(state, error)
       throw toInferenceError(error)
+    } finally {
+      finish(state)
     }
   })()
 }
@@ -52,15 +78,39 @@ const guardedStream = <T>(
 const guardedPromise = async <T>(
   provider: InferenceProvider,
   what: InferenceCapability | "models",
-  run: (() => Promise<T>) | undefined
+  run: ((options: InferenceOptions) => Promise<T>) | undefined,
+  options?: InferenceOptions,
+  model?: string
 ): Promise<T> => {
   if (!run || (what !== "models" && !provider.capabilities().includes(what))) {
     throw unsupportedCapability(provider.id, what)
   }
+  const trace = createInferenceTrace(options?.trace)
+  const finish = startInferenceRequest(trace, {
+    provider: trace.provider ?? provider.id,
+    endpoint: trace.endpoint ?? "sdk-managed",
+    model,
+    capability: what
+  }, options?.signal)
+  let state = "completed"
   try {
-    return await run()
+    if (options?.signal?.aborted) {
+      inferenceEvent("request.cancelled_before_dispatch", {
+        operation_id: trace.operationId,
+        request_id: trace.requestId,
+        provider: trace.provider ?? provider.id,
+        queued_requests: 0
+      }, "warn")
+      state = "cancelled"
+      throw options.signal.reason ?? new DOMException("The request was cancelled.", "AbortError")
+    }
+    return await run({ ...options, trace })
   } catch (error) {
+    state = options?.signal?.aborted ? "cancelled" : "failed"
+    finish(state, error)
     throw toInferenceError(error)
+  } finally {
+    finish(state)
   }
 }
 
@@ -69,26 +119,30 @@ export const guard = (provider: InferenceProvider): InferenceClient => ({
   id: provider.id,
   capabilities: () => provider.capabilities(),
   models: (options) =>
-    guardedPromise(provider, "models", provider.models && (() => provider.models!(options))),
+    guardedPromise(provider, "models", provider.models && ((o) => provider.models!(o)), options),
   fim: (request, options) =>
     guardedStream(
       provider,
-      provider.fim && (() => provider.fim!(request, options)),
+      provider.fim && ((o) => provider.fim!(request, o)),
       "fim",
-      options
+      options,
+      request.model
     ),
   chat: (request, options) =>
     guardedStream(
       provider,
-      provider.chat && (() => provider.chat!(request, options)),
+      provider.chat && ((o) => provider.chat!(request, o)),
       "chat",
-      options
+      options,
+      request.model
     ),
   embeddings: (request, options) =>
     guardedPromise(
       provider,
       "embeddings",
-      provider.embeddings && (() => provider.embeddings!(request, options))
+      provider.embeddings && ((o) => provider.embeddings!(request, o)),
+      options,
+      request.model
     )
 })
 
@@ -129,7 +183,45 @@ export class ProviderRegistry {
         `No inference adapter is registered for provider "${config.provider}".`
       )
     }
-    return guard(adapter.create(config))
+    const endpoint = config.apiHostname
+      ? `${config.apiProtocol ?? "http"}://${config.apiHostname}${config.apiPort ? `:${config.apiPort}` : ""}${config.apiPath ?? ""}`
+      : "sdk-managed"
+    const provider = guard(adapter.create(config))
+    return {
+      ...provider,
+      chat: (request, options) => provider.chat(request, {
+        ...options,
+        trace: createInferenceTrace({
+          ...options?.trace,
+          endpoint,
+          provider: config.provider
+        })
+      }),
+      fim: (request, options) => provider.fim(request, {
+        ...options,
+        trace: createInferenceTrace({
+          ...options?.trace,
+          endpoint,
+          provider: config.provider
+        })
+      }),
+      embeddings: (request, options) => provider.embeddings(request, {
+        ...options,
+        trace: createInferenceTrace({
+          ...options?.trace,
+          endpoint,
+          provider: config.provider
+        })
+      }),
+      models: (options) => provider.models({
+        ...options,
+        trace: createInferenceTrace({
+          ...options?.trace,
+          endpoint,
+          provider: config.provider
+        })
+      })
+    }
   }
 }
 

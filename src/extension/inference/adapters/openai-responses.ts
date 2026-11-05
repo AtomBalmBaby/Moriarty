@@ -10,6 +10,7 @@
  */
 import { getProviderOrigin } from "../../../common/provider-validation"
 import { TwinnyProvider } from "../../../common/types"
+import { createInferenceTrace, startInferenceAttempt } from "../trace"
 import {
   ChatChunk,
   ChatFinishReason,
@@ -36,7 +37,10 @@ export const needsResponsesApi = (request: ChatRequest) =>
 
 const baseUrl = (config: TwinnyProvider) =>
   config.apiHostname
-    ? `${getProviderOrigin(config)}${config.apiPath || "/v1"}`.replace(/\/$/, "")
+    ? `${getProviderOrigin(config)}${config.apiPath || "/v1"}`.replace(
+        /\/$/,
+        ""
+      )
     : DEFAULT_BASE
 
 /** One request to `/v1/responses`, streamed as twinny chat chunks. */
@@ -62,78 +66,112 @@ export async function* responsesChat(
           }))
         }
       : {}),
-    ...(request.reasoningEffort ? { reasoning: { effort: request.reasoningEffort } } : {}),
-    ...(request.maxTokens !== undefined && request.maxTokens > 0 ? { max_output_tokens: request.maxTokens } : {}),
-    ...(request.temperature !== undefined ? { temperature: request.temperature } : {})
+    ...(request.reasoningEffort
+      ? { reasoning: { effort: request.reasoningEffort } }
+      : {}),
+    ...(request.maxTokens !== undefined && request.maxTokens > 0
+      ? { max_output_tokens: request.maxTokens }
+      : {}),
+    ...(request.temperature !== undefined
+      ? { temperature: request.temperature }
+      : {})
   }
   const url = `${baseUrl(config)}/responses`
   logRequest(url, body)
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {})
-    },
-    body: JSON.stringify(body),
-    signal: options?.signal
+  const trace = createInferenceTrace(options?.trace)
+  const attempt = startInferenceAttempt(trace, {
+    provider: config.provider,
+    endpoint: url,
+    model: body.model
   })
-  if (!response.ok) throw await responseError(response)
-  if (!response.body) throw new Error("The server answered without a body.")
+  let state = "consumer-stopped"
+  let failure: unknown
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {})
+      },
+      body: JSON.stringify(body),
+      signal: options?.signal
+    })
+    attempt.response(response)
+    if (!response.ok) throw await responseError(response)
+    if (!response.body) throw new Error("The server answered without a body.")
 
-  const calls: ChatToolCall[] = []
-  const text: string[] = []
-  const reasoning: string[] = []
-  for await (const event of responseEvents(response.body)) {
-    if (options?.signal?.aborted) return
-    switch (event.type) {
-      // A refusal is the model's answer too; left out, the reply would be blank.
-      case "response.output_text.delta":
-      case "response.refusal.delta":
-        if (event.delta) text.push(event.delta)
-        break
-      case "response.reasoning_summary_text.delta":
-        if (event.delta) reasoning.push(event.delta)
-        break
-      case "response.output_item.done":
-        if (event.item?.type === "function_call" && event.item.name) {
-          calls.push({
-            id: event.item.call_id || `call_${calls.length}`,
-            name: event.item.name,
-            arguments: event.item.arguments ?? ""
-          })
-        }
-        break
-      case "response.completed": {
-        const usage: InferenceUsage | undefined = event.response?.usage
-          ? {
-              promptTokens: event.response.usage.input_tokens,
-              completionTokens: event.response.usage.output_tokens
-            }
-          : undefined
-        if (text.length) yield { content: text.join("") }
-        if (reasoning.length) {
-          yield { content: "", reasoning: reasoning.join("") }
-        }
-        const finishReason: ChatFinishReason = "stop"
-        yield {
-          content: "",
-          finishReason,
-          ...(usage ? { usage } : {}),
-          ...(calls.length ? { toolCalls: [...calls] } : {})
-        }
+    const calls: ChatToolCall[] = []
+    const text: string[] = []
+    const reasoning: string[] = []
+    for await (const event of responseEvents(response.body)) {
+      attempt.firstResponse(event.type)
+      if (options?.signal?.aborted) {
+        state = "cancelled"
         return
       }
-      case "response.incomplete":
-        throw new Error(
-          `The response was incomplete${event.response?.incomplete_details?.reason ? `: ${event.response.incomplete_details.reason}` : ""}.`
-        )
-      case "response.failed":
-        throw new Error(
-          event.response?.error?.message || "The response failed."
-        )
-      case "error":
-        throw new Error(event.message || event.error?.message || "The server reported an error.")
+      switch (event.type) {
+        // A refusal is the model's answer too; left out, the reply would be blank.
+        case "response.output_text.delta":
+        case "response.refusal.delta":
+          if (event.delta) text.push(event.delta)
+          break
+        case "response.reasoning_summary_text.delta":
+          if (event.delta) reasoning.push(event.delta)
+          break
+        case "response.output_item.done":
+          if (event.item?.type === "function_call" && event.item.name) {
+            calls.push({
+              id: event.item.call_id || `call_${calls.length}`,
+              name: event.item.name,
+              arguments: event.item.arguments ?? ""
+            })
+          }
+          break
+        case "response.completed": {
+          state = "completed"
+          const usage: InferenceUsage | undefined = event.response?.usage
+            ? {
+                promptTokens: event.response.usage.input_tokens,
+                completionTokens: event.response.usage.output_tokens
+              }
+            : undefined
+          if (text.length) yield { content: text.join("") }
+          if (reasoning.length) {
+            yield { content: "", reasoning: reasoning.join("") }
+          }
+          const finishReason: ChatFinishReason = "stop"
+          yield {
+            content: "",
+            finishReason,
+            ...(usage ? { usage } : {}),
+            ...(calls.length ? { toolCalls: [...calls] } : {})
+          }
+          return
+        }
+        case "response.incomplete":
+          throw new Error(
+            `The response was incomplete${event.response?.incomplete_details?.reason ? `: ${event.response.incomplete_details.reason}` : ""}.`
+          )
+        case "response.failed":
+          throw new Error(
+            event.response?.error?.message || "The response failed."
+          )
+        case "error":
+          throw new Error(
+            event.message ||
+              event.error?.message ||
+              "The server reported an error."
+          )
+      }
     }
+    throw new Error("The response ended without response.completed.")
+  } catch (error) {
+    state = options?.signal?.aborted ? "cancelled" : "failed"
+    failure = error
+    throw error
+  } finally {
+    if (options?.signal?.aborted && state === "consumer-stopped")
+      state = "cancelled"
+    attempt.finish(state, failure)
   }
-  throw new Error("The response ended without response.completed.")
 }

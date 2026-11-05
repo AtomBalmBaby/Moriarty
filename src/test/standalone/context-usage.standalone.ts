@@ -9,6 +9,7 @@ import * as http from "node:http"
 import { AddressInfo } from "node:net"
 import { test } from "node:test"
 
+import { logger } from "../../common/logger"
 import { ChatCompletionMessage, TwinnyProvider } from "../../common/types"
 import { ToolSteps } from "../../extension/chat/tool-steps"
 import { buildStreamingRequest, fluencyChat, parsableToolArguments } from "../../extension/inference/adapters/fluency"
@@ -119,19 +120,100 @@ test("a server that refuses stream_options is asked again without, and not asked
     }
   } as unknown as TokenJS
   const strict = provider("openai-compatible", { apiHostname: "strict.example", apiPort: 9 })
+  const records: string[] = []
+  const info = logger.info
+  const warn = logger.warn
+  logger.info = (message) => records.push(message)
+  logger.warn = (message) => records.push(message)
   const read = async () => {
     const chunks: ChatChunk[] = []
     for await (const chunk of fluencyChat(client, strict, { model: "m", messages: conversation })) chunks.push(chunk)
     return chunks.map((chunk) => chunk.content).join("")
   }
-  assert.strictEqual(await read(), "Hello")
-  assert.strictEqual(await read(), "Hello")
+  try {
+    assert.strictEqual(await read(), "Hello")
+    assert.strictEqual(await read(), "Hello")
+  } finally {
+    logger.info = info
+    logger.warn = warn
+  }
+  const events = records
+    .filter((record) => record.startsWith("[Inference]"))
+    .map((record) => JSON.parse(record.slice("[Inference] ".length)) as Record<string, unknown>)
+  const dispatched = events.filter((event) => event.event === "provider_attempt.dispatched")
+  const terminal = events.filter((event) => event.event === "provider_attempt.terminal")
+  assert.strictEqual(dispatched.length, 3)
+  assert.strictEqual(terminal.length, 3)
+  assert.notStrictEqual(dispatched[0].attempt_id, dispatched[1].attempt_id)
+  assert.strictEqual(dispatched[0].request_id, dispatched[1].request_id)
+  assert.strictEqual(dispatched[0].operation_id, dispatched[1].operation_id)
+  assert.strictEqual(dispatched[0].attempt_number, 1)
+  assert.strictEqual(dispatched[1].attempt_number, 2)
+  assert.strictEqual(terminal[0].state, "retrying-compatibility")
+  assert.strictEqual(terminal[1].state, "completed")
   assert.deepStrictEqual(
     bodies.map((body) => "stream_options" in body),
     [true, false, false],
     "refused once, then left out for that server"
   )
   assert.ok("stream_options" in buildStreamingRequest(provider("openai-compatible", { apiHostname: "other.example" }), conversation))
+})
+
+test("SDK cancellation ends its trace and ignores a late response without retrying", async () => {
+  let resolveCreate!: (stream: AsyncIterable<unknown>) => void
+  const client = {
+    chat: {
+      completions: {
+        create: () => new Promise<AsyncIterable<unknown>>((resolve) => {
+          resolveCreate = resolve
+        })
+      }
+    }
+  } as unknown as TokenJS
+  const controller = new AbortController()
+  const records: string[] = []
+  const info = logger.info
+  const warn = logger.warn
+  logger.info = (message) => records.push(message)
+  logger.warn = (message) => records.push(message)
+  const chunks: ChatChunk[] = []
+  const consume = (async () => {
+    for await (const chunk of fluencyChat(
+      client,
+      provider("openai-compatible"),
+      { model: "m", messages: conversation },
+      {
+        signal: controller.signal,
+        trace: { operationId: "sdk-cancel-operation", requestId: "sdk-cancel-request" }
+      }
+    )) chunks.push(chunk)
+  })()
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    controller.abort()
+    resolveCreate((async function* () {
+      yield { choices: [{ delta: { content: "late" }, finish_reason: "stop" }] }
+    })())
+    await consume
+  } finally {
+    logger.info = info
+    logger.warn = warn
+  }
+  const events = records
+    .filter((record) => record.startsWith("[Inference]"))
+    .map((record) => JSON.parse(record.slice("[Inference] ".length)) as Record<string, unknown>)
+  const terminal = events.filter((event) => event.event === "provider_attempt.terminal")
+  assert.strictEqual(chunks.length, 0)
+  assert.strictEqual(terminal.length, 1)
+  assert.strictEqual(terminal[0].state, "cancelled")
+  assert.strictEqual(
+    events.filter((event) => event.event === "provider_attempt.late_response").length,
+    1
+  )
+  assert.strictEqual(
+    events.find((event) => event.event === "provider_attempt.cancellation_requested")?.transport_abort,
+    "not-exposed-by-provider-sdk"
+  )
 })
 
 const fakeServer = async (routes: Record<string, (body: unknown) => unknown>) => {

@@ -23,6 +23,7 @@ export interface GenerationState {
 }
 
 type Listener<T> = (value: T) => void
+export type StopInitiator = "user" | "host"
 
 const IDLE: GenerationState = { busy: false, stoppable: false }
 
@@ -35,7 +36,7 @@ const IDLE: GenerationState = { busy: false, stoppable: false }
 export class GenerationTracker {
   private readonly _live = new Set<GenerationRun>()
   private readonly _changed = new Set<Listener<GenerationState>>()
-  private readonly _stopped = new Set<Listener<void>>()
+  private readonly _stopped = new Set<Listener<StopInitiator>>()
   private _state = IDLE
 
   public get state(): GenerationState {
@@ -69,16 +70,20 @@ export class GenerationTracker {
    * needs to know, even with nothing running (a multi-part review between
    * parts has to hear it too).
    */
-  public stopAll() {
-    for (const run of [...this._live]) run.abort()
-    for (const listener of [...this._stopped]) listener()
+  public stopAll(initiator: StopInitiator = "user") {
+    const reason = new DOMException(
+      `Twinny ${initiator === "user" ? "user stop" : "host cancellation"}`,
+      "AbortError"
+    )
+    for (const run of [...this._live]) run.abort(reason)
+    for (const listener of [...this._stopped]) listener(initiator)
   }
 
   public onDidChange(listener: Listener<GenerationState>) {
     return this.subscribe(this._changed, listener)
   }
 
-  public onDidStop(listener: Listener<void>) {
+  public onDidStop(listener: Listener<StopInitiator>) {
     return this.subscribe(this._stopped, listener)
   }
 

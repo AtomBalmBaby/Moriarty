@@ -193,7 +193,7 @@ export class BaseProvider {
         await Promise.all([teamShare?.teamChanged(), teamPlugins?.teamChanged()])
       },
       chatGPTPlanSigningOut: () => {
-        this._generations.stopAll()
+        this._generations.stopAll("host")
         this.chat?.abortAll()
       }
     })
@@ -428,7 +428,7 @@ export class BaseProvider {
 
   public destroyStream = () => {
     this.chat?.abort()
-    this.bridge?.emit(EVENT_NAME.twinnyStopGeneration)
+    if (!this.chat) this.bridge?.emit(EVENT_NAME.twinnyStopGeneration, { cancelled: true })
   }
 
   public async streamTemplateCompletion(template: string) {

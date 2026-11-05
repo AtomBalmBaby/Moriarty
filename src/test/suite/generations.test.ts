@@ -22,8 +22,9 @@ const provider = {
 
 const stubBridge = () => {
   const emitted: string[] = []
-  const bridge = { emit: (type: string) => emitted.push(type) } as unknown as ExtensionBridge
-  return { bridge, emitted }
+  const events: Array<{ type: string; data?: unknown }> = []
+  const bridge = { emit: (type: string, data?: unknown) => { emitted.push(type); events.push({ type, data }) } } as unknown as ExtensionBridge
+  return { bridge, emitted, events }
 }
 
 /** A chat that sends one chunk and then waits until it is stopped. */
@@ -107,7 +108,7 @@ suite("Generation tracker", () => {
 
   test("the stop command stops a streaming chat, and the next part of a review", async () => {
     const tracker = new GenerationTracker()
-    const { bridge, emitted } = stubBridge()
+    const { bridge, emitted, events } = stubBridge()
     const generation = new ChatGeneration(bridge, tracker)
     const { client, running } = hangingChat()
     try {
@@ -120,6 +121,7 @@ suite("Generation tracker", () => {
       assert.strictEqual(await reply, "partial")
       assert.ok(generation.cancelled)
       assert.ok(emitted.includes(EVENT_NAME.twinnyStopGeneration))
+      assert.deepStrictEqual(events.find((event) => event.type === EVENT_NAME.twinnyStopGeneration)?.data, { cancelled: true })
       // A later part does not start until the next request resets it.
       assert.strictEqual(await generation.generate(client, request, provider), "")
       assert.strictEqual(tracker.state.busy, false)

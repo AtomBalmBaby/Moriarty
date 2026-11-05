@@ -17,6 +17,7 @@
  * through the secret shield like the rest of the conversation.
  */
 import { API_PROVIDERS, ASSISTANT, DEFAULT_AGENT_STEPS, OPEN_AI_COMPATIBLE_PROVIDERS, SYSTEM, USER } from "../../common/constants"
+import { logger } from "../../common/logger"
 import { HOSTED_PROVIDERS } from "../../common/provider-validation"
 import {
   ChatChunk,
@@ -30,6 +31,7 @@ import {
   isCancelled
 } from "../inference"
 import { hostedTakesTools } from "../inference/adapters/fluency"
+import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
 import { ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
 import { instructionsSection } from "./instructions"
@@ -55,7 +57,7 @@ const MIN_RESULT_CHARS = 1000
 /** Calls repeated in one reply, or requests in a row of calls that cannot be read, before the model is asked to answer. */
 const MAX_REPEATED_CALLS = 3
 const MAX_UNREADABLE_IN_A_ROW = 3
-
+const MAX_NO_PROGRESS_STEPS = 3
 export type ToolMode = "native" | "text"
 
 /**
@@ -394,6 +396,7 @@ interface ResultSlot {
 }
 
 class ToolLoop {
+  private readonly _logicalRequestId = createInferenceTrace().operationId
   private _mode: ToolMode
   private _effort: ChatRequest["reasoningEffort"]
   private _messages: ChatMessage[] = []
@@ -416,6 +419,8 @@ class ToolLoop {
   private _repeats = 0
   /** Requests in a row whose every call could not be read. */
   private _unreadable = 0
+  /** Tool turns in a row that all fail or return no search results. */
+  private _noProgressSteps = 0
   /** Set when the model goes round in circles: the next request asks for its answer. */
   private _stuck = false
 
@@ -456,7 +461,19 @@ class ToolLoop {
 
     // Set once a tool's result says to answer now (an edit waits for review).
     let settled = false
+    let requestSequence = 0
+    const operationId = options?.trace?.operationId ?? this._logicalRequestId
     for (let step = 0; ; step++) {
+      if (outer?.aborted) {
+        inferenceEvent("request.cancelled_before_dispatch", {
+          operation_id: operationId,
+          tool_loop_step: step + 1,
+          max_tool_loop_steps: maxSteps,
+          queued_requests: 0,
+          reason: "operation-aborted-before-next-tool-loop-step"
+        }, "warn")
+        throw cancelled(outer.reason)
+      }
       if (step > 0) this.steer()
       const last = settled || this._stuck || step >= maxSteps
       const native = this._mode === "native"
@@ -465,6 +482,16 @@ class ToolLoop {
       const closing = last && !settled
 
       await this.fit((tools ? definitionChars : 0) + (closing ? FINAL_ANSWER_PROMPT.length : 0))
+      if (outer?.aborted) {
+        inferenceEvent("request.cancelled_before_dispatch", {
+          operation_id: operationId,
+          tool_loop_step: step + 1,
+          max_tool_loop_steps: maxSteps,
+          queued_requests: 0,
+          reason: "operation-aborted-during-context-preparation"
+        }, "warn")
+        throw cancelled(outer.reason)
+      }
       const sent = closing ? withClosingPrompt(this._messages) : this._messages
       const promptChars = charsOf(sent) + (tools ? definitionChars : 0)
       this._options.onRequest?.(promptChars, step, this._mode, this._estimator.tokens(promptChars))
@@ -475,6 +502,7 @@ class ToolLoop {
       const forward = () => stepAbort.abort(outer?.reason)
       if (outer?.aborted) forward()
       else outer?.addEventListener("abort", forward, { once: true })
+      const requestId = `${operationId}-request-${++requestSequence}`
 
       const reply = { text: "", shown: 0, toolCalls: undefined as ChatToolCall[] | undefined, reasoning: "" }
       let found: FoundCall | undefined
@@ -489,7 +517,18 @@ class ToolLoop {
             ...(this._effort ? { reasoningEffort: this._effort } : {}),
             ...(tools ? { tools } : {})
           },
-          { ...options, signal: stepAbort.signal }
+          {
+            ...options,
+            signal: stepAbort.signal,
+            trace: {
+              operationId,
+              requestId,
+              parentRequestId: options?.trace?.requestId,
+              toolLoopStep: step + 1,
+              maxToolLoopSteps: maxSteps,
+              cancellationInitiator: options?.trace?.cancellationInitiator
+            }
+          }
         )
         for await (const chunk of chunks) {
           reply.text += chunk.content
@@ -513,8 +552,17 @@ class ToolLoop {
           }
         }
       } catch (error) {
-        if (outer?.aborted) throw error
+        if (outer?.aborted) {
+          throw error
+        }
         if (this._effort && !reply.text && refusesReasoningEffort(error)) {
+          inferenceEvent("tool_loop.retry_decision", {
+            operation_id: operationId,
+            request_id: requestId,
+            tool_loop_step: step + 1,
+            reason: "reasoning-effort-unsupported",
+            next_action: "new-request-without-reasoning-effort"
+          })
           this._options.onFallback?.((error as Error).message, "reasoning-effort")
           this._effort = undefined
           step--
@@ -524,6 +572,13 @@ class ToolLoop {
           // A server can reject native calls outright or fail to build its
           // tool-schema grammar; either way, no tool ran and text mode is safe.
           if (!this._results.length) {
+            inferenceEvent("tool_loop.retry_decision", {
+              operation_id: operationId,
+              request_id: requestId,
+              tool_loop_step: step + 1,
+              reason: "native-tools-unsupported",
+              next_action: "new-request-in-text-tool-mode"
+            })
             this._options.onFallback?.((error as Error).message, "tools")
             this._mode = "text"
             this._messages = this.prompt(request)
@@ -533,6 +588,13 @@ class ToolLoop {
           // Refused on the last request, which carries tool history but no
           // tools: say the history in plain messages instead, once.
           if (last && !this._flattened) {
+            inferenceEvent("tool_loop.retry_decision", {
+              operation_id: operationId,
+              request_id: requestId,
+              tool_loop_step: step + 1,
+              reason: "native-tool-history-unsupported",
+              next_action: "new-request-with-flattened-history"
+            })
             this._flattened = true
             this._messages = flattenToolHistory(this._messages)
             this._results = []
@@ -545,7 +607,8 @@ class ToolLoop {
         if (!isCancelled(error)) throw error
       } finally {
         outer?.removeEventListener("abort", forward)
-        stepAbort.abort()
+        if (found) stepAbort.abort(new Error("Twinny tool call detected"))
+        else stepAbort.abort()
       }
 
       this.count(promptChars, promptTokens, completionTokens)
@@ -671,9 +734,28 @@ class ToolLoop {
         if (key) this._answered.set(key, { summary: results[i].summary, slot: slots[i] })
       })
       this._unreadable = calls.every((pending) => !pending.call) ? this._unreadable + 1 : 0
+      const noProgress = results.length > 0 && results.every((result, index) => {
+        if (result.failed) return true
+        const name = calls[index]?.call?.name
+        if (name === "find_files") return result.summary.endsWith(" · none")
+        if (name === "search_workspace") {
+          try {
+            return JSON.parse(result.output).total === 0
+          } catch {
+            return false
+          }
+        }
+        return false
+      })
+      this._noProgressSteps = noProgress ? this._noProgressSteps + 1 : 0
       // A small model that keeps asking for what it has, or keeps writing
       // calls that cannot be read, is not getting anywhere with more steps.
-      if (this._repeats >= MAX_REPEATED_CALLS || this._unreadable >= MAX_UNREADABLE_IN_A_ROW) this._stuck = true
+      if (this._repeats >= MAX_REPEATED_CALLS || this._unreadable >= MAX_UNREADABLE_IN_A_ROW || this._noProgressSteps >= MAX_NO_PROGRESS_STEPS) {
+        this._stuck = true
+        if (this._noProgressSteps >= MAX_NO_PROGRESS_STEPS) {
+          logger.warn("Agent tool loop stopped after " + this._noProgressSteps + " consecutive tool steps without progress; asking the model to answer with the information it has.")
+        }
+      }
       settled = results.some((result) => result.final)
       if (this._options.shouldStop?.()) return
     }

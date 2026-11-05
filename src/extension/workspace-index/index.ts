@@ -223,6 +223,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   private scanning?: Promise<void>
   private scanController?: AbortController
   private synchronizing?: Promise<void>
+  private activeOperationId?: string
   private repeatAfterCurrent = false
   private clearAfterCurrent = false
   private paused = false
@@ -335,23 +336,33 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   private synchronize(clear = false, repeatAfterCurrent = false): Promise<void> {
     if (this.disposed) return Promise.resolve()
     if (this.synchronizing) {
+      logger.info(`[WorkspaceIndex] operation=${this.activeOperationId ?? "unknown"} coalesced request clear=${clear} followup=${repeatAfterCurrent}`)
       if (clear) {
         this.clearAfterCurrent = true
         this.scanController?.abort()
       } else if (repeatAfterCurrent) this.repeatAfterCurrent = true
       return this.synchronizing
     }
+    const operationId = randomUUID()
+    const operationStartedAt = Date.now()
+    this.activeOperationId = operationId
+    logger.info(`[WorkspaceIndex] operation=${operationId} start clear=${clear} active_operations=1 inference_requests=0`)
     const operation = (async () => {
       let clearNext = clear
+      let pass = 0
       do {
+        pass += 1
         this.repeatAfterCurrent = false
         this.clearAfterCurrent = false
         const controller = new AbortController()
         this.scanController = controller
-        const scan = this.scan(clearNext, controller.signal)
+        const scanId = randomUUID()
+        logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} pass=${pass} start`)
+        const scan = this.scan(clearNext, controller.signal, operationId, scanId)
         this.scanning = scan
         try {
           await scan
+          logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} terminal=${controller.signal.aborted ? "cancelled" : this.state.status} duration_ms=${Date.now() - operationStartedAt}`)
         } finally {
           if (this.scanning === scan) this.scanning = undefined
           if (this.scanController === controller) this.scanController = undefined
@@ -360,6 +371,8 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       } while (!this.disposed && (clearNext || (!this.paused && this.automaticSyncEnabled() && this.repeatAfterCurrent)))
     })().finally(() => {
       if (this.synchronizing === operation) this.synchronizing = undefined
+      if (this.activeOperationId === operationId) this.activeOperationId = undefined
+      logger.info(`[WorkspaceIndex] operation=${operationId} terminal=${this.disposed ? "disposed" : this.state.status} duration_ms=${Date.now() - operationStartedAt} active_operations=0 inference_requests=0`)
     })
     this.synchronizing = operation
     return operation
@@ -855,7 +868,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     this.throwIfCancelled(signal)
   }
 
-  private async scan(_clear: boolean, signal: AbortSignal): Promise<void> {
+  private async scan(_clear: boolean, signal: AbortSignal, operationId: string, scanId: string): Promise<void> {
     const startedAt = Date.now()
     try {
       await this.initialize()
@@ -894,7 +907,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       let indexed = 0
       let lastProgressUpdate = 0
       this.update({ status: "indexing", filesIndexed: 0, filesPending: 0, queueDepth: 0 })
-      logger.info(`Workspace indexing started across ${folders.length} workspace folders`)
+      logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} discovered workspace_folders=${folders.length}`)
       const work = (async function* (index: WorkspaceIntelligenceIndex): AsyncGenerator<{ uri: vscode.Uri; folder: vscode.WorkspaceFolder; ignored: boolean; skipReason?: string }> {
         for (const folder of folders) {
           for await (const item of index.discoverFiles(folder, include, exclude, signal)) yield { ...item, folder }
@@ -933,7 +946,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         throw error
       }
       if (this.isCancelled(signal)) {
-        logger.info(`Workspace indexing cancelled after ${completed} files; directory traversal and queued work stopped`)
+        logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} cancelled completed_files=${completed} queued_work=stopped`)
         return
       }
       const activeWorkspaceUris = [...(vscode.workspace.workspaceFolders ?? [])].map((folder) => folder.uri.toString())
@@ -966,14 +979,14 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       await this.refreshCounts()
       const duration = Date.now() - startedAt
       this.update({ status: this.paused ? "paused" : "ready", filesPending: 0, queueDepth: 0, activeWorkers: 0, activeSourceBytes: 0, currentIndexDurationMs: undefined, lastIndexDurationMs: duration, storageBytes: await this.measureDatabaseSize(), lastSynchronized: synchronizedAt, discoveryComplete: true, filesDiscovered: discovered })
-      logger.info(`Workspace indexing completed: ${indexed}/${discovered} discovered files updated in ${duration}ms; database ${this.state.storageBytes} bytes; peak active source payload ${this.state.peakSourceBytes} bytes`)
+      logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} completed indexed=${indexed} discovered=${discovered} duration_ms=${duration} database_bytes=${this.state.storageBytes} peak_source_bytes=${this.state.peakSourceBytes} inference_requests=0`)
     } catch (error) {
       if (this.isCancelled(signal)) {
-        logger.info("Workspace indexing cancelled before completion")
+        logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} cancelled before completion`)
         return
       }
       const message = error instanceof Error ? error.message : String(error)
-      logger.error(`Workspace indexing failed: ${message}`)
+      logger.error(`[WorkspaceIndex] operation=${operationId} scan=${scanId} failed: ${message}`)
       this.update({ status: "error", error: message, activeWorkers: 0, activeSourceBytes: 0, currentIndexDurationMs: undefined })
     }
   }

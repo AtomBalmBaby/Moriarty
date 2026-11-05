@@ -447,7 +447,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinnySetSessionContext]: Channel<ContextValue>
   [EVENT_NAME.twinnySetWorkspaceContext]: Channel<ContextValue>
   [EVENT_NAME.twinnySidebarReady]: Channel
-  [EVENT_NAME.twinnyStopGeneration]: Channel
+  [EVENT_NAME.twinnyStopGeneration]: Channel<{ cancelled?: boolean; cancellationReason?: "user" | "host" }>
   [EVENT_NAME.twinnySymbolSearch]: Channel<{ query: string }, ContextItem[]>
   [EVENT_NAME.twinnyTextSelection]: Channel<void, string>
   /**
@@ -584,7 +584,7 @@ export interface ServerEvents {
   [EVENT_NAME.twinnySessionContext]: ContextValue
   [EVENT_NAME.twinnySetLocale]: string
   [EVENT_NAME.twinnySetTab]: string
-  [EVENT_NAME.twinnyStopGeneration]: void
+  [EVENT_NAME.twinnyStopGeneration]: { cancelled?: boolean; cancellationReason?: "user" | "host" }
   [EVENT_NAME.twinnyTextSelection]: string
   [EVENT_NAME.twinnyUpdateContextItems]: AnyContextItem[]
   [EVENT_NAME.twinnyWorkspaceSearch]: WorkspaceSearchReport

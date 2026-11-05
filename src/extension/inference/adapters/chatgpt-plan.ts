@@ -1,6 +1,7 @@
 import { logger } from "../../../common/logger"
 import { TwinnyProvider } from "../../../common/types"
 import { InferenceError } from "../errors"
+import { createInferenceTrace, startInferenceAttempt } from "../trace"
 import {
   ChatChunk,
   ChatFinishReason,
@@ -195,62 +196,88 @@ export class ChatGPTPlanInferenceProvider implements InferenceProvider {
         ? { reasoning: { effort: this._config.reasoningEffort } }
         : {})
     }
-    const response = await fetch(this._endpoints.responses || RESPONSES_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body),
-      signal: options?.signal
+    const url = this._endpoints.responses || RESPONSES_URL
+    const trace = createInferenceTrace(options?.trace)
+    const attempt = startInferenceAttempt(trace, {
+      provider: this._config.provider,
+      endpoint: url,
+      model: body.model
     })
-    if (!response.ok) throw await responseError(response)
-    if (!response.body) throw new Error("OpenAI answered without a response stream.")
+    let state = "consumer-stopped"
+    let failureReason: unknown
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body),
+        signal: options?.signal
+      })
+      attempt.response(response)
+      if (!response.ok) throw await responseError(response)
+      if (!response.body)
+        throw new Error("OpenAI answered without a response stream.")
 
-    // Plan-sharing may report a terminal account or usage failure after
-    // sending deltas. Hold everything until response.completed so a failed
-    // response cannot become part of the saved conversation.
-    const text: string[] = []
-    const reasoning: string[] = []
-    for await (const event of responseEvents(response.body)) {
-      if (options?.signal?.aborted) return
-      switch (event.type) {
-        case "response.output_text.delta":
-        case "response.refusal.delta":
-          if (event.delta) text.push(event.delta)
-          break
-        case "response.reasoning_summary_text.delta":
-          if (event.delta) reasoning.push(event.delta)
-          break
-        case "response.completed": {
-          const usage: InferenceUsage | undefined = event.response?.usage
-            ? {
-                promptTokens: event.response.usage.input_tokens,
-                completionTokens: event.response.usage.output_tokens
-              }
-            : undefined
-          if (text.length) yield { content: text.join("") }
-          if (reasoning.length) {
-            yield { content: "", reasoning: reasoning.join("") }
-          }
-          const finishReason: ChatFinishReason = "stop"
-          yield {
-            content: "",
-            finishReason,
-            ...(usage ? { usage } : {})
-          }
+      // Plan-sharing may report a terminal account or usage failure after
+      // sending deltas. Hold everything until response.completed so a failed
+      // response cannot become part of the saved conversation.
+      const text: string[] = []
+      const reasoning: string[] = []
+      for await (const event of responseEvents(response.body)) {
+        attempt.firstResponse(event.type)
+        if (options?.signal?.aborted) {
+          state = "cancelled"
           return
         }
-        case "response.failed":
-        case "error":
-          throw failure(event)
-        case "response.incomplete":
-          throw new Error(
-            `ChatGPT Plan response was incomplete${event.response?.incomplete_details?.reason ? `: ${event.response.incomplete_details.reason}` : ""}.`
-          )
+        switch (event.type) {
+          case "response.output_text.delta":
+          case "response.refusal.delta":
+            if (event.delta) text.push(event.delta)
+            break
+          case "response.reasoning_summary_text.delta":
+            if (event.delta) reasoning.push(event.delta)
+            break
+          case "response.completed": {
+            state = "completed"
+            const usage: InferenceUsage | undefined = event.response?.usage
+              ? {
+                  promptTokens: event.response.usage.input_tokens,
+                  completionTokens: event.response.usage.output_tokens
+                }
+              : undefined
+            if (text.length) yield { content: text.join("") }
+            if (reasoning.length) {
+              yield { content: "", reasoning: reasoning.join("") }
+            }
+            const finishReason: ChatFinishReason = "stop"
+            yield {
+              content: "",
+              finishReason,
+              ...(usage ? { usage } : {})
+            }
+            return
+          }
+          case "response.failed":
+          case "error":
+            throw failure(event)
+          case "response.incomplete":
+            throw new Error(
+              `ChatGPT Plan response was incomplete${event.response?.incomplete_details?.reason ? `: ${event.response.incomplete_details.reason}` : ""}.`
+            )
+        }
       }
+      throw new Error("ChatGPT Plan response ended without response.completed.")
+    } catch (error) {
+      state = options?.signal?.aborted ? "cancelled" : "failed"
+      failureReason = error
+      throw error
+    } finally {
+      if (options?.signal?.aborted && state === "consumer-stopped")
+        state = "cancelled"
+      attempt.finish(state, failureReason)
     }
-    throw new Error("ChatGPT Plan response ended without response.completed.")
   }
 
   public async *fim(
@@ -280,67 +307,94 @@ export class ChatGPTPlanInferenceProvider implements InferenceProvider {
         : {})
     }
 
+    const url = this._endpoints.responses || RESPONSES_URL
+    const trace = createInferenceTrace(options?.trace)
+    const attempt = startInferenceAttempt(trace, {
+      provider: this._config.provider,
+      endpoint: url,
+      model: body.model
+    })
+    let state = "consumer-stopped"
+    let failureReason: unknown
     const started = Date.now()
     let firstDeltaAt: number | undefined
-    const response = await fetch(this._endpoints.responses || RESPONSES_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body),
-      signal: options?.signal
-    })
-    if (!response.ok) throw await responseError(response)
-    if (!response.body) throw new Error("OpenAI answered without a response stream.")
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body),
+        signal: options?.signal
+      })
+      attempt.response(response)
+      if (!response.ok) throw await responseError(response)
+      if (!response.body)
+        throw new Error("OpenAI answered without a response stream.")
 
-    const deltas: string[] = []
-    for await (const event of responseEvents(response.body)) {
-      if (options?.signal?.aborted) return
-      switch (event.type) {
-        case "response.output_text.delta":
-          if (event.delta) {
-            if (firstDeltaAt === undefined) {
-              firstDeltaAt = Date.now()
-              logger.debug(
-                `ChatGPT Plan FIM first text in ${firstDeltaAt - started}ms`
-              )
-            }
-            // Plan-sharing streams may emit text before a terminal usage
-            // failure. Keep it private until response.completed proves the
-            // request succeeded so early consumers cannot accept stale text.
-            deltas.push(event.delta)
-          }
-          break
-        case "response.completed": {
-          const usage = event.response?.usage
-          const text = deltas.join("")
-          if (text) yield { text }
-          yield {
-            text: "",
-            ...(usage
-              ? {
-                  usage: {
-                    promptTokens: usage.input_tokens,
-                    completionTokens: usage.output_tokens
-                  }
-                }
-              : {})
-          }
-          logger.debug(
-            `ChatGPT Plan FIM completed in ${Date.now() - started}ms`
-          )
+      const deltas: string[] = []
+      for await (const event of responseEvents(response.body)) {
+        attempt.firstResponse(event.type)
+        if (options?.signal?.aborted) {
+          state = "cancelled"
           return
         }
-        case "response.failed":
-        case "error":
-          throw failure(event)
-        case "response.incomplete":
-          throw new Error(
-            `ChatGPT Plan response was incomplete${event.response?.incomplete_details?.reason ? `: ${event.response.incomplete_details.reason}` : ""}.`
-          )
+        switch (event.type) {
+          case "response.output_text.delta":
+            if (event.delta) {
+              if (firstDeltaAt === undefined) {
+                firstDeltaAt = Date.now()
+                attempt.firstResponse("response.output_text.delta")
+                logger.debug(
+                  `ChatGPT Plan FIM first text in ${firstDeltaAt - started}ms`
+                )
+              }
+              // Plan-sharing streams may emit text before a terminal usage
+              // failure. Keep it private until response.completed proves the
+              // request succeeded so early consumers cannot accept stale text.
+              deltas.push(event.delta)
+            }
+            break
+          case "response.completed": {
+            state = "completed"
+            const usage = event.response?.usage
+            const text = deltas.join("")
+            if (text) yield { text }
+            yield {
+              text: "",
+              ...(usage
+                ? {
+                    usage: {
+                      promptTokens: usage.input_tokens,
+                      completionTokens: usage.output_tokens
+                    }
+                  }
+                : {})
+            }
+            logger.debug(
+              `ChatGPT Plan FIM completed in ${Date.now() - started}ms`
+            )
+            return
+          }
+          case "response.failed":
+          case "error":
+            throw failure(event)
+          case "response.incomplete":
+            throw new Error(
+              `ChatGPT Plan response was incomplete${event.response?.incomplete_details?.reason ? `: ${event.response.incomplete_details.reason}` : ""}.`
+            )
+        }
       }
+      throw new Error("ChatGPT Plan response ended without response.completed.")
+    } catch (error) {
+      state = options?.signal?.aborted ? "cancelled" : "failed"
+      failureReason = error
+      throw error
+    } finally {
+      if (options?.signal?.aborted && state === "consumer-stopped")
+        state = "cancelled"
+      attempt.finish(state, failureReason)
     }
-    throw new Error("ChatGPT Plan response ended without response.completed.")
   }
 }

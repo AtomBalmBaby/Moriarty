@@ -10,6 +10,8 @@
 import type { ShieldReport } from "../../common/secret-shield"
 import { ChatCompletionMessage, FimContextFile } from "../../common/types"
 
+import type { InferenceTraceContext } from "./trace"
+
 export type InferenceCapability = "fim" | "chat" | "embeddings"
 
 export const INFERENCE_CAPABILITIES: InferenceCapability[] = [
@@ -33,6 +35,7 @@ export interface InferenceModel {
 }
 
 export interface InferenceOptions {
+  trace?: InferenceTraceContext
   /**
    * Aborting stops the request. A stream being read at the time throws a
    * `cancelled` error; one already finished, or one the consumer stopped

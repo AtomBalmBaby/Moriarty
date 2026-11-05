@@ -10,9 +10,11 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
 
+import { shouldResumeQueuedChat } from "../../common/messaging/chat-stop"
 import { ChatCompletionMessage } from "../../common/types"
 import { buildChatTurn } from "../../extension/chat/turn"
 import { ChatChunk, ChatRequest, InferenceClient, InferenceOptions, isCancelled } from "../../extension/inference"
+import { abortable } from "../../extension/inference/stream"
 import {
   fitResult,
   planContext,
@@ -593,6 +595,67 @@ test("a call repeated with nothing changed in between is answered with a pointer
   assert.ok(requests[3].tools, "one repeat is not enough to stop the reply's tools")
 })
 
+test("three consecutive empty searches stop the tool loop and request a final answer", async () => {
+  const root = workspace({ "src/a.ts": "export const value = 1\n" })
+  const { client, requests } = scripted([
+    { calls: [{ id: "1", name: "find_files", arguments: JSON.stringify({ pattern: "missing-one" }) }] },
+    { calls: [{ id: "2", name: "find_files", arguments: JSON.stringify({ pattern: "missing-two" }) }] },
+    { calls: [{ id: "3", name: "find_files", arguments: JSON.stringify({ pattern: "missing-three" }) }] },
+    "I could not find a matching file."
+  ])
+  const steps: ToolStep[] = []
+  await collect(withTools(client, workspaceTools(root), { mode: "native", maxSteps: 100, onStep: (step) => steps.push(step) }).chat(ask("Find it.")))
+  assert.equal(steps.length, 3)
+  assert.ok(steps.every((step) => step.summary.endsWith("· none")))
+  assert.equal(requests.length, 4, "after three empty searches only one final answer request is made")
+  assert.equal(requests[3].tools, undefined, "the final answer request cannot start another search cycle")
+})
+
+test("three consecutive failed tools stop the tool loop and request a final answer", async () => {
+  const root = workspace({ "src/a.ts": "export const value = 1\n" })
+  const { client, requests } = scripted([
+    { calls: [{ id: "1", name: "read_file", arguments: JSON.stringify({ path: "missing-one.ts" }) }] },
+    { calls: [{ id: "2", name: "read_file", arguments: JSON.stringify({ path: "missing-two.ts" }) }] },
+    { calls: [{ id: "3", name: "read_file", arguments: JSON.stringify({ path: "missing-three.ts" }) }] },
+    "I could not read those files."
+  ])
+  const steps: ToolStep[] = []
+  await collect(withTools(client, workspaceTools(root), { mode: "native", maxSteps: 100, onStep: (step) => steps.push(step) }).chat(ask("Read them.")))
+  assert.equal(steps.length, 3)
+  assert.ok(steps.every((step) => step.failed))
+  assert.equal(requests.length, 4, "after three failed calls only one final answer request is made")
+  assert.equal(requests[3].tools, undefined)
+})
+
+test("an already-stopped tool loop does not send another model request", async () => {
+  const stop = new AbortController()
+  stop.abort()
+  const { client, requests } = scripted(["must not run"])
+  await assert.rejects(collect(withTools(client, workspaceTools(workspace({}),), { mode: "native" }).chat(ask("Stop."), { signal: stop.signal })), isCancelled)
+  assert.equal(requests.length, 0)
+})
+
+test("an already-aborted inference signal does not start a provider request", async () => {
+  const controller = new AbortController()
+  controller.abort()
+  let started = false
+  const source: AsyncIterable<string> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => {
+          started = true
+          return { done: false as const, value: "unexpected" }
+        },
+        return: async () => ({ done: true as const, value: undefined })
+      }
+    }
+  }
+  await assert.rejects(async () => {
+    for await (const chunk of abortable(source, controller.signal)) void chunk
+  }, isCancelled)
+  assert.equal(started, false)
+})
+
 test("a read after a change runs again, and so does one whose result was trimmed away", async () => {
   const root = workspace({ "a.ts": "one\n" })
   const edits = {
@@ -784,4 +847,10 @@ test("a catastrophic tool result stops the current batch before another mutation
   }).chat(ask("edit")))
   assert.deepStrictEqual(calls, ["edit_file"], "the blocked second call never reaches WorkspaceTools.run")
   assert.equal(requests.length, 1, "no implementing-model continuation request is issued inside the unsafe turn")
+})
+
+test("a stopped chat restores queued messages instead of dispatching another request", () => {
+  assert.equal(shouldResumeQueuedChat(false, false), true, "normal completion drains the queue")
+  assert.equal(shouldResumeQueuedChat(true, false), false, "a user stop does not drain the queue")
+  assert.equal(shouldResumeQueuedChat(false, true), false, "a host cancellation does not drain the queue")
 })
