@@ -1,3 +1,4 @@
+import type { TodoToolObservation } from "../../common/types/todo"
 import { isAnalysisOnlyIntent } from "../todos/feedback"
 
 export type ExecutionState = "executing" | "reconciling" | "accepted" | "continue" | "repairing" | "blocked" | "cancelled"
@@ -6,7 +7,16 @@ export type EvaluatorDecision = "accept" | "revise" | "needs_evidence" | "blocke
 export interface ReconciliationLimits {
   maxIterations: number
   maxNoProgress: number
+  /** Turns in a row that may add observations while no criterion passes and the task does not move on. */
+  maxEvidenceOnlyTurns?: number
 }
+
+/**
+ * What a turn added. A passed criterion is durable progress; a new
+ * observation alone only buys a few turns, since it may repeat the same
+ * investigation under other arguments.
+ */
+export type ProgressKind = "criteria" | "observations" | "none"
 
 export interface ReconciliationResult {
   state: ExecutionState
@@ -16,7 +26,8 @@ export interface ReconciliationResult {
 
 export const DEFAULT_RECONCILIATION_LIMITS: ReconciliationLimits = {
   maxIterations: 12,
-  maxNoProgress: 2
+  maxNoProgress: 2,
+  maxEvidenceOnlyTurns: 3
 }
 
 export interface ObservedEvidence {
@@ -31,8 +42,10 @@ export class ExecutionReconciliationController {
   private _state: ExecutionState = "executing"
   private _iterations = 0
   private _noProgress = 0
+  private _evidenceOnly = 0
   private _lastProgress?: string
   private _continuationClaimed = false
+  private _continuations = 0
   private _cancelled = false
   private readonly _succeeded = new Set<string>()
   private readonly _failed = new Set<string>()
@@ -58,28 +71,29 @@ export class ExecutionReconciliationController {
   }
 
   /**
-   * Whether the evidence adds something not already established: a call
-   * not seen before with a successful result, a failed call that now
-   * succeeds, or a criterion newly passed. A repeated identical call does not.
+   * What the evidence adds that is not already established: a criterion
+   * newly passed, or else a call not seen before with a successful result, or
+   * a failed call that now succeeds. A repeated identical call adds nothing.
    */
-  recordEvidence(evidence: ObservedEvidence): boolean {
-    let progressed = false
+  recordEvidence(evidence: ObservedEvidence): ProgressKind {
+    let observed = false
     for (const observation of evidence.observations) {
       const key = observationKey(observation)
       if (observation.failed) {
         if (!this._succeeded.has(key)) this._failed.add(key)
         continue
       }
-      if (!this._succeeded.has(key)) progressed = true
-      if (this._failed.delete(key)) progressed = true
+      if (!this._succeeded.has(key)) observed = true
+      if (this._failed.delete(key)) observed = true
       this._succeeded.add(key)
     }
+    let criteria = false
     for (const criterion of evidence.passedCriteria) {
       if (this._passedCriteria.has(criterion)) continue
       this._passedCriteria.add(criterion)
-      progressed = true
+      criteria = true
     }
-    return progressed
+    return criteria ? "criteria" : observed ? "observations" : "none"
   }
 
   advanceAcceptedTask(progress: string): ReconciliationResult {
@@ -87,26 +101,38 @@ export class ExecutionReconciliationController {
     this._iterations++
     this._lastProgress = progress
     this._noProgress = 0
+    this._evidenceOnly = 0
     if (this._iterations > this._limits.maxIterations) {
       return { state: this._state = "blocked", continue: false, reason: "Execution exceeded " + this._limits.maxIterations + " reconciliation iterations." }
     }
     return { state: this._state = "continue", continue: true }
   }
 
-  reconcile(decision: EvaluatorDecision, progress: string, madeProgress = false): ReconciliationResult {
+  reconcile(decision: EvaluatorDecision, progress: string, progressKind: ProgressKind = "none"): ReconciliationResult {
     this._state = "reconciling"
     if (this._cancelled) return { state: this._state = "cancelled", continue: false }
     if (decision === "accept") return { state: this._state = "accepted", continue: false }
     if (decision === "blocked") return { state: this._state = "blocked", continue: false, reason: "The evaluator identified a genuine blocker." }
 
     this._iterations++
-    this._noProgress = madeProgress ? 0 : progress === this._lastProgress ? this._noProgress + 1 : 1
+    const moved = this._lastProgress !== undefined && progress !== this._lastProgress
+    if (progressKind === "criteria" || moved) this._evidenceOnly = 0
+    else if (progressKind === "observations") this._evidenceOnly++
+    this._noProgress = progressKind !== "none" ? 0 : progress === this._lastProgress ? this._noProgress + 1 : 1
     this._lastProgress = progress
     if (this._iterations > this._limits.maxIterations) {
       return { state: this._state = "blocked", continue: false, reason: `Execution exceeded ${this._limits.maxIterations} reconciliation iterations.` }
     }
     if (this._noProgress >= this._limits.maxNoProgress) {
       return { state: this._state = "blocked", continue: false, reason: `Execution made no measurable progress for ${this._noProgress + 1} consecutive turns.` }
+    }
+    const evidenceLimit = this._limits.maxEvidenceOnlyTurns ?? DEFAULT_RECONCILIATION_LIMITS.maxEvidenceOnlyTurns ?? 0
+    if (this._evidenceOnly > evidenceLimit) {
+      return {
+        state: this._state = "blocked",
+        continue: false,
+        reason: `New observations did not satisfy any open criterion over ${evidenceLimit} consecutive turns, so the same investigation is not repeated.`
+      }
     }
     return { state: this._state = decision === "revise" ? "repairing" : "continue", continue: true }
   }
@@ -119,7 +145,13 @@ export class ExecutionReconciliationController {
 
   continuationStarted(): void {
     this._continuationClaimed = false
+    this._continuations++
     if (!this._cancelled) this._state = "executing"
+  }
+
+  /** Automatic turns started after the first one, for this request. */
+  get continuations(): number {
+    return this._continuations
   }
 }
 
@@ -149,6 +181,20 @@ export const forbiddenDeleteReason = (goal: string, relativePath: string): strin
     || /^\s*(?:(?:and|then)\s+)?(?:delete|remove)\s+(?:it|this file|the file)\b/i.test(after)
   if (explicitPrefix || explicitSuffix) return undefined
   return "Deletion of " + relativePath + " conflicts with the user's request to modify it. Preserve the file and make a targeted edit instead."
+}
+
+export const observationReference = (observation: TodoToolObservation): string => {
+  const path = observation.arguments.path ?? observation.arguments.file
+  const label = path ? `${observation.toolName} ${path}` : `${observation.toolName} ${JSON.stringify(observation.arguments)}`
+  const evidence = observation.evidence
+  const storage = !evidence
+    ? "storage status unknown"
+    : !evidence.retained
+      ? "full output not retained; summary only"
+      : evidence.complete
+        ? `full output retained (${evidence.preservedChars} of ${evidence.originalChars} chars)`
+        : `partial output retained (${evidence.preservedChars} of ${evidence.originalChars} chars; omitted content is not recoverable)`
+  return `[${observation.id}] ${label} — ${storage}; preview: ${observation.output.slice(0, 240)}`
 }
 
 export const continuationContext = (input: {

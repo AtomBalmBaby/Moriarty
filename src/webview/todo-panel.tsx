@@ -72,7 +72,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
   }
 
   const currentFeedback = feedbackStatus?.conversationId === conversationId ? feedbackStatus : undefined
-  const planning = currentFeedback?.state === "planning"
+  const planning = currentFeedback?.state === "planning" || currentFeedback?.state === "retrying"
   const planningFailed = currentFeedback?.state === "failed"
 
   const visibleItems = useMemo(() => {

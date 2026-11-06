@@ -32,6 +32,7 @@ export const EVENT_NAME = {
   twinnyNotification: "twinny-notification",
   twinnyOnCompletion: "twinny-on-completion",
   twinnyOnLoading: "twinny-on-loading",
+  twinnyOnReasoning: "twinny-on-reasoning",
   twinnyOpenFile: "twinny-open-file",
   twinnyOpenProviders: "twinny-open-providers",
   twinnyRemoveContextItem: "twinny-remove-context-item",

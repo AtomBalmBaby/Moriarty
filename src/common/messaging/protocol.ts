@@ -600,7 +600,10 @@ export interface ServerEvents {
   [EVENT_NAME.twinnyReplySteps]: ToolStepView[]
   [EVENT_NAME.twinnyShowShortcuts]: void
   [EVENT_NAME.twinnyOnCompletion]: ChatCompletionMessage
-  [EVENT_NAME.twinnyOnLoading]: void
+  /** `continuation` counts the automatic turns after the first in one request. */
+  [EVENT_NAME.twinnyOnLoading]: { continuation?: number } | void
+  /** Reasoning streamed for the turn in progress, as it arrives; reset when the turn starts. */
+  [EVENT_NAME.twinnyOnReasoning]: string
   [EVENT_NAME.twinnySendLanguage]: LanguageType
   [EVENT_NAME.twinnySendLoader]: string
   [EVENT_NAME.twinnySendTheme]: ThemeType

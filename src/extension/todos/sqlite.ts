@@ -113,7 +113,19 @@ CREATE TABLE IF NOT EXISTS todo_evaluations (
   UNIQUE(list_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS todo_evaluations_item ON todo_evaluations(item_id, created_at);
-PRAGMA user_version = 3;
+CREATE TABLE IF NOT EXISTS todo_tool_evidence (
+  observation_id TEXT PRIMARY KEY REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  content TEXT,
+  retained INTEGER NOT NULL DEFAULT 1,
+  complete INTEGER NOT NULL,
+  original_chars INTEGER NOT NULL,
+  preserved_chars INTEGER NOT NULL,
+  metadata_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS todo_tool_evidence_list ON todo_tool_evidence(list_id, retained, created_at);
+PRAGMA user_version = 4;
 `
 
 export class SqliteFile {
@@ -145,7 +157,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 3) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 4) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -157,7 +169,10 @@ export class SqliteFile {
           await this.persist(database)
         }
         if (version > 0 && version < 3) {
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_observations"), SCHEMA.indexOf("PRAGMA user_version = 3;") + "PRAGMA user_version = 3;".length))
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_observations"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
+          await this.persist(database)
+        } else if (version === 3) {
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_evidence"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
           await this.persist(database)
         }
       } finally {

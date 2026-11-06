@@ -4,7 +4,7 @@ import { WorkspaceSearchReport } from "../common/messaging/protocol"
 import { ChatCompletionMessage, MentionType, ReplyChangesView, ToolStepView } from "../common/types"
 
 import Message from "./message"
-import TypingIndicator from "./typing-indicator"
+import TypingIndicator, { TypingActivity } from "./typing-indicator"
 
 interface MessageListProps {
   message: ChatCompletionMessage
@@ -14,6 +14,8 @@ interface MessageListProps {
   context?: WorkspaceSearchReport
   /** The tool steps of the reply in progress, shown above it. */
   steps?: ToolStepView[]
+  /** Inference, continuation and TODO state of the reply in progress. */
+  activity?: TypingActivity
   isLoading: boolean
   index: number
   generatingRef: React.RefObject<boolean>
@@ -39,6 +41,7 @@ const MessageItem = memo(
     completion,
     context,
     steps,
+    activity,
     isLoading,
     index,
     handleDeleteMessage,
@@ -55,6 +58,8 @@ const MessageItem = memo(
     // A reply the user stopped, or one that used every tool step it had.
     const canContinue =
       isAgentMessage && isLastMessage && !isLoading && !!(message.meta?.stopped || message.meta?.outOfSteps)
+    // Shown while a step runs even between turns, such as during a Feedback review.
+    const stepActive = !!steps?.some((step) => step.status === "running" || step.status === "waiting")
 
     return (
       <>
@@ -103,8 +108,8 @@ const MessageItem = memo(
             onDeleteImage={handleDeleteImage}
           />
         )}
-        {isLoading && !completion && isLastMessage && (
-          <TypingIndicator context={context} steps={steps} />
+        {(isLoading || stepActive) && !completion && isLastMessage && (
+          <TypingIndicator context={context} steps={steps} activity={activity} />
         )}
       </>
     )

@@ -3,6 +3,16 @@ import { Database, SqlValue } from "sql.js"
 
 import { logger } from "../../common/logger"
 
+import {
+  describeGap,
+  evidenceAnchors,
+  evidenceGaps,
+  type EvidenceHit,
+  type EvidenceSource,
+  MAX_EVIDENCE_TEXT,
+  preserveEvidence,
+  redactEvidence
+} from "./evidence"
 import { hasTrustedEvidenceForCriterion, isAnalysisOnlyIntent } from "./feedback"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
@@ -12,8 +22,12 @@ import {
   type IntentPlanContext,
   type IntentPlanOutline,
   type IntentTaskPlan,
+  type RetainedObservationEvidence,
+  type TodoCompletionClaim,
   TodoConflictError,
+  type TodoCreateOutcome,
   type TodoEvaluation,
+  type TodoEvaluationDecision,
   type TodoEvidence,
   type TodoItem,
   type TodoListRequest,
@@ -22,6 +36,7 @@ import {
   type TodoReviewPackage,
   type TodoSource,
   type TodoStatus,
+  type TodoToolEvidenceStatus,
   type TodoToolObservation,
   type TodoToolObservationInput,
   type TodoVerification,
@@ -194,6 +209,60 @@ const normalizeTodoIdentity = (title: string) => normalizeTodoTitle(title)
   .split(" ")
   .filter((word) => word && word !== "the" && word !== "a" && word !== "an")
   .join(" ")
+
+const OVERLAP_STOP_WORDS = new Set(["a", "an", "and", "for", "from", "in", "of", "on", "the", "to", "with"])
+const titleTokens = (title: string) => new Set(normalizeTodoTitle(title).split(/[^a-z0-9]+/).filter((token) => token && !OVERLAP_STOP_WORDS.has(token)))
+
+/**
+ * Matches a model-proposed title to a single authoritative plan task when at
+ * least three meaningful words are shared and cover most of the smaller title.
+ * Ties and weak overlaps return undefined so distinct work is never merged.
+ */
+const planOverlapMatch = (candidates: ItemRow[], title: string): ItemRow | undefined => {
+  const wanted = titleTokens(title)
+  if (wanted.size < 3) return undefined
+  const scored = candidates.map((row) => {
+    const tokens = titleTokens(row.title)
+    const shared = [...wanted].filter((token) => tokens.has(token)).length
+    return { row, shared, ratio: shared / Math.min(wanted.size, tokens.size) }
+  }).filter((entry) => entry.shared >= 3 && entry.ratio >= 0.75)
+    .sort((left, right) => right.shared - left.shared || right.ratio - left.ratio)
+  if (!scored.length) return undefined
+  const [best, next] = scored
+  if (next && next.shared === best.shared && next.ratio === best.ratio) return undefined
+  return best.row
+}
+
+/**
+ * Matches a broad umbrella title that restates several plan tasks at once:
+ * most of its meaningful words must appear across at least two distinct plan
+ * tasks. The best-matching plan task is returned as the existing record.
+ */
+const planUmbrellaMatch = (candidates: ItemRow[], title: string): ItemRow | undefined => {
+  const wanted = titleTokens(title)
+  if (wanted.size < 3) return undefined
+  const scored = candidates.map((row) => {
+    const tokens = titleTokens(row.title)
+    const shared = [...wanted].filter((token) => tokens.has(token)).length
+    return { row, shared }
+  }).filter((entry) => entry.shared >= 1)
+  if (scored.length < 2) return undefined
+  const covered = new Set<string>()
+  for (const { row } of scored) for (const token of titleTokens(row.title)) if (wanted.has(token)) covered.add(token)
+  if (covered.size / wanted.size < 0.75) return undefined
+  return scored.sort((left, right) => right.shared - left.shared)[0].row
+}
+
+const latestItemEvent = (database: Database, listId: string, itemId: string, eventType: string) =>
+  rows<{ list_revision: number; payload_json: string }>(database,
+    "SELECT list_revision, payload_json FROM todo_events WHERE list_id = ? AND item_id = ? AND event_type = ? ORDER BY list_revision DESC LIMIT 1",
+    [listId, itemId, eventType])[0]
+
+const reviewPathFor = (database: Database, listId: string, itemId: string): TodoCompletionClaim["review"] =>
+  rows<{ task_id: string }>(database, "SELECT task_id FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [itemId, listId])[0]
+    ? "feedback_turn_end"
+    : "user_approval"
+
 const PLACEHOLDER_BLOCK_REASONS = new Set(["no reason", "none", "n/a", "na", "tbd", "todo", "unknown", "blocked", "-"])
 const isPlaceholderBlockReason = (reason: string) => {
   const normalized = normalizeTodoTitle(reason).replace(/[.!?]+$/, "")
@@ -204,11 +273,74 @@ const validateRequestId = (requestId: string) => {
   if (!requestId.trim() || requestId.length > 200) throw new Error("A request ID between 1 and 200 characters is required")
 }
 
+/** Per-list storage for retained tool output; beyond the limit the oldest retained output is evicted. */
+export interface EvidenceStorageLimits {
+  listChars: number
+}
+
+export const DEFAULT_EVIDENCE_STORAGE_LIMITS: EvidenceStorageLimits = { listChars: 2_000_000 }
+
+/**
+ * Retained observations for a review. With `sharedListId`, observations from
+ * every active plan task in that list are included, so one retained read can
+ * support several related criteria. Each keeps its own item provenance.
+ */
+const retainedEvidenceFor = (database: Database, itemId: string, withContent: boolean, sharedListId?: string): RetainedObservationEvidence[] =>
+  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
+    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, evidence.retained, " +
+    (withContent ? "evidence.content" : "NULL AS content") +
+    ", evidence.complete, evidence.original_chars, evidence.preserved_chars, evidence.metadata_json " +
+    "FROM todo_tool_observations AS observations LEFT JOIN todo_tool_evidence AS evidence ON evidence.observation_id = observations.id " +
+    (sharedListId
+      ? "WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) "
+      : "WHERE observations.item_id = ? ") +
+    "ORDER BY observations.created_at, observations.id", sharedListId ? [sharedListId, sharedListId] : [itemId]).map((row) => {
+      const metadata = row.metadata_json
+        ? JSON.parse(row.metadata_json) as { sources: EvidenceSource[]; hits: EvidenceHit[] }
+        : { sources: [], hits: [] }
+      return {
+        observationId: row.observation_id,
+        itemId: row.observed_item_id,
+        toolName: row.tool_name,
+        arguments: JSON.parse(row.arguments_json) as Record<string, string>,
+        failed: row.failed !== 0,
+        retained: row.retained === 1,
+        complete: row.complete === 1,
+        originalChars: row.original_chars ?? 0,
+        preservedChars: row.preserved_chars ?? 0,
+        content: withContent && row.retained === 1 ? row.content ?? undefined : undefined,
+        sources: metadata.sources,
+        hits: metadata.hits
+      }
+    })
+
+const evidenceStatus = (entry: RetainedObservationEvidence | undefined): TodoToolEvidenceStatus => ({
+  retained: entry?.retained ?? false,
+  complete: entry?.complete ?? false,
+  originalChars: entry?.originalChars ?? 0,
+  preservedChars: entry?.preservedChars ?? 0
+})
+
+const enforceEvidenceBudget = (database: Database, listId: string, keepId: string, limitChars: number) => {
+  let excess = (rows<{ total: number }>(database,
+    "SELECT COALESCE(SUM(preserved_chars), 0) AS total FROM todo_tool_evidence WHERE list_id = ? AND retained = 1", [listId])[0]?.total ?? 0) - limitChars
+  if (excess <= 0) return
+  const candidates = rows<{ observation_id: string; preserved_chars: number }>(database,
+    "SELECT observation_id, preserved_chars FROM todo_tool_evidence WHERE list_id = ? AND retained = 1 AND observation_id != ? ORDER BY created_at, observation_id", [listId, keepId])
+  for (const candidate of candidates) {
+    if (excess <= 0) break
+    database.run("UPDATE todo_tool_evidence SET retained = 0, content = NULL WHERE observation_id = ?", [candidate.observation_id])
+    excess -= candidate.preserved_chars
+  }
+}
+
 export class TodoRepository {
   private readonly sqlite: SqliteFile
+  private readonly evidenceLimits: EvidenceStorageLimits
 
-  constructor(databasePath: string, wasmPath: string) {
+  constructor(databasePath: string, wasmPath: string, evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS) {
     this.sqlite = new SqliteFile(databasePath, wasmPath)
+    this.evidenceLimits = evidenceLimits
   }
 
   initialize(): Promise<void> {
@@ -391,12 +523,14 @@ export class TodoRepository {
         "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 3",
         [current.id]
       )
+      const retainedEvidence = retainedEvidenceFor(database, current.id, false)
       const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
         "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [current.id]
       ).map((observation) => ({
         id: observation.id, itemId: observation.itemId, toolName: observation.toolName,
         arguments: JSON.parse(observation.arguments_json) as Record<string, string>, output: observation.output,
-        failed: observation.failed !== 0, exitCode: observation.exitCode ?? undefined, createdAt: observation.createdAt
+        failed: observation.failed !== 0, exitCode: observation.exitCode ?? undefined, createdAt: observation.createdAt,
+        evidence: evidenceStatus(retainedEvidence.find((entry) => entry.observationId === observation.id))
       }))
       const lastEvaluation = rows<{ evaluation_json: string }>(database,
         "SELECT evaluation_json FROM todo_evaluations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1", [current.id])[0]
@@ -478,8 +612,9 @@ export class TodoRepository {
       return tasks.filter((task) => task.status === "in_review").map((row) => {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
+        const retainedEvidence = retainedEvidenceFor(database, row.id, true, list.id)
         const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed_number: number; exitCode: number | null; createdAt: string }>(database,
-          "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed AS failed_number, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC", [row.id]
+          "SELECT observations.id, observations.item_id AS itemId, observations.tool_name AS toolName, observations.arguments_json, observations.output, observations.failed AS failed_number, observations.exit_code AS exitCode, observations.created_at AS createdAt FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) ORDER BY observations.created_at DESC", [list.id, list.id]
         ).map((observation) => ({
           id: observation.id,
           itemId: observation.itemId,
@@ -488,7 +623,8 @@ export class TodoRepository {
           output: observation.output,
           failed: observation.failed_number !== 0,
           exitCode: observation.exitCode ?? undefined,
-          createdAt: observation.createdAt
+          createdAt: observation.createdAt,
+          evidence: evidenceStatus(retainedEvidence.find((entry) => entry.observationId === observation.id))
         }))
         const dependencyIds = JSON.parse(row.dependencies_json) as string[]
         const lastEvaluation = rows<{ evaluation_json: string }>(database,
@@ -509,6 +645,7 @@ export class TodoRepository {
           }),
           evidence,
           observations,
+          retainedEvidence,
           lastEvaluation: lastEvaluation ? JSON.parse(lastEvaluation.evaluation_json) as TodoEvaluation : undefined
         }
       })
@@ -518,25 +655,49 @@ export class TodoRepository {
   recordToolObservation(request: TodoListRequest, input: TodoToolObservationInput): Promise<TodoToolObservation> {
     validateRequestId(input.requestId)
     const toolName = input.toolName.trim()
-    const redact = (value: string) => value
-      .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, "$1[REDACTED]")
-      .replace(/\b(api[_-]?key|token|secret|password)\b(\s*[:=]\s*["']?)[^\s"',;]+/gi, "$1$2[REDACTED]")
-      .replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]")
-    const output = redact(input.output)
-    const arguments_ = Object.fromEntries(Object.entries(input.arguments).map(([key, value]) => [key, redact(value)]))
-    if (!toolName || toolName.length > 120 || output.length > 12000) throw new Error("Tool observation exceeds its storage limits")
+    if (!toolName || toolName.length > 120) throw new Error("Tool observation has an invalid tool name")
+    const output = redactEvidence(input.output).slice(0, MAX_EVIDENCE_TEXT)
+    const arguments_ = Object.fromEntries(Object.entries(input.arguments).map(([key, value]) => [key, redactEvidence(value)]))
+    const preserved = input.evidenceOutput === undefined ? undefined : preserveEvidence(input.evidenceOutput)
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
       const prior = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
         "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE list_id = ? AND request_id = ?", [list.id, input.requestId])[0]
-      if (prior) return { ...prior, arguments: JSON.parse(prior.arguments_json) as Record<string, string>, failed: prior.failed !== 0, exitCode: prior.exitCode ?? undefined }
+      if (prior) {
+        const priorEvidence = rows<{ retained: number; complete: number; original_chars: number; preserved_chars: number }>(database,
+          "SELECT retained, complete, original_chars, preserved_chars FROM todo_tool_evidence WHERE observation_id = ?", [prior.id])[0]
+        return {
+          ...prior,
+          arguments: JSON.parse(prior.arguments_json) as Record<string, string>,
+          failed: prior.failed !== 0,
+          exitCode: prior.exitCode ?? undefined,
+          evidence: priorEvidence && {
+            retained: priorEvidence.retained === 1,
+            complete: priorEvidence.complete === 1,
+            originalChars: priorEvidence.original_chars,
+            preservedChars: priorEvidence.preserved_chars
+          }
+        }
+      }
       const row = rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ? AND list_id = ?", [input.itemId, list.id])[0]
       if (!row || row.status === "completed" || row.status === "cancelled") throw new Error("Tool observation task is no longer actionable")
       const intentTask = rows<{ task_id: string }>(database, "SELECT task_id FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [input.itemId, list.id])[0]
       if (!intentTask) throw new Error("Tool observations are limited to active Intent tasks")
-      const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now() }
+      const retain = preserved !== undefined && preserved.preservedChars <= this.evidenceLimits.listChars
+      const evidence: TodoToolEvidenceStatus | undefined = preserved && {
+        retained: retain,
+        complete: preserved.complete,
+        originalChars: preserved.originalChars,
+        preservedChars: preserved.preservedChars
+      }
+      const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence }
       database.run("INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt])
+      if (preserved) {
+        database.run("INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
+        enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
+      }
       if (row.status === "in_review") database.run("UPDATE todo_items SET version = version + 1, updated_at = ? WHERE id = ?", [observation.createdAt, row.id])
       bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
       logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId })
@@ -565,8 +726,8 @@ export class TodoRepository {
       if (evaluation.criteria.length !== acceptanceCriteria.length || evaluation.criteria.some((criterion, index) => criterion.criterion !== acceptanceCriteria[index])) {
         throw new Error("Evaluation criteria do not match the stored task acceptance criteria")
       }
-      const observations = rows<{ id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null }>(database,
-        "SELECT id, tool_name, arguments_json, failed, exit_code FROM todo_tool_observations WHERE item_id = ?", [itemId])
+      const observations = rows<{ id: string; item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null }>(database,
+        "SELECT observations.id, observations.item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)", [list.id, list.id])
       const evidenceIds = new Set(rows<{ id: string }>(database, "SELECT id FROM todo_evidence WHERE item_id = ?", [itemId]).map((entry) => entry.id))
       const observationIds = new Set(observations.map((observation) => observation.id))
       for (const [index, criterion] of evaluation.criteria.entries()) {
@@ -579,18 +740,26 @@ export class TodoRepository {
       }
       if (evaluation.decision === "accept") {
         const byId = new Map(observations.map((observation) => [observation.id, observation]))
+        const records = retainedEvidenceFor(database, itemId, true, list.id)
+        const coverageGaps = (criterion: string) => evidenceGaps(evidenceAnchors(criterion), records)
         const unsupported = evaluation.criteria.some((criterion) => {
           if (criterion.status !== "passed") return true
+          if (coverageGaps(criterion.criterion).length > 0) return true
           const refs = criterion.evidenceRefs.filter((id) => byId.has(id))
-          const trusted = observations.filter((observation) => byId.has(observation.id)).map((observation) => ({
-            id: observation.id, itemId, toolName: observation.tool_name, arguments: JSON.parse(observation.arguments_json) as Record<string, string>, output: "",
+          const needsCommandEvidence = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
+          // Command results prove only the task's own runs; shared observations may support reads and searches.
+          const trusted = observations.filter((observation) => !needsCommandEvidence || observation.item_id === itemId).map((observation) => ({
+            id: observation.id, itemId: observation.item_id, toolName: observation.tool_name, arguments: JSON.parse(observation.arguments_json) as Record<string, string>, output: "",
             failed: observation.failed !== 0, exitCode: observation.exit_code ?? undefined, createdAt: ""
           }))
-          const needsCommandEvidence = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
           const evidenceFreeAnalysis = isAnalysisOnlyIntent(currentPlan.goal) && !needsCommandEvidence
           return criterion.status !== "passed" || (!hasTrustedEvidenceForCriterion(criterion.criterion, refs, trusted) && !evidenceFreeAnalysis)
         })
-        if (unsupported) throw new Error("Evaluation cannot accept criteria without adequate trusted tool observations")
+        if (unsupported) {
+          const gapMessages = evaluation.criteria.flatMap((criterion, index) =>
+            criterion.status === "passed" ? coverageGaps(criterion.criterion).map((gap) => `criteria[${index}]: ${describeGap(gap)}`) : [])
+          throw new Error(["Evaluation cannot accept criteria without adequate trusted tool observations", ...gapMessages].join("; "))
+        }
         const unfinishedDependency = rows<{ id: string }>(database,
           "SELECT prerequisite.id FROM todo_dependencies dependency JOIN todo_items prerequisite ON prerequisite.id = dependency.depends_on_item_id WHERE dependency.item_id = ? AND prerequisite.status != 'completed' LIMIT 1", [itemId])[0]
         if (unfinishedDependency) throw new Error("Cannot verify a task while its dependencies are incomplete")
@@ -653,6 +822,16 @@ export class TodoRepository {
   }
 
   createItem(request: TodoListRequest, input: CreateTodoInput, requestId: string, actor: "user" | "model" = "model"): Promise<TodoItem> {
+    return this.createItemOutcome(request, input, requestId, actor).then((outcome) => outcome.item)
+  }
+
+  /**
+   * Creates a TODO, or reuses the existing one when a model create matches a
+   * task that is already present. Exact titles match first; within an
+   * authoritative intent plan, a clear word overlap also matches. Ambiguous or
+   * weak overlaps create a new item rather than merging distinct work.
+   */
+  createItemOutcome(request: TodoListRequest, input: CreateTodoInput, requestId: string, actor: "user" | "model" = "model"): Promise<TodoCreateOutcome> {
     validateRequestId(requestId)
     const title = input.title.trim()
     const parentId = input.parentId?.trim() || undefined
@@ -663,24 +842,35 @@ export class TodoRepository {
 
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
-      const prior = parseRequest<TodoItem>(database, list.id, requestId, "create")
-      if (prior) return prior
+      const prior = parseRequest<TodoCreateOutcome | TodoItem>(database, list.id, requestId, "create")
+      if (prior) return "item" in prior ? prior : { item: prior, reused: false }
       if (parentId) {
         const parent = rows<{ id: string }>(database, "SELECT id FROM todo_items WHERE id = ? AND list_id = ?", [parentId, list.id])[0]
         if (!parent) throw new Error("Parent TODO item must be in the active conversation")
       }
       if (actor === "model") {
         const wanted = normalizeTodoIdentity(title)
-        const existing = rows<ItemRow>(
+        const siblings = rows<ItemRow>(
           database,
           "SELECT * FROM todo_items WHERE list_id = ? AND status != 'cancelled' AND COALESCE(parent_id, '') = ? ORDER BY sort_order, created_at",
           [list.id, parentId ?? ""]
-        ).find((row) => normalizeTodoIdentity(row.title) === wanted)
-        if (existing) {
-          const item = itemOf(existing)
-          recordRequest(database, list.id, requestId, "create", item)
-          logTodoEvent("todo.duplicate.reconciled", { operation_id: list.id, item_id: item.id, status: item.status, actor, request_id: requestId })
-          return item
+        )
+        const exact = siblings.find((row) => normalizeTodoIdentity(row.title) === wanted)
+        const planRows = exact ? [] : rows<ItemRow>(
+          database,
+          `SELECT items.* FROM todo_items AS items JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id
+           WHERE items.list_id = ? AND tasks.list_id = ? AND tasks.active = 1 AND items.status NOT IN ('completed','cancelled') AND COALESCE(items.parent_id, '') = ?`,
+          [list.id, list.id, parentId ?? ""]
+        )
+        const overlap = exact ? undefined : planOverlapMatch(planRows, title)
+        const umbrella = exact || overlap ? undefined : planUmbrellaMatch(planRows, title)
+        const reusedRow = exact ?? overlap ?? umbrella
+        if (reusedRow) {
+          const matchedBy = exact ? "title" : overlap ? "plan_overlap" : "plan_umbrella"
+          const outcome: TodoCreateOutcome = { item: itemOf(reusedRow), reused: true, matchedBy }
+          recordRequest(database, list.id, requestId, "create", outcome)
+          logTodoEvent("todo.duplicate.reconciled", { operation_id: list.id, item_id: outcome.item.id, status: outcome.item.status, actor, matched_by: outcome.matchedBy ?? null, request_id: requestId })
+          return outcome
         }
       }
       const createdAt = now()
@@ -691,10 +881,10 @@ export class TodoRepository {
         [id, list.id, parentId ?? null, title, input.details ?? null, priority, actor, actor, list.id, createdAt, createdAt]
       )
       bumpList(database, list.id, id, "item_created", actor, requestId, { title, parentId, priority })
-      const item = itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [id])[0])
-      recordRequest(database, list.id, requestId, "create", item)
-      logTodoEvent("todo.created", { operation_id: list.id, item_id: id, status: item.status, actor, request_id: requestId })
-      return item
+      const outcome: TodoCreateOutcome = { item: itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [id])[0]), reused: false }
+      recordRequest(database, list.id, requestId, "create", outcome)
+      logTodoEvent("todo.created", { operation_id: list.id, item_id: id, status: outcome.item.status, actor, request_id: requestId })
+      return outcome
     })
   }
 
@@ -774,6 +964,70 @@ export class TodoRepository {
       recordRequest(database, list.id, input.requestId, "update", item)
       logTodoEvent("todo.updated", { operation_id: list.id, item_id: row.id, status: item.status, version: item.version, actor: input.actor, request_id: input.requestId })
       return item
+    })
+  }
+
+  /**
+   * Records a model completion claim exactly once. The first valid claim moves
+   * the TODO to in_review and queues its Feedback review. Repeats while that
+   * review is pending are acknowledged without changing the version. Only
+   * Feedback or a trusted user action can complete the TODO.
+   */
+  claimCompletion(request: TodoListRequest, input: { itemId: string; expectedVersion: number; requestId: string }): Promise<TodoCompletionClaim> {
+    validateRequestId(input.requestId)
+    return this.sqlite.write((database) => {
+      const list = ensureList(database, request)
+      const prior = parseRequest<TodoCompletionClaim>(database, list.id, input.requestId, "claim")
+      if (prior) return prior
+      const row = rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ? AND list_id = ?", [input.itemId, list.id])[0]
+      if (!row) throw new Error("TODO item was not found in the active conversation")
+      if (row.status === "completed" || row.status === "cancelled") throw new Error(`Cannot claim completion for a ${row.status} TODO`)
+
+      const review = reviewPathFor(database, list.id, row.id)
+      const lastClaim = latestItemEvent(database, list.id, row.id, "completion_claimed")
+      const lastEvaluation = latestItemEvent(database, list.id, row.id, "evaluation_recorded")
+      const reviewPending = row.status === "in_review" && lastClaim !== undefined
+        && (lastEvaluation === undefined || lastEvaluation.list_revision < lastClaim.list_revision)
+
+      if (reviewPending) {
+        const claimed = JSON.parse(lastClaim.payload_json) as { expectedVersion: number }
+        if (input.expectedVersion < claimed.expectedVersion || input.expectedVersion > row.version) {
+          throw new TodoConflictError(`Completion claim is already pending review at version ${row.version}; resubmitting from version ${input.expectedVersion} is not a valid retry`)
+        }
+        const claim: TodoCompletionClaim = { disposition: "already_submitted", item: itemOf(row), review }
+        recordRequest(database, list.id, input.requestId, "claim", claim)
+        logTodoEvent("todo.claim.already_submitted", { operation_id: list.id, item_id: row.id, version: row.version, request_id: input.requestId })
+        return claim
+      }
+
+      if (lastEvaluation) {
+        const evaluated = JSON.parse(lastEvaluation.payload_json) as { decision: TodoEvaluationDecision; evaluation: TodoEvaluation }
+        const newEvidence = rows<{ found: number }>(database,
+          "SELECT 1 AS found FROM todo_events WHERE list_id = ? AND item_id = ? AND event_type IN ('tool_observed','evidence_added') AND list_revision > ? LIMIT 1",
+          [list.id, row.id, lastEvaluation.list_revision]).length > 0
+        if (evaluated.decision !== "accept" && !newEvidence) {
+          const corrections = evaluated.evaluation.correctiveInstructions.length ? evaluated.evaluation.correctiveInstructions : [evaluated.evaluation.explanation]
+          throw new TodoConflictError(`Feedback ${evaluated.decision === "needs_evidence" ? "needs more evidence" : "rejected the previous completion claim"} and no new observation was recorded. Do not resubmit the same claim; ${corrections.join("; ")}`)
+        }
+      }
+
+      if (row.version !== input.expectedVersion) throw new TodoConflictError(`TODO changed since version ${input.expectedVersion}; current version is ${row.version}`)
+      const alreadyInReview = row.status === "in_review"
+      if (!alreadyInReview && !statusTransitions[row.status].has("in_review")) throw new Error(`Invalid TODO transition: ${row.status} -> in_review`)
+
+      if (!alreadyInReview) {
+        database.run(
+          "UPDATE todo_items SET status = 'in_review', verification = 'not_checked', blocked_reason = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
+          [now(), row.id, row.version]
+        )
+        if (database.getRowsModified() !== 1) throw new TodoConflictError("TODO changed while recording its completion claim")
+      }
+      const resultVersion = alreadyInReview ? row.version : row.version + 1
+      bumpList(database, list.id, row.id, "completion_claimed", "model", input.requestId, { expectedVersion: input.expectedVersion, resultVersion, previousStatus: row.status, review })
+      const claim: TodoCompletionClaim = { disposition: "accepted", item: itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [row.id])[0]), review }
+      recordRequest(database, list.id, input.requestId, "claim", claim)
+      logTodoEvent("todo.claim.accepted", { operation_id: list.id, item_id: row.id, previous_status: row.status, version: claim.item.version, review, request_id: input.requestId })
+      return claim
     })
   }
 

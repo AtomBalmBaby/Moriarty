@@ -2,7 +2,7 @@
  * Helpers for the streams the layer hands out.
  */
 import { InferenceError } from "./errors"
-import { ChatChunk, FimChunk } from "./types"
+import { ChatChunk, ChatFinishReason, FimChunk } from "./types"
 
 const cancelled = (reason: unknown) =>
   new InferenceError("cancelled", "The request was cancelled.", {
@@ -57,4 +57,26 @@ export const readText = async (
     text += "text" in chunk ? chunk.text : chunk.content
   }
   return text
+}
+
+/**
+ * A chat reply with what the reply channels said: the visible content, the
+ * length of any reasoning streamed beside it, and why the reply ended.
+ */
+export interface ChatReply {
+  content: string
+  reasoningChars: number
+  finishReason?: ChatFinishReason
+}
+
+export const readReply = async (stream: AsyncIterable<ChatChunk>): Promise<ChatReply> => {
+  let content = ""
+  let reasoningChars = 0
+  let finishReason: ChatFinishReason | undefined
+  for await (const chunk of stream) {
+    content += chunk.content
+    if (chunk.reasoning) reasoningChars += chunk.reasoning.length
+    if (chunk.finishReason) finishReason = chunk.finishReason
+  }
+  return { content, reasoningChars, ...(finishReason ? { finishReason } : {}) }
 }

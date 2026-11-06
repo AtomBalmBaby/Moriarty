@@ -50,7 +50,7 @@ import { agentToolSelectionDiagnostic, projectTaskRelevantTools, resolveAgentToo
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
-import { isCancelled, readText, resolveInferenceProvider } from "../inference"
+import { isCancelled, readReply, readText, resolveInferenceProvider } from "../inference"
 import {
   assumedContextWindow,
   contextWindowOf,
@@ -64,12 +64,12 @@ import { describeProviderError, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { evaluateTodoReview, feedbackContext, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { evaluateTodoReview, feedbackContext, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
-import { TodoEvaluation, TodoListRequest } from "../todos/types"
+import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
-import { DEFAULT_MAX_STEPS, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
+import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import type { ToolCall } from "../tools/protocol"
 import { todoTools, todoWorkspaceTools } from "../tools/todos"
@@ -80,14 +80,14 @@ import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
-import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, requiresWorkspaceChanges } from "./execution-reconciliation"
-import { FeedbackPlanner, type FeedbackPlanOutcome } from "./feedback-planner"
+import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, observationReference, requiresWorkspaceChanges } from "./execution-reconciliation"
+import { FeedbackGate, FeedbackPlanner, type FeedbackPlanOutcome, type FeedbackRetryOutcome } from "./feedback-planner"
 import { ChatGeneration } from "./generation"
 import { McpHost } from "./mcp-host"
 import { PROMPT_COMPILER_PROTOCOL, PromptCompiler, PromptCompilerTraceRecord } from "./prompt-compiler"
 import { ChangeStore, ReplyChanges, viewOf } from "./reply-changes"
 import { ReplyChangesEditor } from "./reply-changes-editor"
-import type { RoleResolution } from "./role-inference"
+import { type RoleReply, type RoleResolution,structuredReply } from "./role-inference"
 import { DiagnosticRegressionMonitor, SafeEditCheckpoints } from "./safe-edit-recovery"
 import {
   ChatCommandMode,
@@ -114,16 +114,6 @@ const mcpAllowed = (team: TeamAgentPolicy | undefined) => team?.commands !== "of
 
 /** How long an agent reply waits for the team's policy to be re-read. */
 const POLICY_REFRESH_WAIT_MS = 1500
-/** How long a new message waits for its Feedback plan before the first model call. */
-const FEEDBACK_PLAN_WAIT_MS = 20_000
-const settleWithin = <T>(promise: Promise<T>, ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    void promise.finally(() => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
 /** The steps an agent reply may take, as `twinny.chatToolsMaxSteps` may set them. */
 const MIN_STEPS_SETTING = 4
 const MAX_STEPS_SETTING = 100
@@ -306,6 +296,7 @@ export class Chat extends Base {
   private _activeMcpTools: McpToolSpec[] = []
   private _missingMcpCapabilities: string[] = []
   private _agentToolDiagnostic?: string
+  private readonly _runtimeInventorySignatures = new Map<string, string>()
   private readonly _steps: ToolSteps
   private readonly _stopSubscription: { dispose(): void }
   /** What agent replies changed, kept so each can be compared or undone from the chat. */
@@ -335,6 +326,8 @@ export class Chat extends Base {
   private readonly _promptCompiler: PromptCompiler
   /** TODO planning on the Feedback provider, alongside each agent turn. */
   private readonly _feedbackPlanner: FeedbackPlanner
+  /** Holds an agent turn until its message's Feedback plan is synchronized. */
+  private readonly _feedbackGate: FeedbackGate
 
   constructor(
     generations: GenerationTracker,
@@ -371,6 +364,11 @@ export class Chat extends Base {
       onSnapshot: (snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot),
       onStatus: (status) => this._bridge.emit(TODO_EVENT_NAME.feedbackStatus, status),
       onFailure: (message) => this._bridge.emit(EVENT_NAME.twinnyNotification, message)
+    })
+    this._feedbackGate = new FeedbackGate({
+      planner: this._feedbackPlanner,
+      busy: () => this._generation.running || this._preparing,
+      notify: (message) => this._steps.said("feedback-blocked", message)
     })
 
     // Initialize generation and context
@@ -568,6 +566,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   public resetConversation() {
     this._conversation = []
     this._feedbackPlanner.cancel("conversation-changed")
+    this._feedbackGate.clear()
   }
 
   /**
@@ -621,15 +620,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         provider: provider.provider,
         model: provider.modelName,
         label: provider.label,
-        infer: async ({ system, user }, { signal, trace }) => {
-          try {
-            return await readText(resolveInferenceProvider(provider).chat({
+        infer: async ({ system, user, json }, { signal, trace }) => {
+          const messages = [
+            ...(system ? [{ role: SYSTEM, content: system }] : []),
+            { role: USER, content: user }
+          ] as ChatCompletionMessage[]
+          const send = async (responseFormat: boolean): Promise<RoleReply> => {
+            const reply = await readReply(resolveInferenceProvider(provider).chat({
               model: provider.modelName,
-              messages: [
-                ...(system ? [{ role: SYSTEM, content: system }] : []),
-                { role: USER, content: user }
-              ] as ChatCompletionMessage[]
+              messages,
+              ...(responseFormat ? { responseFormat: "json" as const } : {})
             }, { signal, trace }))
+            return { text: reply.content, reasoningChars: reply.reasoningChars, finishReason: reply.finishReason }
+          }
+          try {
+            return json
+              ? await structuredReply(`${provider.provider}|${provider.modelName}|${provider.label}`, send, signal)
+              : await send(false)
           } catch (failure) {
             if (isCancelled(failure)) throw failure
             throw new Error(`${role} (${provider.label}): ${describeProviderError(failure, provider)}`)
@@ -789,47 +796,54 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (this._missingMcpCapabilities.length) {
         this._bridge.emit(EVENT_NAME.twinnyNotification, `Agent MCP capabilities unavailable: ${this._missingMcpCapabilities.join(", ")}`)
       }
-      // The first model call must see the plan for this message, so planning
-      // is awaited here with a bound; a slower plan still reconciles after the reply.
-      if (isFeedbackEnabled(workspace.getConfiguration("twinny"))) {
-        const planning = this.startFeedbackPlanning(messages)
-        if (planning) await settleWithin(planning, FEEDBACK_PLAN_WAIT_MS)
-      }
-      this._conversation = await buildChatTurn(messages, {
-        systemPrompt: async () => {
-          const snapshot = await this._context.systemPromptSnapshot()
-          const base = snapshot.prompt
-          const baseLayers = [snapshot.hasTeamPolicy ? "team-policy" : "", snapshot.instructions.content.trim() ? "chat-base" : ""].filter(Boolean)
-          const agentId = this._activeAgent?.summary.id ?? this._requestAgentSelection
-          const taskContext = await this.activeIntentTaskProjection()
-          if (this._requestAgentSelection === "off") {
-            logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=off order=" + [...baseLayers, ...(taskContext ? ["active-intent-task"] : []), "runtime-user-context", ...(view ? ["provider-tool-definitions"] : [])].join(","))
-            return taskContext ? base + "\n\n" + taskContext : base
-          }
-          const workspaceContext = await this.agentWorkspaceContext(view)
-          const context = [workspaceContext, taskContext].filter(Boolean).join("\n\n")
-          const layers = [...baseLayers]
-          if (this._activeAgent?.profile.instructions.trim()) layers.push("agent-profile")
-          if (workspaceContext.trim()) layers.push("workspace-context")
-          if (taskContext) layers.push("active-intent-task")
-          if (this._missingMcpCapabilities.length) layers.push("mcp-capability-notes")
-          layers.push("runtime-user-context")
-          if (view) layers.push("provider-tool-definitions")
-          logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=" + agentId + " order=" + layers.join(","))
-          return composeAgentPrompt(base, this._activeAgent?.profile.instructions ?? "", context, [...this._missingMcpCapabilities, ...(this._agentToolDiagnostic ? [this._agentToolDiagnostic] : [])])
-        },
-        additionalContext: async (question, sources, history) => {
-          const context = await this._context.additionalContext(question, sources, mentions, history)
-          // With tools, where the user is in the editor comes with the
-          // question, so "this function" needs no tool call to place.
-          const hint = view ? editorHint(view) : ""
-          return hint ? `${hint}\n\n${context}` : context
+      // Mycroft starts only after Feedback has produced an authoritative plan
+      // (or Feedback is off). The gate holds the turn on any other outcome.
+      const planning = isFeedbackEnabled(workspace.getConfiguration("twinny"))
+        ? this.startFeedbackPlanning(messages)
+        : undefined
+      const dispatch = async (): Promise<string | undefined> => {
+        this._preparing = true
+        try {
+          this._conversation = await buildChatTurn(messages, {
+            systemPrompt: async () => {
+              const snapshot = await this._context.systemPromptSnapshot()
+              const base = snapshot.prompt
+              const baseLayers = [snapshot.hasTeamPolicy ? "team-policy" : "", snapshot.instructions.content.trim() ? "chat-base" : ""].filter(Boolean)
+              const agentId = this._activeAgent?.summary.id ?? this._requestAgentSelection
+              const taskContext = await this.activeIntentTaskProjection()
+              if (this._requestAgentSelection === "off") {
+                logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=off order=" + [...baseLayers, ...(taskContext ? ["active-intent-task"] : []), "runtime-user-context", ...(view ? ["provider-tool-definitions"] : [])].join(","))
+                return taskContext ? base + "\n\n" + taskContext : base
+              }
+              const workspaceContext = await this.agentWorkspaceContext(view)
+              const context = [workspaceContext, taskContext].filter(Boolean).join("\n\n")
+              const layers = [...baseLayers]
+              if (this._activeAgent?.profile.instructions.trim()) layers.push("agent-profile")
+              if (workspaceContext.trim()) layers.push("workspace-context")
+              if (taskContext) layers.push("active-intent-task")
+              if (this._missingMcpCapabilities.length) layers.push("mcp-capability-notes")
+              layers.push("runtime-user-context")
+              if (view) layers.push("provider-tool-definitions")
+              logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=" + agentId + " order=" + layers.join(","))
+              return composeAgentPrompt(base, this._activeAgent?.profile.instructions ?? "", context, [...this._missingMcpCapabilities, ...(this._agentToolDiagnostic ? [this._agentToolDiagnostic] : [])])
+            },
+            additionalContext: async (question, sources, history) => {
+              const context = await this._context.additionalContext(question, sources, mentions, history)
+              // With tools, where the user is in the editor comes with the
+              // question, so "this function" needs no tool call to place.
+              const hint = view ? editorHint(view) : ""
+              return hint ? `${hint}\n\n${context}` : context
+            }
+          })
+        } finally {
+          this._preparing = false
         }
-      })
+        return this.run(provider, "", view)
+      }
+      return await this._feedbackGate.admit(conversationId ?? "", planning, dispatch)
     } finally {
       this._preparing = false
     }
-    return this.run(provider, "", view)
   }
 
   /** A code action (explain, refactor…) run over the editor selection. */
@@ -1100,9 +1114,39 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return this._todoRepository!.getList(scope)
   }
 
-  /** Re-runs Feedback planning for the conversation's last message after a failure. */
-  public async retryFeedback(conversationId: string): Promise<FeedbackPlanOutcome> {
-    return this._feedbackPlanner.retry(conversationId)
+  /** Re-runs Feedback planning for the held message after a failure; the turn starts only once that plan is synchronized. */
+  public async retryFeedback(conversationId: string): Promise<FeedbackRetryOutcome> {
+    return this._feedbackGate.retry(conversationId)
+  }
+
+  /** Records the outgoing tool definitions as a trusted host observation, only when they change for the active TODO. */
+  private generationOptions() {
+    return {
+      generationLimits: () => generationLimitsFrom({
+        durationSeconds: this.config.get<number>("chatInferenceMaxDurationSeconds", GENERATION_LIMIT_DEFAULTS.durationSeconds),
+        noProgressSeconds: this.config.get<number>("chatInferenceNoProgressSeconds", GENERATION_LIMIT_DEFAULTS.noProgressSeconds),
+        outputTokens: this.config.get<number>("chatInferenceMaxOutputTokens", GENERATION_LIMIT_DEFAULTS.outputTokens)
+      }),
+      onGenerationStop: (stop: GenerationStopped) => logger.warn(`Chat · inference stopped (${stop.reason}, limit ${stop.limit}).`)
+    }
+  }
+
+  private async recordRuntimeInventory(scope: TodoListRequest, itemId: string, tools: WorkspaceTools): Promise<void> {
+    const names = tools.tools.map((tool) => tool.name).sort()
+    const signature = names.join("\n")
+    const key = `${scope.projectFingerprint}\n${scope.conversationId}\n${itemId}`
+    if (this._runtimeInventorySignatures.get(key) === signature || !this._todoRepository) return
+    const output = JSON.stringify({ outgoingToolCount: names.length, outgoingTools: names })
+    await this._todoRepository.recordToolObservation(scope, {
+      itemId,
+      toolName: RUNTIME_INVENTORY_TOOL,
+      arguments: {},
+      output,
+      evidenceOutput: output,
+      failed: false,
+      requestId: randomUUID()
+    }).then(() => this._runtimeInventorySignatures.set(key, signature))
+      .catch((error: unknown) => logger.error("[Todo] could not record the runtime tool inventory: " + String(error)))
   }
 
   private async reviewTodoTasks(
@@ -1113,9 +1157,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   ): Promise<TodoEvaluation[]> {
     if (!this._todoRepository) return []
     const reviews = await this._todoRepository.getReviewPackages(scope)
-    const candidates = itemId
-      ? reviews.filter((review) => review.task.id === itemId)
-      : reviews.filter((review) => !review.lastEvaluation || review.lastEvaluation.metadata.taskVersion !== review.task.version - 1)
+    const candidates = reviewCandidates(reviews, itemId)
     if (!candidates.length) {
       if (itemId) throw new Error("This TODO is not awaiting evaluation")
       return []
@@ -1248,6 +1290,19 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return undefined
     }
 
+    if (!reviewFailure) {
+      // Other plan tasks may hold pending claims; the active task was just evaluated and its new version excludes it.
+      try {
+        await this.reviewTodoTasks(scope, undefined, changes, {
+          finalResponse,
+          requireWorkspaceChanges: requireChanges,
+          signal: this._executionAbort?.signal
+        })
+      } catch (error) {
+        logger.warn("[Execution] turn-end Feedback sweep failed; pending claims remain in review: " + redact(error instanceof Error ? error.message : String(error)))
+      }
+    }
+
     const after = await this._todoRepository.getList({ ...scope, includeCompleted: true })
     current = after.items.find((item) => item.id === intent.task.id)
     if (reviewFailure && current?.status === "in_review") {
@@ -1320,7 +1375,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ? workflow.advanceAcceptedTask(progress)
       : workflow.reconcile(decision, progress, workflow.recordEvidence({ observations: next.observations ?? [], passedCriteria }))
     if (!outcome.continue) {
-      const reason = outcome.reason ?? "The autonomous execution retry budget was exhausted."
+      const open = evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => criterion.criterion) ?? []
+      const reason = (outcome.reason ?? "The autonomous execution retry budget was exhausted.") + (open.length ? ` Unsatisfied: ${open.slice(0, 3).join("; ")}.` : "")
       this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution stopped: ${reason}` })
       logger.warn("[Execution] stopped: " + reason)
       return undefined
@@ -1356,13 +1412,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       feedback,
       verifiedObservations: [
         ...(intent.observations ?? []).filter((observation) => !observation.failed).slice(0, 5).map((observation) => {
-          const path = observation.arguments.path ?? observation.arguments.file
-          return observation.toolName + (path ? " " + path : "") + ": " + observation.output.slice(0, 240)
+          return observationReference(observation)
         }),
         ...(changes?.files ?? []).slice(0, 5).map((file) => "Current reply change: " + file.path + " (" + file.status + ", +" + file.added + "/-" + file.removed + ")")
       ],
       failedActions: (intent.observations ?? []).filter((observation) => observation.failed).slice(0, 3).map((observation) =>
-        observation.toolName + " " + JSON.stringify(observation.arguments) + ": " + observation.output.slice(0, 240)
+        observationReference(observation)
       ),
       finalResponse
     })
@@ -1459,6 +1514,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     void contextWindowOf(provider)
     this._steering = []
     this._steerable = !!view
+    // Every model turn, including an automatic continuation after Feedback,
+    // is generating from here on; the chat shows its tool steps while it does.
+    this._bridge.emit(EVENT_NAME.twinnyOnLoading, { continuation: execution.continuations })
     const hooks = {
       onNotes: (notes: string | undefined) => (toolNotes = notes),
       onUsage: (counted: ToolLoopUsage) => Object.assign(usage, counted),
@@ -1470,10 +1528,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         const scope = this.activeTodoScope()
         if (!scope) return
         const invocationId = randomUUID()
+        const rawOutput = result.execution?.output ?? result.output
         const evidence = compactToolEvidence({
           name: call.name,
           args: call.args,
-          output: result.execution?.output ?? result.output,
+          output: rawOutput,
           failed: result.failed ?? false,
           exitCode: result.execution?.exitCode,
           invocationId
@@ -1488,6 +1547,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             toolName: call.name,
             arguments: compactArguments(evidence),
             output: compactEvidenceText(evidence),
+            evidenceOutput: evidence.failed ? undefined : rawOutput,
             failed: evidence.failed,
             exitCode: evidence.exitCode,
             requestId: invocationId
@@ -1533,10 +1593,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         })
       }
     }
+    const inventoryHooks = {
+      ...hooks,
+      onTools: (tools: WorkspaceTools) => {
+        hooks.onTools(tools)
+        if (todoScope && intentAtStart) void this.recordRuntimeInventory(todoScope, intentAtStart.task.id, tools)
+      }
+    }
     const client = view
-      ? this.toolsClient(provider, view, hooks, intentAtStart?.goal, activeCheckpoints, onCatastrophic)
+      ? this.toolsClient(provider, view, inventoryHooks, intentAtStart?.goal, activeCheckpoints, onCatastrophic)
       : todoOnly && todoScope
-        ? this.todoToolsClient(provider, todoScope, hooks)
+        ? this.todoToolsClient(provider, todoScope, inventoryHooks)
         : resolveInferenceProvider(provider)
     const reply = await this._generation.generate(
       client,
@@ -1575,6 +1642,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       this._steerable = false
       this._steering = []
     })
+    // The reply carries its steps now (the chat took them with it).
+    this._steps.handOff()
     if (reply) {
       this._conversation = [
         ...this._conversation,
@@ -1602,6 +1671,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       // Reviews run after this reply was saved; the webview attaches them to it.
       const late = this._steps.steps.filter((step) => step.name === "feedback" && !priorSteps.has(step))
       if (late.length) this._bridge.emit(EVENT_NAME.twinnyReplySteps, late)
+      this._steps.handOff()
       if (continuation && execution.claimContinuation() && !this.cancelled) {
         this._conversation = [...this._conversation, { role: USER, content: continuation }]
         logger.info("[Execution] continuing automatically after independent reconciliation")
@@ -1658,6 +1728,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
+      ...this.generationOptions(),
       maxResultChars,
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
       contextWindow: async () => {
@@ -1856,6 +1927,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
+      ...this.generationOptions(),
       maxResultChars,
       // OpenAI's reasoning models think silently on the chat route; at their
       // default effort one tool step can take minutes.

@@ -5,6 +5,8 @@ import * as path from "node:path"
 import { test } from "node:test"
 
 import {
+  AGENT_GLYPHS,
+  agentGlyphState,
   discoverAgentFileNames,
   nextAgentSelection,
   normalizeAgentSelection,
@@ -162,6 +164,37 @@ test("compiled webview exposes one interactive agent selector and its management
   const settingsStyles = fs.readFileSync(path.resolve(__dirname, "../../../src/webview/styles/agent-settings.module.css"), "utf8")
   assert.match(settingsStyles, /\.agentsSection\s*\{[^}]*overflow: visible;/)
   assert.match(settingsStyles, /\.agentAddForm\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\);/)
+})
+
+test("agent glyph precedence keeps blocked and failed states visible and celebrates only when idle", () => {
+  const idle = { enabled: true, toolsRunning: false, toolsWaiting: false, toolFailed: false, feedbackPlanning: false, feedbackFailed: false, todoBlocked: false, generating: false }
+  assert.equal(agentGlyphState(idle), "ready")
+  assert.equal(agentGlyphState({ ...idle, enabled: false, toolFailed: true }), "off")
+  assert.equal(agentGlyphState({ ...idle, generating: true, todoBlocked: true, toolsRunning: true }), "blocked")
+  assert.equal(agentGlyphState({ ...idle, feedbackFailed: true, feedbackPlanning: true }), "blocked")
+  assert.equal(agentGlyphState({ ...idle, toolFailed: true, generating: true }), "blocked")
+  assert.equal(agentGlyphState({ ...idle, toolsWaiting: true, toolsRunning: true }), "waiting")
+  assert.equal(agentGlyphState({ ...idle, toolsRunning: true, feedbackPlanning: true, generating: true }), "tools")
+  assert.equal(agentGlyphState({ ...idle, feedbackPlanning: true, generating: true }), "verifying")
+  assert.equal(agentGlyphState({ ...idle, generating: true }), "thinking")
+  assert.equal(agentGlyphState({ ...idle, celebration: "complete" }), "complete")
+  assert.equal(agentGlyphState({ ...idle, celebration: "milestone", generating: true }), "thinking")
+  assert.equal(agentGlyphState({ ...idle, celebration: "milestone", todoBlocked: true }), "blocked")
+})
+
+test("agent glyph table gives every state one distinct glyph and a label", () => {
+  const entries = Object.entries(AGENT_GLYPHS)
+  assert.equal(entries.length, 9)
+  assert.equal(new Set(entries.map(([, value]) => value.glyph)).size, entries.length)
+  for (const [, value] of entries) assert.ok(value.label.length > 0)
+  assert.equal(AGENT_GLYPHS.complete.glyph, "🎉")
+  assert.equal(AGENT_GLYPHS.milestone.glyph, "🎆")
+})
+
+test("agent glyph animations are disabled for reduced motion", () => {
+  const styles = fs.readFileSync(path.resolve(__dirname, "../../../src/webview/styles/chat.module.css"), "utf8")
+  assert.match(styles, /@media \(prefers-reduced-motion: reduce\) \{\s*\.agentGlyph \{\s*animation: none !important;/)
+  assert.match(styles, /\.agentGlyph\[data-state="complete"\]/)
 })
 
 test("agents settings schema defaults new profiles to Off and provides registration fields", () => {

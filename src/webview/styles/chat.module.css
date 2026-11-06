@@ -628,6 +628,74 @@
   text-overflow: ellipsis;
 }
 
+/* The agent's status glyph on the picker; one per state, see AGENT_GLYPHS. */
+.agentGlyph {
+  display: inline-block;
+  font-size: var(--tw-fs-sm);
+  line-height: 1;
+}
+
+.agentGlyph[data-state="ready"] {
+  animation: glyph-shimmer 4s ease-in-out infinite;
+}
+
+.agentGlyph[data-state="thinking"] {
+  animation: glyph-pulse 1.4s ease-in-out infinite;
+}
+
+.agentGlyph[data-state="tools"] {
+  animation: glyph-move 1s ease-in-out infinite;
+}
+
+.agentGlyph[data-state="verifying"] {
+  animation: glyph-scan 1.6s ease-in-out infinite;
+}
+
+.agentGlyph[data-state="milestone"],
+.agentGlyph[data-state="complete"] {
+  animation: glyph-burst 1s ease-out 1;
+}
+
+@keyframes glyph-shimmer {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes glyph-pulse {
+  50% {
+    transform: scale(1.18);
+  }
+}
+
+@keyframes glyph-move {
+  50% {
+    transform: translateX(2px);
+  }
+}
+
+@keyframes glyph-scan {
+  50% {
+    transform: rotate(-14deg) scale(1.1);
+  }
+}
+
+@keyframes glyph-burst {
+  0% {
+    transform: scale(0.7);
+  }
+
+  50% {
+    transform: scale(1.4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agentGlyph {
+    animation: none !important;
+  }
+}
+
 .agentSelect:hover,
 .agentSettingsButton:hover {
   color: var(--tw-fg);

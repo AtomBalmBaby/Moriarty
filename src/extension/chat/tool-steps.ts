@@ -138,6 +138,20 @@ export class ToolSteps {
     this.update(step.id, { stoppable: true })
   }
 
+  /**
+   * The reply's steps were saved with it: the list starts again, so the
+   * steps that follow (a Feedback review, the next turn) are not sent twice.
+   */
+  public handOff() {
+    this._steps = []
+    this._skipped.clear()
+    this._stoppers.clear()
+    this._stopped.clear()
+    clearTimeout(this._liveTimer)
+    this._liveTimer = undefined
+    this._live = undefined
+  }
+
   /** The user's stop on a running step: that command ends, the reply goes on. */
   public stop(id: string) {
     const stop = this._stoppers.get(id)

@@ -58,6 +58,90 @@ const MIN_RESULT_CHARS = 1000
 const MAX_REPEATED_CALLS = 3
 const MAX_UNREADABLE_IN_A_ROW = 3
 const MAX_NO_PROGRESS_STEPS = 3
+
+/** Why the host stopped one request, rather than the model finishing it. */
+export type GenerationStopReason = "duration_limit" | "no_progress" | "output_limit"
+
+/** Ends a request's stream. It carries the reason, so the stop is never read as a finished reply. */
+export class GenerationStopped extends Error {
+  constructor(readonly reason: GenerationStopReason, readonly limit: number) {
+    super(`generation stopped: ${reason}`)
+    this.name = "GenerationStopped"
+  }
+}
+
+export interface GenerationLimits {
+  /** Longest one request may run, in milliseconds; 0 turns the limit off. */
+  maxDurationMs: number
+  /** Longest silence between chunks of one request, in milliseconds; 0 turns the limit off. */
+  noProgressMs: number
+  /** Output tokens asked of the server for one request; 0 keeps the server's own limit. */
+  maxOutputTokens: number
+}
+
+export const NO_GENERATION_LIMITS: GenerationLimits = { maxDurationMs: 0, noProgressMs: 0, maxOutputTokens: 0 }
+
+/** Defaults for the `twinny.chatInference*` settings, in whole seconds and tokens. */
+export const GENERATION_LIMIT_DEFAULTS = { durationSeconds: 900, noProgressSeconds: 300, outputTokens: 0 }
+const MAX_GENERATION_SECONDS = 7200
+const MAX_GENERATION_TOKENS = 1_000_000
+/** How often a running request is compared with its limits. */
+const GENERATION_CHECK_MS = 1000
+
+const wholeSetting = (value: number, fallback: number, max: number) =>
+  Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : fallback
+
+export const generationLimitsFrom = (settings: { durationSeconds: number; noProgressSeconds: number; outputTokens: number }): GenerationLimits => ({
+  maxDurationMs: wholeSetting(settings.durationSeconds, GENERATION_LIMIT_DEFAULTS.durationSeconds, MAX_GENERATION_SECONDS) * 1000,
+  noProgressMs: wholeSetting(settings.noProgressSeconds, GENERATION_LIMIT_DEFAULTS.noProgressSeconds, MAX_GENERATION_SECONDS) * 1000,
+  maxOutputTokens: wholeSetting(settings.outputTokens, GENERATION_LIMIT_DEFAULTS.outputTokens, MAX_GENERATION_TOKENS)
+})
+
+/** Tracks one request against its limits. The clock is injected, so the limits test without waiting. */
+export class GenerationMonitor {
+  private readonly started: number
+  private lastOutput: number
+
+  constructor(private readonly limits: GenerationLimits, private readonly clock: () => number = Date.now) {
+    this.started = clock()
+    this.lastOutput = this.started
+  }
+
+  /** Whether any time limit applies, so a checking timer is needed. */
+  get timed(): boolean {
+    return this.limits.maxDurationMs > 0 || this.limits.noProgressMs > 0
+  }
+
+  /** Called for every chunk the server sends. */
+  output(): void {
+    this.lastOutput = this.clock()
+  }
+
+  /** The limit this request has run past, if any. */
+  exceeded(): GenerationStopped | undefined {
+    const now = this.clock()
+    if (this.limits.maxDurationMs > 0 && now - this.started >= this.limits.maxDurationMs) {
+      return new GenerationStopped("duration_limit", this.limits.maxDurationMs)
+    }
+    if (this.limits.noProgressMs > 0 && now - this.lastOutput >= this.limits.noProgressMs) {
+      return new GenerationStopped("no_progress", this.limits.noProgressMs)
+    }
+    return undefined
+  }
+}
+
+/** What the user is told when the host stopped a request. */
+export const generationStopNotice = (stop: GenerationStopped): string => {
+  switch (stop.reason) {
+    case "duration_limit":
+      return `Stopped: this request ran past its ${stop.limit / 1000} second limit before the model finished. Completed tool results are kept; continue to resume.`
+    case "no_progress":
+      return `Stopped: the model sent no output for ${stop.limit / 1000} seconds. Completed tool results are kept; continue to resume.`
+    case "output_limit":
+      return "Stopped: the model reached its output limit before finishing this reply. A tool call it was still writing was not run; continue to resume."
+  }
+}
+
 export type ToolMode = "native" | "text"
 
 /**
@@ -173,6 +257,10 @@ export interface ToolLoopOptions {
   steering?(): string[]
   /** Called when the reply ended because it used every tool step it had, with the work maybe unfinished. */
   onOutOfSteps?(): void
+  /** Limits on one request's duration, silence, and output, read before each request. */
+  generationLimits?(): GenerationLimits
+  /** Called when the host stopped a request; the reason is shown to the user in place of a finished reply. */
+  onGenerationStop?(stop: GenerationStopped): void
   /**
    * Called when the reply ends, however it ends, with the calls made and
    * what they returned, cut to size: kept with the reply so the next turn
@@ -516,17 +604,27 @@ class ToolLoop {
       else outer?.addEventListener("abort", forward, { once: true })
       const requestId = `${operationId}-request-${++requestSequence}`
 
+      const limits = this._options.generationLimits?.() ?? NO_GENERATION_LIMITS
+      const monitor = new GenerationMonitor(limits)
+      const maxOutputTokens = limits.maxOutputTokens > 0 ? limits.maxOutputTokens : undefined
       const reply = { text: "", shown: 0, toolCalls: undefined as ChatToolCall[] | undefined, reasoning: "" }
       let found: FoundCall | undefined
       let finishReason: ChatFinishReason | undefined
       let promptTokens: number | undefined
       let completionTokens: number | undefined
+      const watch = monitor.timed
+        ? setInterval(() => {
+          const stop = monitor.exceeded()
+          if (stop && !stepAbort.signal.aborted) stepAbort.abort(stop)
+        }, GENERATION_CHECK_MS)
+        : undefined
       try {
         const chunks = this._client.chat(
           {
             ...request,
             messages: sent,
             ...(this._effort ? { reasoningEffort: this._effort } : {}),
+            ...(maxOutputTokens ? { maxTokens: maxOutputTokens } : {}),
             ...(tools ? { tools } : {})
           },
           {
@@ -544,8 +642,13 @@ class ToolLoop {
           }
         )
         for await (const chunk of chunks) {
+          monitor.output()
           reply.text += chunk.content
-          if (typeof chunk.reasoning === "string" && chunk.reasoning) reply.reasoning += chunk.reasoning
+          if (typeof chunk.reasoning === "string" && chunk.reasoning) {
+            reply.reasoning += chunk.reasoning
+            // Passed on as it arrives, so the chat can show the thinking while it happens.
+            yield { content: "", reasoning: chunk.reasoning }
+          }
           if (chunk.toolCalls) reply.toolCalls = [...(reply.toolCalls ?? []), ...chunk.toolCalls]
           if (chunk.usage?.promptTokens) promptTokens = chunk.usage.promptTokens
           if (chunk.usage?.completionTokens) completionTokens = chunk.usage.completionTokens
@@ -567,6 +670,12 @@ class ToolLoop {
       } catch (error) {
         if (outer?.aborted) {
           throw error
+        }
+        if (stepAbort.signal.reason instanceof GenerationStopped) {
+          // The host stopped this request. It is not retried, and what it was
+          // writing is neither run nor read as a finished reply.
+          yield* this.stopped(stepAbort.signal.reason)
+          return
         }
         if (this._effort && !reply.text && refusesReasoningEffort(error)) {
           inferenceEvent("tool_loop.retry_decision", {
@@ -619,12 +728,19 @@ class ToolLoop {
         }
         if (!isCancelled(error)) throw error
       } finally {
+        if (watch) clearInterval(watch)
         outer?.removeEventListener("abort", forward)
         if (found) stepAbort.abort(new Error("Twinny tool call detected"))
         else stepAbort.abort()
       }
 
       this.count(promptChars, promptTokens, completionTokens)
+      // A reply the output cap cut short may hold half a call: nothing it
+      // says is run, and it is not presented as finished.
+      if (finishReason === "length") {
+        yield* this.stopped(new GenerationStopped("output_limit", maxOutputTokens ?? 0))
+        return
+      }
 
       const nativeCalls = native && !last ? this.nativeCalls(reply.toolCalls) : []
       if (!nativeCalls.length) found ??= findToolCall(reply.text, true)
@@ -657,8 +773,8 @@ class ToolLoop {
         }
         if (last && !settled && !this._stuck && step >= maxSteps) this._options.onOutOfSteps?.()
         const usage = this._usage.promptTokens || this._usage.completionTokens ? { ...this._usage } : undefined
-        if (usage || finishReason || reply.reasoning) {
-          yield { content: "", ...(reply.reasoning ? { reasoning: reply.reasoning } : {}), ...(usage ? { usage } : {}), ...(finishReason ? { finishReason } : {}) }
+        if (usage || finishReason) {
+          yield { content: "", ...(usage ? { usage } : {}), ...(finishReason ? { finishReason } : {}) }
         }
         return
       }
@@ -908,6 +1024,12 @@ class ToolLoop {
   private show(content: string): ChatChunk {
     this._shown += content
     return { content }
+  }
+
+  /** Tells the user the host stopped the request; no finished reply is written after it. */
+  private *stopped(stop: GenerationStopped): Generator<ChatChunk> {
+    this._options.onGenerationStop?.(stop)
+    yield this.show(`${this._shown.trim() ? "\n\n" : ""}${generationStopNotice(stop)}`)
   }
 
   private nativeCalls(toolCalls: ChatToolCall[] | undefined): PendingCall[] {

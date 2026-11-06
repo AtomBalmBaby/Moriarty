@@ -1072,6 +1072,33 @@
           "markdownDescription": "How many tool steps one agent reply may take before the model is asked to answer with what it has (with `#twinny.chatTools#` on). More lets a capable model finish longer tasks in one reply; each step is another request to the model.",
           "scope": "machine"
         },
+        "twinny.chatInferenceMaxDurationSeconds": {
+          "order": 21,
+          "type": "number",
+          "default": 900,
+          "minimum": 0,
+          "maximum": 7200,
+          "markdownDescription": "The longest one model request may run, in seconds, before `#twinny.chatTools#` stops it and keeps the completed tool results. `0` turns this limit off.",
+          "scope": "machine"
+        },
+        "twinny.chatInferenceNoProgressSeconds": {
+          "order": 22,
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 7200,
+          "markdownDescription": "How long a model request may send no output, in seconds, before it is stopped as stalled. `0` turns this limit off.",
+          "scope": "machine"
+        },
+        "twinny.chatInferenceMaxOutputTokens": {
+          "order": 23,
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 1000000,
+          "markdownDescription": "Output tokens asked of the server for each model request. `0` keeps the server's own limit. A request that reaches it is stopped, and a tool call it was still writing is not run.",
+          "scope": "machine"
+        },
         "twinny.chatToolsMaxReadLines": {
           "order": 20,
           "type": "number",

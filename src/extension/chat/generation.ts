@@ -12,6 +12,7 @@ import {
 } from "../inference/trace"
 import { ExtensionBridge } from "../messaging/bridge"
 import { describeProviderError, describeProviderErrorPlain, isAbortError } from "../providers/errors"
+import { redactEvidence } from "../todos/evidence"
 
 /** Message content is a string, or text parts alongside images. */
 const contentText = (content: ChatCompletionMessage["content"]): string => {
@@ -168,6 +169,7 @@ export class ChatGeneration {
           streamChunks++
           streamedContentChars += chunk.content.length
           reasoningChars += chunk.reasoning?.length ?? 0
+          if (chunk.reasoning) this._bridge.emit(EVENT_NAME.twinnyOnReasoning, redactEvidence(chunk.reasoning))
           if (chunk.finishReason) finishReason = chunk.finishReason
           if (chunk.usage?.completionTokens) {
             meta.completionTokens = chunk.usage.completionTokens

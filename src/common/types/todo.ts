@@ -51,6 +51,13 @@ export interface TodoEvaluation {
   metadata: { evaluator: string; evaluatedAt: string; taskVersion: number; planRevision: number }
 }
 
+export interface TodoToolEvidenceStatus {
+  retained: boolean
+  complete: boolean
+  originalChars: number
+  preservedChars: number
+}
+
 export interface TodoToolObservation {
   id: string
   itemId: string
@@ -60,6 +67,7 @@ export interface TodoToolObservation {
   failed: boolean
   exitCode?: number
   createdAt: string
+  evidence?: TodoToolEvidenceStatus
 }
 
 export interface TodoListSnapshot {
@@ -73,7 +81,7 @@ export interface TodoListSnapshot {
 /** The Feedback planning state of one conversation, shown above its TODO list. */
 export interface TodoFeedbackStatus {
   conversationId: string
-  state: "planning" | "planned" | "failed" | "idle"
+  state: "planning" | "retrying" | "planned" | "failed" | "idle"
   error?: string
 }
 

@@ -112,7 +112,7 @@ export const parsableToolArguments = (messages: ChatMessage[]): ChatMessage[] =>
 
 type ChatParameters = Pick<
   ChatRequest,
-  "maxTokens" | "temperature" | "think" | "tools" | "reasoningEffort"
+  "maxTokens" | "temperature" | "think" | "tools" | "reasoningEffort" | "responseFormat"
 >
 
 const llamaCppSchema = (
@@ -216,6 +216,12 @@ const withReasoningHistory = (
     return { ...rest, reasoning_content: reasoning } as ChatMessage
   })
 
+/** OpenAI and the OpenAI-style servers take `response_format: json_object`; QVAC's own server is not known to. */
+const supportsJsonObjectMode = (provider: TwinnyProvider) =>
+  provider.provider === API_PROVIDERS.OpenAI ||
+  (isOpenAICompatibleProvider(provider.provider) &&
+    provider.provider !== API_PROVIDERS.Qvac)
+
 /**
  * Only real API parameters: OpenAI rejects unknown ones such as an `id`.
  * `think: false` is sent as OpenAI's own `reasoning_effort: "none"`, which
@@ -236,6 +242,9 @@ const requestParameters = (
     : {}),
   ...(request.reasoningEffort && provider.provider === API_PROVIDERS.OpenAI
     ? { reasoning_effort: request.reasoningEffort }
+    : {}),
+  ...(request.responseFormat === "json" && supportsJsonObjectMode(provider)
+    ? { response_format: { type: "json_object" as const } }
     : {}),
   ...(request.tools?.length
     ? {

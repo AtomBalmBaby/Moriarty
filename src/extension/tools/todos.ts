@@ -78,7 +78,7 @@ export const todoTools = (
   },
   {
     name: "twinny_todo_create",
-    description: "Create a task in Twinny's canonical native TODO list for this conversation.",
+    description: "Create a task in Twinny's canonical native TODO list for this conversation. If the authoritative plan already has an equivalent task, this returns that existing item (result existing_task) instead of creating a duplicate; update that item by item_id with twinny_todo_update. Create only genuinely new work.",
     parameters: [
       { name: "title", description: "Short task title." },
       { name: "request_id", description: "Generate a non-empty unique ID; reuse it only when retrying the exact same mutation." },
@@ -102,14 +102,25 @@ export const todoTools = (
       try {
         const priority = args.priority as TodoPriority | undefined
         if (priority && !priorities.has(priority)) throw new Error("Invalid priority")
-        const item = await repository.createItem(scope, {
+        const outcome = await repository.createItemOutcome(scope, {
           title: args.title,
           details: args.details,
           parentId: args.parent_id,
           priority
         }, requestId(args))
         onChanged()
-        return result(item, "created a native TODO")
+        const { item } = outcome
+        return result({
+          ok: true,
+          result: outcome.reused ? "existing_task" : "created",
+          item_id: item.id,
+          task_status: item.status,
+          version: item.version,
+          title: item.title,
+          ...(outcome.reused ? { matched_by: outcome.matchedBy } : {}),
+          next_action: outcome.reused ? "use_existing_task" : "continue",
+          item
+        }, outcome.reused ? "matched an existing native TODO" : "created a native TODO")
       } catch (error) {
         return errorResult(error)
       }
@@ -117,7 +128,7 @@ export const todoTools = (
   },
   {
     name: "twinny_todo_update",
-    description: "Update a native TODO with optimistic concurrency. Setting status to completed is treated as a model completion claim and moves it to in_review; repeating an identical claim changes nothing. Only the user can approve completion, in the TODO panel; the model cannot complete or waive verification. A blocked TODO can move to in_review when its blocker is resolved and the completion claim is supported by evidence, or back to pending or in_progress.",
+    description: "Update a native TODO with optimistic concurrency. Setting status to completed submits a completion claim, not a final state: the first valid claim moves the TODO to in_review and queues Feedback review; an identical repeat is acknowledged without changes. Submit a claim once. in_review means the claim was received, so do not retry it. Continue other actionable work or finish the turn so Feedback can review. If Feedback rejects a claim, follow its corrective instructions instead of resubmitting an unchanged claim. Only trusted Feedback verification or the user, in the TODO panel, can approve completion. A blocked TODO can be claimed again when its blocker is resolved, or moved back to pending or in_progress.",
     parameters: [
       { name: "item_id", description: "ID of the TODO item." },
       { name: "expected_version", description: "Current item version from twinny_todo_list or twinny_todo_get.", type: "integer" },
@@ -155,6 +166,28 @@ export const todoTools = (
         for (const [source, target] of [["title", "title"], ["details", "details"], ["status", "status"], ["priority", "priority"], ["blocked_reason", "blockedReason"]]) {
           if (args[source] !== undefined) patch[target] = args[source]
         }
+        if (status === "completed") {
+          const others = Object.keys(patch).filter((key) => key !== "status")
+          if (others.length) throw new Error(`A completion claim must not change other fields (${others.join(", ")}); update those in a separate call first`)
+          const claim = await repository.claimCompletion(scope, {
+            itemId: args.item_id,
+            expectedVersion,
+            requestId: requestId(args)
+          })
+          onChanged()
+          return result({
+            ok: true,
+            claim: claim.disposition,
+            item_id: claim.item.id,
+            task_status: claim.item.status,
+            verification: "pending",
+            review: claim.review,
+            version: claim.item.version,
+            retry_required: false,
+            next_action: "continue_other_work_or_finish_turn",
+            ...(claim.review === "user_approval" ? { note: "This task is not in a Feedback plan; it awaits the user's approval in the TODO panel." } : {})
+          }, claim.disposition === "accepted" ? "completion claim accepted; Feedback review is pending" : "completion claim already submitted; no change")
+        }
         const item = await repository.updateItem(scope, {
           itemId: args.item_id,
           expectedVersion,
@@ -163,10 +196,7 @@ export const todoTools = (
           requestId: requestId(args)
         })
         onChanged()
-        const summary = patch.status === "completed" && item.status === "in_review"
-          ? "completion claim moved to in_review; it awaits evidence or the user's approval in the TODO panel"
-          : "updated a native TODO"
-        return result(item, summary)
+        return result(item, "updated a native TODO")
       } catch (error) {
         return errorResult(error)
       }

@@ -3,7 +3,8 @@ import { createHash } from "node:crypto"
 import { logger, redact } from "../../common/logger"
 import type { ReplyChangesView, TodoEvaluation, TodoEvaluationCriterion } from "../../common/types"
 
-import type { IntentPlanContext, TodoReviewPackage } from "./types"
+import { describeGap, evidenceAnchors, evidenceGaps, type EvidenceSource, evidenceWindows, propositionNeedles, redactEvidence, samePath } from "./evidence"
+import { type IntentPlanContext, RUNTIME_INVENTORY_TOOL, type TodoReviewPackage } from "./types"
 
 export const taskRequiresWorkspaceChanges = (task: Pick<TodoReviewPackage["task"], "title" | "details">, criteria: string[]): boolean => {
   const taskText = [task.title, task.details ?? "", ...criteria].join("\n")
@@ -151,6 +152,14 @@ export const hasTrustedEvidenceForCriterion = (
   })
 }
 
+/**
+ * A criterion about tool exposure (available, exposed, offered, outgoing) may
+ * be established by the host's runtime inventory. Anything naming a source
+ * path is a source-level proposition that the inventory cannot establish.
+ */
+const runtimeExposureProposition = (criterion: string, anchors: { paths: string[] }) =>
+  anchors.paths.length === 0 && /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(criterion)
+
 export const parseTodoEvaluation = (
   raw: string,
   review: TodoReviewPackage,
@@ -213,6 +222,21 @@ export const parseTodoEvaluation = (
     return number
   }
   let decision = value.decision as TodoEvaluation["decision"]
+  for (const criterion of criteria) {
+    if (criterion.status !== "passed") continue
+    const anchors = evidenceAnchors(criterion.criterion)
+    const runtimeCanCover = runtimeExposureProposition(criterion.criterion, anchors)
+    const cited = review.retainedEvidence.filter((entry) => criterion.evidenceRefs.includes(entry.observationId))
+    if (!runtimeCanCover && (anchors.paths.length || anchors.symbols.length) && cited.length && cited.every((entry) => entry.toolName === RUNTIME_INVENTORY_TOOL)) {
+      criterion.status = "unverified"
+      problems.push("Runtime tool exposure does not establish source registration; cite a source observation for: " + criterion.criterion)
+      continue
+    }
+    const gaps = evidenceGaps(anchors, review.retainedEvidence.filter((entry) => runtimeCanCover || entry.toolName !== RUNTIME_INVENTORY_TOOL))
+    if (!gaps.length) continue
+    criterion.status = "unverified"
+    problems.push(...gaps.map((gap) => `${criterion.criterion} — ${describeGap(gap)}`.slice(0, 500)))
+  }
   if (decision === "accept") {
     for (const criterion of criteria) {
       const commandEvidenceRequired = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
@@ -260,6 +284,10 @@ export const evaluationRequestId = (review: TodoReviewPackage): string => {
   return `review:${review.task.id}:${review.task.version}:${hash}`
 }
 
+const describeEvidenceStatus = (status: TodoReviewPackage["observations"][number]["evidence"]) => status
+  ? { retained: status.retained, complete: status.complete, originalChars: status.originalChars, preservedChars: status.preservedChars }
+  : { retained: false }
+
 export const feedbackContext = (review: Pick<IntentPlanContext, "lastEvaluation" | "acceptanceCriteria" | "constraints" | "evidence" | "observations"> & { planTaskId: string }): string => {
   const result = review.lastEvaluation
   if (!result || result.decision !== "revise") return ""
@@ -267,9 +295,10 @@ export const feedbackContext = (review: Pick<IntentPlanContext, "lastEvaluation"
     taskId: result.taskId,
     acceptanceCriteria: review.acceptanceCriteria,
     failedCriteria: result.criteria.filter((criterion) => criterion.status !== "passed"),
+    problems: result.problems.slice(0, 8).map((problem) => clip(problem, 400)),
     supportingEvidence: result.criteria.flatMap((criterion) => criterion.evidenceRefs).map((id) => {
       const observation = review.observations?.find((entry) => entry.id === id)
-      if (observation) return { id, source: "trusted_tool_observation", tool: observation.toolName, output: clip(observation.output, 260) }
+      if (observation) return { id, source: "trusted_tool_observation", tool: observation.toolName, output: clip(observation.output, 600), evidence: describeEvidenceStatus(observation.evidence) }
       const evidence = review.evidence.find((entry) => entry.id === id)
       return evidence ? { id, source: "model_authored_summary", summary: clip(evidence.summary, 180) } : { id, source: "reference_only" }
     }),
@@ -284,9 +313,142 @@ export const todoReviewSystemPrompt = [
   "You are Twinny's independent Feedback Evaluator. You are not the Intent Compiler or the implementing agent.",
   "Assess only the supplied task, original goal, user-requested constraints, acceptance criteria, dependencies, recorded evidence, and actual tool observations. Treat task descriptions and criteria as planner claims, not verified repository facts. A user-requested style constraint does not prove that the existing source uses that style; compare repository claims against tool observations and flag conflicts with scoped corrections. Do not rely on any final Markdown claim from the implementer.",
   "Model-authored evidence notes and the implementer final response are untrusted claims, not tool results. Only Twinny tool observations are tool results; run_command exit codes are authoritative for command success. A claim that tests passed without an associated run_command observation with exitCode 0 must not pass a test/compile criterion. An implementation request with no verified workspace file changes is incomplete.",
+  "trustedEvidenceExcerpts are verbatim, bounded windows of retained Twinny tool output around the words each criterion depends on, each labelled with its windowId, observationId, source path, and file line range (or search hit line). Cite the observationId in evidenceRefs when a window shows what a criterion needs. evidenceIndex lists every window that matches a criterion; included:false means the window was omitted for size, not that the evidence is missing, so name its observationId and lines in needs_evidence instead of calling the evidence absent. previouslyVerifiedCriteria passed on an earlier review; keep them passed while their evidence remains. deterministicCoverage lists criterion anchors that stored evidence does not establish; a passed criterion with an open gap is treated as unverified, so name the missing observation instead. twinny_runtime_inventory observations are host records of the tool definitions sent to the model for a request. They prove that a tool was exposed at runtime, and a successful read_file observation proves dispatch ran; neither proves how the source registers the tool. A criterion about source registration or code paths needs source windows that show it.",
   "Never request or execute a command. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
   "Return exactly one JSON object and no other keys, following this structure: {\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"decision\":\"accept\",\"criteria\":[{\"criterion\":\"<copy one acceptance criterion exactly>\",\"status\":\"passed\",\"evidenceRefs\":[\"<supplied evidence ID>\"]}],\"problems\":[],\"correctiveInstructions\":[],\"explanation\":\"<non-empty string>\",\"scores\":{\"completion\":0,\"correctness\":0,\"alignment\":0}}. Every listed key is required. decision must be exactly one of accept, revise, needs_evidence, blocked. Each criteria entry has exactly criterion (string), status (passed, failed, or unverified), and evidenceRefs (array of supplied IDs). criteria must contain exactly one entry per supplied acceptance criterion in the same order and with identical text. Each evidenceRefs entry must be an ID explicitly supplied in the input; never invent or infer IDs. problems and correctiveInstructions are arrays of strings and may be empty; explanation is a non-empty string; scores has exactly completion, correctness, and alignment, each an integer from -7 to +8. Do not use 'text' instead of 'criterion', do not return correctiveInstructions as a string, and do not add fields."
 ].join("\n")
+
+const MAX_CRITERION_EXCERPT_CHARS = 4_000
+const MAX_REVIEW_EXCERPT_CHARS = 16_000
+const MAX_EVIDENCE_INDEX = 80
+const EXCERPT_CONTEXT_LINES = 3
+
+interface EvidenceCandidate {
+  key: string
+  observationId: string
+  toolName: string
+  sources: EvidenceSource[]
+  complete: boolean
+  originalChars: number
+  preservedChars: number
+  lines?: { start: number; end: number }
+  text: string
+  truncated: boolean
+}
+
+/** Windows of visible retained evidence that mention a word one criterion depends on. */
+const candidatesForCriterion = (review: TodoReviewPackage, criterion: string, visible: Set<string>): EvidenceCandidate[] => {
+  const needles = propositionNeedles(criterion)
+  const criterionPaths = evidenceAnchors(criterion).paths
+  return review.retainedEvidence.flatMap((entry): EvidenceCandidate[] => {
+    if (entry.failed || !visible.has(entry.observationId)) return []
+    const base = {
+      observationId: entry.observationId,
+      toolName: entry.toolName,
+      sources: entry.sources,
+      complete: entry.complete,
+      originalChars: entry.originalChars,
+      preservedChars: entry.preservedChars
+    }
+    const onCriterionPath = entry.sources.some((source) => criterionPaths.some((path) => samePath(source.path, path)))
+    // Search output is one JSON line, so its parsed hits are the windows, not the raw text.
+    const contentWindows = entry.content !== undefined && entry.hits.length === 0 && (needles.length > 0 || onCriterionPath)
+      ? evidenceWindows(entry.content.split("\n"), needles, EXCERPT_CONTEXT_LINES).map((window) => ({
+        key: `${entry.observationId}:${window.from}-${window.to}`,
+        lines: window.lines,
+        text: window.text,
+        truncated: window.truncated
+      }))
+      : []
+    const hitWindows = entry.hits.flatMap((hit, index) => {
+      if (!needles.some((needle) => `${hit.path} ${hit.preview}`.toLowerCase().includes(needle))) return []
+      return [{
+        key: `${entry.observationId}:hit-${index}`,
+        sources: [{ path: hit.path, ...(hit.line !== undefined ? { startLine: hit.line, endLine: hit.line } : {}) }],
+        lines: hit.line !== undefined ? { start: hit.line, end: hit.line } : undefined,
+        text: redactEvidence(`${hit.path}${hit.line !== undefined ? `:${hit.line}` : ""} ${hit.preview}`),
+        truncated: false
+      }]
+    })
+    return [...contentWindows, ...hitWindows].map((window) => ({ ...base, ...window }))
+  })
+}
+
+/**
+ * Evidence windows for the whole review. A window shared by several criteria is
+ * shown once. Each criterion's first window is always shown so it can be judged;
+ * further windows must fit the per-criterion and global budgets. Omitted windows
+ * stay in the index with their observation and line range, so they can be retrieved.
+ */
+const reviewEvidence = (review: TodoReviewPackage) => {
+  const visible = new Set(preserveObservationSet(review).map((observation) => observation.id))
+  const seen = new Map<string, { candidate: EvidenceCandidate; criteria: string[]; included: boolean }>()
+  let globalUsed = 0
+  for (const criterion of review.acceptanceCriteria) {
+    let criterionUsed = 0
+    let covered = false
+    for (const candidate of candidatesForCriterion(review, criterion, visible)) {
+      const existing = seen.get(candidate.key)
+      if (existing) {
+        if (!existing.criteria.includes(criterion)) existing.criteria.push(criterion)
+        if (existing.included) covered = true
+        continue
+      }
+      const size = candidate.text.length
+      const included = !covered || (criterionUsed + size <= MAX_CRITERION_EXCERPT_CHARS && globalUsed + size <= MAX_REVIEW_EXCERPT_CHARS)
+      if (included) {
+        criterionUsed += size
+        globalUsed += size
+        covered = true
+      }
+      seen.set(candidate.key, { candidate, criteria: [criterion], included })
+    }
+  }
+  const entries = [...seen.values()]
+  return {
+    excerpts: entries.filter((entry) => entry.included).map(({ candidate, criteria }) => ({
+      windowId: candidate.key,
+      observationId: candidate.observationId,
+      toolName: candidate.toolName,
+      sources: candidate.sources,
+      ...(candidate.lines ? { lines: candidate.lines } : {}),
+      complete: candidate.complete,
+      originalChars: candidate.originalChars,
+      preservedChars: candidate.preservedChars,
+      truncated: candidate.truncated,
+      criteria: criteria.map((value) => clip(value, 200)),
+      text: candidate.text
+    })),
+    index: entries.slice(0, MAX_EVIDENCE_INDEX).map(({ candidate, criteria, included }) => ({
+      windowId: candidate.key,
+      observationId: candidate.observationId,
+      sources: candidate.sources,
+      ...(candidate.lines ? { lines: candidate.lines } : {}),
+      criteria: criteria.map((value) => clip(value, 200)),
+      included
+    })),
+    indexOmitted: Math.max(0, entries.length - MAX_EVIDENCE_INDEX)
+  }
+}
+
+const reviewEvidenceFields = (review: TodoReviewPackage) => {
+  const evidence = reviewEvidence(review)
+  return {
+    trustedEvidenceExcerpts: evidence.excerpts,
+    evidenceIndex: evidence.index,
+    evidenceIndexOmitted: evidence.indexOmitted
+  }
+}
+
+/** Deterministic coverage: which criterion anchors the stored evidence does not establish, and what would. */
+const evidenceCoverage = (review: TodoReviewPackage) => review.acceptanceCriteria.flatMap((criterion) =>
+  evidenceGaps(evidenceAnchors(criterion), review.retainedEvidence.filter((entry) => entry.toolName !== RUNTIME_INVENTORY_TOOL)).map((gap) => ({
+    criterion,
+    anchor: gap.anchor,
+    reason: gap.reason,
+    next: describeGap(gap)
+  }))
+)
 
 export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChangesView, finalResponse?: string): string => JSON.stringify({
   originalGoal: clip(review.goal, 800),
@@ -310,18 +472,33 @@ export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChange
     problems: review.lastEvaluation.problems.slice(0, 5),
     correctiveInstructions: review.lastEvaluation.correctiveInstructions.slice(0, 5)
   } : undefined,
+  previouslyVerifiedCriteria: review.lastEvaluation?.criteria
+    .filter((criterion) => criterion.status === "passed")
+    .map((criterion) => ({ criterion: clip(criterion.criterion, 300), evidenceRefs: criterion.evidenceRefs.slice(0, 8) })),
   trustedTwinnyToolObservations: preserveObservationSet(review).map((entry) => ({
     id: entry.id,
     toolName: entry.toolName,
     arguments: Object.fromEntries(Object.entries(entry.arguments).slice(0, 8).map(([key, value]) => [clip(key, 100), clip(value, 500)])),
-    output: clip(entry.output, 1800),
+    output: clip(entry.output, 1000),
+    evidence: describeEvidenceStatus(entry.evidence),
     failed: entry.failed,
     ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {})
   })),
+  ...reviewEvidenceFields(review),
+  deterministicCoverage: evidenceCoverage(review),
   implementerFinalResponseUntrusted: finalResponse ? clip(finalResponse, 1200) : undefined
 })
 
 const reviewsInFlight = new Map<string, Promise<TodoEvaluation>>()
+
+/**
+ * Plan tasks awaiting Feedback: a task with no evaluation, or one whose last
+ * evaluation predates its current version (a claim or new evidence arrived).
+ */
+export const reviewCandidates = (reviews: TodoReviewPackage[], itemId?: string): TodoReviewPackage[] =>
+  itemId
+    ? reviews.filter((review) => review.task.id === itemId)
+    : reviews.filter((review) => !review.lastEvaluation || review.lastEvaluation.metadata.taskVersion !== review.task.version - 1)
 
 export const evaluateTodoReview = (
   repository: import("./repository").TodoRepository,

@@ -749,3 +749,17 @@ test("a message the user sent mid-reply shows among the steps where the model re
   steps.settle()
   assert.strictEqual(steps.steps[1].status, "done", "settling a stopped reply leaves what was said alone")
 })
+
+test("handing off a saved reply's steps leaves the next steps to show alone, with no resend of the reply", () => {
+  const sent: ToolStepView[][] = []
+  const steps = new ToolSteps((list) => sent.push(list))
+  steps.start({ id: "0.0", name: "search_workspace", args: { query: "read_file" } })
+  steps.finish({ id: "0.0", index: 0, mode: "native", summary: "searched", output: "hits", promptChars: 0 })
+  steps.handOff()
+  assert.deepStrictEqual(steps.steps, [], "the saved reply's steps are not kept for the next emission")
+  steps.review("feedback.review.1", "Feedback is reviewing the task", "running")
+  assert.deepStrictEqual(sent[sent.length - 1].map((step) => step.id), ["feedback.review.1"])
+  steps.handOff()
+  steps.start({ id: "1.0", name: "read_file", args: { path: "src/a.ts" } })
+  assert.deepStrictEqual(sent[sent.length - 1].map((step) => step.id), ["1.0"], "a continuation's first call shows without the review")
+})

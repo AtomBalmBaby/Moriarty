@@ -19,7 +19,8 @@ export {
   resolveInferenceProvider
 } from "./registry"
 export { leavesMachine, type SecretShieldMode, shieldClient, shouldShield } from "./shield"
-export { abortable, readText } from "./stream"
+export type { ChatReply } from "./stream"
+export { abortable, readReply, readText } from "./stream"
 export type {
   ChatChunk,
   ChatFinishReason,

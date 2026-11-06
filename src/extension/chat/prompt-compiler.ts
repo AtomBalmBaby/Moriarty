@@ -9,7 +9,7 @@ import {
   InferenceTraceContext
 } from "../inference/trace"
 
-import { abortAfter, extractJsonObject, RoleResolver, RoleTimeoutError } from "./role-inference"
+import { abortAfter, extractJsonObject, replyText, RoleResolver, RoleTimeoutError } from "./role-inference"
 
 export const PROMPT_COMPILER_PROTOCOL =
   "Rewrite the user's draft into a clearer, more complete prompt for a coding assistant without changing its intent, scope, constraints or exclusions. " +
@@ -118,7 +118,7 @@ export class PromptCompiler {
     try {
       const system = (await options.systemPrompt()).trim()
       const user = input.history ? `${input.history}\n\nCurrent draft:\n${draft}` : draft
-      const response = await endpoint.infer({ system, user }, { signal: controller.signal, trace })
+      const response = replyText(await endpoint.infer({ system, user }, { signal: controller.signal, trace }))
       if (controller.signal.aborted) throw controller.signal.reason ?? new Error("aborted")
       if (options.trace) {
         await options.trace({ requestId, operationId: trace.operationId, provider: endpoint.provider, model: endpoint.model, system, user, response })

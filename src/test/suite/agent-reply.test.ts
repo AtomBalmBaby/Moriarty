@@ -107,7 +107,11 @@ suite("Agent reply, end to end", function () {
       "Created the TODO."
     ])
     providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
-    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider }
+    // Feedback is on by default and plans every send; the planner answers that the request needs no new plan.
+    const planner = new ScriptedModel([JSON.stringify({ track: false, plan: null })])
+    providerRegistry.register("scripted-planner", { id: "scripted-planner", create: () => planner })
+    const plannerProvider: TwinnyProvider = { ...provider, id: "scripted-planner", provider: "scripted-planner", type: "intent" }
+    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: plannerProvider }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),
@@ -184,7 +188,11 @@ suite("Agent reply, end to end", function () {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-task-context-"))
     const model = new ScriptedModel(["Done.", "Done."])
     providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
-    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider }
+    // Only the enabled turn plans; the existing synchronized plan already covers the request.
+    const planner = new ScriptedModel([JSON.stringify({ track: false, plan: null })])
+    providerRegistry.register("scripted-task-planner", { id: "scripted-task-planner", create: () => planner })
+    const plannerProvider: TwinnyProvider = { ...provider, id: "scripted-task-planner", provider: "scripted-task-planner", type: "intent" }
+    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: plannerProvider }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
       globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),

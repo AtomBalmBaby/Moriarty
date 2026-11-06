@@ -147,6 +147,11 @@ export interface ChatRequest {
    * refuse the parameter.
    */
   reasoningEffort?: "low" | "medium" | "high"
+  /**
+   * `json` asks the server for a JSON object (structured output) where the
+   * provider supports it. Servers that refuse it get the plain request.
+   */
+  responseFormat?: "json"
 }
 
 /**

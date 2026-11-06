@@ -23,7 +23,15 @@ import {
   trimmedResult
 } from "../../extension/tools/budget"
 import { contentHash } from "../../extension/tools/line-edit"
-import { flattenToolHistory, ToolLoopUsage, ToolStep, withTools } from "../../extension/tools/loop"
+import {
+  flattenToolHistory,
+  generationLimitsFrom,
+  GenerationMonitor,
+  NO_GENERATION_LIMITS,
+  ToolLoopUsage,
+  ToolStep,
+  withTools
+} from "../../extension/tools/loop"
 import { ToolResult, WorkspaceTools, workspaceTools } from "../../extension/tools/workspace"
 import { parsePeerFrame } from "../../protocol/peer"
 
@@ -146,6 +154,131 @@ test("old results are trimmed, oldest first, when the next request would not fit
   const untrimmed = scripted([{ calls: [read("1", "a.ts")] }, { calls: [read("2", "b.ts")] }, "Done."])
   await collect(withTools(untrimmed.client, workspaceTools(root), { mode: "native" }).chat(ask("Read two.")))
   assert.ok(results(untrimmed.requests[2]).every((content) => content.includes("const value59")))
+})
+
+/** A client that sends its first chunks, then goes quiet until the host aborts the request. */
+const stalled = (chunks: ChatChunk[], requests: ChatRequest[]) =>
+  ({
+    id: "stalled",
+    chat(request: ChatRequest, options?: InferenceOptions) {
+      requests.push(structuredClone(request))
+      return (async function* (): AsyncGenerator<ChatChunk> {
+        for (const chunk of chunks) yield chunk
+        await new Promise<never>((_, reject) => {
+          const signal = options?.signal
+          if (signal?.aborted) reject(signal.reason)
+          else signal?.addEventListener("abort", () => reject(signal.reason), { once: true })
+        })
+      })()
+    }
+  }) as unknown as InferenceClient
+
+test("a request's silence and duration are measured apart, and output resets the silence", () => {
+  let now = 0
+  const clock = () => now
+  const quiet = new GenerationMonitor({ maxDurationMs: 10_000, noProgressMs: 3_000, maxOutputTokens: 0 }, clock)
+  now = 2_000
+  quiet.output()
+  now = 4_000
+  assert.strictEqual(quiet.exceeded(), undefined, "two seconds of silence is within the limit")
+  now = 5_100
+  assert.strictEqual(quiet.exceeded()?.reason, "no_progress")
+
+  now = 0
+  const long = new GenerationMonitor({ maxDurationMs: 10_000, noProgressMs: 3_000, maxOutputTokens: 0 }, clock)
+  for (now = 1_000; now <= 9_000; now += 1_000) long.output()
+  now = 10_000
+  assert.strictEqual(long.exceeded()?.reason, "duration_limit", "duration counts from the start, whatever the output")
+})
+
+test("no limits never stop a request, and configured limits are clamped to sane values", () => {
+  let now = 0
+  const free = new GenerationMonitor(NO_GENERATION_LIMITS, () => now)
+  now = 10 ** 9
+  assert.strictEqual(free.timed, false)
+  assert.strictEqual(free.exceeded(), undefined)
+  assert.deepStrictEqual(
+    generationLimitsFrom({ durationSeconds: Number.NaN, noProgressSeconds: 99_999, outputTokens: -5 }),
+    { maxDurationMs: 900_000, noProgressMs: 7_200_000, maxOutputTokens: 0 }
+  )
+})
+
+test("a request gone silent is stopped, the stop is reported, and it is not retried", async () => {
+  const requests: ChatRequest[] = []
+  const stops: string[] = []
+  const { text } = await collect(
+    withTools(stalled([{ content: "Looking at the file" }], requests), workspaceTools(workspace({})), {
+      mode: "native",
+      generationLimits: () => ({ maxDurationMs: 0, noProgressMs: 1_000, maxOutputTokens: 0 }),
+      onGenerationStop: (stop) => stops.push(stop.reason)
+    }).chat(ask("Read a.ts."))
+  )
+  assert.deepStrictEqual(stops, ["no_progress"])
+  assert.strictEqual(requests.length, 1, "a stopped request is not sent again")
+  assert.ok(text.startsWith("Looking at the file"), "what arrived before the stop is kept")
+  assert.ok(text.includes("Stopped: the model sent no output for 1 seconds."), "the stop is shown in place of a finished reply")
+})
+
+test("a request that runs past its duration keeps the tool results it already had", async () => {
+  const root = workspace({ "a.ts": "export const a = 1\n" })
+  const requests: ChatRequest[] = []
+  const script = scripted([{ calls: [read("1", "a.ts")] }])
+  const stalling = stalled([], requests)
+  let turn = 0
+  const client = {
+    id: "after-a-tool",
+    chat(request: ChatRequest, options?: InferenceOptions) {
+      turn++
+      return turn === 1 ? script.client.chat(request) : stalling.chat(request, options)
+    }
+  } as unknown as InferenceClient
+  const stops: string[] = []
+  const { text } = await collect(
+    withTools(client, workspaceTools(root), {
+      mode: "native",
+      generationLimits: () => ({ maxDurationMs: 1_000, noProgressMs: 0, maxOutputTokens: 0 }),
+      onGenerationStop: (stop) => stops.push(stop.reason)
+    }).chat(ask("Read a.ts."))
+  )
+  assert.deepStrictEqual(stops, ["duration_limit"])
+  assert.strictEqual(requests.length, 1)
+  assert.ok(JSON.stringify(requests[0].messages).includes("const a = 1"), "the completed read is still in the next request")
+  assert.ok(text.includes("Stopped: this request ran past its 1 second limit"))
+})
+
+test("a reply cut short by the output limit runs none of the calls it was writing", async () => {
+  const requests: ChatRequest[] = []
+  const stops: string[] = []
+  let ran = 0
+  const client = {
+    id: "length",
+    chat(request: ChatRequest) {
+      requests.push(structuredClone(request))
+      return (async function* (): AsyncGenerator<ChatChunk> {
+        yield { content: "", toolCalls: [read("1", "a.ts")] }
+        yield { content: "", finishReason: "length" }
+      })()
+    }
+  } as unknown as InferenceClient
+  const { text } = await collect(
+    withTools(client, workspaceTools(workspace({ "a.ts": "export const a = 1\n" })), {
+      mode: "native",
+      generationLimits: () => ({ maxDurationMs: 0, noProgressMs: 0, maxOutputTokens: 256 }),
+      onToolResult: () => void ran++,
+      onGenerationStop: (stop) => stops.push(stop.reason)
+    }).chat(ask("Read a.ts."))
+  )
+  assert.strictEqual(ran, 0, "a call from a truncated reply is never run")
+  assert.strictEqual(requests.length, 1)
+  assert.strictEqual(requests[0].maxTokens, 256, "the output budget is sent to the server")
+  assert.deepStrictEqual(stops, ["output_limit"])
+  assert.ok(text.includes("reached its output limit"))
+})
+
+test("a request without an output budget sends none", async () => {
+  const { client, requests } = scripted(["Done."])
+  await collect(withTools(client, workspaceTools(workspace({})), { mode: "native" }).chat(ask("Hi.")))
+  assert.strictEqual(requests[0].maxTokens, undefined)
 })
 
 test("the reply reports what the server counted: the largest prompt, all the output", async () => {

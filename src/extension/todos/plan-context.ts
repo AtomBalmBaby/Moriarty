@@ -20,8 +20,8 @@ export const renderPlanContext = (outline: IntentPlanOutline): string => {
   const omitted = outline.tasks.length - MAX_TASKS
   return [
     `Twinny's native TODO plan for this conversation (plan ${outline.planId}, revision ${outline.revision}). These TODO items already exist.`,
-    "Update them by item_id with twinny_todo_update, passing expected_version from the version above. Do not create a TODO that repeats one listed here; twinny_todo_create is only for newly discovered work.",
-    "A task is complete only when its needed evidence is recorded from real tool results. Setting status to completed moves it to in_review for Feedback to check.",
+    "Use twinny_todo_list and twinny_todo_get to read these items, and twinny_todo_update to change them by item_id, passing expected_version from the version above. Do not create a TODO that repeats one listed here; twinny_todo_create is only for genuinely new work, and a matching create returns the existing item (result existing_task).",
+    "A task is complete only when Feedback verifies it from recorded tool results. Setting status to completed submits one completion claim that moves the task to in_review (claim accepted). Submit each claim once: in_review means it was received, so do not retry it. Continue other actionable tasks or finish this turn so Feedback can review. If Feedback rejects a claim, follow its corrective instructions instead of resubmitting an unchanged claim.",
     ...lines,
     ...(omitted > 0 ? [`… ${omitted} more task${omitted === 1 ? "" : "s"} not shown; use twinny_todo_list.`] : [])
   ].join("\n")

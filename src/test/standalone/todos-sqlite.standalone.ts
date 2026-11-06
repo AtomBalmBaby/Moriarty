@@ -5,7 +5,7 @@ import path from "node:path"
 import { test } from "node:test"
 
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import { TodoConflictError } from "../../extension/todos/types"
+import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
 
@@ -138,7 +138,7 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
       args: { title: "Create from native tool", request_id: "tool-create", parent_id: "" }
     })
     assert.equal(created.failed, undefined)
-    assert.equal(JSON.parse(created.output).parentId, undefined, "an empty optional parent is treated as no parent")
+    assert.equal(JSON.parse(created.output).item.parentId, undefined, "an empty optional parent is treated as no parent")
     assert.equal(changed, 1)
     const listed = await tools.run({ name: "twinny_todo_list", args: {} })
     assert.equal(listed.failed, undefined)
@@ -147,21 +147,21 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
     const completionClaim = await tools.run({
       name: "twinny_todo_update",
       args: {
-        item_id: JSON.parse(created.output).id,
+        item_id: JSON.parse(created.output).item_id,
         expected_version: "1",
         request_id: "tool-complete",
         status: "completed"
       }
     })
-    assert.equal(JSON.parse(completionClaim.output).status, "in_review")
-    assert.match(completionClaim.summary, /in_review/)
-    assert.match(completionClaim.summary, /awaits evidence or the user's approval/)
+    assert.equal(JSON.parse(completionClaim.output).task_status, "in_review")
+    assert.equal(JSON.parse(completionClaim.output).retry_required, false)
+    assert.match(completionClaim.summary, /completion claim accepted/)
     assert.equal(changed, 2)
 
     const modelCompletion = await tools.run({
       name: "twinny_todo_complete",
       args: {
-        item_id: JSON.parse(created.output).id,
+        item_id: JSON.parse(created.output).item_id,
         expected_version: "2",
         request_id: "tool-model-complete",
         reason: "The user explicitly asked to mark this TODO complete."
@@ -169,10 +169,10 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
     })
     assert.ok(modelCompletion.failed, "the model has no tool that completes or waives a TODO")
     assert.equal(changed, 2)
-    const forged = repository.completeByUser(scope, JSON.parse(created.output).id, 2, "forged", "tool-forged-complete", { source: "model" } as never)
+    const forged = repository.completeByUser(scope, JSON.parse(created.output).item_id, 2, "forged", "tool-forged-complete", { source: "model" } as never)
     await assert.rejects(forged, /Only an explicit user action/)
     const approved = await repository.completeByUser(
-      scope, JSON.parse(created.output).id, 2, "The user explicitly asked to mark this TODO complete.", "tool-explicit-complete", trustedTodoPanelApproval
+      scope, JSON.parse(created.output).item_id, 2, "The user explicitly asked to mark this TODO complete.", "tool-explicit-complete", trustedTodoPanelApproval
     )
     assert.equal(approved.status, "completed")
     assert.equal(approved.verification, "waived")
@@ -180,7 +180,7 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
     const evidence = await tools.run({
       name: "twinny_todo_evidence",
       args: {
-        item_id: JSON.parse(created.output).id,
+        item_id: JSON.parse(created.output).item_id,
         kind: "test",
         summary: "Native TODO create/read/update/evidence test",
         result: "successful",
@@ -193,7 +193,7 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
     const invalidEvidence = await tools.run({
       name: "twinny_todo_evidence",
       args: {
-        item_id: JSON.parse(created.output).id,
+        item_id: JSON.parse(created.output).item_id,
         kind: "test",
         summary: "Invalid result is rejected clearly",
         result: "unknown",
@@ -356,6 +356,76 @@ test("model-created TODO reconciliation ignores articles but keeps distinct task
     const distinct = await repository.createItem(scope, { title: "Locate and verify native edit_lines definition" }, "model-distinct")
     assert.notEqual(distinct.id, planned.id)
     assert.equal((await repository.getList(scope)).items.length, 2)
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("the first completion claim is accepted once and repeats are acknowledged without version churn", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-claim-todos-"))
+  try {
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-claims"]), conversationId: "chat-claims" }
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const item = await repository.createItem(scope, { title: "Locate the read_file definition" }, "create-claim")
+
+    const first = await repository.claimCompletion(scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-first" })
+    assert.equal(first.disposition, "accepted")
+    assert.equal(first.item.status, "in_review")
+    assert.equal(first.item.verification, "not_checked")
+    assert.equal(first.item.version, item.version + 1)
+    assert.equal(first.review, "user_approval")
+
+    const replay = await repository.claimCompletion(scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-first" })
+    assert.deepEqual(replay, JSON.parse(JSON.stringify(first)), "an identical request replays its recorded acknowledgement")
+
+    const newRequest = await repository.claimCompletion(scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-second" })
+    assert.equal(newRequest.disposition, "already_submitted")
+    assert.equal(newRequest.item.version, first.item.version)
+
+    const currentVersion = await repository.claimCompletion(scope, { itemId: item.id, expectedVersion: first.item.version, requestId: "claim-third" })
+    assert.equal(currentVersion.disposition, "already_submitted")
+    assert.equal(currentVersion.item.version, first.item.version)
+
+    await assert.rejects(
+      repository.claimCompletion(scope, { itemId: item.id, expectedVersion: first.item.version + 1, requestId: "claim-future" }),
+      TodoConflictError
+    )
+
+    await repository.completeByUser(scope, item.id, first.item.version, "Reviewed the claim", "user-complete", trustedTodoPanelApproval)
+    await assert.rejects(
+      repository.claimCompletion(scope, { itemId: item.id, expectedVersion: first.item.version, requestId: "claim-after-complete" }),
+      /Cannot claim completion for a completed TODO/
+    )
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("eleven repeated completion requests produce one accepted claim, one review lifecycle, and no version churn", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-repeat-claims-"))
+  try {
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-repeat-claims"]), conversationId: "chat-repeat-claims" }
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const item = await repository.createItem(scope, { title: "Locate the native read_file definition" }, "create-repeat")
+
+    const claims: TodoCompletionClaim[] = []
+    for (let attempt = 1; attempt <= 11; attempt += 1) {
+      const requestId = attempt <= 2 ? "todo1-update" : `todo1-update-${attempt}`
+      const expectedVersion = attempt % 3 === 0 ? claims[0].item.version : item.version
+      const claim = await repository.claimCompletion(scope, { itemId: item.id, expectedVersion, requestId })
+      if (attempt === 2) {
+        assert.deepEqual(claim, JSON.parse(JSON.stringify(claims[0])), "an identical request replays its recorded acknowledgement")
+      } else if (attempt > 1) {
+        assert.equal(claim.disposition, "already_submitted")
+      }
+      claims.push(claim)
+    }
+
+    assert.equal(claims[0].disposition, "accepted")
+    assert.ok(claims.every((claim) => claim.item.status === "in_review"))
+    assert.ok(claims.every((claim) => claim.item.version === item.version + 1), "no claim may bump the version after the first")
+    assert.equal((await repository.getItem(scope, item.id)).item.version, item.version + 1)
+    assert.equal((await repository.getItem(scope, item.id)).item.status, "in_review")
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }

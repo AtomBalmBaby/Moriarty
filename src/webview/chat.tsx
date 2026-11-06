@@ -11,8 +11,8 @@ import cx from "classnames"
 import { v4 as uuidv4 } from "uuid"
 
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
-import { nextAgentSelection, withAgentSelection } from "../common/agents"
-import { ASSISTANT, EVENT_NAME, USER } from "../common/constants"
+import { AGENT_GLYPHS, agentGlyphState, nextAgentSelection, withAgentSelection } from "../common/agents"
+import { ASSISTANT, EVENT_NAME, TODO_EVENT_NAME, USER } from "../common/constants"
 import { exportConversation } from "../common/conversation-export"
 import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
@@ -25,6 +25,8 @@ import {
   ImageAttachment,
   MentionType,
   ReplyChangesView,
+  TodoFeedbackStatus,
+  TodoListSnapshot,
   ToolStepView
 } from "../common/types"
 
@@ -58,6 +60,7 @@ import { Suggestions } from "./suggestions"
 import { TodoPanel } from "./todo-panel"
 import { answerToolStep } from "./tool-steps"
 import { conversationMarkdown } from "./transcript"
+import type { TypingActivity } from "./typing-indicator"
 import { CustomKeyMap, getThinkingMessage } from "./utils"
 
 import styles from "./styles/chat.module.css"
@@ -70,6 +73,9 @@ const COMPOSER_MIN_HEIGHT = 44
 const COMPOSER_HEIGHT_KEY = "twinny.composerHeight"
 const PROMPT_HISTORY_KEY = "twinny.promptHistory"
 const PROMPT_HISTORY_LIMIT = 50
+const REASONING_LIMIT = 20_000
+const REASONING_FLUSH_MS = 200
+const CELEBRATION_MS = 3000
 /** Two presses of Esc this close together clear the draft. */
 const DOUBLE_ESCAPE_MS = 800
 /** Where a key belongs to whatever has focus, not to the chat. */
@@ -331,6 +337,67 @@ export const Chat = (props: ChatProps): JSX.Element => {
     return stored > 0 ? stored : null
   })
 
+  const [reasoning, setReasoning] = useState("")
+  const [continuation, setContinuation] = useState(0)
+  const [todoSnapshot, setTodoSnapshot] = useState<TodoListSnapshot>()
+  const [feedbackState, setFeedbackState] = useState<TodoFeedbackStatus>()
+  const [celebration, setCelebration] = useState<"milestone" | "complete">()
+  const reasoningRef = useRef("")
+  const reasoningTimerRef = useRef<ReturnType<typeof setTimeout>>()
+  const celebrationTimerRef = useRef<ReturnType<typeof setTimeout>>()
+  const progressRef = useRef<{ conversationId: string; verified: number }>()
+
+  useEffect(() => () => {
+    clearTimeout(reasoningTimerRef.current)
+    clearTimeout(celebrationTimerRef.current)
+  }, [])
+
+  // Reasoning streams token by token; the view is updated at most every REASONING_FLUSH_MS.
+  const resetReasoning = () => {
+    clearTimeout(reasoningTimerRef.current)
+    reasoningTimerRef.current = undefined
+    reasoningRef.current = ""
+    setReasoning("")
+  }
+
+  useServerEvent(EVENT_NAME.twinnyOnReasoning, (delta) => {
+    reasoningRef.current = (reasoningRef.current + delta).slice(-REASONING_LIMIT)
+    if (reasoningTimerRef.current !== undefined) return
+    reasoningTimerRef.current = setTimeout(() => {
+      reasoningTimerRef.current = undefined
+      setReasoning(reasoningRef.current)
+    }, REASONING_FLUSH_MS)
+  })
+
+  const acceptTodoSnapshot = (next: TodoListSnapshot) => {
+    if (next.conversationId !== conversationIdRef.current) return
+    setTodoSnapshot(next)
+    const live = next.items.filter((item) => item.status !== "cancelled")
+    const verified = live.filter((item) => item.verification === "passed").length
+    const previous = progressRef.current
+    progressRef.current = { conversationId: next.conversationId, verified }
+    // The first snapshot of a conversation is a load, not a result.
+    if (!previous || previous.conversationId !== next.conversationId || verified <= previous.verified) return
+    const finished = live.length > 0 && live.every((item) => item.status === "completed" && item.verification === "passed")
+    setCelebration(finished ? "complete" : "milestone")
+    clearTimeout(celebrationTimerRef.current)
+    celebrationTimerRef.current = setTimeout(() => setCelebration(undefined), CELEBRATION_MS)
+  }
+
+  useEffect(() => {
+    setTodoSnapshot(undefined)
+    setCelebration(undefined)
+    const conversationId = conversation?.id
+    if (!conversationId) return
+    void bridge.request(TODO_EVENT_NAME.getList, { conversationId }).then(acceptTodoSnapshot).catch(() => undefined)
+  }, [conversation?.id])
+
+  useServerEvent(TODO_EVENT_NAME.changed, acceptTodoSnapshot)
+
+  useServerEvent(TODO_EVENT_NAME.feedbackStatus, (next) => {
+    if (next.conversationId === conversationIdRef.current) setFeedbackState(next)
+  })
+
   const handleAddMessage = (added: ChatCompletionMessage | undefined) => {
     if (!added) {
       setCompletion(null)
@@ -382,6 +449,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
     setCompletion(null)
     setIsLoading(false)
+    resetReasoning()
   }
 
   useServerEvent(EVENT_NAME.twinnyAddMessage, (incoming) => {
@@ -394,7 +462,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
     setCompletion(incoming)
   })
 
-  useServerEvent(EVENT_NAME.twinnyOnLoading, () => setIsLoading(true))
+  useServerEvent(EVENT_NAME.twinnyOnLoading, (turn) => {
+    resetReasoning()
+    setContinuation(typeof turn === "object" ? turn.continuation ?? 0 : 0)
+    setIsLoading(true)
+  })
 
   useServerEvent(EVENT_NAME.twinnyNewConversation, () => {
     updateQueue([])
@@ -1407,6 +1479,36 @@ export const Chat = (props: ChatProps): JSX.Element => {
     [handleOpenFile, removeContextItem]
   )
 
+  const currentTodo = todoSnapshot?.conversationId === conversation?.id ? todoSnapshot : undefined
+  const currentFeedback = feedbackState?.conversationId === conversation?.id ? feedbackState : undefined
+  const feedbackPlanning = currentFeedback?.state === "planning" || currentFeedback?.state === "retrying"
+  const activeTask = currentTodo?.items.find((item) => item.status === "in_progress")?.title
+  const verifiedDone = currentTodo?.items.filter((item) => item.status === "completed").length ?? 0
+  const verifiedTotal = currentTodo?.items.length ?? 0
+  const lastToolStep = toolSteps[toolSteps.length - 1]
+  const glyphState = agentGlyphState({
+    enabled: agentSelection !== "off",
+    toolsRunning: toolSteps.some((step) => step.status === "running"),
+    toolsWaiting: toolSteps.some((step) => step.status === "waiting"),
+    toolFailed: isLoading && lastToolStep?.status === "failed",
+    feedbackPlanning,
+    feedbackFailed: currentFeedback?.state === "failed",
+    todoBlocked: !!currentTodo?.items.some((item) => item.status === "blocked"),
+    generating: isLoading,
+    celebration
+  })
+  const typingActivity = useMemo<TypingActivity>(
+    () => ({
+      reasoning,
+      continuation,
+      activeTask,
+      feedbackPlanning,
+      status: AGENT_GLYPHS[glyphState],
+      verified: { done: verifiedDone, total: verifiedTotal }
+    }),
+    [reasoning, continuation, activeTask, feedbackPlanning, glyphState, verifiedDone, verifiedTotal]
+  )
+
   const itemContent = useCallback(
     (index: number) => (
       <MessageItem
@@ -1414,6 +1516,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         completion={completion}
         context={searchReport}
         steps={toolSteps}
+        activity={typingActivity}
         generatingRef={generatingRef}
         handleDeleteImage={handleDeleteImage}
         handleDeleteMessage={handleDeleteMessage}
@@ -1438,6 +1541,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
       completion,
       searchReport,
       toolSteps,
+      typingActivity,
       generatingRef
     ]
   )
@@ -1631,7 +1735,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
               </div>
               <div className={styles.modeSwitches}>
                 <div className={styles.agentPicker} ref={agentPickerRef} data-agent-picker>
-                  <span className="codicon codicon-hubot" aria-hidden="true" />
+                  <span className={styles.agentGlyph} data-state={glyphState} title={AGENT_GLYPHS[glyphState].label} aria-hidden="true">{AGENT_GLYPHS[glyphState].glyph}</span>
                   <button
                     ref={agentPickerButtonRef}
                     type="button"
