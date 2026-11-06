@@ -1,4 +1,4 @@
-import { ToolStepView } from "../common/types"
+import { ToolStepView } from "./types"
 
 export type ReplyPart = { text: string } | { steps: ToolStepView[] }
 

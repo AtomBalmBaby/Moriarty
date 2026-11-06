@@ -75,6 +75,8 @@
     "onCommand:twinny.manageTemplates",
     "onCommand:twinny.newConversation",
     "onCommand:twinny.exportConversation",
+    "onCommand:twinny.copyEntireChat",
+    "onCommand:twinny.saveEntireChat",
     "onCommand:twinny.showShortcuts",
     "onCommand:twinny.forgetAlwaysRunCommands",
     "onCommand:twinny.openPanelChat",
@@ -190,6 +192,16 @@
           "command": "twinny.exportConversation",
           "when": "view == twinny.sidebar",
           "group": "conversation@1"
+        },
+        {
+          "command": "twinny.copyEntireChat",
+          "when": "view == twinny.sidebar",
+          "group": "conversation@3"
+        },
+        {
+          "command": "twinny.saveEntireChat",
+          "when": "view == twinny.sidebar",
+          "group": "conversation@4"
         },
         {
           "command": "twinny.showShortcuts",
@@ -328,6 +340,16 @@
         "command": "twinny.exportConversation",
         "title": "Twinny - Open conversation as Markdown",
         "icon": "$(markdown)"
+      },
+      {
+        "command": "twinny.copyEntireChat",
+        "title": "Twinny - Copy Entire Chat",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "twinny.saveEntireChat",
+        "title": "Twinny - Save Entire Chat…",
+        "icon": "$(save)"
       },
       {
         "command": "twinny.showShortcuts",

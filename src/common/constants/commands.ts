@@ -21,6 +21,8 @@ export const TWINNY_COMMAND_NAME = {
   manageTemplates: "twinny.manageTemplates",
   newConversation: "twinny.newConversation",
   exportConversation: "twinny.exportConversation",
+  copyEntireChat: "twinny.copyEntireChat",
+  saveEntireChat: "twinny.saveEntireChat",
   showShortcuts: "twinny.showShortcuts",
   forgetAlwaysRunCommands: "twinny.forgetAlwaysRunCommands",
   openPanelChat: "twinny.openPanelChat",

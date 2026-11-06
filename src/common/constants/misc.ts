@@ -15,6 +15,8 @@ export const DEFAULT_AGENT_STEPS = 30
 /** The step counts the agent settings offer. */
 export const AGENT_STEP_PRESETS = [12, 20, 30, 40]
 export const ASSISTANT = "assistant"
+/** The line an automatic continuation's reply opens with: where one run ends and the next picks up. */
+export const CONTINUATION_PREFIX = "Twinny · continuing automatically\n\n"
 export const USER = "user"
 export const TWINNY = "twinny"
 export const SYSTEM = "system"

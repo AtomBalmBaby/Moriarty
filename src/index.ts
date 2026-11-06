@@ -26,6 +26,7 @@ import {
 } from "./common/constants"
 import { messageOf } from "./common/errors"
 import { formatMs, logger } from "./common/logger"
+import type { EntireChatAction } from "./common/messaging/protocol"
 import { getLineBreakCount } from "./common/text"
 import { ContextItem, SelectionContextItem } from "./common/types"
 import { ChatGPTPlanSession } from "./extension/chatgpt-plan/session"
@@ -384,6 +385,13 @@ export async function activate(context: ExtensionContext) {
     }
   }
 
+  const exportEntireChat = async (action: EntireChatAction) => {
+    await commands.executeCommand(TWINNY_COMMAND_NAME.focusSidebar)
+    await sidebarProvider.waitForSidebarReady()
+    sidebarProvider.bridge?.emit(EVENT_NAME.twinnySetTab, WEBUI_TABS.chat)
+    sidebarProvider.bridge?.emit(EVENT_NAME.twinnyExportEntireChat, action)
+  }
+
   context.subscriptions.push(
     statusBar,
     p2p,
@@ -589,6 +597,8 @@ export async function activate(context: ExtensionContext) {
     commands.registerCommand(TWINNY_COMMAND_NAME.exportConversation, () =>
       sidebarProvider.bridge?.emit(EVENT_NAME.twinnyExportConversation)
     ),
+    commands.registerCommand(TWINNY_COMMAND_NAME.copyEntireChat, () => exportEntireChat("copy")),
+    commands.registerCommand(TWINNY_COMMAND_NAME.saveEntireChat, () => exportEntireChat("save")),
     commands.registerCommand(TWINNY_COMMAND_NAME.showShortcuts, async () => {
       await commands.executeCommand("twinny.sidebar.focus")
       sidebarProvider.bridge?.emit(EVENT_NAME.twinnySetTab, WEBUI_TABS.chat)

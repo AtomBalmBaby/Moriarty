@@ -4,7 +4,7 @@ import { Extension } from "@tiptap/react"
 import { CodeLanguage, supportedLanguages } from "../common/languages"
 import { LanguageType } from "../common/types"
 
-export { getLineBreakCount, kebabToSentence } from "../common/text"
+export { getLineBreakCount, getThinkingMessage, kebabToSentence } from "../common/text"
 
 const MentionPluginKey = new PluginKey("mention")
 
@@ -113,16 +113,3 @@ export const CustomKeyMap = Extension.create({
   },
 })
 
-/**
- * A reply's thinking and its message. An agent reply is several requests
- * in a row and a model may think before each, so every block is taken
- * out, an unfinished last one included.
- */
-export const getThinkingMessage = (content: string): { thinking: string | null; message: string } => {
-  const blocks = [...content.matchAll(/<(?:think|thinking)>([\s\S]*?)(?:<\/(?:think|thinking)>|$)/g)];
-  if (!blocks.length) return { thinking: null, message: content };
-
-  const thinking = blocks.map((block) => block[1].trim()).filter(Boolean).join("\n\n");
-  const message = content.replace(/<(?:think|thinking)>[\s\S]*?(?:<\/(?:think|thinking)>|$)/g, "").trim();
-  return { thinking, message };
-};

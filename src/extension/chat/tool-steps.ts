@@ -26,6 +26,8 @@ const shown = (text: string, limit: number) =>
 const shownArgs = (args: Record<string, string>) =>
   Object.fromEntries(Object.entries(args).map(([name, value]) => [name, shown(value, MAX_SHOWN_ARG)]))
 
+const omitted = (text: string, limit: number) => Math.max(0, text.length - limit)
+
 const firstArg = (args: Record<string, string>) => {
   const value = Object.values(args).find((v) => v.trim())?.trim() ?? ""
   const line = value.split("\n")[0]
@@ -69,15 +71,24 @@ export class ToolSteps {
   }
 
   public start(start: ToolStart) {
+    const argsOmitted = Object.values(start.args).reduce((total, value) => total + omitted(value, MAX_SHOWN_ARG), 0)
     this._steps = [
       ...this._steps,
-      { id: start.id, name: start.name, args: shownArgs(start.args), summary: startSummary(start), status: "running" }
+      {
+        id: start.id,
+        name: start.name,
+        args: shownArgs(start.args),
+        summary: startSummary(start),
+        status: "running",
+        ...(argsOmitted ? { argsOmitted } : {})
+      }
     ]
     this.send()
   }
 
   public finish(step: ToolStep) {
     const output = shown(step.output, MAX_SHOWN_OUTPUT)
+    const outputOmitted = omitted(step.output, MAX_SHOWN_OUTPUT)
     this._stoppers.delete(step.id)
     const status = this._skipped.has(step.id)
       ? "skipped"
@@ -89,6 +100,7 @@ export class ToolSteps {
     this.update(step.id, {
       summary: step.summary,
       output,
+      outputOmitted: outputOmitted || undefined,
       status,
       command: undefined,
       approval: undefined,
@@ -101,12 +113,14 @@ export class ToolSteps {
   /**
    * An independent Feedback review of the active task, in the same timeline:
    * shown as running while it is evaluated, then as done or failed (rejected).
+   * `output` is the whole verdict when `summary` had to be cut short.
    */
-  public review(id: string, summary: string, status: "running" | "done" | "failed") {
+  public review(id: string, summary: string, status: "running" | "done" | "failed", output?: string) {
     const exists = this._steps.some((step) => step.id === id)
+    const change = { summary, status, ...(output ? { output } : {}) }
     this._steps = exists
-      ? this._steps.map((step) => (step.id === id ? { ...step, summary, status } : step))
-      : [...this._steps, { id, name: "feedback", args: {}, summary, status }]
+      ? this._steps.map((step) => (step.id === id ? { ...step, ...change } : step))
+      : [...this._steps, { id, name: "feedback", args: {}, ...change }]
     this.send()
   }
 

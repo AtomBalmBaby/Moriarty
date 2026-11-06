@@ -11,6 +11,7 @@ import { Markdown as TiptapMarkdown } from "tiptap-markdown"
 
 import { ASSISTANT, EVENT_NAME, TWINNY, YOU } from "../common/constants"
 import { WorkspaceSearchReport } from "../common/messaging/protocol"
+import { replyParts } from "../common/reply-parts"
 import {
   ChatCompletionMessage,
   ImageAttachment,
@@ -26,7 +27,6 @@ import { createCustomImageExtension } from "./image-extension"
 import { MentionExtension } from "./mention-extention"
 import { emit } from "./messaging"
 import { ReplyChanges } from "./reply-changes"
-import { replyParts } from "./reply-parts"
 import { useToast } from "./toast"
 import ToolSteps from "./tool-steps"
 import { getThinkingMessage } from "./utils"

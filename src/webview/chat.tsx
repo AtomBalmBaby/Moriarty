@@ -13,9 +13,12 @@ import { v4 as uuidv4 } from "uuid"
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
 import { nextAgentSelection, withAgentSelection } from "../common/agents"
 import { ASSISTANT, EVENT_NAME, USER } from "../common/constants"
+import { exportConversation } from "../common/conversation-export"
 import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
-import type { PromptCompileResult } from "../common/messaging/protocol"
+import type { EntireChatAction, PromptCompileResult } from "../common/messaging/protocol"
+import { attachLateSteps } from "../common/reply-steps"
+import { messageText } from "../common/text"
 import {
   AnyContextItem,
   ChatCompletionMessage,
@@ -983,6 +986,38 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
   // The sidebar's title-bar menu asks; the panel has its own button.
   useServerEvent(EVENT_NAME.twinnyExportConversation, handleOpenAsMarkdown)
+
+  /**
+   * The whole chat as Markdown, from the conversation state: every saved
+   * message, then the reply still streaming with the steps it has so far.
+   */
+  const handleEntireChatExport = (action: EntireChatAction) => {
+    const streaming = completionRef.current
+    const streamingSteps = toolSteps.length ? toolSteps : streaming?.toolSteps
+    const inProgress: ChatCompletionMessage | null = streaming || streamingSteps?.length
+      ? { role: ASSISTANT, content: messageText(streaming), toolSteps: streamingSteps }
+      : null
+    const markdown = messages.length || inProgress
+      ? exportConversation(messages, { title: conversation?.title, inProgress })
+      : ""
+    emit(EVENT_NAME.twinnyEntireChatExport, { action, markdown })
+  }
+
+  useServerEvent(EVENT_NAME.twinnyExportEntireChat, handleEntireChatExport)
+
+  // A feedback review finishes after its reply was saved, so it joins that reply.
+  useServerEvent(EVENT_NAME.twinnyReplySteps, (late) => {
+    const last = messages[messages.length - 1]
+    if (!last || last.role !== ASSISTANT || !late?.length) return
+    setMessages((prev) => {
+      const current = prev[prev.length - 1]
+      if (!current || current.role !== ASSISTANT) return prev
+      const updated = [...prev.slice(0, -1), attachLateSteps(current, late)]
+      saveLastConversation({ ...conversation, messages: updated })
+      return updated
+    })
+    clearToolSteps()
+  })
 
   const handleNewConversation = useCallback(() => {
     setActiveConversation({

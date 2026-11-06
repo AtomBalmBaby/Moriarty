@@ -9,6 +9,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
 
+import { replyParts } from "../../common/reply-parts"
 import { ToolStepView } from "../../common/types"
 import { ToolSteps } from "../../extension/chat/tool-steps"
 import { ChatChunk, ChatRequest, InferenceClient } from "../../extension/inference"
@@ -16,7 +17,6 @@ import { planReplacement } from "../../extension/tools/edit"
 import { toolModeFor, withTools } from "../../extension/tools/loop"
 import { displayableLength, findToolCall, nameArguments, repairJson } from "../../extension/tools/protocol"
 import { workspaceTools } from "../../extension/tools/workspace"
-import { replyParts } from "../../webview/reply-parts"
 
 test("reads the JSON form as soon as its object closes, and not before", () => {
   const text = "Let me look.\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"foo\"}}\n</tool_call>"

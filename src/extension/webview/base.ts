@@ -11,7 +11,7 @@ import {
   WORKSPACE_STORAGE_KEY
 } from "../../common/constants"
 import { FEEDBACK_ENABLED_KEY, isFeedbackEnabled, isPromptCompilerEnabled, PROMPT_COMPILER_ENABLED_KEY, readSettingWithLegacy } from "../../common/feedback-settings"
-import { logger } from "../../common/logger"
+import { logger, redact } from "../../common/logger"
 import {
   ContextValue,
   NewDocumentRequest,
@@ -28,6 +28,7 @@ import {
 import { AgentRegistry } from "../agents/registry"
 import { Chat } from "../chat"
 import { ConversationHistory } from "../chat/conversation-history"
+import { deliverEntireChat, type EntireChatExportDeps } from "../chat/entire-chat-export"
 import { searchSymbols } from "../chat/symbols"
 import { WorkspaceIndex } from "../embeddings"
 import { EmbeddingService } from "../embeddings/service"
@@ -362,6 +363,8 @@ export class BaseProvider {
       [EVENT_NAME.twinnyNewConversation]: () => this.newConversation(),
       [EVENT_NAME.twinnyNewDocument]: (request) =>
         this.createNewUntitledDocument(request),
+      [EVENT_NAME.twinnyEntireChatExport]: (request) =>
+        deliverEntireChat(request, this.entireChatExportDeps()),
       [EVENT_NAME.twinnyNotification]: (message) =>
         void vscode.window.showInformationMessage(message),
       [EVENT_NAME.twinnyRemoveContextItem]: (id) => this.removeContextItem(id),
@@ -552,6 +555,28 @@ export class BaseProvider {
     })
     await vscode.window.showTextDocument(document)
   }
+
+  private entireChatExportDeps = (): EntireChatExportDeps => ({
+    redact,
+    writeClipboard: async (text) => {
+      await vscode.env.clipboard.writeText(text)
+    },
+    saveMarkdown: async (text) => {
+      const folder = vscode.workspace.workspaceFolders?.[0]?.uri
+      const target = await vscode.window.showSaveDialog({
+        defaultUri: folder ? vscode.Uri.joinPath(folder, "twinny-chat.md") : undefined,
+        filters: { Markdown: ["md"] },
+        saveLabel: "Save Entire Chat"
+      })
+      if (!target) return undefined
+      await vscode.workspace.fs.writeFile(target, Buffer.from(text, "utf8"))
+      return target.fsPath
+    },
+    notify: (level, message) =>
+      level === "error"
+        ? void vscode.window.showErrorMessage(message)
+        : void vscode.window.showInformationMessage(message)
+  })
 
   /*
    * Pasted, not executed: the user reads the command in the terminal and

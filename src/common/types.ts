@@ -121,6 +121,10 @@ export interface ToolStepView {
   args?: Record<string, string>
   /** What the model was given back, cut to a size worth showing. */
   output?: string
+  /** Characters of the output that were cut before being kept; the full output was never stored. */
+  outputOmitted?: number
+  /** Characters of the arguments (all of them together) that were cut before being kept. */
+  argsOmitted?: number
   /** `stopped`: the reply was stopped while the tool was running or waiting. */
   status: "running" | "waiting" | "done" | "failed" | "skipped" | "stopped"
   /** For a step waiting on the user: the command that would run, or the change that would be made. */

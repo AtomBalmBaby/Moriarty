@@ -11,6 +11,7 @@ import {
   ACTIVE_CONVERSATION_STORAGE_KEY,
   API_PROVIDERS,
   ASSISTANT,
+  CONTINUATION_PREFIX,
   EVENT_NAME,
   EXTENSION_CONTEXT_NAME,
   GLOBAL_STORAGE_KEY,
@@ -1239,7 +1240,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         : accepted
           ? `Feedback accepted \`${intent.task.title}\``
           : `Feedback ${evaluation?.decision === "blocked" ? "blocked" : "rejected"} \`${intent.task.title}\`${evaluation?.explanation ? `: ${evaluation.explanation}` : ""}`
-      this._steps.review(reviewId, verdict.slice(0, 300), accepted ? "done" : "failed")
+      this._steps.review(reviewId, verdict.slice(0, 300), accepted ? "done" : "failed", verdict.length > 300 ? verdict : undefined)
     }
 
     if (this.cancelled || workflow.state === "cancelled") {
@@ -1592,12 +1593,16 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }
     if (reply !== undefined && !this.cancelled && feedbackEnabled && todoScope && intentForTurn) {
+      const priorSteps = new Set(this._steps.steps)
       const continuation = await this.reconcileIntentTurn(todoScope, intentForTurn, reply, changed, view, execution, recoveryNotice)
+      // Reviews run after this reply was saved; the webview attaches them to it.
+      const late = this._steps.steps.filter((step) => step.name === "feedback" && !priorSteps.has(step))
+      if (late.length) this._bridge.emit(EVENT_NAME.twinnyReplySteps, late)
       if (continuation && execution.claimContinuation() && !this.cancelled) {
         this._conversation = [...this._conversation, { role: USER, content: continuation }]
         logger.info("[Execution] continuing automatically after independent reconciliation")
         execution.continuationStarted()
-        return this.run(provider, "Twinny · continuing automatically\n\n", view, execution, activeCheckpoints)
+        return this.run(provider, CONTINUATION_PREFIX, view, execution, activeCheckpoints)
       }
     } else if (reply !== undefined && feedbackEnabled && todoScope) {
       void this.reviewTodoTasks(todoScope, undefined, changed).catch((error) => {

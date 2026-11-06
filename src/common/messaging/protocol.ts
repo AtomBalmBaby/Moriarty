@@ -387,6 +387,15 @@ export interface NewDocumentRequest {
   language?: string
 }
 
+/** What to do with a whole-chat export: put it on the clipboard or save it to a file. */
+export type EntireChatAction = "copy" | "save"
+
+/** The whole chat as Markdown, built by the webview from its conversation state. */
+export interface EntireChatExportRequest {
+  action: EntireChatAction
+  markdown: string
+}
+
 /** An explicit, user-requested rewrite of the composer draft. */
 export interface PromptCompileRequest {
   /** Chosen by the webview; cancels and late answers are matched on it. */
@@ -443,6 +452,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinnyListTemplates]: Channel<void, string[]>
   [EVENT_NAME.twinnyNewConversation]: Channel
   [EVENT_NAME.twinnyNewDocument]: Channel<NewDocumentRequest>
+  [EVENT_NAME.twinnyEntireChatExport]: Channel<EntireChatExportRequest>
   [EVENT_NAME.twinnyNotification]: Channel<string>
   [EVENT_NAME.twinnyOpenFile]: Channel<string | FileLocation>
   [EVENT_NAME.twinnyOpenProviders]: Channel
@@ -586,6 +596,8 @@ export interface ServerEvents {
   [EVENT_NAME.twinnyListTemplates]: string[]
   [EVENT_NAME.twinnyNewConversation]: void
   [EVENT_NAME.twinnyExportConversation]: void
+  [EVENT_NAME.twinnyExportEntireChat]: EntireChatAction
+  [EVENT_NAME.twinnyReplySteps]: ToolStepView[]
   [EVENT_NAME.twinnyShowShortcuts]: void
   [EVENT_NAME.twinnyOnCompletion]: ChatCompletionMessage
   [EVENT_NAME.twinnyOnLoading]: void
