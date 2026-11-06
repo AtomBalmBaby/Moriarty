@@ -2,7 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { useTranslation } from "react-i18next"
 
 import { TODO_EVENT_NAME } from "../common/constants"
-import { TodoItem, TodoListSnapshot } from "../common/types"
+import { TodoFeedbackStatus, TodoItem, TodoListSnapshot } from "../common/types"
 
 import { bridge, useServerEvent } from "./messaging"
 
@@ -17,6 +17,7 @@ const newRequestId = () => window.crypto.randomUUID()
 export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
   const { t } = useTranslation()
   const [snapshot, setSnapshot] = useState<TodoListSnapshot>()
+  const [feedbackStatus, setFeedbackStatus] = useState<TodoFeedbackStatus>()
   const [expandedMap, setExpandedMap] = useState<Record<string, boolean>>({})
   const [expanded, setExpanded] = useState(true)
   const [showCompleted, setShowCompleted] = useState(false)
@@ -59,12 +60,29 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     }
   })
 
+  useServerEvent(TODO_EVENT_NAME.feedbackStatus, (next) => {
+    if (next.conversationId === conversationId) setFeedbackStatus(next)
+  })
+
+  const retryFeedback = () => {
+    if (!conversationId) return
+    void bridge.request(TODO_EVENT_NAME.retryFeedback, { conversationId }).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    })
+  }
+
+  const currentFeedback = feedbackStatus?.conversationId === conversationId ? feedbackStatus : undefined
+  const planning = currentFeedback?.state === "planning"
+  const planningFailed = currentFeedback?.state === "failed"
+
   const visibleItems = useMemo(() => {
     const items = snapshot?.items ?? []
     return showCompleted ? items : items.filter((item) => item.status !== "completed" && item.status !== "cancelled")
   }, [snapshot, showCompleted])
   const completedCount = snapshot?.items.filter((item) => item.status === "completed").length ?? 0
   const pendingCount = snapshot?.items.filter((item) => item.status !== "completed" && item.status !== "cancelled").length ?? 0
+  // Finished work leaves the active panel; its items stay in history behind the header toggle.
+  const retired = !planning && pendingCount === 0 && completedCount > 0
 
   const mutate = useCallback(async (action: () => Promise<TodoListSnapshot>): Promise<boolean> => {
     setBusy(true)
@@ -182,13 +200,18 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     <section className={styles.panel} aria-label={t("todo-title")}>
       <div className={styles.header}>
         <button type="button" className={styles.toggle} aria-expanded={expanded} onClick={() => setExpanded(prev => !prev)}>
-                    <span className={`codicon codicon-chevron-right`} aria-hidden="true" />
+                    <span className={"codicon codicon-chevron-right"} aria-hidden="true" />
                     <strong>{t("todo-title")}</strong>
                     <span className={styles.count}>{pendingCount} {t("todo-of")} {(snapshot?.items.length ?? 0)} {t("todo-open")}</span>
                   </button>
         {!!completedCount && <span className={styles.completedCount}>{completedCount} {t("todo-completed-count")}</span>}
+        {retired && (
+          <button type="button" className={styles.showCompleted} aria-pressed={showCompleted} onClick={() => setShowCompleted((value) => !value)}>
+            {showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
+          </button>
+        )}
       </div>
-      {expanded && (
+      {expanded && !(retired && !showCompleted) && (
         <div className={styles.content}>
           {!conversationId ? (
             <p className={styles.empty}>{t("todo-start-chat")}</p>
@@ -199,8 +222,15 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
                 <button type="submit" disabled={busy || !title.trim()}>{t("todo-add")}</button>
               </form>
               {!!error && <p className={styles.error} role="alert">{error}</p>}
-              {visibleItems.length ? <ul className={styles.list}>{visibleItems.map(renderItem)}</ul> : <p className={styles.empty}>{t("todo-empty")}</p>}
-              {!!completedCount && (
+              {planning && <p className={styles.planning} role="status">{t("todo-planning")}</p>}
+              {planningFailed && (
+                <div className={styles.error} role="alert">
+                  <span>{t("todo-feedback-failed")}{currentFeedback?.error ? `: ${currentFeedback.error}` : ""}</span>
+                  <button type="button" disabled={busy || planning} onClick={retryFeedback}>{t("todo-retry")}</button>
+                </div>
+              )}
+              {visibleItems.length ? <ul className={styles.list}>{visibleItems.map(renderItem)}</ul> : !retired && <p className={styles.empty}>{planning ? t("todo-planning-empty") : t("todo-empty")}</p>}
+              {!!completedCount && !retired && (
                 <button type="button" className={styles.showCompleted} onClick={() => setShowCompleted((value) => !value)}>
                   {showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
                 </button>

@@ -117,7 +117,7 @@ export const todoTools = (
   },
   {
     name: "twinny_todo_update",
-    description: "Update a native TODO with optimistic concurrency. Setting status to completed is treated as a model completion claim and moves it to in_review. Use twinny_todo_complete only when the user explicitly asks to complete the TODO.",
+    description: "Update a native TODO with optimistic concurrency. Setting status to completed is treated as a model completion claim and moves it to in_review. Only the user can approve completion, in the TODO panel; the model cannot complete or waive verification.",
     parameters: [
       { name: "item_id", description: "ID of the TODO item." },
       { name: "expected_version", description: "Current item version from twinny_todo_list or twinny_todo_get.", type: "integer" },
@@ -164,47 +164,9 @@ export const todoTools = (
         })
         onChanged()
         const summary = patch.status === "completed" && item.status === "in_review"
-          ? "completion claim moved to in_review; use twinny_todo_complete only when the user explicitly requested completion"
+          ? "completion claim moved to in_review; it awaits evidence or the user's approval in the TODO panel"
           : "updated a native TODO"
         return result(item, summary)
-      } catch (error) {
-        return errorResult(error)
-      }
-    }
-  },
-  {
-    name: "twinny_todo_complete",
-    description: "Complete a TODO only in response to the user's explicit request. This records the user's decision and waives verification; parent and dependency requirements still apply.",
-    parameters: [
-      { name: "item_id", description: "ID of the TODO item." },
-      { name: "expected_version", description: "Current item version from twinny_todo_list or twinny_todo_get.", type: "integer" },
-      { name: "request_id", description: "Generate a non-empty unique ID; reuse it only for an exact retry." },
-      { name: "reason", description: "The user's explicit completion instruction, briefly summarized." }
-    ],
-    schema: {
-      type: "object",
-      properties: {
-        item_id: { type: "string", description: "ID of the TODO item." },
-        expected_version: { type: "integer", minimum: 1, description: "Current version from twinny_todo_get or twinny_todo_list." },
-        request_id: { type: "string", maxLength: 200, description: "Generate a non-empty unique ID; reuse only for an exact retry." },
-        reason: { type: "string", maxLength: 1000, description: "Briefly summarize the user's explicit instruction to complete this TODO." }
-      },
-      required: ["item_id", "expected_version", "request_id", "reason"],
-      additionalProperties: false
-    },
-    async run(args) {
-      try {
-        const expectedVersion = Number(args.expected_version)
-        if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) throw new Error("expected_version must be a positive integer")
-        const item = await repository.completeByUser(
-          scope,
-          args.item_id,
-          expectedVersion,
-          args.reason,
-          requestId(args)
-        )
-        onChanged()
-        return result(item, "completed a native TODO at the user's explicit request")
       } catch (error) {
         return errorResult(error)
       }
@@ -262,7 +224,7 @@ export const todoWorkspaceTools = (
   const tools = todoTools(repository, scope, onChanged)
   return {
     tools,
-    orientation: "Twinny's canonical TODO list for the current conversation is available through the native TODO tools, including in ordinary chats with Agent mode off. These tools cannot access another conversation's list. Optional parent_id values must be omitted when creating a top-level TODO. Use twinny_todo_complete only when the user explicitly asks to complete a task; ordinary model completion claims through twinny_todo_update remain in_review. Report every native TODO tool error; a later successful retry does not erase an earlier failure.",
+    orientation: "Twinny's canonical TODO list for the current conversation is available through the native TODO tools, including in ordinary chats with Agent mode off. These tools cannot access another conversation's list. Optional parent_id values must be omitted when creating a top-level TODO. Model completion claims through twinny_todo_update remain in_review until evidence supports them or the user approves them in the TODO panel. Report every native TODO tool error; a later successful retry does not erase an earlier failure.",
     instructionFiles: () => [],
     async run(call, context) {
       const tool = tools.find((candidate) => candidate.name === call.name)

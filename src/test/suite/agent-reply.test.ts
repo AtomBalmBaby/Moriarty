@@ -227,7 +227,9 @@ suite("Agent reply, end to end", function () {
       assert.match(taskProjection, /twinny_active_intent_task/)
       assert.match(taskProjection, /The active task acceptance criterion is visible to the model\./)
       assert.match(taskProjection, /"status":"pending"/)
-      assert.doesNotMatch(taskProjection, /Do not project unrelated task/)
+      assert.doesNotMatch(taskProjection, /This should not be included in the active task context\./)
+      assert.doesNotMatch(taskProjection, /Not part of this request/)
+      assert.match(taskProjection, /\(pending, verification not_checked, version 1\) Do not project unrelated task/, "sibling tasks appear only as plan status rows")
       assert.ok(taskProjection.length < 4000, `Task context was unexpectedly large: ${taskProjection.length} characters`)
       assert.match(enabledSystem, /You are a helpful, respectful and honest coding assistant/)
     } finally {

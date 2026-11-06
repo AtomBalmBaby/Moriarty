@@ -1,9 +1,30 @@
-import type { TodoEvaluation,TodoEvidence, TodoItem, TodoPriority, TodoToolObservation } from "../../common/types"
+import type { TodoEvaluation,TodoEvidence, TodoItem, TodoPriority, TodoStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 
 export type { TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoPriority, TodoSource, TodoStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
 
 export type { IntentTaskDefinition, IntentTaskPlan } from "../../common/types"
+
+/** Every active plan task with its TODO item, for the executor to update instead of recreating. */
+export interface IntentPlanOutline {
+  planId: string
+  revision: number
+  goal: string
+  tasks: IntentPlanOutlineTask[]
+}
+
+export interface IntentPlanOutlineTask {
+  taskId: string
+  itemId: string
+  title: string
+  status: TodoStatus
+  verification: TodoVerification
+  version: number
+  blockedReason?: string
+  /** Criteria the latest Feedback evaluation did not pass, with the reason it gave. */
+  unmetCriteria: string[]
+  problems: string[]
+}
 
 export interface IntentPlanContext {
   planId: string

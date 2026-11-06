@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
 import { Database, SqlValue } from "sql.js"
 
+import { logger } from "../../common/logger"
+
 import { hasTrustedEvidenceForCriterion, isAnalysisOnlyIntent } from "./feedback"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
@@ -8,6 +10,7 @@ import {
   type AddTodoEvidenceInput,
   type CreateTodoInput,
   type IntentPlanContext,
+  type IntentPlanOutline,
   type IntentTaskPlan,
   TodoConflictError,
   type TodoEvaluation,
@@ -56,6 +59,8 @@ interface ItemRow {
 }
 
 const now = () => new Date().toISOString()
+type TodoLogField = string | number | boolean | null
+const logTodoEvent = (event: string, fields: Record<string, TodoLogField>) => logger.info("[Todo] " + event + " " + JSON.stringify(fields))
 const validStatuses = new Set<TodoStatus>(["pending", "in_progress", "in_review", "blocked", "completed", "cancelled"])
 const validPriorities = new Set<TodoPriority>(["low", "normal", "high", "urgent"])
 const statusTransitions: Record<TodoStatus, Set<TodoStatus>> = {
@@ -172,6 +177,19 @@ const bumpList = (database: Database, listId: string, itemId: string | undefined
   )
   return revision.revision
 }
+
+/**
+ * Proof that a completion came from an explicit user action in the TODO panel.
+ * Only the webview bridge may create one; model tools never receive it, so a
+ * model-supplied `actor` or `verification` argument cannot grant approval.
+ */
+export interface TrustedUserApproval {
+  readonly source: "todo-panel"
+}
+
+export const trustedTodoPanelApproval: TrustedUserApproval = Object.freeze({ source: "todo-panel" })
+
+const normalizeTodoTitle = (title: string) => title.toLowerCase().replace(/\s+/g, " ").replace(/[\s.!:;]+$/, "").trim()
 
 const validateRequestId = (requestId: string) => {
   if (!requestId.trim() || requestId.length > 200) throw new Error("A request ID between 1 and 200 characters is required")
@@ -392,6 +410,46 @@ export class TodoRepository {
     })
   }
 
+  getPlanOutline(request: TodoListRequest): Promise<IntentPlanOutline | undefined> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return undefined
+      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+      if (!list) return undefined
+      const plan = rows<{ plan_id: string; revision: number; goal: string }>(
+        database, "SELECT plan_id, revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id]
+      )[0]
+      if (!plan) return undefined
+      const tasks = rows<{ task_id: string; id: string; title: string; status: TodoStatus; verification: TodoVerification; version: number; blocked_reason: string | null }>(
+        database,
+        `SELECT tasks.task_id, items.id, items.title, items.status, items.verification, items.version, items.blocked_reason
+         FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
+         WHERE tasks.list_id = ? AND tasks.active = 1 ORDER BY items.sort_order, items.created_at`, [list.id]
+      )
+      return {
+        planId: plan.plan_id,
+        revision: plan.revision,
+        goal: plan.goal,
+        tasks: tasks.map((task) => {
+          const latest = rows<{ evaluation_json: string }>(database,
+            "SELECT evaluation_json FROM todo_evaluations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1", [task.id])[0]
+          const evaluation = latest ? JSON.parse(latest.evaluation_json) as TodoEvaluation : undefined
+          return {
+            taskId: task.task_id,
+            itemId: task.id,
+            title: task.title,
+            status: task.status,
+            verification: task.verification,
+            version: task.version,
+            blockedReason: task.blocked_reason ?? undefined,
+            unmetCriteria: evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => criterion.criterion) ?? [],
+            problems: evaluation?.problems ?? []
+          }
+        })
+      }
+    })
+  }
+
   getReviewPackages(request: TodoListRequest): Promise<TodoReviewPackage[]> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
@@ -472,6 +530,7 @@ export class TodoRepository {
         [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt])
       if (row.status === "in_review") database.run("UPDATE todo_items SET version = version + 1, updated_at = ? WHERE id = ?", [observation.createdAt, row.id])
       bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
+      logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId })
       return observation
     })
   }
@@ -537,6 +596,8 @@ export class TodoRepository {
         [status, verification, blockedReason, updatedAt, itemId, expectedVersion])
       if (database.getRowsModified() !== 1) throw new TodoConflictError("TODO changed while applying its evaluation")
       bumpList(database, list.id, itemId, "evaluation_recorded", "system", requestId, { decision: evaluation.decision, evaluation })
+      logTodoEvent("feedback.reconciled", { operation_id: list.id, item_id: itemId, decision: evaluation.decision, status, verification, request_id: requestId })
+      if (status === "completed") logTodoEvent("todo.completed", { operation_id: list.id, item_id: itemId, verification, request_id: requestId })
       return evaluation
     })
   }
@@ -599,6 +660,20 @@ export class TodoRepository {
         const parent = rows<{ id: string }>(database, "SELECT id FROM todo_items WHERE id = ? AND list_id = ?", [parentId, list.id])[0]
         if (!parent) throw new Error("Parent TODO item must be in the active conversation")
       }
+      if (actor === "model") {
+        const wanted = normalizeTodoTitle(title)
+        const existing = rows<ItemRow>(
+          database,
+          "SELECT * FROM todo_items WHERE list_id = ? AND status != 'cancelled' AND COALESCE(parent_id, '') = ? ORDER BY sort_order, created_at",
+          [list.id, parentId ?? ""]
+        ).find((row) => normalizeTodoTitle(row.title) === wanted)
+        if (existing) {
+          const item = itemOf(existing)
+          recordRequest(database, list.id, requestId, "create", item)
+          logTodoEvent("todo.duplicate.reconciled", { operation_id: list.id, item_id: item.id, status: item.status, actor, request_id: requestId })
+          return item
+        }
+      }
       const createdAt = now()
       const id = randomUUID()
       database.run(
@@ -609,6 +684,7 @@ export class TodoRepository {
       bumpList(database, list.id, id, "item_created", actor, requestId, { title, parentId, priority })
       const item = itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [id])[0])
       recordRequest(database, list.id, requestId, "create", item)
+      logTodoEvent("todo.created", { operation_id: list.id, item_id: id, status: item.status, actor, request_id: requestId })
       return item
     })
   }
@@ -670,12 +746,14 @@ export class TodoRepository {
       bumpList(database, list.id, row.id, "item_updated", input.actor, input.requestId, { ...patch, status, blockedReason })
       const item = itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [row.id])[0])
       recordRequest(database, list.id, input.requestId, "update", item)
+      logTodoEvent("todo.updated", { operation_id: list.id, item_id: row.id, status: item.status, version: item.version, actor: input.actor, request_id: input.requestId })
       return item
     })
   }
 
-  completeByUser(request: TodoListRequest, itemId: string, expectedVersion: number, reason: string, requestId: string): Promise<TodoItem> {
+  async completeByUser(request: TodoListRequest, itemId: string, expectedVersion: number, reason: string, requestId: string, approval: TrustedUserApproval): Promise<TodoItem> {
     validateRequestId(requestId)
+    if (approval?.source !== "todo-panel") throw new Error("Only an explicit user action in the TODO panel can complete a TODO")
     const completionReason = reason.trim()
     if (!completionReason || completionReason.length > 1000) throw new Error("An explicit completion reason is required")
     return this.sqlite.write((database) => {
@@ -704,6 +782,7 @@ export class TodoRepository {
       bumpList(database, list.id, itemId, "item_completed_by_user", "user", requestId, { reason: completionReason })
       const item = itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [itemId])[0])
       recordRequest(database, list.id, requestId, "complete", item)
+      logTodoEvent("todo.completed", { operation_id: list.id, item_id: itemId, verification: item.verification, actor: "user", request_id: requestId })
       return item
     })
   }

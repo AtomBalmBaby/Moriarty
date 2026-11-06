@@ -70,6 +70,13 @@ export interface TodoListSnapshot {
   items: TodoItem[]
 }
 
+/** The Feedback planning state of one conversation, shown above its TODO list. */
+export interface TodoFeedbackStatus {
+  conversationId: string
+  state: "planning" | "planned" | "failed" | "idle"
+  error?: string
+}
+
 export interface IntentTaskDefinition {
   id: string
   title: string

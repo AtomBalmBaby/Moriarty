@@ -1,5 +1,5 @@
 import { logger, redact } from "../../common/logger"
-import type { TodoListSnapshot } from "../../common/types"
+import type { TodoFeedbackStatus, TodoListSnapshot } from "../../common/types"
 import { isAbortError } from "../inference/errors"
 import {
   cancelInferenceOperation,
@@ -66,6 +66,8 @@ export interface FeedbackPlannerDeps {
   resolve: RoleResolver
   repository: () => FeedbackPlanRepository | undefined
   onSnapshot?: (snapshot: TodoListSnapshot) => void
+  /** The planning state the TODO panel shows; only the newest planning reports. */
+  onStatus?: (status: TodoFeedbackStatus) => void
   /** A visible report of a failure; the chat itself carries on. */
   onFailure?: (message: string) => void
   timeoutMs?: number
@@ -88,12 +90,20 @@ interface ActivePlanning {
 export class FeedbackPlanner {
   private _sequence = 0
   private _active?: ActivePlanning
+  private _last?: { scope: TodoListRequest; prompt: string }
 
   constructor(private readonly _deps: FeedbackPlannerDeps) {}
 
   /** The planning in flight, settled (never rejected), if any. */
   public pending(): Promise<FeedbackPlanOutcome> | undefined {
     return this._active?.done
+  }
+
+  /** Runs the last ordinary message's planning again, e.g. after a provider failure. */
+  public retry(conversationId: string): Promise<FeedbackPlanOutcome> {
+    const last = this._last
+    if (!last || last.scope.conversationId !== conversationId) return Promise.resolve({ status: "untracked" })
+    return this.start(last.scope, last.prompt)
   }
 
   public start(scope: TodoListRequest, prompt: string, parentOperationId?: string): Promise<FeedbackPlanOutcome> {
@@ -110,12 +120,24 @@ export class FeedbackPlanner {
       ...(parentOperationId ? { parentRequestId: parentOperationId } : {})
     })
     const active = { sequence, controller, trace } as ActivePlanning
-    active.done = this.plan(active, scope, request, repository)
+    this._last = { scope, prompt: request }
+    active.done = this.plan(active, scope, request, repository).then((outcome) => {
+      if (this._active === active) this.reportStatus(scope.conversationId, outcome)
+      return outcome
+    })
     this._active = active
+    this._deps.onStatus?.({ conversationId: scope.conversationId, state: "planning" })
     void active.done.finally(() => {
       if (this._active === active) this._active = undefined
     })
     return active.done
+  }
+
+  /** Only the newest planning reports; superseded and cancelled runs stay silent. */
+  private reportStatus(conversationId: string, outcome: FeedbackPlanOutcome) {
+    if (outcome.status === "planned") this._deps.onStatus?.({ conversationId, state: "planned" })
+    else if (outcome.status === "failed" || outcome.status === "unavailable") this._deps.onStatus?.({ conversationId, state: "failed", error: outcome.error })
+    else this._deps.onStatus?.({ conversationId, state: "idle" })
   }
 
   /** Cancels the planning in flight; its answer, if it still comes, is dropped. */
@@ -152,6 +174,7 @@ export class FeedbackPlanner {
     }
     const { endpoint } = resolution
     trace.provider = endpoint.provider
+    inferenceEvent("feedback.started", { operation_id: trace.operationId, parent_operation_id: trace.parentRequestId, conversation_id: scope.conversationId, provider: endpoint.provider })
     inferenceEvent("operation.started", {
       operation_id: trace.operationId,
       kind: "feedback",
@@ -213,6 +236,9 @@ export class FeedbackPlanner {
     } finally {
       clear()
       finishInferenceOperation(trace, state, { kind: "feedback", phase: "plan" })
+      const outcome = { operation_id: trace.operationId, parent_operation_id: trace.parentRequestId, conversation_id: scope.conversationId, state }
+      if (state === "failed" || state === "invalid-response" || state === "timeout") inferenceEvent("feedback.failed", outcome, "warn")
+      else if (state !== "cancelled") inferenceEvent("feedback.completed", outcome)
     }
   }
 

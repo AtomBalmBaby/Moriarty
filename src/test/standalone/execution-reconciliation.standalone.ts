@@ -8,6 +8,21 @@ import {
   forbiddenDeleteReason,
   requiresWorkspaceChanges
 } from "../../extension/chat/execution-reconciliation"
+import { ToolSteps } from "../../extension/chat/tool-steps"
+
+test("tool steps are emitted when each call starts, before it finishes, and a review updates in place", () => {
+  const sent: string[] = []
+  const steps = new ToolSteps((list) => sent.push(list.map((step) => `${step.id}:${step.status}`).join(",")))
+  steps.start({ id: "t1", name: "read_file", args: { path: "a.ts" } })
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0], "t1:running", "a running call is visible before its result exists")
+  steps.finish({ id: "t1", index: 0, mode: "native", output: "ok", failed: false, summary: "1 line of output" } as never)
+  assert.equal(sent[sent.length - 1], "t1:done")
+  steps.review("feedback.review.p1", "Feedback reviewing `Edit`", "running")
+  steps.review("feedback.review.p1", "Feedback rejected `Edit`: needs evidence", "failed")
+  assert.equal(sent[sent.length - 1], "t1:done,feedback.review.p1:failed")
+  assert.equal(steps.steps.length, 2, "the review entry is replaced, not duplicated")
+})
 
 test("an incomplete implementation turn is independently continued once", () => {
   const controller = new ExecutionReconciliationController()

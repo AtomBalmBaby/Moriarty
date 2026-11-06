@@ -144,6 +144,11 @@ export interface ToolLoopOptions {
    * refuses it (models that do not reason).
    */
   reasoningEffort?: ChatRequest["reasoningEffort"]
+  /**
+   * Current host state added to the system prompt of every request, not
+   * kept in the conversation, so it stays fresh and never grows the history.
+   */
+  requestContext?(): Promise<string | undefined> | string | undefined
   /** Called before each call runs. */
   onToolStart?(start: ToolStart): void
   onStep?(step: ToolStep): void
@@ -222,6 +227,12 @@ const withClosingPrompt = (messages: ChatMessage[]): ChatMessage[] => {
   return final?.role === USER && typeof final.content === "string"
     ? [...messages.slice(0, -1), { ...final, content: `${final.content}\n\n${FINAL_ANSWER_PROMPT}` }]
     : [...messages, { role: USER, content: FINAL_ANSWER_PROMPT }]
+}
+
+/** The conversation with host state added to its system prompt for one request only. */
+const withRequestContext = (messages: ChatMessage[], context: string | undefined): ChatMessage[] => {
+  if (!context?.trim()) return messages
+  return withToolPrompt(messages, context)
 }
 
 const stepLine = (summary: string) => `> ${summary}\n\n`
@@ -481,7 +492,8 @@ class ToolLoop {
       const tools = native && !last ? definitions : undefined
       const closing = last && !settled
 
-      await this.fit((tools ? definitionChars : 0) + (closing ? FINAL_ANSWER_PROMPT.length : 0))
+      const context = await this._options.requestContext?.()
+      await this.fit((tools ? definitionChars : 0) + (closing ? FINAL_ANSWER_PROMPT.length : 0) + (context?.length ?? 0))
       if (outer?.aborted) {
         inferenceEvent("request.cancelled_before_dispatch", {
           operation_id: operationId,
@@ -492,7 +504,7 @@ class ToolLoop {
         }, "warn")
         throw cancelled(outer.reason)
       }
-      const sent = closing ? withClosingPrompt(this._messages) : this._messages
+      const sent = withRequestContext(closing ? withClosingPrompt(this._messages) : this._messages, context)
       const promptChars = charsOf(sent) + (tools ? definitionChars : 0)
       this._options.onRequest?.(promptChars, step, this._mode, this._estimator.tokens(promptChars))
 

@@ -149,8 +149,13 @@ button:disabled {
   width: 100%;
 }
 
-.empty {
+.empty,
+.planning {
   color: var(--vscode-descriptionForeground);
+}
+
+.planning {
+  margin: 0 0 8px;
 }
 
 .error {

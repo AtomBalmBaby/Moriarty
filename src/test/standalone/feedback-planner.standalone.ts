@@ -212,3 +212,58 @@ test("pending() exposes the planning in flight so the turn can reconcile against
     assert.equal(planner.pending(), undefined)
   })
 })
+
+test("planning status moves through planning, failed and retry, and retry replans the last message", async () => {
+  await withRepository(async (repository) => {
+    const statuses: string[] = []
+    let calls = 0
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      onStatus: ({ state, error }) => statuses.push(error ? `${state}:${error}` : state),
+      resolve: () => endpoint(async () => {
+        calls += 1
+        if (calls === 1) throw new Error("Feedback key rejected")
+        return JSON.stringify({ track: true, plan: plan() })
+      })
+    })
+    await quietly(() => planner.start(scope, "Fix the parser."))
+    assert.deepEqual(statuses, ["planning", "failed:Feedback provider failed: Feedback key rejected"])
+
+    const { result } = await quietly(() => planner.retry(scope.conversationId))
+    assert.equal(result.status, "planned")
+    assert.deepEqual(statuses, ["planning", "failed:Feedback provider failed: Feedback key rejected", "planning", "planned"])
+    assert.equal((await repository.getList(scope)).items.length, 2)
+  })
+})
+
+test("a superseded planning never reports its outcome, only the newest does", async () => {
+  await withRepository(async (repository) => {
+    const statuses: string[] = []
+    const calls: Array<{ user: string; resolve: (value: string) => void }> = []
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      onStatus: ({ state }) => statuses.push(state),
+      resolve: () => endpoint(({ user }) => new Promise((resolve) => calls.push({ user, resolve })))
+    })
+    const older = planner.start(scope, "First message.")
+    const newer = planner.start(scope, "Second message.")
+    const newest = async () => {
+      const deadline = Date.now() + 2000
+      while (!calls.some((call) => call.user.startsWith("Second message.")) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      return calls.find((call) => call.user.startsWith("Second message."))
+    }
+    const call = await newest()
+    assert.ok(call, "the newest planning reaches the Feedback provider")
+    call.resolve(JSON.stringify({ track: true, plan: plan() }))
+    assert.equal((await newer).status, "planned")
+    // An older call may have been aborted before the provider saw it; a late answer must still stay silent.
+    calls.filter((other) => other.user.startsWith("First message.")).forEach((other) => other.resolve(JSON.stringify({ track: true, plan: plan({ planId: "stale" }) })))
+    assert.notEqual((await older).status, "planned")
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(statuses, ["planning", "planning", "planned"])
+  })
+})

@@ -261,6 +261,25 @@ suite("Prompt Compiler and Feedback", () => {
     }
   })
 
+  test("a compiled execution prompt still starts Feedback and the first chat request sees the plan", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-compiled-"))
+    const context = makeContext({}, { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: roleProvider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: roleProvider })
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const emitted: Array<{ event: string; data: unknown }> = []
+    const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
+    try {
+      await chat.completion([{ role: USER, content: "fix parser", prompt: "Refined execution prompt: fix the parser and add a regression test." }], [], "off", "compiled-chat")
+      await feedbackPlanner(chat).pending()
+      const changed = emitted.filter(({ event }) => event === TODO_EVENT_NAME.changed).map(({ data }) => data as { conversationId: string; items: unknown[] })
+      assert.ok(changed.some((snapshot) => snapshot.conversationId === "compiled-chat" && snapshot.items.length > 0), "compiled prompts create TODOs")
+      const chatRequest = model.requests.find((request) => !/track \(boolean\)/.test(String(request.messages[0]?.content ?? "")))
+      assert.ok(String(chatRequest?.messages[0]?.content ?? "").includes("twinny_active_intent_task"), "the first model call already sees the plan")
+    } finally {
+      chat.dispose()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("Feedback disabled plans nothing and calls no provider", async () => {
     await setSetting(FEEDBACK_ENABLED_KEY, false)
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-off-"))

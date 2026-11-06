@@ -5,10 +5,14 @@ import path from "node:path"
 import { test } from "node:test"
 import initSqlJs from "sql.js"
 
+import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
+import { compactEvidenceText, compactToolEvidence, MAX_EVIDENCE_TEXT } from "../../extension/todos/evidence"
 import { evaluateTodoReview, feedbackContext, parseTodoEvaluation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput } from "../../extension/todos/feedback"
-import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import type { TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
+import { renderPlanContext } from "../../extension/todos/plan-context"
+import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import type { IntentPlanOutline, TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
+import { todoWorkspaceTools } from "../../extension/tools/todos"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
 const plan = (tasks: { id: string; acceptance: string; dependencies?: string[] }[]) => ({
@@ -78,6 +82,99 @@ const addObservation = (repository: TodoRepository, scope: { projectFingerprint:
     exitCode,
     requestId: `observation-${itemId}-${toolName}`
   })
+
+test("the executor receives the synchronized plan with stable IDs, versions, and bounded detail", () => {
+  const tasks: IntentPlanOutline["tasks"] = Array.from({ length: 26 }, (_, index) => ({
+    taskId: `task-${index}`,
+    itemId: `item-${index}`,
+    title: `Task ${index}`,
+    status: index === 0 ? "in_review" : "pending",
+    verification: "not_checked",
+    version: index + 3,
+    unmetCriteria: index === 0 ? ["edited file shows the new identifier"] : [],
+    problems: []
+  }))
+  const rendered = renderPlanContext({ planId: "plan-1", revision: 4, tasks } as IntentPlanOutline)
+  assert.match(rendered, /plan plan-1, revision 4/)
+  assert.match(rendered, /- item-0 \(in_review, verification not_checked, version 3\) Task 0/)
+  assert.match(rendered, /needs evidence: edited file shows the new identifier/)
+  assert.match(rendered, /item-23 \(/)
+  assert.doesNotMatch(rendered, /item-24 \(/)
+  assert.match(rendered, /2 more tasks not shown/)
+  assert.match(rendered, /expected_version/)
+})
+
+test("oversized tool output becomes bounded valid evidence with its fingerprint extracted, not recomputed", () => {
+  const fingerprint = "sha256:" + "a".repeat(64)
+  const output = [`${fingerprint}`, "x".repeat(200_000), "{\"observation_id\":\"obs-12345\"}"].join("\n")
+  const evidence = compactToolEvidence({
+    name: "read_file", args: { path: "src/a.ts", start_line: 1, end_line: 20 }, output, failed: false, invocationId: "inv-1"
+  })
+  assert.deepEqual(evidence.fingerprints, [fingerprint])
+  assert.deepEqual(evidence.resultIds, ["obs-12345"])
+  assert.deepEqual(evidence.lineRange, { start: 1, end: 20 })
+  const stored = compactEvidenceText(evidence)
+  assert.ok(stored.length <= MAX_EVIDENCE_TEXT)
+  assert.equal(JSON.parse(stored).invocationId, "inv-1")
+  const failed = compactToolEvidence({ name: "edit_lines", args: { path: "b.ts" }, output: "token=sk-abcdefghijklmnopqrstuvwx boom", failed: true, invocationId: "inv-2" })
+  assert.match(failed.summary, /^failed: /)
+  assert.doesNotMatch(failed.summary, /sk-abcdefghij/)
+})
+
+test("no-progress detection stops repeated identical work but not turns that add new evidence", () => {
+  const stalled = new ExecutionReconciliationController()
+  const repeat = { observations: [{ toolName: "search_workspace", arguments: { query: "x" }, failed: false }], passedCriteria: [] }
+  const looped: boolean[] = []
+  for (let turn = 0; turn < 3; turn++) {
+    const progressed = stalled.recordEvidence(repeat)
+    looped.push(stalled.reconcile("revise", "task-1|in_progress", progressed).continue)
+  }
+  assert.deepEqual(looped, [true, true, false])
+  assert.equal(stalled.state, "blocked")
+
+  const working = new ExecutionReconciliationController()
+  for (let turn = 0; turn < 4; turn++) {
+    const progressed = working.recordEvidence({
+      observations: [{ toolName: "read_file", arguments: { path: `file-${turn}.ts` }, failed: false }], passedCriteria: []
+    })
+    assert.equal(working.reconcile("revise", "task-1|in_progress", progressed).continue, true, `turn ${turn} added evidence`)
+  }
+})
+
+test("evidence gates progress: repeated identical calls and re-passed criteria do not count", () => {
+  const controller = new ExecutionReconciliationController()
+  const search = { toolName: "search_workspace", arguments: { query: "ALPHA" }, failed: false }
+  assert.equal(controller.recordEvidence({ observations: [search], passedCriteria: [] }), true)
+  assert.equal(controller.recordEvidence({ observations: [search], passedCriteria: [] }), false)
+  assert.equal(controller.recordEvidence({ observations: [], passedCriteria: ["file edited"] }), true)
+  assert.equal(controller.recordEvidence({ observations: [], passedCriteria: ["file edited"] }), false)
+  const edit = { toolName: "edit_lines", arguments: { path: "a.ts" } }
+  assert.equal(controller.recordEvidence({ observations: [{ ...edit, failed: true }], passedCriteria: [] }), false)
+  assert.equal(controller.recordEvidence({ observations: [{ ...edit, failed: false }], passedCriteria: [] }), true, "a failed call that now succeeds is progress")
+})
+
+test("continuation names the outstanding TODO items and forbids replacements", () => {
+  const text = continuationContext({
+    goal: "Verify index", constraints: [], task: "Edit smoke file", criteria: ["BETA is present"], feedback: ["needs_evidence"],
+    todoTargets: ["item-7 (version 4, in_progress) Edit smoke file: needs evidence: BETA is present"],
+    finalResponse: "done"
+  })
+  assert.match(text, /Outstanding TODO items:\n- item-7 \(version 4/)
+  assert.match(text, /Do not create replacements/)
+})
+
+test("a model create that repeats an existing title in the same list reconciles to that item", async () => {
+  const state = await fixture([{ id: "seed", acceptance: "Seed criterion" }])
+  try {
+    const existing = await state.repository.createItem(state.scope, { title: "Map the parser" }, "seed-create")
+    const duplicate = await state.repository.createItem(state.scope, { title: "  map   the PARSER. " }, "model-dup", "model")
+    assert.equal(duplicate.id, existing.id)
+    const userCreate = await state.repository.createItem(state.scope, { title: "Map the parser" }, "user-create", "user")
+    assert.notEqual(userCreate.id, existing.id, "explicit user creation is never silently merged")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
 
 test("trusted passing observations accept a task and persist verification", async () => {
   const state = await fixture([{ id: "verify", acceptance: "Focused tests pass" }])
@@ -203,7 +300,7 @@ test("manual completion and independent project/chat scopes remain isolated", as
   const state = await fixture([{ id: "user-completed", acceptance: "Review by user" }])
   try {
     const item = state.items[0]
-    await state.repository.completeByUser(state.scope, item.id, item.version, "Explicitly approved by user", "user-complete")
+    await state.repository.completeByUser(state.scope, item.id, item.version, "Explicitly approved by user", "user-complete", trustedTodoPanelApproval)
     assert.deepEqual(await state.repository.getReviewPackages(state.scope), [])
     const otherScope = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "feedback-chat" }
     const otherPlan = { ...plan([{ id: "other", acceptance: "Other task is inspected" }]), planId: "other-plan" }
@@ -229,7 +326,7 @@ test("every eligible task is evaluated with its own IDs and observations", async
     const expected = new Map<string, string>()
     for (const item of state.items) {
       const task = item.title
-      const observation = await addObservation(state.repository, state.scope, item.id, task === "test" ? "run_command" : task, task === "test" ? 0 : undefined)
+      const observation = await addObservation(state.repository, state.scope, item.id, task === "test" ? "run_command" : task === "change" ? "edit_lines" : task, task === "test" ? 0 : undefined)
       expected.set(item.id, observation.id)
     }
     const reviews = await state.repository.getReviewPackages(state.scope)
@@ -492,7 +589,7 @@ test("an implementation cannot be accepted from prose without verified workspace
       async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer",
       { requireWorkspaceChanges: true, hasVerifiedFileChanges: false })
     assert.equal(evaluation.decision, "needs_evidence")
-    assert.match(evaluation.problems.join(" "), /No verified workspace file changes/)
+    assert.match(evaluation.problems.join(" "), /No verified workspace file changes|file-mutation observation/)
     assert.equal((await state.repository.getList(state.scope)).items[0].status, "in_review")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -630,5 +727,111 @@ test("accepted source inspection persists and unlocks implementation without acc
     assert.equal(controller.state, "continue", "task acceptance does not declare goal-level completion")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+const recordTool = (repository: TodoRepository, scope: { projectFingerprint: string; conversationId: string }, itemId: string, toolName: string, failed = false) =>
+  repository.recordToolObservation(scope, {
+    itemId,
+    toolName,
+    arguments: { path: "twinny_index_smoke_test.ts" },
+    output: failed ? "Tool failed." : "Tool returned the expected result.",
+    failed,
+    requestId: `mutation-${itemId}-${toolName}-${failed}`
+  })
+
+test("file-mutation criteria require a successful matching mutation tool, not any read", async () => {
+  const cases: { acceptance: string; tool: string; expectAccept: boolean }[] = [
+    { acceptance: "Create twinny_index_smoke_test.ts with the ALPHA identifier", tool: "read_file", expectAccept: false },
+    { acceptance: "Create twinny_index_smoke_test.ts with the ALPHA identifier", tool: "create_file", expectAccept: true },
+    { acceptance: "Replace ALPHA with BETA in twinny_index_smoke_test.ts", tool: "search_workspace", expectAccept: false },
+    { acceptance: "Replace ALPHA with BETA in twinny_index_smoke_test.ts", tool: "edit_lines", expectAccept: true },
+    { acceptance: "Delete twinny_index_smoke_test.ts from the workspace", tool: "edit_lines", expectAccept: false },
+    { acceptance: "Delete twinny_index_smoke_test.ts from the workspace", tool: "delete_file", expectAccept: true }
+  ]
+  for (const example of cases) {
+    const state = await fixture([{ id: "mutation", acceptance: example.acceptance }])
+    try {
+      const observation = await recordTool(state.repository, state.scope, state.items[0].id, example.tool)
+      const review = (await state.repository.getReviewPackages(state.scope))[0]
+      const evaluation = await evaluateTodoReview(state.repository, state.scope, review,
+        async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer")
+      assert.equal(evaluation.decision === "accept", example.expectAccept, `${example.tool} for "${example.acceptance}"`)
+      if (!example.expectAccept) {
+        assert.ok(evaluation.problems.some((problem) => problem.includes("file-mutation observation")), "missing mutation problem is explained")
+        assert.equal((await state.repository.getList(state.scope)).items[0].status !== "completed", true)
+      }
+    } finally {
+      fs.rmSync(state.directory, { recursive: true, force: true })
+    }
+  }
+})
+
+test("a failed mutation observation never supports a file-change claim", async () => {
+  const state = await fixture([{ id: "create", acceptance: "Create twinny_index_smoke_test.ts" }])
+  try {
+    const failed = await recordTool(state.repository, state.scope, state.items[0].id, "create_file", true)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const result = parseTodoEvaluation(responseFor(review, { refs: [failed.id] }), review, "mock-reviewer")
+    assert.notEqual(result.decision, "accept")
+    assert.equal(result.criteria[0].status, "unverified")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("analysis-only evidence exemption does not cover file-mutation claims", async () => {
+  const state = await fixture([{ id: "claim", acceptance: "Create, edit, and delete twinny_index_smoke_test.ts" }])
+  try {
+    const search = await recordTool(state.repository, state.scope, state.items[0].id, "search_workspace")
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const result = parseTodoEvaluation(responseFor(review, { refs: [search.id] }), review, "mock-reviewer", new Date().toISOString(), true)
+    assert.notEqual(result.decision, "accept")
+    assert.equal(result.criteria[0].status, "unverified")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("workspace-index regression: claimed create, edit, and delete without tool execution stays unverified", async () => {
+  const state = await fixture([{ id: "index-smoke", acceptance: "Create twinny_index_smoke_test.ts, replace ALPHA with BETA, then delete it" }])
+  try {
+    const reads = await Promise.all([
+      recordTool(state.repository, state.scope, state.items[0].id, "read_file"),
+      recordTool(state.repository, state.scope, state.items[0].id, "search_workspace"),
+      recordTool(state.repository, state.scope, state.items[0].id, "find_files")
+    ])
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review,
+      async () => responseFor(review, { refs: reads.map((observation) => observation.id) }), "mock-reviewer")
+    assert.notEqual(evaluation.decision, "accept")
+    const persisted = (await state.repository.getList(state.scope)).items[0]
+    assert.notEqual(persisted.verification, "passed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("the native TODO tools are offered to the agent by default and dispatch to the repository", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-todo-tools-"))
+  try {
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///todo-tools"]), conversationId: "todo-tools-chat" }
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const workspace = todoWorkspaceTools(repository, scope, () => undefined)
+    const names = workspace.tools.map((tool) => tool.name)
+    for (const name of ["twinny_todo_list", "twinny_todo_get", "twinny_todo_create", "twinny_todo_update", "twinny_todo_evidence"]) {
+      assert.ok(names.includes(name), `${name} is missing from the offered tools`)
+    }
+    assert.ok(!names.includes("twinny_todo_complete"), "the model must not be offered a tool that completes TODOs")
+    for (const tool of workspace.tools) {
+      assert.ok(tool.description.length > 0, `${tool.name} needs a description for its schema`)
+    }
+    assert.equal(resolveAgentToolSelection(undefined, workspace.tools, []).native.length, workspace.tools.length)
+
+    const created = await workspace.run({ name: "twinny_todo_list", args: {} } as never, undefined)
+    assert.equal(created.failed, undefined)
+    assert.match(created.output, /"items":\[\]/)
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
   }
 })

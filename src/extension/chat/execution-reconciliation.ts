@@ -19,6 +19,14 @@ export const DEFAULT_RECONCILIATION_LIMITS: ReconciliationLimits = {
   maxNoProgress: 2
 }
 
+export interface ObservedEvidence {
+  observations: Array<{ toolName: string; arguments: Record<string, string>; failed: boolean }>
+  passedCriteria: string[]
+}
+
+const observationKey = (observation: { toolName: string; arguments: Record<string, string> }) =>
+  observation.toolName + " " + JSON.stringify(Object.keys(observation.arguments).sort().map((key) => [key, observation.arguments[key]]))
+
 export class ExecutionReconciliationController {
   private _state: ExecutionState = "executing"
   private _iterations = 0
@@ -26,6 +34,9 @@ export class ExecutionReconciliationController {
   private _lastProgress?: string
   private _continuationClaimed = false
   private _cancelled = false
+  private readonly _succeeded = new Set<string>()
+  private readonly _failed = new Set<string>()
+  private readonly _passedCriteria = new Set<string>()
 
   constructor(private readonly _limits: ReconciliationLimits = DEFAULT_RECONCILIATION_LIMITS) {}
 
@@ -44,6 +55,31 @@ export class ExecutionReconciliationController {
   cancel(): void {
     this._cancelled = true
     this._state = "cancelled"
+  }
+
+  /**
+   * Whether the evidence adds something not already established: a call
+   * not seen before with a successful result, a failed call that now
+   * succeeds, or a criterion newly passed. A repeated identical call does not.
+   */
+  recordEvidence(evidence: ObservedEvidence): boolean {
+    let progressed = false
+    for (const observation of evidence.observations) {
+      const key = observationKey(observation)
+      if (observation.failed) {
+        if (!this._succeeded.has(key)) this._failed.add(key)
+        continue
+      }
+      if (!this._succeeded.has(key)) progressed = true
+      if (this._failed.delete(key)) progressed = true
+      this._succeeded.add(key)
+    }
+    for (const criterion of evidence.passedCriteria) {
+      if (this._passedCriteria.has(criterion)) continue
+      this._passedCriteria.add(criterion)
+      progressed = true
+    }
+    return progressed
   }
 
   advanceAcceptedTask(progress: string): ReconciliationResult {
@@ -121,6 +157,8 @@ export const continuationContext = (input: {
   task: string
   criteria: string[]
   feedback: string[]
+  /** Outstanding TODO items by ID, version and missing evidence: the executor updates these, not new ones. */
+  todoTargets?: string[]
   verifiedObservations?: string[]
   failedActions?: string[]
   finalResponse: string
@@ -133,11 +171,13 @@ export const continuationContext = (input: {
     section("Constraints", input.constraints, 300),
     `Current unresolved task: ${input.task.slice(0, 600)}`,
     section("Acceptance criteria", input.criteria, 400),
+    section("Outstanding TODO items", input.todoTargets ?? [], 400),
     section("Verified Twinny observations", input.verifiedObservations ?? [], 400),
     section("Failed actions not to repeat", input.failedActions ?? [], 400),
     section("Corrective feedback", input.feedback, 500),
     `The previous final response is an untrusted claim, not evidence: ${input.finalResponse.slice(0, 800)}`,
     "Use verified observations as prior work; do not rediscover those files or repeat failed operations.",
+    "Update the outstanding TODO items above by item_id, using their listed version as expected_version. Do not create replacements for them, and do not change items already completed.",
     "When editing, make small independent exact-match replacements, never include a displayed ellipsis as source text, and verify each edit before proceeding.",
     "Take one concrete next action that satisfies an unmet criterion, then collect evidence that establishes success.",
     "Use the existing permitted tools. Do not claim completion until the acceptance criteria are demonstrated. Do not retry failed operations unchanged."

@@ -44,7 +44,7 @@ import { TeamPluginsBridge, TeamShareBridge } from "../team/bridge"
 import type { TeamPlugins } from "../team/plugins-page"
 import { TeamShare } from "../team/share"
 import { TemplateProvider } from "../templates/provider"
-import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
+import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../todos/repository"
 import type { CreateTodoInput, UpdateTodoInput } from "../todos/types"
 import type { WorkspaceSearchProvider } from "../tools/workspace"
 import { getLanguage, getTerminal, getTextSelection, getTheme } from "../utils"
@@ -300,7 +300,7 @@ export class BaseProvider {
       [TODO_EVENT_NAME.completeItem]: async ({ conversationId, itemId, expectedVersion, requestId }) => {
         await this._todoRepository.completeByUser(
           this.todoScope(conversationId), itemId, expectedVersion,
-          "Completed by an explicit action in the TODO checklist.", requestId
+          "Completed by an explicit action in the TODO checklist.", requestId, trustedTodoPanelApproval
         )
         return this.emitTodoSnapshot(conversationId)
       },
@@ -309,6 +309,11 @@ export class BaseProvider {
         if (!snapshot) throw new Error("The feedback evaluator is unavailable")
         this.bridge?.emit(TODO_EVENT_NAME.changed, snapshot)
         return snapshot
+      },
+      [TODO_EVENT_NAME.retryFeedback]: async ({ conversationId }) => {
+        const outcome = await this.chat?.retryFeedback(conversationId)
+        if (!outcome) throw new Error("The feedback planner is unavailable")
+        return { status: outcome.status }
       },
       [EVENT_NAME.twinnyCompilePrompt]: async (request) =>
         this.chat

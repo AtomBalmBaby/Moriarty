@@ -62,7 +62,9 @@ import { resolveProviderEndpoint } from "../providers/endpoint"
 import { describeProviderError, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
+import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
 import { evaluateTodoReview, feedbackContext, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { TodoEvaluation, TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
@@ -352,7 +354,11 @@ export class Chat extends Base {
     this._search = search
     this._agents = agents
     this._workspaceSearch = workspaceSearch
-    this._steps = new ToolSteps((steps) => bridge.emit(EVENT_NAME.twinnyToolSteps, steps))
+    this._steps = new ToolSteps((steps) => {
+      const last = steps[steps.length - 1]
+      logger.debug(`[ToolSteps] emit count=${steps.length} last=${last ? `${last.id}:${last.status}` : "none"} at=${Date.now()}`)
+      bridge.emit(EVENT_NAME.twinnyToolSteps, steps)
+    })
     this._promptCompiler = new PromptCompiler({
       enabled: () => isPromptCompilerEnabled(workspace.getConfiguration("twinny")),
       resolve: () => this.roleResolution("Prompt Compiler", promptCompilerProviderSelection(workspace.getConfiguration("twinny")))
@@ -362,6 +368,7 @@ export class Chat extends Base {
       resolve: () => this.roleResolution("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny"))),
       repository: () => this._todoRepository,
       onSnapshot: (snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot),
+      onStatus: (status) => this._bridge.emit(TODO_EVENT_NAME.feedbackStatus, status),
       onFailure: (message) => this._bridge.emit(EVENT_NAME.twinnyNotification, message)
     })
 
@@ -563,17 +570,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   }
 
   /**
-   * Feedback plans TODOs from the user's own message, whether or not it was
-   * compiled, on its own provider and alongside the reply. Continue turns
-   * (whose hidden prompt differs from what is shown) keep the plan they
-   * continue.
+   * Feedback plans TODOs from every ordinary user message, compiled or not,
+   * on its own provider and alongside the reply. Planning reads the execution
+   * prompt, the text the agent acts on. Continuation turns bypass this path,
+   * so they keep the plan they continue.
    */
   private startFeedbackPlanning(messages: ChatCompletionMessage[]): Promise<FeedbackPlanOutcome> | undefined {
     const scope = this.activeTodoScope()
     const latest = messages.at(-1)
     if (!scope || latest?.role !== USER) return undefined
-    if (typeof latest.prompt === "string" && latest.prompt !== latest.content) return undefined
-    const text = (typeof latest.content === "string" ? latest.content : normalizeText(latest.content))
+    const source = typeof latest.prompt === "string" && latest.prompt.trim() ? latest.prompt : latest.content
+    const text = (typeof source === "string" ? source : normalizeText(source))
       .replace(/<br\s*\/?>/gi, "\n")
       .replace(/<[^>]+>/g, "")
       .replace(/&nbsp;/g, " ")
@@ -1092,6 +1099,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return this._todoRepository!.getList(scope)
   }
 
+  /** Re-runs Feedback planning for the conversation's last message after a failure. */
+  public async retryFeedback(conversationId: string): Promise<FeedbackPlanOutcome> {
+    return this._feedbackPlanner.retry(conversationId)
+  }
+
   private async reviewTodoTasks(
     scope: TodoListRequest,
     itemId?: string,
@@ -1206,6 +1218,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           requestId: randomUUID()
         })
       }
+      const reviewId = "feedback.review." + intent.planTaskId
+      this._steps.review(reviewId, `Feedback reviewing \`${intent.task.title}\``, "running")
       try {
         const results = await this.reviewTodoTasks(scope, current.id, changes, {
           strict: true,
@@ -1219,6 +1233,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         reviewFailure = error instanceof Error ? error.message : String(error)
         logger.error("[Execution] independent evaluation failed (" + (error instanceof TodoEvaluationProviderError ? "provider" : "validation/parsing") + "): " + redact(reviewFailure))
       }
+      const accepted = !reviewFailure && evaluation?.decision === "accept"
+      const verdict = reviewFailure
+        ? `Feedback could not evaluate \`${intent.task.title}\`: ${reviewFailure}`
+        : accepted
+          ? `Feedback accepted \`${intent.task.title}\``
+          : `Feedback ${evaluation?.decision === "blocked" ? "blocked" : "rejected"} \`${intent.task.title}\`${evaluation?.explanation ? `: ${evaluation.explanation}` : ""}`
+      this._steps.review(reviewId, verdict.slice(0, 300), accepted ? "done" : "failed")
     }
 
     if (this.cancelled || workflow.state === "cancelled") {
@@ -1286,11 +1307,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return undefined
     }
 
-    const progress = `${intent.planTaskId}|${changes?.files.map((file) => `${file.path}:${file.added}:${file.removed}`).sort().join(",") ?? "no-file-changes"}`
+    // Progress is new evidence for the task still open, not the files a reply touched.
+    const progress = `${next.planTaskId}|${next.task.status}`
     const decision = evaluation?.decision === "revise" ? "revise" : "needs_evidence"
+    const passedCriteria = evaluation?.criteria.filter((criterion) => criterion.status === "passed").map((criterion) => criterion.criterion) ?? []
     const outcome = evaluation?.decision === "accept"
       ? workflow.advanceAcceptedTask(progress)
-      : workflow.reconcile(decision, progress, !!changes?.files.length)
+      : workflow.reconcile(decision, progress, workflow.recordEvidence({ observations: next.observations ?? [], passedCriteria }))
     if (!outcome.continue) {
       const reason = outcome.reason ?? "The autonomous execution retry budget was exhausted."
       this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution stopped: ${reason}` })
@@ -1310,10 +1333,20 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             ...(evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => `${criterion.status}: ${criterion.criterion}`) ?? [])
           ]
     if (view === undefined && requireChanges) feedback.push("No workspace editing tools are currently available; do not claim implementation completion.")
+    const outline = await this._todoRepository.getPlanOutline(scope)
+    const todoTargets = (outline?.tasks ?? [])
+      .filter((task) => task.status !== "completed" && task.status !== "cancelled")
+      .slice(0, 6)
+      .map((task) => {
+        const needs = task.unmetCriteria.length ? ` — needs evidence: ${task.unmetCriteria.slice(0, 3).join("; ")}` : ""
+        const problem = task.problems.length ? ` — problem: ${task.problems[0]}` : ""
+        return `${task.itemId} (version ${task.version}, ${task.status}): ${task.title}${needs}${problem}`
+      })
     return continuationContext({
       goal,
       constraints: intent.constraints,
       task: `${next.task.title}${next.task.details ? ` — ${next.task.details}` : ""}`,
+      todoTargets,
       criteria: next.acceptanceCriteria,
       feedback,
       verifiedObservations: [
@@ -1335,6 +1368,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return {
       projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
       conversationId: this._activeConversationId
+    }
+  }
+
+  private async planRequestContext(): Promise<string | undefined> {
+    const scope = this.activeTodoScope()
+    if (!scope || !this._todoRepository) return undefined
+    try {
+      const outline = await this._todoRepository.getPlanOutline(scope)
+      return outline && outline.tasks.length ? renderPlanContext(outline) : undefined
+    } catch (error) {
+      logger.warn(`[Intent] Could not load the TODO plan for this request: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
     }
   }
 
@@ -1419,20 +1464,41 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         if (!this._todoRepository || call.name.startsWith("twinny_todo_") || (call.name === "run_command" && !result.execution)) return
         const scope = this.activeTodoScope()
         if (!scope) return
+        const invocationId = randomUUID()
+        const evidence = compactToolEvidence({
+          name: call.name,
+          args: call.args,
+          output: result.execution?.output ?? result.output,
+          failed: result.failed ?? false,
+          exitCode: result.execution?.exitCode,
+          invocationId
+        })
+        let itemId: string | undefined
         try {
           const active = await this._todoRepository.getActiveIntentContext(scope)
           if (!active) return
+          itemId = active.task.id
           await this._todoRepository.recordToolObservation(scope, {
-            itemId: active.task.id,
+            itemId,
             toolName: call.name,
-            arguments: call.args,
-            output: result.execution?.output ?? result.output,
-            failed: result.failed ?? false,
-            exitCode: result.execution?.exitCode,
-            requestId: randomUUID()
+            arguments: compactArguments(evidence),
+            output: compactEvidenceText(evidence),
+            failed: evidence.failed,
+            exitCode: evidence.exitCode,
+            requestId: invocationId
           })
         } catch (error) {
-          logger.warn("Could not persist trusted TODO tool observation: " + (error instanceof Error ? error.message : String(error)))
+          const reason = error instanceof Error ? error.message : String(error)
+          logger.error(`[Todo] todo.evidence.missing ${JSON.stringify({ tool_name: call.name, invocation_id: invocationId, reason })}`)
+          if (itemId) {
+            await this._todoRepository.addEvidence(scope, {
+              itemId,
+              kind: "evidence_storage_failed",
+              summary: `Result of ${call.name} (${invocationId}) was not recorded as evidence: ${reason}`.slice(0, 400),
+              result: "failed",
+              requestId: randomUUID()
+            }).catch((storageError: unknown) => logger.error("[Todo] could not record the evidence storage failure: " + String(storageError)))
+          }
         }
       }
     }
@@ -1565,17 +1631,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   ) {
     this._steps.reset()
-    let available = todoWorkspaceTools(this._todoRepository!, scope, () => {
+    const available = todoWorkspaceTools(this._todoRepository!, scope, () => {
       void this._todoRepository!.getList(scope).then((snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)).catch((error) => {
         logger.error(`Native TODO snapshot refresh failed: ${error}`)
       })
     })
-    const requestedTools = this.config.get<boolean>("agents.ignoreAgentToolRestrictions", false)
-      ? undefined
-      : this._activeAgent?.profile.tools
-    const selection = resolveAgentToolSelection(requestedTools, available.tools, [])
-    const selectedNames = new Set(selection.native.map((tool) => tool.name))
-    available = { ...available, tools: available.tools.filter((tool) => selectedNames.has(tool.name)) }
+    // TODO tools are always offered: agent profile tool restrictions must not hide task tracking.
     logger.info(`[ToolTrace] outgoing=${available.tools.length} native TODO tools: ${available.tools.map((tool) => tool.name).join(", ")}`)
     hooks.onTools(available)
     const maxResultChars = clampNumericSetting(
@@ -1600,6 +1661,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       },
       stepLines: false,
       steering: () => this.takeSteering(),
+      requestContext: () => this.planRequestContext(),
       onOutOfSteps: hooks.onOutOfSteps,
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,
@@ -1802,6 +1864,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       },
       stepLines: false,
       steering: () => this.takeSteering(),
+      requestContext: () => this.planRequestContext(),
       onOutOfSteps: hooks.onOutOfSteps,
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,

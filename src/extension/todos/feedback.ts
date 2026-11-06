@@ -117,6 +117,18 @@ const preserveObservationSet = (review: TodoReviewPackage) => {
     .map(({ observation }) => observation)
 }
 
+const FILE_CREATE_TOOLS = ["create_file"]
+const FILE_EDIT_TOOLS = ["edit_lines", "edit_file"]
+const FILE_DELETE_TOOLS = ["delete_file"]
+
+export const requiredFileMutations = (criterion: string): string[][] => {
+  const groups: string[][] = []
+  if (/\b(creat(?:e|es|ed|ing)|new file)\b/i.test(criterion)) groups.push(FILE_CREATE_TOOLS)
+  if (/\b(edit|edits|edited|editing|modif(?:y|ies|ied|ying)|replac(?:e|es|ed|ing)|updat(?:e|es|ed|ing))\b/i.test(criterion)) groups.push(FILE_EDIT_TOOLS)
+  if (/\b(delet(?:e|es|ed|ing))\b/i.test(criterion)) groups.push(FILE_DELETE_TOOLS)
+  return groups
+}
+
 export const hasTrustedEvidenceForCriterion = (
   criterion: string,
   references: string[],
@@ -124,6 +136,8 @@ export const hasTrustedEvidenceForCriterion = (
 ): boolean => {
   const cited = observations.filter((observation) => references.includes(observation.id) && !observation.failed)
   if (!cited.length) return false
+  const mutationGroups = requiredFileMutations(criterion)
+  if (mutationGroups.some((group) => !cited.some((observation) => group.includes(observation.toolName)))) return false
   const commands = cited.filter((observation) => observation.toolName === "run_command" && observation.exitCode === 0)
   const needsTest = /\b(test|tests|assertions?)\b/i.test(criterion)
   const needsCompile = /\b(compile|compilation|build|type.?check)\b/i.test(criterion)
@@ -202,12 +216,16 @@ export const parseTodoEvaluation = (
   if (decision === "accept") {
     for (const criterion of criteria) {
       const commandEvidenceRequired = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
-      if (criterion.status === "passed" && !hasTrustedEvidenceForCriterion(criterion.criterion, criterion.evidenceRefs, visibleObservations) && (!allowEvidenceFreeAnalysis || commandEvidenceRequired)) {
+      const mutationRequired = requiredFileMutations(criterion.criterion).length > 0
+      if (criterion.status === "passed" && !hasTrustedEvidenceForCriterion(criterion.criterion, criterion.evidenceRefs, visibleObservations) && (!allowEvidenceFreeAnalysis || commandEvidenceRequired || mutationRequired)) {
         criterion.status = "unverified"
         const requiresCommand = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
         problems.push(requiresCommand
           ? "Missing a relevant successful run_command observation (exit code 0) for: " + criterion.criterion
-          : "Missing a trusted Twinny tool observation for: " + criterion.criterion)
+          : mutationRequired
+            ? "Missing a successful file-mutation observation (create_file, edit_lines/edit_file, or delete_file) for: " + criterion.criterion
+            : "Missing a trusted Twinny tool observation for: " + criterion.criterion)
+        logger.warn("[Feedback] todo.evidence.missing task=" + value.taskId + " criterion_refs=" + criterion.evidenceRefs.length + " mutation_required=" + mutationRequired)
       }
     }
     if (criteria.some((criterion) => criterion.status === "failed")) decision = "revise"

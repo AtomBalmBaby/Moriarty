@@ -98,6 +98,18 @@ export class ToolSteps {
     })
   }
 
+  /**
+   * An independent Feedback review of the active task, in the same timeline:
+   * shown as running while it is evaluated, then as done or failed (rejected).
+   */
+  public review(id: string, summary: string, status: "running" | "done" | "failed") {
+    const exists = this._steps.some((step) => step.id === id)
+    this._steps = exists
+      ? this._steps.map((step) => (step.id === id ? { ...step, summary, status } : step))
+      : [...this._steps, { id, name: "feedback", args: {}, summary, status }]
+    this.send()
+  }
+
   /** A message the user sent mid-reply, shown where the model read it. */
   public said(id: string, text: string) {
     this._steps = [...this._steps, { id: `said.${id}`, name: "said", summary: text, status: "done", said: true }]

@@ -71,7 +71,9 @@ export const TODO_EVENT_NAME = {
   updateItem: "twinny.todo.update-item",
   completeItem: "twinny.todo.complete-item",
   evaluateItem: "twinny.todo.evaluate-item",
-  changed: "twinny.todo.changed"
+  retryFeedback: "twinny.todo.retry-feedback",
+  changed: "twinny.todo.changed",
+  feedbackStatus: "twinny.todo.feedback-status"
 } as const
 
 export const CONVERSATION_EVENT_NAME = {

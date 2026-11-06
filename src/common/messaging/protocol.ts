@@ -36,6 +36,7 @@ import type {
   ModelCatalogue,
   ReplyChangesView,
   ThemeType,
+  TodoFeedbackStatus,
   TodoItem,
   TodoListSnapshot,
   TodoPriority,
@@ -415,6 +416,7 @@ export interface ClientEvents {
   [TODO_EVENT_NAME.updateItem]: Channel<TodoUpdateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.completeItem]: Channel<TodoCompleteRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.evaluateItem]: Channel<TodoEvaluateRequest, TodoListSnapshot>
+  [TODO_EVENT_NAME.retryFeedback]: Channel<{ conversationId: string }, { status: string }>
   [EVENT_NAME.twinnyToolInventory]: Channel<void, ToolInventoryItem[]>
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>
   [EVENT_NAME.twinnyAcceptSolution]: Channel<string>
@@ -572,6 +574,7 @@ export interface ClientEvents {
 
 export interface ServerEvents {
   [TODO_EVENT_NAME.changed]: TodoListSnapshot
+  [TODO_EVENT_NAME.feedbackStatus]: TodoFeedbackStatus
   [EVENT_NAME.twinnyAddMessage]: ChatCompletionMessage | undefined
   [EVENT_NAME.twinnyAgentRegistry]: AgentProfileSummary[]
   [EVENT_NAME.twinnyPromptInstructions]: PromptInstructionsResponse
