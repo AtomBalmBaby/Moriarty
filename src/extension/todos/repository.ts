@@ -18,9 +18,15 @@ import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
 import {
   type AddTodoEvidenceInput,
+  type ChildTodoContext,
+  type ChildTodoDecision,
+  type ChildTodoDecisionKind,
+  type ChildTodoOutcome,
+  type ChildTodoProposal,
   type CreateTodoInput,
   type IntentPlanContext,
   type IntentPlanOutline,
+  type IntentPlanOutlineChild,
   type IntentTaskPlan,
   type RetainedObservationEvidence,
   type TodoCompletionClaim,
@@ -134,6 +140,133 @@ const recordRequest = (database: Database, listId: string, requestId: string, op
     "INSERT INTO todo_requests(list_id, request_id, operation, result_json, created_at) VALUES (?, ?, ?, ?, ?)",
     [listId, requestId, operation, JSON.stringify(result), now()]
   )
+}
+
+const findList = (database: Database, request: TodoListRequest): ListRow | undefined => {
+  const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+  if (!project) return undefined
+  return rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+}
+
+interface PlanTaskLink {
+  taskId: string
+  acceptance: string[]
+  dependencies: string[]
+}
+
+interface PlanMembership {
+  /** Active, non-cancelled TODO items in the list. */
+  items: Map<string, ItemRow>
+  /** Each plan member mapped to the plan task at or above it. Walks are cycle-guarded. */
+  planTaskOf: Map<string, string>
+  /** Plan task links keyed by TODO item ID. */
+  tasks: Map<string, PlanTaskLink>
+}
+
+const planMembership = (database: Database, listId: string): PlanMembership => {
+  const items = new Map<string, ItemRow>(
+    rows<ItemRow>(database, "SELECT * FROM todo_items WHERE list_id = ? AND status != 'cancelled' ORDER BY sort_order, created_at", [listId])
+      .map((row): [string, ItemRow] => [row.id, row])
+  )
+  const tasks = new Map<string, PlanTaskLink>(
+    rows<{ item_id: string; task_id: string; acceptance_json: string; dependencies_json: string }>(
+      database,
+      "SELECT item_id, task_id, acceptance_json, dependencies_json FROM todo_intent_tasks WHERE list_id = ? AND active = 1",
+      [listId]
+    )
+      .filter((task) => items.has(task.item_id))
+      .map((task): [string, PlanTaskLink] => [task.item_id, {
+        taskId: task.task_id,
+        acceptance: JSON.parse(task.acceptance_json) as string[],
+        dependencies: JSON.parse(task.dependencies_json) as string[]
+      }])
+  )
+  const planTaskOf = new Map<string, string>()
+  for (const id of items.keys()) {
+    const seen = new Set<string>()
+    let current: string | null = id
+    while (current && items.has(current) && !seen.has(current)) {
+      if (tasks.has(current)) {
+        planTaskOf.set(id, current)
+        break
+      }
+      seen.add(current)
+      current = items.get(current)!.parent_id
+    }
+  }
+  return { items, planTaskOf, tasks }
+}
+
+/** Returns the plan task that anchors the parent, or throws when the parent cannot take a child. */
+const anchorForParent = (membership: PlanMembership, parentId: string): string => {
+  if (!membership.items.has(parentId)) throw new Error("todo_parent_id must name an active TODO in this conversation's plan")
+  const anchor = membership.planTaskOf.get(parentId)
+  if (!anchor) throw new Error("The parent TODO is not part of the authoritative plan")
+  return anchor
+}
+
+const childFingerprint = (proposal: Pick<ChildTodoProposal, "parentId" | "title" | "details">): string =>
+  createHash("sha256")
+    .update(JSON.stringify([proposal.parentId, normalizeTodoTitle(proposal.title), (proposal.details ?? "").replace(/\s+/g, " ").trim().toLowerCase()]))
+    .digest("hex")
+
+const insertItem = (
+  database: Database,
+  listId: string,
+  input: { parentId?: string; title: string; details?: string; priority: TodoPriority; actor: "user" | "model"; requestId: string }
+): string => {
+  const createdAt = now()
+  const id = randomUUID()
+  database.run(
+    `INSERT INTO todo_items(id, list_id, parent_id, title, details, status, verification, priority, created_by, source, sort_order, version, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', 'not_checked', ?, ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM todo_items WHERE list_id = ?), 1, ?, ?)`,
+    [id, listId, input.parentId ?? null, input.title, input.details ?? null, input.priority, input.actor, input.actor, listId, createdAt, createdAt]
+  )
+  bumpList(database, listId, id, "item_created", input.actor, input.requestId, { title: input.title, parentId: input.parentId, priority: input.priority })
+  return id
+}
+
+const liveChildOutcome = (database: Database, listId: string, outcome: ChildTodoOutcome): ChildTodoOutcome | undefined => {
+  if (!outcome.itemId) return outcome
+  const [item] = rows<{ status: TodoStatus }>(database, "SELECT status FROM todo_items WHERE id = ? AND list_id = ?", [outcome.itemId, listId])
+  return item && item.status !== "cancelled" ? outcome : undefined
+}
+
+const recordedChildOutcome = (database: Database, listId: string, proposal: ChildTodoProposal): ChildTodoOutcome | undefined => {
+  const [prior] = rows<{ fingerprint: string; result_json: string }>(
+    database,
+    "SELECT fingerprint, result_json FROM todo_child_proposals WHERE list_id = ? AND request_id = ?",
+    [listId, proposal.requestId]
+  )
+  if (!prior) return undefined
+  if (prior.fingerprint !== childFingerprint(proposal)) throw new TodoConflictError("This request ID was already used for a different child TODO proposal")
+  return JSON.parse(prior.result_json) as ChildTodoOutcome
+}
+
+const childContext = (membership: PlanMembership, plan: { plan_id: string; revision: number; goal: string }, parentId: string): ChildTodoContext => {
+  const parent = membership.items.get(parentId)!
+  const ownLink = membership.tasks.get(parentId)
+  const titleByTaskId = new Map([...membership.tasks].map(([itemId, link]) => [link.taskId, membership.items.get(itemId)!.title]))
+  return {
+    planId: plan.plan_id,
+    revision: plan.revision,
+    goal: plan.goal,
+    parent: {
+      id: parent.id,
+      title: parent.title,
+      details: parent.details ?? undefined,
+      status: parent.status,
+      acceptance: ownLink?.acceptance ?? [],
+      dependsOn: (ownLink?.dependencies ?? []).flatMap((taskId) => titleByTaskId.get(taskId) ?? [])
+    },
+    children: [...membership.items.values()]
+      .filter((item) => item.parent_id === parentId && membership.planTaskOf.has(item.id))
+      .map((item) => ({ itemId: item.id, parentItemId: parentId, title: item.title, status: item.status })),
+    planItems: [...membership.tasks.keys()].map((itemId) => {
+      const item = membership.items.get(itemId)!
+      return { id: item.id, title: item.title, status: item.status }
+    })
+  }
 }
 
 const ensureList = (database: Database, request: TodoListRequest): ListRow => {
@@ -286,8 +419,8 @@ export const DEFAULT_EVIDENCE_STORAGE_LIMITS: EvidenceStorageLimits = { listChar
  * support several related criteria. Each keeps its own item provenance.
  */
 const retainedEvidenceFor = (database: Database, itemId: string, withContent: boolean, sharedListId?: string): RetainedObservationEvidence[] =>
-  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
-    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, evidence.retained, " +
+  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
+    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, evidence.retained, " +
     (withContent ? "evidence.content" : "NULL AS content") +
     ", evidence.complete, evidence.original_chars, evidence.preserved_chars, evidence.metadata_json " +
     "FROM todo_tool_observations AS observations LEFT JOIN todo_tool_evidence AS evidence ON evidence.observation_id = observations.id " +
@@ -304,6 +437,7 @@ const retainedEvidenceFor = (database: Database, itemId: string, withContent: bo
         toolName: row.tool_name,
         arguments: JSON.parse(row.arguments_json) as Record<string, string>,
         failed: row.failed !== 0,
+        ...(row.exit_code === null || row.exit_code === undefined ? {} : { exitCode: row.exit_code }),
         retained: row.retained === 1,
         complete: row.complete === 1,
         originalChars: row.original_chars ?? 0,
@@ -523,7 +657,7 @@ export class TodoRepository {
         "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 3",
         [current.id]
       )
-      const retainedEvidence = retainedEvidenceFor(database, current.id, false)
+      const retainedEvidence = retainedEvidenceFor(database, current.id, false, list.id)
       const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
         "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [current.id]
       ).map((observation) => ({
@@ -563,12 +697,14 @@ export class TodoRepository {
         database, "SELECT plan_id, revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id]
       )[0]
       if (!plan) return undefined
-      const tasks = rows<{ task_id: string; id: string; title: string; status: TodoStatus; verification: TodoVerification; version: number; blocked_reason: string | null }>(
+      const tasks = rows<{ task_id: string; id: string; title: string; status: TodoStatus; verification: TodoVerification; version: number; blocked_reason: string | null; dependencies_json: string }>(
         database,
-        `SELECT tasks.task_id, items.id, items.title, items.status, items.verification, items.version, items.blocked_reason
+        `SELECT tasks.task_id, items.id, items.title, items.status, items.verification, items.version, items.blocked_reason, tasks.dependencies_json
          FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
          WHERE tasks.list_id = ? AND tasks.active = 1 ORDER BY items.sort_order, items.created_at`, [list.id]
       )
+      const byTaskId = new Map(tasks.map((task) => [task.task_id, task]))
+      const membership = planMembership(database, list.id)
       return {
         planId: plan.plan_id,
         revision: plan.revision,
@@ -577,6 +713,7 @@ export class TodoRepository {
           const latest = rows<{ evaluation_json: string }>(database,
             "SELECT evaluation_json FROM todo_evaluations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1", [task.id])[0]
           const evaluation = latest ? JSON.parse(latest.evaluation_json) as TodoEvaluation : undefined
+          const dependencies = JSON.parse(task.dependencies_json) as string[]
           return {
             taskId: task.task_id,
             itemId: task.id,
@@ -586,10 +723,35 @@ export class TodoRepository {
             version: task.version,
             blockedReason: task.blocked_reason ?? undefined,
             unmetCriteria: evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => criterion.criterion) ?? [],
-            problems: evaluation?.problems ?? []
+            problems: evaluation?.problems ?? [],
+            awaitingDependencies: dependencies
+              .map((id) => byTaskId.get(id))
+              .filter((dependency) => dependency !== undefined && dependency.status !== "completed")
+              .map((dependency) => dependency!.title)
           }
-        })
+        }),
+        children: [...membership.items.values()]
+          .filter((item) => item.parent_id && !membership.tasks.has(item.id) && membership.planTaskOf.has(item.id))
+          .map((item): IntentPlanOutlineChild => ({ itemId: item.id, parentItemId: item.parent_id!, title: item.title, status: item.status }))
       }
+    })
+  }
+
+  /** Every failed tool operation recorded for this conversation's TODO list, oldest first. */
+  failedToolOperations(request: TodoListRequest): Promise<string[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+      if (!list) return []
+      return rows<{ tool_name: string; arguments_json: string; exit_code: number | null; output: string }>(database,
+        "SELECT tool_name, arguments_json, exit_code, output FROM todo_tool_observations WHERE list_id = ? AND failed = 1 ORDER BY created_at ASC", [list.id]
+      ).map((row) => {
+        const args = JSON.parse(row.arguments_json) as Record<string, unknown>
+        const target = typeof args.path === "string" ? args.path : JSON.stringify(args).slice(0, 160)
+        const exit = row.exit_code === null ? "" : ` (exit ${row.exit_code})`
+        return `${row.tool_name} ${target}${exit}: ${row.output.replace(/\s+/g, " ").slice(0, 160)}`
+      })
     })
   }
 
@@ -859,8 +1021,8 @@ export class TodoRepository {
         const planRows = exact ? [] : rows<ItemRow>(
           database,
           `SELECT items.* FROM todo_items AS items JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id
-           WHERE items.list_id = ? AND tasks.list_id = ? AND tasks.active = 1 AND items.status NOT IN ('completed','cancelled') AND COALESCE(items.parent_id, '') = ?`,
-          [list.id, list.id, parentId ?? ""]
+           WHERE items.list_id = ? AND tasks.list_id = ? AND tasks.active = 1 AND items.status != 'cancelled'`,
+          [list.id, list.id]
         )
         const overlap = exact ? undefined : planOverlapMatch(planRows, title)
         const umbrella = exact || overlap ? undefined : planUmbrellaMatch(planRows, title)
@@ -873,17 +1035,154 @@ export class TodoRepository {
           return outcome
         }
       }
-      const createdAt = now()
-      const id = randomUUID()
-      database.run(
-        `INSERT INTO todo_items(id, list_id, parent_id, title, details, status, verification, priority, created_by, source, sort_order, version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', 'not_checked', ?, ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM todo_items WHERE list_id = ?), 1, ?, ?)`,
-        [id, list.id, parentId ?? null, title, input.details ?? null, priority, actor, actor, list.id, createdAt, createdAt]
-      )
-      bumpList(database, list.id, id, "item_created", actor, requestId, { title, parentId, priority })
+      const id = insertItem(database, list.id, { parentId, title, details: input.details, priority, actor, requestId })
       const outcome: TodoCreateOutcome = { item: itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [id])[0]), reused: false }
       recordRequest(database, list.id, requestId, "create", outcome)
       logTodoEvent("todo.created", { operation_id: list.id, item_id: id, status: outcome.item.status, actor, request_id: requestId })
+      return outcome
+    })
+  }
+
+  hasAuthoritativePlan(request: TodoListRequest): Promise<boolean> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      if (!list) return false
+      return rows<{ plan_id: string }>(database, "SELECT plan_id FROM todo_intent_plans WHERE list_id = ?", [list.id]).length > 0
+    })
+  }
+
+  /** Everything Feedback reviews a child proposal against. Throws when the parent cannot take a child. */
+  childTodoContext(request: TodoListRequest, parentId: string): Promise<ChildTodoContext> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      const plan = list ? rows<{ plan_id: string; revision: number; goal: string }>(database, "SELECT plan_id, revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id])[0] : undefined
+      if (!list || !plan) throw new Error("No authoritative plan exists for this conversation")
+      const membership = planMembership(database, list.id)
+      anchorForParent(membership, parentId)
+      return childContext(membership, plan, parentId)
+    })
+  }
+
+  /**
+   * A result that needs no Feedback review: the recorded decision for this request or an identical
+   * proposal. Undefined when Feedback must review.
+   */
+  childTodoReplay(request: TodoListRequest, proposal: ChildTodoProposal): Promise<ChildTodoOutcome | undefined> {
+    validateRequestId(proposal.requestId)
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      if (!list) return undefined
+      const byRequest = recordedChildOutcome(database, list.id, proposal)
+      if (byRequest) return byRequest
+      const fingerprint = childFingerprint(proposal)
+      const decided = rows<{ result_json: string }>(
+        database,
+        "SELECT result_json FROM todo_child_proposals WHERE list_id = ? AND fingerprint = ? ORDER BY created_at DESC",
+        [list.id, fingerprint]
+      )
+      for (const row of decided) {
+        const outcome = liveChildOutcome(database, list.id, JSON.parse(row.result_json) as ChildTodoOutcome)
+        if (outcome) return outcome
+      }
+      return undefined
+    })
+  }
+
+  /**
+   * A live TODO that already covers this title: an exact sibling under the parent, or an overlapping or
+   * umbrella plan task. Read-only, so it decides without any model call or mutation.
+   */
+  existingTaskFor(request: TodoListRequest, title: string, parentId?: string): Promise<{ item: TodoItem; matchedBy: "title" | "plan_overlap" | "plan_umbrella"; planRevision: number } | undefined> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      if (!list) return undefined
+      const wanted = normalizeTodoIdentity(title)
+      const siblings = rows<ItemRow>(
+        database,
+        "SELECT * FROM todo_items WHERE list_id = ? AND status != 'cancelled' AND COALESCE(parent_id, '') = ? ORDER BY sort_order, created_at",
+        [list.id, parentId ?? ""]
+      )
+      const exact = siblings.find((row) => normalizeTodoIdentity(row.title) === wanted)
+      const planRows = exact ? [] : rows<ItemRow>(
+        database,
+        `SELECT items.* FROM todo_items AS items JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id
+         WHERE items.list_id = ? AND tasks.list_id = ? AND tasks.active = 1 AND items.status != 'cancelled'`,
+        [list.id, list.id]
+      )
+      const overlap = exact ? undefined : planOverlapMatch(planRows, title)
+      const umbrella = exact || overlap ? undefined : planUmbrellaMatch(planRows, title)
+      const match = exact ? { row: exact, matchedBy: "title" as const } : overlap ? { row: overlap, matchedBy: "plan_overlap" as const } : umbrella ? { row: umbrella, matchedBy: "plan_umbrella" as const } : undefined
+      if (!match) return undefined
+      const [plan] = rows<{ revision: number }>(database, "SELECT revision FROM todo_intent_plans WHERE list_id = ?", [list.id])
+      return { item: itemOf(match.row), matchedBy: match.matchedBy, planRevision: plan?.revision ?? 0 }
+    })
+  }
+
+
+  /**
+   * Applies a host-validated Feedback decision in one transaction. Accepted and
+   * revised proposals insert exactly one child and advance the plan revision;
+   * other decisions leave the TODO list untouched.
+   */
+  applyChildTodo(request: TodoListRequest, proposal: ChildTodoProposal, decision: ChildTodoDecision): Promise<ChildTodoOutcome> {
+    validateRequestId(proposal.requestId)
+    return this.sqlite.write((database) => {
+      const list = findList(database, request)
+      const plan = list ? rows<{ revision: number }>(database, "SELECT revision FROM todo_intent_plans WHERE list_id = ?", [list.id])[0] : undefined
+      if (!list || !plan) throw new Error("No authoritative plan exists for this conversation")
+      const recorded = recordedChildOutcome(database, list.id, proposal)
+      if (recorded) return recorded
+      const fingerprint = childFingerprint(proposal)
+      const sameProposal = rows<{ result_json: string }>(
+        database,
+        "SELECT result_json FROM todo_child_proposals WHERE list_id = ? AND fingerprint = ? ORDER BY created_at DESC",
+        [list.id, fingerprint]
+      ).map((row) => liveChildOutcome(database, list.id, JSON.parse(row.result_json) as ChildTodoOutcome)).find((outcome) => outcome)
+      if (sameProposal) return sameProposal
+
+      const membership = planMembership(database, list.id)
+      const parentId = decision.parentId ?? proposal.parentId
+      anchorForParent(membership, proposal.parentId)
+      if (parentId !== proposal.parentId) anchorForParent(membership, parentId)
+
+      let kind: ChildTodoDecisionKind = decision.decision
+      let itemId = decision.itemId
+      let instruction = decision.instruction
+      let planRevision = plan.revision
+
+      if (kind === "accepted" || kind === "revised") {
+        const title = (decision.title ?? proposal.title).trim()
+        const details = (decision.details ?? proposal.details)?.trim() || undefined
+        if (!title || title.length > 500) throw new Error("TODO title must contain 1 to 500 characters")
+        if (details && details.length > 8000) throw new Error("TODO details cannot exceed 8,000 characters")
+        const wanted = normalizeTodoIdentity(title)
+        const sibling = rows<ItemRow>(
+          database,
+          "SELECT * FROM todo_items WHERE list_id = ? AND status != 'cancelled' AND COALESCE(parent_id, '') = ? ORDER BY sort_order, created_at",
+          [list.id, parentId]
+        ).find((row) => normalizeTodoIdentity(row.title) === wanted)
+        if (sibling) {
+          kind = "existing_task"
+          itemId = sibling.id
+          instruction = "An equivalent TODO already exists under this parent; use it instead of creating another."
+        } else {
+          itemId = insertItem(database, list.id, { parentId, title, details, priority: proposal.priority, actor: "model", requestId: proposal.requestId })
+          planRevision = plan.revision + 1
+          database.run("UPDATE todo_intent_plans SET revision = revision + 1, updated_at = ? WHERE list_id = ?", [now(), list.id])
+        }
+      } else if (kind === "existing_task") {
+        if (!itemId || !membership.planTaskOf.has(itemId)) throw new Error("An existing-task decision must name an active item in the authoritative plan")
+      } else {
+        itemId = undefined
+      }
+
+      const outcome: ChildTodoOutcome = { decision: kind, parentId, itemId, planRevision, instruction }
+      database.run(
+        "INSERT INTO todo_child_proposals(list_id, request_id, fingerprint, parent_id, decision, item_id, plan_revision, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [list.id, proposal.requestId, fingerprint, proposal.parentId, kind, itemId ?? null, planRevision, JSON.stringify(outcome), now()]
+      )
+      bumpList(database, list.id, itemId, "child_todo_decided", "model", proposal.requestId, { decision: kind, parentId, planRevision })
+      logTodoEvent("todo.child.decided", { operation_id: list.id, item_id: itemId ?? null, decision: kind, plan_revision: planRevision, request_id: proposal.requestId })
       return outcome
     })
   }

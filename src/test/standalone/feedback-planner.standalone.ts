@@ -6,11 +6,12 @@ import { test } from "node:test"
 
 import { logger } from "../../common/logger"
 import type { TodoListSnapshot } from "../../common/types"
-import { FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository,parseFeedbackPlanResponse } from "../../extension/chat/feedback-planner"
-import { replyText, type RoleInference, type RoleReply, type RoleResolution,structuredReply } from "../../extension/chat/role-inference"
+import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository, parseChildTodoDecision, parseFeedbackPlanResponse, requestsTodoMachineryWork, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
+import { replyText, type RoleInference, type RoleReply, type RoleResolution, structuredReply } from "../../extension/chat/role-inference"
 import { readReply } from "../../extension/inference/stream"
 import type { ChatChunk } from "../../extension/inference/types"
 import { TodoRepository } from "../../extension/todos/repository"
+import type { ChildTodoContext, ChildTodoProposal } from "../../extension/todos/types"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
 
@@ -380,6 +381,136 @@ test("valid JSON with an invalid TODO schema is a schema failure", () => {
   assert.equal(failureOf(parseFeedbackPlanResponse(JSON.stringify({ track: "yes", plan: plan() }))), "schema")
 })
 
+const tasksOf = (parsed: ReturnType<typeof parseFeedbackPlanResponse>) => {
+  assert.ok("plan" in parsed, "a plan was produced")
+  return (parsed as { plan: { tasks: { id: string; dependencies: string[] }[] } }).plan.tasks
+}
+
+test("a read-only investigation plan drops the TODO administration Feedback generated, not the investigation", () => {
+  const objective = "Investigate how read_file resolves paths and report where it can fail. Read-only: do not change any files."
+  const reply = {
+    track: true,
+    plan: plan({
+      goal: objective,
+      tasks: [
+        { id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Record the investigation in the TODO list.", acceptanceCriteria: ["A TODO entry exists with a clear title and description.", "Its status is Open or equivalent."], dependencies: [] },
+        { id: "todo-status", title: "Update TODO statuses and record evidence", description: "Keep the TODO statuses current.", acceptanceCriteria: ["Statuses reflect progress."], dependencies: ["todo-init"] },
+        { id: "trace", title: "Trace read_file path resolution", description: "Read the read_file implementation and its path helpers.", acceptanceCriteria: ["Path resolution steps are cited from source."], dependencies: ["todo-init"] },
+        { id: "report", title: "Report failure modes", description: "Summarize where read_file can fail with cited lines.", acceptanceCriteria: ["Each failure mode cites a source line."], dependencies: ["trace", "todo-status"] }
+      ]
+    })
+  }
+  const tasks = tasksOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective))
+  assert.deepEqual(tasks.map((task) => task.id), ["trace", "report"])
+  assert.deepEqual(tasks.find((task) => task.id === "report")?.dependencies, ["trace"], "a dependency on a removed task is dropped with it")
+  assert.deepEqual(tasks.find((task) => task.id === "trace")?.dependencies, [])
+})
+
+test("a plan made only of TODO administration is rejected, so Mycroft does not start", () => {
+  const objective = "Investigate read_file and report its failure modes."
+  const reply = {
+    track: true,
+    plan: plan({
+      goal: objective,
+      tasks: [{ id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Set up tracking.", acceptanceCriteria: ["A TODO entry exists."], dependencies: [] }]
+    })
+  }
+  assert.equal(failureOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective)), "schema")
+})
+
+test("a request to build or fix TODO functionality keeps its TODO tasks", () => {
+  const objective = "Implement a filter for the TODO panel so completed items can be hidden."
+  const reply = {
+    track: true,
+    plan: plan({
+      goal: objective,
+      tasks: [
+        { id: "filter", title: "Create the TODO filter control", description: "Add a checkbox that hides completed TODO items.", acceptanceCriteria: ["The checkbox hides completed items."], dependencies: [] },
+        { id: "verify", title: "Test the TODO filter", description: "Check that hidden items stay hidden after reload.", acceptanceCriteria: ["Hidden items stay hidden."], dependencies: ["filter"] }
+      ]
+    })
+  }
+  assert.deepEqual(tasksOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective)).map((task) => task.id), ["filter", "verify"])
+})
+
+test("a read-only request that mentions TODO code is not treated as TODO administration", () => {
+  const objective = "Investigate the TODO scanner and report how it finds comments."
+  const reply = {
+    track: true,
+    plan: plan({
+      goal: objective,
+      tasks: [{ id: "scan", title: "Record the TODO-related code path", description: "Trace how scanner tokens are read.", acceptanceCriteria: ["The token path is cited."], dependencies: [] }]
+    })
+  }
+  assert.deepEqual(tasksOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective)).map((task) => task.id), ["scan"])
+})
+
+test("a negated build verb does not make a read-only request TODO work", () => {
+  const objective = "Do not fix anything. Read the TODO handling code and report what it does."
+  assert.equal(requestsTodoMachineryWork(objective), false)
+  assert.equal(requestsTodoMachineryWork("Implement a filter for the TODO panel."), true)
+})
+
+// The read_file acceptance prompt in the HTML form it was sent, recovered verbatim from the extension-host log.
+const READ_FILE_ACCEPTANCE_PROMPT = [
+  "<h2>Twinny Feedback/TODO Live Acceptance Test</h2>Perform a read-only investigation of the current Twinny repository.",
+  "<br><strong>Objective:</strong> Trace how the native <code>read_file</code> tool is registered and executed, from its tool definition through dispatch to the actual filesystem operation.",
+  "<br>This is a verification task. Do not modify, create, or delete any files.<br><h3>Tasks</h3><ol>",
+  "<li>Locate the native <code>read_file</code> tool definition using workspace search.<br></li>",
+  "<li>Identify where the tool is registered and made available to the agent.<br></li>",
+  "<li>Trace how an incoming <code>read_file</code> tool call is dispatched to its implementation.<br></li>",
+  "<li>Identify where its arguments are validated and where the file is actually read.<br></li>",
+  "<li>Verify your findings by reading the relevant source code.<br></li></ol>",
+  "<h3>Feedback and TODO requirements</h3><ul>",
+  "<li>Use the available native TODO system to track this investigation.<br></li>",
+  "<li>Create actionable TODOs before beginning the investigation.<br></li>",
+  "<li>Update TODO status as each step progresses.<br></li>",
+  "<li>Record actual tool execution evidence for completed work.<br></li>",
+  "<li>Do not mark tasks complete without verifying the relevant source.<br></li>",
+  "<li>If a tool fails, record the failure and try an appropriate alternative.<br></li>",
+  "<li>Reconcile the final TODO states against the work actually performed.<br></li></ul>",
+  "<h3>Completion</h3>Provide a concise report containing:<br><ul>",
+  "<li>Source file paths and line numbers.<br></li>",
+  "<li>The execution path from registration to filesystem access.<br></li>",
+  "<li>A PASS, FAIL, or NOT VERIFIED result for each investigation step.<br></li>",
+  "<li>Any tool errors encountered.<br></li></ul>",
+  "Finish the task normally when all steps have been evaluated.<br>",
+  "Do not modify the repository, create documentation, or perform unrelated work."
+].join("")
+
+// The objective as the chat turn reads it: tags removed, line breaks kept.
+const acceptanceObjective = READ_FILE_ACCEPTANCE_PROMPT.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "").trim()
+
+test("the read_file acceptance prompt is a read-only investigation, not TODO administration", () => {
+  assert.equal(requestsTodoMachineryWork(acceptanceObjective), false)
+  assert.equal(userRequestsTodoCreation(acceptanceObjective), false, "its TODO workflow lines do not authorize root-level creation")
+})
+
+test("a build word in a heading does not make a read-only investigation TODO work", () => {
+  assert.equal(requestsTodoMachineryWork("Twinny Feedback/TODO Live Acceptance Test\nPerform a read-only investigation of the TODO panel."), false)
+  assert.equal(requestsTodoMachineryWork("Feedback/TODO work: test the TODO filter and fix the panel."), true)
+})
+
+test("the administrative TODO tasks Feedback produced for the read_file acceptance prompt are dropped, and the investigation is kept", () => {
+  const reply = {
+    track: true,
+    plan: plan({
+      goal: acceptanceObjective,
+      tasks: [
+        { id: "todo-create", title: "Create actionable TODOs before beginning the investigation", description: "Create the initial TODO entries.", acceptanceCriteria: ["A TODO entry exists."], dependencies: [] },
+        { id: "todo-status", title: "Update TODO status as each step progresses", description: "Keep the TODO statuses current.", acceptanceCriteria: ["Statuses reflect progress."], dependencies: ["todo-create"] },
+        { id: "register", title: "Locate read_file registration", description: "Find where the native read_file tool definition is registered and made available to the agent.", acceptanceCriteria: ["Registration sites are cited with line numbers."], dependencies: ["todo-create"] },
+        { id: "dispatch", title: "Trace read_file dispatch", description: "Trace an incoming read_file call to its implementation.", acceptanceCriteria: ["The dispatch path is cited."], dependencies: ["register", "todo-status"] },
+        { id: "validate", title: "Locate read_file argument validation and file read", description: "Identify where arguments are validated and where the file is read.", acceptanceCriteria: ["Both sites are cited."], dependencies: ["dispatch"] }
+      ]
+    })
+  }
+  const tasks = tasksOf(parseFeedbackPlanResponse(JSON.stringify(reply), acceptanceObjective))
+  assert.deepEqual(tasks.map((task) => task.id), ["register", "dispatch", "validate"])
+  assert.deepEqual(tasks.find((task) => task.id === "register")?.dependencies, [], "a dependency on a removed task is dropped with it")
+  assert.deepEqual(tasks.find((task) => task.id === "dispatch")?.dependencies, ["register"])
+})
+
 test("an unsupported structured-output parameter is retried once without it, and remembered", async () => {
   const modes: boolean[] = []
   const call = async (json: boolean): Promise<RoleReply> => {
@@ -581,4 +712,83 @@ test("with Feedback disabled, the turn runs without planning", async () => {
     assert.deepEqual(dispatched, ["turn", "turn"])
     assert.deepEqual(notices, [])
   })
+})
+
+const childContext: ChildTodoContext = {
+  planId: "plan-child",
+  revision: 2,
+  goal: "Investigate the read path",
+  parent: { id: "parent-task", title: "Trace read_file", status: "pending", acceptance: ["The read path is traced"], dependsOn: [] },
+  children: [],
+  planItems: [{ id: "parent-task", title: "Trace read_file", status: "pending" }, { id: "sibling-task", title: "Locate definition", status: "pending" }]
+}
+
+test("child TODO decisions are accepted only in the schema Feedback was given", () => {
+  const reply = (value: unknown) => JSON.stringify(value)
+  const accepted = parseChildTodoDecision(reply({ decision: "accepted", instruction: "Create the child under the parent." }), childContext)
+  assert.equal(accepted.ok, true)
+  if (accepted.ok) assert.equal(accepted.decision.decision, "accepted")
+
+  const unknownPlanTask = parseChildTodoDecision(reply({ decision: "existing_task", item_id: "not-in-plan", instruction: "Use it." }), childContext)
+  assert.equal(unknownPlanTask.ok, false, "existing_task must name a TODO that is in the plan")
+
+  const extraKey = parseChildTodoDecision(reply({ decision: "accepted", instruction: "Create it.", execute: true }), childContext)
+  assert.equal(extraKey.ok, false, "unexpected keys are rejected")
+
+  const unknownKind = parseChildTodoDecision(reply({ decision: "approved", instruction: "Create it." }), childContext)
+  assert.equal(unknownKind.ok, false)
+
+  const reasoningOnly = parseChildTodoDecision({ text: "", reasoning: "thinking", finishReason: "stop" } as RoleReply, childContext)
+  assert.equal(reasoningOnly.ok, false)
+})
+
+test("only a direct request for one named task authorizes user-directed creation", () => {
+  assert.equal(userRequestsTodoCreation("Please create a TODO to track the release notes."), true)
+  assert.equal(userRequestsTodoCreation("Add a to-do for the migration."), true)
+  assert.equal(userRequestsTodoCreation("Context first.\n- Create the TODO for the migration."), true)
+  assert.equal(userRequestsTodoCreation("Trace how read_file reaches its implementation."), false)
+  assert.equal(userRequestsTodoCreation("Do not create a TODO for this investigation."), false)
+  assert.equal(userRequestsTodoCreation("Explain how the TODO panel displays tasks."), false)
+})
+
+test("workflow text about TODO tracking does not authorize root-level creation", () => {
+  assert.equal(userRequestsTodoCreation("Use TODOs to track this investigation."), false)
+  assert.equal(userRequestsTodoCreation("Create actionable TODOs before beginning the investigation."), false)
+  assert.equal(userRequestsTodoCreation("Create initial TODO entries for each source file."), false)
+  assert.equal(userRequestsTodoCreation("Update TODO status as each step progresses."), false)
+  assert.equal(userRequestsTodoCreation("Record actual tool execution evidence for completed work."), false)
+})
+
+test("a stop during child TODO review returns at once, and a late decision is discarded", async () => {
+  const requests: string[] = []
+  const releases: Array<(value: string) => void> = []
+  // Ignores the abort signal, so the decision would arrive late.
+  const reviewer = new ChildTodoReviewer({
+    resolve: () =>
+      endpoint((request) => {
+        requests.push(request.user)
+        return new Promise((resolve) => releases.push(resolve))
+      })
+  })
+  const proposal: ChildTodoProposal = {
+    parentId: "parent-task",
+    title: "Locate the read handler",
+    details: "Find the handler that serves read_file.",
+    reason: "Needed to trace read_file.",
+    priority: "normal",
+    requestId: "request-stop"
+  }
+  const controller = new AbortController()
+  const review = reviewer.review(proposal, childContext, controller.signal)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  controller.abort(new Error("stopped"))
+  const outcome = await Promise.race([
+    review,
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("review did not return after Stop")), 2000).unref())
+  ])
+  assert.equal(outcome.ok, false)
+  releases[0](JSON.stringify({ decision: "accepted", instruction: "Create the child under the parent." }))
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(outcome.ok, false, "a decision that arrives after Stop never authorizes a mutation")
+  assert.equal(requests.length, 1, "no correction request starts after Stop")
 })

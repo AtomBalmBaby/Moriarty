@@ -135,7 +135,7 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
 
     const created = await tools.run({
       name: "twinny_todo_create",
-      args: { title: "Create from native tool", request_id: "tool-create", parent_id: "" }
+      args: { title: "Create from native tool", request_id: "tool-create", todo_parent_id: "" }
     })
     assert.equal(created.failed, undefined)
     assert.equal(JSON.parse(created.output).item.parentId, undefined, "an empty optional parent is treated as no parent")
@@ -203,6 +203,77 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
     assert.equal(invalidEvidence.failed, true)
     assert.match(invalidEvidence.output, /^Native TODO tool error:/)
     assert.match(invalidEvidence.output, /must be observed, passed, or failed/)
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("concurrent and stale plan revisions are resolved transactionally without losing progress or accepted children", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-revision-todos-"))
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-revision"]), conversationId: "chat-revision" }
+    const repository = new TodoRepository(databasePath, wasmPath)
+    const makePlan = (revision: number, title = "Inspect parser") => ({
+      planId: "plan-revision",
+      version: 1 as const,
+      revision,
+      goal: "Keep the parser reliable",
+      constraints: ["Preserve public API"],
+      tasks: [
+        { id: "inspect", title, description: "Inspect the parser", acceptanceCriteria: ["Parser inspected"], dependencies: [] },
+        { id: "verify", title: "Verify parser", description: "Run focused checks", acceptanceCriteria: ["Checks pass"], dependencies: ["inspect"] }
+      ]
+    })
+    const intentResult = (plan: ReturnType<typeof makePlan>) => ({ prompt: "Fix the parser", plan })
+
+    const seeded = await repository.synchronizeIntentPlan(scope, makePlan(1), intentResult(makePlan(1)))
+    const inspect = seeded.items[0]
+    await repository.updateItem(scope, { itemId: inspect.id, expectedVersion: inspect.version, patch: { status: "completed" }, actor: "model", requestId: "revision-claim" })
+
+    const racing = await Promise.allSettled([
+      repository.synchronizeIntentPlan(scope, makePlan(2, "Inspect parser A"), intentResult(makePlan(2, "Inspect parser A"))),
+      repository.synchronizeIntentPlan(scope, makePlan(2, "Inspect parser B"), intentResult(makePlan(2, "Inspect parser B")))
+    ])
+    const winners = racing.filter((result) => result.status === "fulfilled")
+    const losers = racing.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
+    assert.equal(winners.length, 1, "exactly one same-revision plan commits")
+    assert.equal(losers.length, 1)
+    assert.ok(losers[0] instanceof TodoConflictError)
+    const winnerTitle = (await repository.getList(scope)).items.find((item) => item.id === inspect.id)?.title
+    assert.ok(winnerTitle === "Inspect parser A" || winnerTitle === "Inspect parser B")
+    assert.equal((await repository.getIntentTaskPlan(scope))?.revision, 2)
+    assert.equal((await repository.getList(scope)).items.find((item) => item.id === inspect.id)?.status, "in_review", "claimed progress survives the conflict")
+
+    const proposal = {
+      parentId: inspect.id,
+      title: "Trace the delimiter caller",
+      details: "Follow the delimiter branch to its caller.",
+      reason: "The parent needs the caller trace.",
+      priority: "normal" as const,
+      requestId: "child-race"
+    }
+    const child = await repository.applyChildTodo(scope, proposal, { decision: "accepted", instruction: "Accepted under the parent." })
+    assert.equal(child.planRevision, 3)
+    const afterChild = await repository.getList(scope)
+    const childItem = afterChild.items.find((item) => item.title === "Trace the delimiter caller")
+    assert.equal(childItem?.parentId, inspect.id)
+
+    const staleRevision = makePlan(3, "Inspect parser boundaries")
+    await assert.rejects(
+      repository.synchronizeIntentPlan(scope, staleRevision, intentResult(staleRevision)),
+      TodoConflictError,
+      "a plan built before the accepted child cannot overwrite its revision"
+    )
+    assert.deepEqual(await repository.getList(scope), afterChild, "the rejected revision leaves no partial writes")
+
+    const replanned = makePlan(4, "Inspect parser boundaries")
+    await repository.synchronizeIntentPlan(scope, replanned, intentResult(replanned))
+    const finalList = await repository.getList(scope)
+    assert.equal(finalList.items.find((item) => item.id === inspect.id)?.title, "Inspect parser boundaries")
+    assert.equal(finalList.items.find((item) => item.id === inspect.id)?.status, "in_review", "verified progress is preserved across the re-plan")
+    assert.ok(finalList.items.some((item) => item.id === childItem?.id), "the accepted child survives the re-plan")
+    assert.equal((await repository.getIntentTaskPlan(scope))?.revision, 4)
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }

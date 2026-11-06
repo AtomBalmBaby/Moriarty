@@ -33,10 +33,22 @@ export interface TodoEvidence {
 
 export type TodoEvaluationDecision = "accept" | "revise" | "needs_evidence" | "blocked"
 
+/**
+ * Deterministic result for one criterion. `semantic` marks criteria that name
+ * no checkable source path or runtime fact; those remain with the Feedback AI.
+ */
+export interface TodoCriterionReconciliation {
+  outcome: "proven" | "disproven" | "unknown" | "semantic"
+  supportingObservationIds: string[]
+  missing: string[]
+  version: number
+}
+
 export interface TodoEvaluationCriterion {
   criterion: string
   status: "passed" | "failed" | "unverified"
   evidenceRefs: string[]
+  reconciliation?: TodoCriterionReconciliation
 }
 
 export interface TodoEvaluation {

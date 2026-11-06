@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto"
 
 import { logger, redact } from "../../common/logger"
-import type { ReplyChangesView, TodoEvaluation, TodoEvaluationCriterion } from "../../common/types"
+import type { ReplyChangesView, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion } from "../../common/types"
+import { verifyContentFingerprint } from "../tools/fingerprint"
 
 import { describeGap, evidenceAnchors, evidenceGaps, type EvidenceSource, evidenceWindows, propositionNeedles, redactEvidence, samePath } from "./evidence"
-import { type IntentPlanContext, RUNTIME_INVENTORY_TOOL, type TodoReviewPackage } from "./types"
+import { type IntentPlanContext, type RetainedObservationEvidence, RUNTIME_INVENTORY_TOOL, type TodoReviewPackage } from "./types"
 
 export const taskRequiresWorkspaceChanges = (task: Pick<TodoReviewPackage["task"], "title" | "details">, criteria: string[]): boolean => {
   const taskText = [task.title, task.details ?? "", ...criteria].join("\n")
@@ -118,6 +119,18 @@ const preserveObservationSet = (review: TodoReviewPackage) => {
     .map(({ observation }) => observation)
 }
 
+const MAX_SHARED_OBSERVATIONS = 40
+
+/**
+ * Observations from other tasks on the active plan that this review may cite. The payload and the
+ * citation check both use this set, so a reference is valid only when the evaluator was shown that record.
+ */
+const sharedObservationRecords = (review: TodoReviewPackage, visible: TodoReviewPackage["observations"]) =>
+  review.retainedEvidence
+    .filter((record) => record.itemId !== review.task.id && !visible.some((observation) => observation.id === record.observationId))
+    .slice(0, MAX_SHARED_OBSERVATIONS)
+    .map((record) => ({ id: record.observationId, taskId: record.itemId, toolName: record.toolName, arguments: record.arguments, failed: record.failed, exitCode: record.exitCode }))
+
 const FILE_CREATE_TOOLS = ["create_file"]
 const FILE_EDIT_TOOLS = ["edit_lines", "edit_file"]
 const FILE_DELETE_TOOLS = ["delete_file"]
@@ -130,10 +143,19 @@ export const requiredFileMutations = (criterion: string): string[][] => {
   return groups
 }
 
+/** Host-recorded tool facts usable as evidence, whether captured for this task or a sibling. */
+export interface TrustedObservationRef {
+  id: string
+  toolName: string
+  arguments: Record<string, string>
+  failed: boolean
+  exitCode?: number
+}
+
 export const hasTrustedEvidenceForCriterion = (
   criterion: string,
   references: string[],
-  observations: TodoReviewPackage["observations"]
+  observations: TrustedObservationRef[]
 ): boolean => {
   const cited = observations.filter((observation) => references.includes(observation.id) && !observation.failed)
   if (!cited.length) return false
@@ -160,12 +182,161 @@ export const hasTrustedEvidenceForCriterion = (
 const runtimeExposureProposition = (criterion: string, anchors: { paths: string[] }) =>
   anchors.paths.length === 0 && /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(criterion)
 
+/** Returns the current text of a workspace file, or undefined when it cannot be read. */
+export type CurrentSourceReader = (path: string) => Promise<string | undefined>
+
+/** Bumped when the deterministic rules change, so stored outcomes can be told apart. */
+export const RECONCILIATION_VERSION = 1
+
+const BACKTICKED_TEXT = /`[^`\n]*`/g
+const COMMAND_OR_MUTATION = /\b(tests?|assertions?|compil\w*|build|type.?check|commands?|execut\w*|run|creat\w*|edit\w*|modif\w*|replac\w*|updat\w*|delet\w*|remov\w*|renam\w*)\b/i
+const BEHAVIOR = /\b(when|whenever|if|unless|before|after|only|never|always|must|should|returns?|throws?|rejects?|validates?|ensures?|fails?|succeeds?|propagates?|retries|persists?|prevents?|guarantees?|rolls?\s+back)\b/i
+
+const reconciled = (
+  outcome: TodoCriterionReconciliation["outcome"],
+  supportingObservationIds: string[],
+  missing: string[]
+): TodoCriterionReconciliation => ({
+  outcome,
+  supportingObservationIds: [...new Set(supportingObservationIds)],
+  missing,
+  version: RECONCILIATION_VERSION
+})
+
+const isWholeFileRead = (record: RetainedObservationEvidence, paths: string[]): boolean =>
+  record.complete && record.sources.some((source) =>
+    paths.some((path) => samePath(source.path, path)) &&
+    source.startLine === 1 && source.totalLines !== undefined && source.endLine === source.totalLines)
+
+const inventoryOutcome = (symbols: string[], records: RetainedObservationEvidence[]): TodoCriterionReconciliation => {
+  const inventories = records.filter((record) =>
+    record.toolName === RUNTIME_INVENTORY_TOOL && !record.failed && record.retained && record.content !== undefined)
+  if (!inventories.length) return reconciled("unknown", [], ["no retained trusted runtime inventory"])
+  const supporting: string[] = []
+  const missing: string[] = []
+  let contradicted = false
+  for (const symbol of symbols) {
+    const found = inventories.find((record) => record.content?.includes(symbol))
+    if (found) {
+      supporting.push(found.observationId)
+      continue
+    }
+    if (inventories.some((record) => record.complete)) {
+      contradicted = true
+      missing.push(`\`${symbol}\` is absent from the complete runtime inventory`)
+    } else {
+      missing.push(`\`${symbol}\` is not in the retained runtime inventory, which is incomplete`)
+    }
+  }
+  if (contradicted) return reconciled("disproven", supporting, missing)
+  if (missing.length) return reconciled("unknown", supporting, missing)
+  return reconciled("proven", supporting, [])
+}
+
+/**
+ * Judges a path-anchored criterion from retained, successful reads. Each read is
+ * checked against the fingerprint of the source it captured; a read whose source
+ * changed, or whose source cannot be read now, is not proof about the current file.
+ */
+const sourceOutcome = async (
+  anchors: { paths: string[]; symbols: string[] },
+  records: RetainedObservationEvidence[],
+  current: (path: string) => Promise<string | undefined>
+): Promise<TodoCriterionReconciliation> => {
+  const supporting: string[] = []
+  const missing: string[] = []
+  const contradictions: string[] = []
+  const usable: RetainedObservationEvidence[] = []
+  for (const path of anchors.paths) {
+    const reads = records.filter((record) =>
+      !record.failed && record.retained && record.content !== undefined && record.sources.some((source) => samePath(source.path, path)))
+    if (!reads.length) {
+      missing.push(`no retained successful read of ${path}`)
+      continue
+    }
+    for (const record of reads) {
+      const hash = record.sources.find((source) => samePath(source.path, path))?.contentHash
+      if (!hash) {
+        missing.push(`observation ${record.observationId} of ${path} records no source fingerprint, so its currency is unknown`)
+        continue
+      }
+      const text = await current(path)
+      if (text === undefined) {
+        missing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
+        continue
+      }
+      if (await verifyContentFingerprint(text, hash).catch(() => false)) usable.push(record)
+      else missing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
+    }
+  }
+  for (const symbol of anchors.symbols) {
+    const needle = symbol.toLowerCase()
+    const hit = usable.find((record) => record.content?.toLowerCase().includes(needle))
+    if (hit) {
+      supporting.push(hit.observationId)
+      continue
+    }
+    const whole = usable.find((record) => isWholeFileRead(record, anchors.paths))
+    if (whole) {
+      supporting.push(whole.observationId)
+      contradictions.push(`\`${symbol}\` does not appear in the current full read of ${anchors.paths.join(", ")}`)
+      continue
+    }
+    missing.push(`\`${symbol}\` does not appear in any fresh retained read; read the relevant lines again`)
+  }
+  if (contradictions.length) return reconciled("disproven", supporting, [...contradictions, ...missing])
+  if (missing.length) return reconciled("unknown", supporting, missing)
+  if (!usable.length) return reconciled("unknown", [], ["no fresh retained read establishes the criterion"])
+  return reconciled("proven", [...supporting, ...usable.map((record) => record.observationId)], [])
+}
+
+/**
+ * Deterministic pass over acceptance criteria. Only narrow, anchored presence
+ * facts (paths, backticked symbols, runtime tool exposure) are decided here.
+ * Behavioral, command, and mutation criteria stay `semantic` for the Feedback AI,
+ * and a presence match alone never proves a behavioral relationship.
+ */
+export const reconcileCriteria = async (
+  criteria: string[],
+  records: RetainedObservationEvidence[],
+  readCurrent?: CurrentSourceReader
+): Promise<TodoCriterionReconciliation[]> => {
+  const cache = new Map<string, Promise<string | undefined>>()
+  const current = (path: string) => {
+    if (!readCurrent) return Promise.resolve(undefined)
+    let text = cache.get(path)
+    if (!text) {
+      text = readCurrent(path).catch(() => undefined)
+      cache.set(path, text)
+    }
+    return text
+  }
+  const outcomes: TodoCriterionReconciliation[] = []
+  for (const criterion of criteria) {
+    const anchors = evidenceAnchors(criterion)
+    const prose = criterion.replace(BACKTICKED_TEXT, " ")
+    const semantic = !anchors.paths.length && !anchors.symbols.length
+      || COMMAND_OR_MUTATION.test(prose)
+      || BEHAVIOR.test(prose)
+    if (semantic) {
+      outcomes.push(reconciled("semantic", [], []))
+    } else if (!anchors.paths.length) {
+      const exposure = /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(prose)
+      outcomes.push(exposure ? inventoryOutcome(anchors.symbols, records) : reconciled("semantic", [], []))
+    } else {
+      outcomes.push(await sourceOutcome(anchors, records, current))
+    }
+  }
+  return outcomes
+}
+
 export const parseTodoEvaluation = (
   raw: string,
   review: TodoReviewPackage,
   evaluator: string,
   evaluatedAt = new Date().toISOString(),
-  allowEvidenceFreeAnalysis = false
+  allowEvidenceFreeAnalysis = false,
+  reconciliations: TodoCriterionReconciliation[] = []
 ): TodoEvaluation => {
   if (!raw.trim()) invalid("empty_response", "Evaluator returned an empty response")
   let value: unknown
@@ -191,7 +362,8 @@ export const parseTodoEvaluation = (
   exactKeys(value, ["schemaVersion", "taskId", "decision", "criteria", "problems", "correctiveInstructions", "explanation", "scores"], "response")
   const visibleObservations = preserveObservationSet(review)
   const visibleEvidence = review.evidence.slice(0, 8)
-  const knownRefs = new Set([...visibleObservations.map((observation) => observation.id), ...visibleEvidence.map((evidence) => evidence.id)])
+  const trustedRecords = [...visibleObservations, ...sharedObservationRecords(review, visibleObservations)]
+  const knownRefs = new Set([...trustedRecords.map((observation) => observation.id), ...visibleEvidence.map((evidence) => evidence.id)])
   const criteria: TodoEvaluationCriterion[] = criteriaValue.map((entry, index) => {
     if (!isRecord(entry)) invalid("invalid_shape", "Evaluator criterion at index " + index + " must be an object", review.acceptanceCriteria[index], entry, "criteria[" + index + "]")
     if (!("criterion" in entry)) invalid("missing_field", "Evaluator criterion at index " + index + " is missing the required 'criterion' field", review.acceptanceCriteria[index], undefined, `criteria[${index}].criterion`)
@@ -203,7 +375,13 @@ export const parseTodoEvaluation = (
     if (!criterionStatuses.has(String(entry.status))) invalid("invalid_shape", "Evaluator criterion at index " + index + " has an invalid status; expected passed, failed, or unverified", [...criterionStatuses], entry.status, "criteria[" + index + "].status")
     const evidenceRefs = boundedStrings(entry.evidenceRefs, 100, 20, `criteria[${index}].evidenceRefs`)
     if (evidenceRefs.some((reference) => !knownRefs.has(reference))) invalid("invalid_shape", "Evaluator cited evidence outside this task review package", [...knownRefs], evidenceRefs, "criteria[" + index + "].evidenceRefs")
-    return { criterion: entry.criterion, status: entry.status as TodoEvaluationCriterion["status"], evidenceRefs }
+    const reconciliation = reconciliations[index]
+    return {
+      criterion: entry.criterion,
+      status: entry.status as TodoEvaluationCriterion["status"],
+      evidenceRefs,
+      ...(reconciliation ? { reconciliation } : {})
+    }
   })
   const problems = boundedStrings(value.problems, 500, 20, "problems")
   const correctiveInstructions = boundedStrings(value.correctiveInstructions, 500, 20, "correctiveInstructions")
@@ -222,8 +400,23 @@ export const parseTodoEvaluation = (
     return number
   }
   let decision = value.decision as TodoEvaluation["decision"]
+  let disproven = false
   for (const criterion of criteria) {
-    if (criterion.status !== "passed") continue
+    const outcome = criterion.reconciliation?.outcome
+    if (outcome === "disproven") {
+      disproven = true
+      criterion.status = "failed"
+      const contradiction = (criterion.reconciliation?.missing ?? []).join("; ") || "trusted observations contradict this criterion"
+      if (problems.length < 20) problems.push((criterion.criterion + " — " + contradiction).slice(0, 500))
+      if (correctiveInstructions.length < 20) correctiveInstructions.push(("Correct the work so trusted observations support: " + criterion.criterion).slice(0, 500))
+    } else if (outcome === "proven" && criterion.status !== "failed") {
+      criterion.status = "passed"
+    }
+  }
+  if (disproven) decision = "revise"
+  else if (decision === "needs_evidence" && criteria.every((criterion) => criterion.status === "passed") && criteria.some((criterion) => criterion.reconciliation?.outcome === "proven")) decision = "accept"
+  for (const criterion of criteria) {
+    if (criterion.status !== "passed" || criterion.reconciliation?.outcome === "proven") continue
     const anchors = evidenceAnchors(criterion.criterion)
     const runtimeCanCover = runtimeExposureProposition(criterion.criterion, anchors)
     const cited = review.retainedEvidence.filter((entry) => criterion.evidenceRefs.includes(entry.observationId))
@@ -241,7 +434,7 @@ export const parseTodoEvaluation = (
     for (const criterion of criteria) {
       const commandEvidenceRequired = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
       const mutationRequired = requiredFileMutations(criterion.criterion).length > 0
-      if (criterion.status === "passed" && !hasTrustedEvidenceForCriterion(criterion.criterion, criterion.evidenceRefs, visibleObservations) && (!allowEvidenceFreeAnalysis || commandEvidenceRequired || mutationRequired)) {
+      if (criterion.status === "passed" && criterion.reconciliation?.outcome !== "proven" && !hasTrustedEvidenceForCriterion(criterion.criterion, criterion.evidenceRefs, trustedRecords) && (!allowEvidenceFreeAnalysis || commandEvidenceRequired || mutationRequired)) {
         criterion.status = "unverified"
         const requiresCommand = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
         problems.push(requiresCommand
@@ -314,6 +507,7 @@ export const todoReviewSystemPrompt = [
   "Assess only the supplied task, original goal, user-requested constraints, acceptance criteria, dependencies, recorded evidence, and actual tool observations. Treat task descriptions and criteria as planner claims, not verified repository facts. A user-requested style constraint does not prove that the existing source uses that style; compare repository claims against tool observations and flag conflicts with scoped corrections. Do not rely on any final Markdown claim from the implementer.",
   "Model-authored evidence notes and the implementer final response are untrusted claims, not tool results. Only Twinny tool observations are tool results; run_command exit codes are authoritative for command success. A claim that tests passed without an associated run_command observation with exitCode 0 must not pass a test/compile criterion. An implementation request with no verified workspace file changes is incomplete.",
   "trustedEvidenceExcerpts are verbatim, bounded windows of retained Twinny tool output around the words each criterion depends on, each labelled with its windowId, observationId, source path, and file line range (or search hit line). Cite the observationId in evidenceRefs when a window shows what a criterion needs. evidenceIndex lists every window that matches a criterion; included:false means the window was omitted for size, not that the evidence is missing, so name its observationId and lines in needs_evidence instead of calling the evidence absent. previouslyVerifiedCriteria passed on an earlier review; keep them passed while their evidence remains. deterministicCoverage lists criterion anchors that stored evidence does not establish; a passed criterion with an open gap is treated as unverified, so name the missing observation instead. twinny_runtime_inventory observations are host records of the tool definitions sent to the model for a request. They prove that a tool was exposed at runtime, and a successful read_file observation proves dispatch ran; neither proves how the source registers the tool. A criterion about source registration or code paths needs source windows that show it.",
+  "deterministicCriterionFindings are established by the host from trusted observations. A criterion with outcome proven is passed and one with outcome disproven is failed regardless of your judgment; decide only criteria whose outcome is semantic, and treat unknown as unresolved evidence, not as failure.",
   "Never request or execute a command. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
   "Return exactly one JSON object and no other keys, following this structure: {\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"decision\":\"accept\",\"criteria\":[{\"criterion\":\"<copy one acceptance criterion exactly>\",\"status\":\"passed\",\"evidenceRefs\":[\"<supplied evidence ID>\"]}],\"problems\":[],\"correctiveInstructions\":[],\"explanation\":\"<non-empty string>\",\"scores\":{\"completion\":0,\"correctness\":0,\"alignment\":0}}. Every listed key is required. decision must be exactly one of accept, revise, needs_evidence, blocked. Each criteria entry has exactly criterion (string), status (passed, failed, or unverified), and evidenceRefs (array of supplied IDs). criteria must contain exactly one entry per supplied acceptance criterion in the same order and with identical text. Each evidenceRefs entry must be an ID explicitly supplied in the input; never invent or infer IDs. problems and correctiveInstructions are arrays of strings and may be empty; explanation is a non-empty string; scores has exactly completion, correctness, and alignment, each an integer from -7 to +8. Do not use 'text' instead of 'criterion', do not return correctiveInstructions as a string, and do not add fields."
 ].join("\n")
@@ -450,7 +644,7 @@ const evidenceCoverage = (review: TodoReviewPackage) => review.acceptanceCriteri
   }))
 )
 
-export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChangesView, finalResponse?: string): string => JSON.stringify({
+export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChangesView, finalResponse?: string, reconciliations?: TodoCriterionReconciliation[]): string => JSON.stringify({
   originalGoal: clip(review.goal, 800),
   userRequestedConstraints: review.constraints.slice(0, 8).map((value) => clip(value, 300)),
   plan: { id: review.planId, revision: review.planRevision },
@@ -465,6 +659,12 @@ export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChange
     acceptanceCriteria: review.acceptanceCriteria
   },
   dependencies: review.dependencies.slice(0, 8),
+  deterministicCriterionFindings: reconciliations?.map((entry, index) => ({
+    criterion: clip(review.acceptanceCriteria[index] ?? "", 300),
+    outcome: entry.outcome,
+    supportingObservationIds: entry.supportingObservationIds.slice(0, 8),
+    missing: entry.missing.slice(0, 4).map((value) => clip(value, 300))
+  })),
   modelAuthoredEvidenceNotes: review.evidence.slice(0, 8).map((entry) => ({ id: entry.id, kind: entry.kind, result: entry.result, summary: clip(entry.summary, 500) })),
   relevantFileChanges: changes?.files.slice(0, 20).map((file) => ({ path: clip(file.path, 240), status: file.status, added: file.added, removed: file.removed })),
   previousEvaluation: review.lastEvaluation ? {
@@ -485,6 +685,14 @@ export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChange
     ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {})
   })),
   ...reviewEvidenceFields(review),
+  sharedTrustedObservations: sharedObservationRecords(review, preserveObservationSet(review)).map((entry) => ({
+    id: entry.id,
+    taskId: entry.taskId,
+    toolName: entry.toolName,
+    arguments: Object.fromEntries(Object.entries(entry.arguments).slice(0, 8).map(([key, value]) => [clip(key, 100), clip(value, 500)])),
+    failed: entry.failed,
+    ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {})
+  })),
   deterministicCoverage: evidenceCoverage(review),
   implementerFinalResponseUntrusted: finalResponse ? clip(finalResponse, 1200) : undefined
 })
@@ -495,33 +703,39 @@ const reviewsInFlight = new Map<string, Promise<TodoEvaluation>>()
  * Plan tasks awaiting Feedback: a task with no evaluation, or one whose last
  * evaluation predates its current version (a claim or new evidence arrived).
  */
+/** A task is reviewable only once every prerequisite is verified; otherwise its claim waits without a Feedback call. */
+export const dependenciesComplete = (review: TodoReviewPackage): boolean =>
+  review.dependencies.every((dependency) => dependency.status === "completed")
+
 export const reviewCandidates = (reviews: TodoReviewPackage[], itemId?: string): TodoReviewPackage[] =>
-  itemId
+  (itemId
     ? reviews.filter((review) => review.task.id === itemId)
     : reviews.filter((review) => !review.lastEvaluation || review.lastEvaluation.metadata.taskVersion !== review.task.version - 1)
+  ).filter(dependenciesComplete)
 
 export const evaluateTodoReview = (
   repository: import("./repository").TodoRepository,
   scope: import("./types").TodoListRequest,
   review: TodoReviewPackage,
-  evaluator: (correction?: string) => Promise<string>,
+  evaluator: (correction?: string, reconciliations?: TodoCriterionReconciliation[]) => Promise<string>,
   evaluatorName: string,
-  requirements: { requireWorkspaceChanges?: boolean; hasVerifiedFileChanges?: boolean; allowEvidenceFreeAnalysis?: boolean } = {}
+  requirements: { requireWorkspaceChanges?: boolean; hasVerifiedFileChanges?: boolean; allowEvidenceFreeAnalysis?: boolean; readCurrentSource?: CurrentSourceReader } = {}
 ): Promise<TodoEvaluation> => {
   const key = `${scope.projectFingerprint}\n${scope.conversationId}\n${review.task.id}\n${review.task.version}`
   const inFlight = reviewsInFlight.get(key)
   if (inFlight) return inFlight
   const operation = (async () => {
-    let raw = await evaluator()
+    const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource)
+    let raw = await evaluator(undefined, reconciliations)
     let result: TodoEvaluation
     try {
-      result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis)
+      result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis, reconciliations)
     } catch (error) {
       if (!(error instanceof TodoEvaluationValidationError)) throw error
       logger.warn("[FeedbackEvaluator] Invalid response (code=" + error.code + ", field=" + (error.field ?? "root") + "): " + error.message + "; expected=" + JSON.stringify(error.expected) + "; received=" + JSON.stringify(error.received) + "; raw=" + redact(raw).slice(0, 4000))
-      raw = await evaluator("Your prior response failed validation (" + error.code + ": " + error.message + "). Return a corrected JSON object only. The canonical taskId must be exactly " + JSON.stringify(review.planTaskId) + ". Do not change the supplied task criteria or invent evidence.")
+      raw = await evaluator("Your prior response failed validation (" + error.code + ": " + error.message + "). Return a corrected JSON object only. The canonical taskId must be exactly " + JSON.stringify(review.planTaskId) + ". Do not change the supplied task criteria or invent evidence.", reconciliations)
       try {
-        result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis)
+        result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis, reconciliations)
       } catch (retryError) {
         if (retryError instanceof TodoEvaluationValidationError) {
           logger.warn("[FeedbackEvaluator] Correction response still invalid (code=" + retryError.code + ", field=" + (retryError.field ?? "root") + "): " + retryError.message + "; expected=" + JSON.stringify(retryError.expected) + "; received=" + JSON.stringify(retryError.received) + "; raw=" + redact(raw).slice(0, 4000))

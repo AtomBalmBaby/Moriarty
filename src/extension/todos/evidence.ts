@@ -126,6 +126,7 @@ const MAX_HITS = 50
 const MAX_HIT_PREVIEW = 200
 const READ_HEADER = /^(.+?) \((?:lines (\d+)–(\d+) of (\d+)|full line (\d+))\)$/
 const TOTAL_LINES = /total_lines: (\d+)/
+const CONTENT_HASH = /content_hash: ([a-z0-9_]+:[a-f0-9]+)/i
 const CODE_PATH = /(?:[\w.-]+\/)*[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|json|md|py|go|rs|java|cs|css|html|ya?ml)\b/g
 const BACKTICKED = /`([^`\n]{2,120})`/g
 
@@ -134,6 +135,8 @@ export interface EvidenceSource {
   startLine?: number
   endLine?: number
   totalLines?: number
+  /** Fingerprint of the whole document as it was read; absent for outputs that carry none. */
+  contentHash?: string
 }
 
 export interface EvidenceHit {
@@ -154,7 +157,9 @@ export interface PreservedEvidence {
 const parseSources = (text: string): EvidenceSource[] => {
   const header = READ_HEADER.exec(text.split("\n", 1)[0] ?? "")
   if (!header) return []
-  const total = TOTAL_LINES.exec(text.slice(0, 400))
+  const head = text.slice(0, 400)
+  const total = TOTAL_LINES.exec(head)
+  const hash = CONTENT_HASH.exec(head)
   const start = Number(header[2] ?? header[5])
   const end = Number(header[3] ?? header[5])
   const totalLines = Number(header[4] ?? total?.[1])
@@ -162,7 +167,8 @@ const parseSources = (text: string): EvidenceSource[] => {
     path: header[1].slice(0, 500),
     startLine: Number.isSafeInteger(start) ? start : undefined,
     endLine: Number.isSafeInteger(end) ? end : undefined,
-    totalLines: Number.isSafeInteger(totalLines) ? totalLines : undefined
+    totalLines: Number.isSafeInteger(totalLines) ? totalLines : undefined,
+    contentHash: hash?.[1]
   }]
 }
 

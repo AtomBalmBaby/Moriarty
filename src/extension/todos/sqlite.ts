@@ -126,6 +126,20 @@ CREATE TABLE IF NOT EXISTS todo_tool_evidence (
 );
 CREATE INDEX IF NOT EXISTS todo_tool_evidence_list ON todo_tool_evidence(list_id, retained, created_at);
 PRAGMA user_version = 4;
+CREATE TABLE IF NOT EXISTS todo_child_proposals (
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  parent_id TEXT NOT NULL REFERENCES todo_items(id),
+  decision TEXT NOT NULL CHECK(decision IN ('accepted','existing_task','revised','rejected','needs_clarification')),
+  item_id TEXT REFERENCES todo_items(id),
+  plan_revision INTEGER NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(list_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS todo_child_proposals_fingerprint ON todo_child_proposals(list_id, fingerprint, created_at);
+PRAGMA user_version = 5;
 `
 
 export class SqliteFile {
@@ -157,7 +171,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 4) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 5) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -173,6 +187,10 @@ export class SqliteFile {
           await this.persist(database)
         } else if (version === 3) {
           database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_evidence"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
+          await this.persist(database)
+        }
+        if (version > 0 && version < 5) {
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_child_proposals"), SCHEMA.indexOf("PRAGMA user_version = 5;") + "PRAGMA user_version = 5;".length))
           await this.persist(database)
         }
       } finally {

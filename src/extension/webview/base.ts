@@ -386,7 +386,10 @@ export class BaseProvider {
         await configuration.update(key, value, target)
         this.bridge?.emit(EVENT_NAME.twinnyConfigValueChanged, { key, value })
       },
-      [EVENT_NAME.twinnySidebarReady]: () => this._sidebarReadyHandler?.(),
+      [EVENT_NAME.twinnySidebarReady]: () => {
+        this._sidebarReadyHandler?.()
+        this.chat?.announceOperation()
+      },
       [EVENT_NAME.twinnyStopGeneration]: () => this.destroyStream(),
       [EVENT_NAME.twinnyToolApproval]: ({ id, run, always }) => this.chat?.answerToolApproval(id, run, always),
       [EVENT_NAME.twinnyToolStop]: ({ id }) => this.chat?.stopToolStep(id),

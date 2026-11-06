@@ -16,11 +16,13 @@ import * as vscode from "vscode"
 import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../../common/constants"
 import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
+import { CHILD_TODO_PROTOCOL } from "../../extension/chat/feedback-planner"
 import { Chat } from "../../extension/chat/index"
 import { createSafeEditCheckpoints } from "../../extension/chat/tool-sinks"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
+import { todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
 
 /** A model that answers each request with the next scripted reply. */
@@ -28,7 +30,11 @@ class ScriptedModel implements InferenceProvider {
   public readonly id = "scripted-agent"
   public requests: ChatRequest[] = []
 
-  constructor(private readonly _replies: string[], private readonly _planReply?: string) {}
+  constructor(
+    private readonly _replies: string[],
+    private readonly _planReply?: string,
+    private readonly _hold?: (request: ChatRequest) => Promise<void> | void
+  ) {}
 
   capabilities() {
     return ["chat" as const]
@@ -38,6 +44,8 @@ class ScriptedModel implements InferenceProvider {
     this.requests.push(structuredClone(request))
     const system = String(request.messages[0]?.content ?? "")
     const planning = this._planReply !== undefined && /track \(boolean\)/.test(system)
+    // A held reply is a provider response that may arrive after the test has stopped the operation.
+    await this._hold?.(request)
     const reply = planning ? this._planReply! : this._replies.shift() ?? "Done."
     for (let i = 0; i < reply.length; i += 9) yield { content: reply.slice(i, i + 9) }
   }
@@ -93,6 +101,91 @@ const fakeWebview = () => {
     },
     dispatch: (message: unknown) => {
       listener?.(message)
+    }
+  }
+}
+
+/** A promise the test resolves once the event it waits for has happened. */
+const deferred = () => {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => (resolve = done))
+  return { promise, resolve }
+}
+
+const revisionVerdict = (taskId: string, criterion: string) => JSON.stringify({
+  schemaVersion: 1,
+  taskId,
+  decision: "revise",
+  criteria: [{ criterion, status: "failed", evidenceRefs: [] }],
+  problems: ["No source changes were made."],
+  correctiveInstructions: ["Make the requested change."],
+  explanation: "The requested implementation is not present.",
+  scores: { completion: 0, correctness: 0, alignment: 0 }
+})
+
+/**
+ * A chat with one Feedback-planned task on the real repository. Both
+ * providers are scripted, and `onMessage` sees each host message as it is sent.
+ */
+const feedbackRig = async (
+  name: string,
+  agent: ScriptedModel,
+  evaluator: ScriptedModel,
+  criterion: string,
+  onMessage?: (message: { type: string; data?: unknown }) => void
+) => {
+  const settings = vscode.workspace.getConfiguration("twinny")
+  const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
+  await settings.update("feedback.enabled", true, vscode.ConfigurationTarget.Global)
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `twinny-${name}-`))
+  const agentId = `${name}-agent`
+  const evaluatorId = `${name}-evaluator`
+  providerRegistry.register(agentId, { id: agentId, create: () => agent })
+  providerRegistry.register(evaluatorId, { id: evaluatorId, create: () => evaluator })
+  const stored: Record<string, unknown> = {
+    [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: { ...provider, id: agentId, provider: agentId },
+    [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: { ...provider, id: evaluatorId, provider: evaluatorId, type: "intent" }
+  }
+  const context = {
+    extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+    globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),
+    globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+    workspaceState: { get: () => undefined, update: async () => undefined },
+    subscriptions: []
+  } as unknown as vscode.ExtensionContext
+  const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+  const goal = "Make the requested change to the cancellation fixture."
+  const scope = {
+    projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+    conversationId: name
+  }
+  const plan = {
+    planId: `${name}-plan`,
+    version: 1 as const,
+    revision: 1,
+    goal,
+    constraints: ["Change only the fixture."],
+    tasks: [{ id: `${name}-task`, title: "Make the requested change", description: "Change the cancellation fixture.", acceptanceCriteria: [criterion], dependencies: [] as string[] }]
+  }
+  await repository.synchronizeIntentPlan(scope, plan, { prompt: goal, plan })
+  const webview = fakeWebview()
+  const bridge = new ExtensionBridge({
+    ...webview,
+    postMessage: (payload: unknown) => {
+      webview.postMessage(payload)
+      onMessage?.(payload as { type: string; data?: unknown })
+    }
+  } as unknown as vscode.Webview)
+  const chat = new Chat(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
+  return {
+    chat,
+    repository,
+    scope,
+    goal,
+    dispose: async () => {
+      chat.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
     }
   }
 }
@@ -186,10 +279,10 @@ suite("Agent reply, end to end", function () {
     const settings = vscode.workspace.getConfiguration("twinny")
     const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-task-context-"))
-    const model = new ScriptedModel(["Done.", "Done."])
+    const model = new ScriptedModel(["Done.", "Done.", "Done."])
     providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
-    // Only the enabled turn plans; the existing synchronized plan already covers the request.
-    const planner = new ScriptedModel([JSON.stringify({ track: false, plan: null })])
+    // Each Feedback-enabled turn plans with the same answer; the planning prompt never consumes the scripted queue.
+    const planner = new ScriptedModel([], JSON.stringify({ track: false, plan: null }))
     providerRegistry.register("scripted-task-planner", { id: "scripted-task-planner", create: () => planner })
     const plannerProvider: TwinnyProvider = { ...provider, id: "scripted-task-planner", provider: "scripted-task-planner", type: "intent" }
     const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: plannerProvider }
@@ -238,8 +331,20 @@ suite("Agent reply, end to end", function () {
       assert.doesNotMatch(taskProjection, /This should not be included in the active task context\./)
       assert.doesNotMatch(taskProjection, /Not part of this request/)
       assert.match(taskProjection, /\(pending, verification not_checked, version 1\) Do not project unrelated task/, "sibling tasks appear only as plan status rows")
-      assert.ok(taskProjection.length < 4000, `Task context was unexpectedly large: ${taskProjection.length} characters`)
+      const projectionLine = taskProjection.split("\n").find((line) => line.includes("twinny_active_intent_task")) ?? ""
+      assert.ok(projectionLine, "the active task projection is one JSON line")
+      assert.ok(projectionLine.length < 4000, `Task context was unexpectedly large: ${projectionLine.length} characters`)
       assert.match(enabledSystem, /You are a helpful, respectful and honest coding assistant/)
+
+      // An accepted plan revision must reach the next real inference request, not only the context helper.
+      const revised = { ...plan, revision: 2, tasks: [{ ...plan.tasks[0], acceptanceCriteria: ["The revised acceptance criterion reaches the next request."] }, plan.tasks[1]] }
+      await repository.synchronizeIntentPlan(scope, revised, { prompt: "Implement the feature", plan: revised })
+      const revisedReply = await chat.completion([{ role: "user", content: "Continue after the revision." }], [], "off", scope.conversationId)
+      assert.equal(model.requests.length, 3, `the revised turn must reach the implementing model; reply=${JSON.stringify(revisedReply)}`)
+      const revisedSystem = String(model.requests[2].messages[0]?.content ?? "")
+      assert.match(revisedSystem, /"revision":2/)
+      assert.match(revisedSystem, /The revised acceptance criterion reaches the next request\./)
+      assert.doesNotMatch(revisedSystem, /The active task acceptance criterion is visible to the model\./)
     } finally {
       chat.dispose()
       await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
@@ -318,6 +423,94 @@ suite("Agent reply, end to end", function () {
     }
   })
 
+  test("stopping during Feedback verification starts no continuation, and the late verdict cannot restart the reply", async () => {
+    const criterion = "The requested change is made."
+    const agent = new ScriptedModel(["Implementation report: the change is made.", "A continuation that must not run."])
+    const verificationStarted = deferred()
+    const releaseVerdict = deferred()
+    const evaluator = new ScriptedModel([revisionVerdict("cancel-verification-task", criterion)], JSON.stringify({ track: false }), async (request) => {
+      if (String(request.messages[0]?.content ?? "") === todoReviewSystemPrompt) {
+        verificationStarted.resolve()
+        await releaseVerdict.promise
+      }
+    })
+    const rig = await feedbackRig("cancel-verification", agent, evaluator, criterion)
+    try {
+      const turn = rig.chat.completion([{ role: "user", content: rig.goal }], [], "off", rig.scope.conversationId)
+      await verificationStarted.promise
+      rig.chat.abort()
+      const requestsAtStop = agent.requests.length
+      releaseVerdict.resolve()
+      await turn
+      assert.equal(requestsAtStop, 1, "only the first implementing request had started")
+      assert.equal(agent.requests.length, requestsAtStop, "no request may start after Stop")
+      const items = (await rig.repository.getList({ ...rig.scope, includeCompleted: true })).items
+      assert.equal(items.filter((item) => item.status === "completed").length, 0, "a late verdict must not complete the task")
+    } finally {
+      await rig.dispose()
+    }
+  })
+
+  test("stopping at a scheduled continuation starts no corrective turn", async () => {
+    const criterion = "The requested change is made."
+    const agent = new ScriptedModel(["Implementation report: the change is made.", "A continuation that must not run."])
+    const evaluator = new ScriptedModel([revisionVerdict("cancel-continuation-task", criterion)], JSON.stringify({ track: false }))
+    const rig = await feedbackRig("cancel-continuation", agent, evaluator, criterion, (message) => {
+      // The continuation announces itself just before its request; Stop lands in that gap.
+      const continuation = (message.data as { continuation?: number } | undefined)?.continuation ?? 0
+      if (message.type === EVENT_NAME.twinnyOnLoading && continuation > 0) rig.chat.abort()
+    })
+    try {
+      await rig.chat.completion([{ role: "user", content: rig.goal }], [], "off", rig.scope.conversationId)
+      assert.equal(agent.requests.length, 1, "Stop in the continuation gap must prevent the corrective request")
+      assert.equal(evaluator.requests.filter((request) => String(request.messages[0]?.content ?? "") === todoReviewSystemPrompt).length, 1, "the revise verdict was reached before the gap")
+    } finally {
+      await rig.dispose()
+    }
+  })
+
+  test("stopping while a child TODO proposal awaits Feedback creates no child and starts no further step", async () => {
+    const criterion = "The requested change is made."
+    const accepted = JSON.stringify({ decision: "accepted", item_id: null, title: null, details: null, parent_id: null, instruction: "Proceed with the child." })
+    const reviewStarted = deferred()
+    const releaseReview = deferred()
+    const evaluator = new ScriptedModel([accepted], JSON.stringify({ track: false }), async (request) => {
+      if (String(request.messages[0]?.content ?? "") === CHILD_TODO_PROTOCOL) {
+        reviewStarted.resolve()
+        await releaseReview.promise
+      }
+    })
+    const replies: string[] = []
+    const agent = new ScriptedModel(replies)
+    const rig = await feedbackRig("cancel-child", agent, evaluator, criterion)
+    try {
+      // todo_parent_id names the repository item id, which is generated when the plan is synchronized.
+      const parent = (await rig.repository.getList({ ...rig.scope, includeCompleted: true })).items.find((item) => item.title === "Make the requested change")
+      assert.ok(parent, "the plan task must be a TODO item")
+      replies.push(
+        call("twinny_todo_create", {
+          todo_parent_id: parent.id,
+          title: "Handle the empty state",
+          details: "Cover the empty fixture.",
+          reason: "The change needs the empty case.",
+          request_id: "cancel-child-1"
+        }),
+        "A step that must not run."
+      )
+      const turn = rig.chat.completion([{ role: "user", content: rig.goal }], [], "off", rig.scope.conversationId)
+      await reviewStarted.promise
+      rig.chat.abort()
+      const requestsAtStop = agent.requests.length
+      releaseReview.resolve()
+      await turn
+      assert.equal(agent.requests.length, requestsAtStop, "no further step may start after Stop")
+      const items = (await rig.repository.getList({ ...rig.scope, includeCompleted: true })).items
+      assert.ok(!items.some((item) => item.title === "Handle the empty state"), "a late acceptance must not create the child")
+    } finally {
+      await rig.dispose()
+    }
+  })
+
   test("safe edit rollback preserves a dirty editor buffer and its distinct disk contents", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-dirty-buffer-checkpoint-"))
     const file = path.join(root, "panel.tsx")
@@ -336,7 +529,7 @@ suite("Agent reply, end to end", function () {
       await setText("agent regression\n")
       assert.equal(await document.save(), true)
       await checkpoints.markChanged([file])
-      assert.deepEqual(await checkpoints.rollback(), { restored: true })
+      assert.deepEqual(await checkpoints.rollback(), { restored: true, contentVerified: true })
       assert.equal(document.getText(), "user's unsaved buffer\n")
       assert.equal(fs.readFileSync(file, "utf8"), "disk before\n")
     } finally {

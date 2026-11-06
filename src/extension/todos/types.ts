@@ -13,7 +13,64 @@ export interface IntentPlanOutline {
   revision: number
   goal: string
   tasks: IntentPlanOutlineTask[]
+  /** Child TODOs Feedback accepted under plan tasks. They are not plan tasks and add no dependencies. */
+  children: IntentPlanOutlineChild[]
 }
+
+export interface IntentPlanOutlineChild {
+  itemId: string
+  parentItemId: string
+  title: string
+  status: TodoStatus
+}
+
+/** An agent's request to add a child under a plan TODO, before Feedback reviews it. */
+export interface ChildTodoProposal {
+  parentId: string
+  title: string
+  details?: string
+  reason: string
+  priority: TodoPriority
+  requestId: string
+}
+
+export type ChildTodoDecisionKind = "accepted" | "existing_task" | "revised" | "rejected" | "needs_clarification"
+
+/** A Feedback decision after the host has validated it. `revised` may change the title, details, or parent. */
+export interface ChildTodoDecision {
+  decision: ChildTodoDecisionKind
+  itemId?: string
+  title?: string
+  details?: string
+  parentId?: string
+  instruction: string
+}
+
+/** The authoritative result of a child TODO proposal, as stored and returned to the agent. */
+export interface ChildTodoOutcome {
+  decision: ChildTodoDecisionKind
+  parentId: string
+  itemId?: string
+  planRevision: number
+  instruction: string
+}
+
+/** The plan state Feedback reviews a child proposal against. */
+export interface ChildTodoContext {
+  planId: string
+  revision: number
+  goal: string
+  parent: { id: string; title: string; details?: string; status: TodoStatus; acceptance: string[]; dependsOn: string[] }
+  children: IntentPlanOutlineChild[]
+  planItems: { id: string; title: string; status: TodoStatus }[]
+}
+
+export type ChildTodoReviewOutcome =
+  | { ok: true; decision: ChildTodoDecision }
+  | { ok: false; error: string }
+
+/** Reviews an agent's child proposal on the Feedback provider. A failure never authorizes a mutation. */
+export type ChildTodoReview = (proposal: ChildTodoProposal, context: ChildTodoContext, signal?: AbortSignal) => Promise<ChildTodoReviewOutcome>
 
 export interface IntentPlanOutlineTask {
   taskId: string
@@ -26,6 +83,8 @@ export interface IntentPlanOutlineTask {
   /** Criteria the latest Feedback evaluation did not pass, with the reason it gave. */
   unmetCriteria: string[]
   problems: string[]
+  /** Titles of prerequisite tasks that are not yet completed; a claim waits on these rather than failing review. */
+  awaitingDependencies: string[]
 }
 
 export interface IntentPlanContext {
@@ -93,6 +152,7 @@ export interface RetainedObservationEvidence {
   toolName: string
   arguments: Record<string, string>
   failed: boolean
+  exitCode?: number
   retained: boolean
   complete: boolean
   originalChars: number

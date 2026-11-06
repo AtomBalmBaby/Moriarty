@@ -206,6 +206,8 @@ export const continuationContext = (input: {
   /** Outstanding TODO items by ID, version and missing evidence: the executor updates these, not new ones. */
   todoTargets?: string[]
   verifiedObservations?: string[]
+  /** Unresolved criteria with the trusted observation IDs that establish part of each and the fact still missing. */
+  unresolvedEvidence?: string[]
   failedActions?: string[]
   finalResponse: string
 }): string => {
@@ -219,6 +221,7 @@ export const continuationContext = (input: {
     section("Acceptance criteria", input.criteria, 400),
     section("Outstanding TODO items", input.todoTargets ?? [], 400),
     section("Verified Twinny observations", input.verifiedObservations ?? [], 400),
+    ...(input.unresolvedEvidence?.length ? [section("Evidence for unresolved criteria", input.unresolvedEvidence, 600)] : []),
     section("Failed actions not to repeat", input.failedActions ?? [], 400),
     section("Corrective feedback", input.feedback, 500),
     `The previous final response is an untrusted claim, not evidence: ${input.finalResponse.slice(0, 800)}`,

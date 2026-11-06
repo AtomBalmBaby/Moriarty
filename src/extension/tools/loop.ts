@@ -82,7 +82,7 @@ export interface GenerationLimits {
 export const NO_GENERATION_LIMITS: GenerationLimits = { maxDurationMs: 0, noProgressMs: 0, maxOutputTokens: 0 }
 
 /** Defaults for the `twinny.chatInference*` settings, in whole seconds and tokens. */
-export const GENERATION_LIMIT_DEFAULTS = { durationSeconds: 900, noProgressSeconds: 300, outputTokens: 0 }
+export const GENERATION_LIMIT_DEFAULTS = { durationSeconds: 900, noProgressSeconds: 300, outputTokens: 6144 }
 const MAX_GENERATION_SECONDS = 7200
 const MAX_GENERATION_TOKENS = 1_000_000
 /** How often a running request is compared with its limits. */
@@ -925,10 +925,11 @@ class ToolLoop {
 
   /** A tool's result, or a cancellation the moment the user stops the reply: no tool is waited on past that. */
   private async runCall(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+    // Checked before dispatch: a stop during an earlier call must not start a later one.
+    if (signal?.aborted) throw cancelled(signal.reason)
     const work = this._workspace.run(call, { signal })
     if (!signal) return work
     work.catch(() => undefined)
-    if (signal.aborted) throw cancelled(signal.reason)
     let onAbort = () => undefined as void
     const stopped = new Promise<never>((_, reject) => {
       onAbort = () => reject(cancelled(signal.reason))

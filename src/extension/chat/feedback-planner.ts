@@ -9,10 +9,18 @@ import {
   InferenceTraceContext
 } from "../inference/trace"
 import { validateIntentTaskPlan } from "../todos/intent-plan"
-import type { IntentTaskPlan, TodoListRequest } from "../todos/types"
+import type {
+  ChildTodoContext,
+  ChildTodoDecision,
+  ChildTodoDecisionKind,
+  ChildTodoProposal,
+  ChildTodoReviewOutcome,
+  IntentTaskPlan,
+  TodoListRequest
+} from "../todos/types"
 import { TodoConflictError } from "../todos/types"
 
-import { abortAfter, extractJsonObject, JsonFailure, replyText, RoleEndpoint, RoleReply, RoleResolver, RoleTimeoutError } from "./role-inference"
+import { abortAfter, extractJsonObject, JsonFailure, replyText, RoleEndpoint, RoleReply, RoleResolution, RoleResolver, RoleTimeoutError } from "./role-inference"
 
 export const FEEDBACK_PLAN_PROTOCOL =
   "You maintain the task plan Twinny uses to track progress on the user's request. " +
@@ -35,20 +43,62 @@ export type FeedbackPlanParse =
 const OUTPUT_LIMIT_MESSAGE = "The provider stopped at its output limit before the plan was complete."
 const EXCERPT_CHARS = 240
 
-const BOOKKEEPING_TASK = /\b(?:initiali[sz]e|set\s+up|populate|create|record|track|maintain)\s+(?:the\s+|a\s+|an\s+|our\s+)?(?:(?:investigation|planning|progress|plan|task)\s+)?(?:todos?|todo\s+list|task\s+list|plan\s+items?|tracking\s+items?)\b/i
+/** Twinny's own TODO machinery: the list, its items, and their statuses. */
+const TODO_MACHINERY = /\b(?:todos?|to-dos?|task\s+list|plan\s+items?|tracking\s+items?|task\s+(?:statuses?|entries))(?![-\w])/i
+/** A bookkeeping verb applied to that machinery, e.g. "create initial TODO entry" or "update TODO statuses". */
+const BOOKKEEPING_OF_MACHINERY = new RegExp(
+  "\\b(?:create|initiali[sz]e|set\\s+up|populate|record|track|maintain|update|mark|log|submit|claim|complete|close|move|set)\\s+(?:\\S+\\s+){0,5}?" +
+    TODO_MACHINERY.source,
+  "i"
+)
+/**
+ * Verbs that build, change, or debug the work itself, when they direct it: at the start of a line or sentence, or after
+ * a request word such as "please" or "to". A word like "Test" inside a heading does not direct anything.
+ */
+const BUILD_DIRECTIVE = /(?:^|[.!?;:]\s+|\n\s*|\b(?:please|and|then|also|to|need to|want to|can you|could you)\s+)(?<verb>implement|fix|debug|test|refactor|build|design|change|improve|rename|remove|redesign)\b/gim
+const NEGATED_BEFORE = /\b(?:not|never|no|don'?t|do\s+not|without|avoid)\b\s*(?:\S+\s*){0,2}$/i
+
+/**
+ * Whether the user's objective is itself about the TODO machinery, so that TODO tasks are the deliverable.
+ * It needs both a TODO noun and an un-negated build verb. A read-only request that merely mentions TODOs does not qualify.
+ */
+export const requestsTodoMachineryWork = (objective: string): boolean => {
+  if (!TODO_MACHINERY.test(objective)) return false
+  for (const match of objective.matchAll(BUILD_DIRECTIVE)) {
+    const verbAt = (match.index ?? 0) + match[0].length - (match.groups?.verb.length ?? 0)
+    const before = objective.slice(Math.max(0, verbAt - 40), verbAt)
+    if (!NEGATED_BEFORE.test(before)) return true
+  }
+  return false
+}
+
+// A directive for one named task, starting a line: "Please create a TODO to track the release notes." Plural
+// objects, qualifiers ("create actionable TODOs before starting") and workflow mentions ("use TODOs to track
+// this") do not match, so a task description cannot grant the authority.
+const DIRECT_TODO_CREATE = /^[\s>*\-\d.)]*(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:create|add|make|open)\s+(?:(?:a|an|one|the|this|that|new)\s+)?(?:todo|to-do|task)(?![-\w])/im
+
+/**
+ * Whether the user's own message directly asks for a single TODO to be created. Only the host reads this, from the
+ * user's message, so Mycroft cannot grant itself this authority.
+ */
+export const userRequestsTodoCreation = (message: string): boolean => DIRECT_TODO_CREATE.test(message)
 
 /**
  * Removes plan-management tasks that Twinny already performs itself. Dependencies on a removed task are dropped with it.
+ * A task is administrative when the objective is not about the TODO machinery and the task applies a bookkeeping verb to it.
  */
-export const removeBookkeepingTasks = (plan: unknown): unknown => {
+export const removeBookkeepingTasks = (plan: unknown, objective = ""): unknown => {
   if (!plan || typeof plan !== "object" || !Array.isArray((plan as { tasks?: unknown }).tasks)) return plan
-  const candidate = plan as { tasks: { id?: unknown; title?: unknown; description?: unknown; dependencies?: unknown }[] }
+  const candidate = plan as { goal?: unknown; tasks: { id?: unknown; title?: unknown; description?: unknown; dependencies?: unknown }[] }
+  const basis = objective || (typeof candidate.goal === "string" ? candidate.goal : "")
+  if (requestsTodoMachineryWork(basis)) return plan
   const isBookkeeping = (task: { title?: unknown; description?: unknown }) => {
     const text = [task.title, task.description].filter((part): part is string => typeof part === "string").join(" ")
-    return BOOKKEEPING_TASK.test(text)
+    return BOOKKEEPING_OF_MACHINERY.test(text)
   }
   const removed = new Set(candidate.tasks.filter(isBookkeeping).map((task) => String(task.id)))
   if (!removed.size) return plan
+  logger.info(`[Feedback] Removed ${removed.size} TODO administration task(s) from the plan: ${[...removed].join(", ")}`)
   const tasks = candidate.tasks
     .filter((task) => !removed.has(String(task.id)))
     .map((task) => ({
@@ -62,7 +112,7 @@ export const removeBookkeepingTasks = (plan: unknown): unknown => {
 const reasoningOnly = (reply: string | RoleReply | undefined) =>
   typeof reply === "object" && !replyText(reply).trim() && (reply.reasoningChars ?? 0) > 0
 
-const parseFeedbackPlanBody = (reply: string | RoleReply | undefined): FeedbackPlanParse => {
+const parseFeedbackPlanBody = (reply: string | RoleReply | undefined, objective: string): FeedbackPlanParse => {
   if (reasoningOnly(reply)) return { error: "The provider returned reasoning but no answer.", failure: "reasoning-only" }
   const extraction = extractJsonObject(replyText(reply))
   const { value } = extraction
@@ -77,7 +127,7 @@ const parseFeedbackPlanBody = (reply: string | RoleReply | undefined): FeedbackP
   if (unexpected.length) return { error: "Unexpected keys: " + unexpected.join(", ") + ".", failure: "schema" }
   if (typeof value.track !== "boolean") return { error: "track must be a boolean.", failure: "schema" }
   if (!value.track) return { track: false }
-  const validation = validateIntentTaskPlan(removeBookkeepingTasks(value.plan))
+  const validation = validateIntentTaskPlan(removeBookkeepingTasks(value.plan, objective))
   if (!validation.plan) {
     return { error: "Invalid task plan: " + (validation.diagnostic ?? "validation failed"), failure: "schema" }
   }
@@ -85,12 +135,156 @@ const parseFeedbackPlanBody = (reply: string | RoleReply | undefined): FeedbackP
 }
 
 /** Parses a planning reply. A reply that stopped at the output limit is reported as such, never repaired. */
-export const parseFeedbackPlanResponse = (reply: string | RoleReply | undefined): FeedbackPlanParse => {
-  const parsed = parseFeedbackPlanBody(reply)
+export const parseFeedbackPlanResponse = (reply: string | RoleReply | undefined, objective = ""): FeedbackPlanParse => {
+  const parsed = parseFeedbackPlanBody(reply, objective)
   if ("error" in parsed && typeof reply === "object" && reply.finishReason === "length") {
     return { error: OUTPUT_LIMIT_MESSAGE, failure: "output-limit" }
   }
   return parsed
+}
+
+export const CHILD_TODO_PROTOCOL =
+  "You review one proposed child TODO for the task plan Twinny executes. The agent executing the plan wants to add the proposed child under the parent TODO shown. " +
+  "Return exactly one valid JSON object, with no prose or Markdown fences, with keys decision, item_id, title, details, parent_id, and instruction. " +
+  "decision is one of: accepted (add the child as proposed), existing_task (a TODO in plan_items or existing_children already covers the work; set item_id to it), " +
+  "revised (add the child with a narrower or corrected title, details, or parent_id; parent_id must name a TODO in the plan), " +
+  "rejected (the work is unnecessary, out of scope, or is planning-system administration), or needs_clarification (the proposal is too broad; the instruction says how to narrow it). " +
+  "Child TODOs must be concrete steps that serve the goal. Reject or revise any child that only manages, records, or updates TODOs. " +
+  "instruction is one short sentence telling the executing agent what to do next. Use null for item_id, title, details, and parent_id when they do not apply."
+
+export type ChildTodoParse = { ok: true; decision: ChildTodoDecision } | { ok: false; error: string }
+
+const CHILD_DECISION_KINDS = new Set<ChildTodoDecisionKind>(["accepted", "existing_task", "revised", "rejected", "needs_clarification"])
+const CHILD_RESPONSE_KEYS = new Set(["decision", "item_id", "title", "details", "parent_id", "instruction"])
+const MAX_CHILD_INSTRUCTION = 500
+
+/** Validates a child review reply against the plan the reviewer saw. Only the schema and plan membership are checked here; the repository checks authority. */
+export const parseChildTodoDecision = (reply: string | RoleReply | undefined, context: ChildTodoContext): ChildTodoParse => {
+  if (reasoningOnly(reply)) return { ok: false, error: "The provider returned reasoning but no answer." }
+  const { value, error } = extractJsonObject(replyText(reply))
+  if (!value) return { ok: false, error: error ?? "The provider response was not valid JSON." }
+  const unexpected = Object.keys(value).filter((key) => !CHILD_RESPONSE_KEYS.has(key))
+  if (unexpected.length) return { ok: false, error: "Unexpected keys: " + unexpected.join(", ") + "." }
+  const { decision } = value
+  if (typeof decision !== "string" || !CHILD_DECISION_KINDS.has(decision as ChildTodoDecisionKind)) {
+    return { ok: false, error: "decision must be accepted, existing_task, revised, rejected, or needs_clarification." }
+  }
+  for (const key of ["item_id", "title", "details", "parent_id", "instruction"]) {
+    const field = value[key]
+    if (field !== undefined && field !== null && typeof field !== "string") return { ok: false, error: `${key} must be a string or null.` }
+  }
+  const text = (key: string) => {
+    const field = value[key]
+    return typeof field === "string" && field.trim() ? field.trim() : undefined
+  }
+  const kind = decision as ChildTodoDecisionKind
+  const instruction = text("instruction")
+  if (!instruction) return { ok: false, error: "instruction must be a non-empty string." }
+  const itemId = text("item_id")
+  const title = text("title")
+  const details = text("details")
+  const parentId = text("parent_id")
+  const planIds = new Set([context.parent.id, ...context.planItems.map((item) => item.id), ...context.children.map((child) => child.itemId)])
+  if (kind === "existing_task" && (!itemId || !planIds.has(itemId))) return { ok: false, error: "existing_task must set item_id to a TODO listed in the plan." }
+  if (kind === "revised" && !title && !details && !parentId) return { ok: false, error: "revised must change title, details, or parent_id." }
+  if (kind === "revised" && parentId && !planIds.has(parentId)) return { ok: false, error: "parent_id must name a TODO listed in the plan." }
+  if (title && title.length > 500) return { ok: false, error: "title must be 500 characters or fewer." }
+  return {
+    ok: true,
+    decision: {
+      decision: kind,
+      ...(kind === "existing_task" ? { itemId } : {}),
+      ...(kind === "accepted" || kind === "revised" ? { title, details, parentId } : {}),
+      instruction: instruction.slice(0, MAX_CHILD_INSTRUCTION)
+    }
+  }
+}
+
+const childReviewPrompt = (proposal: ChildTodoProposal, context: ChildTodoContext) =>
+  "Review this proposed child TODO against the plan. Reply with the JSON object only.\n" +
+  JSON.stringify({
+    goal: context.goal,
+    plan_revision: context.revision,
+    parent: {
+      item_id: context.parent.id,
+      title: context.parent.title,
+      details: context.parent.details ?? null,
+      status: context.parent.status,
+      acceptance: context.parent.acceptance,
+      depends_on: context.parent.dependsOn
+    },
+    existing_children: context.children.map((child) => ({ item_id: child.itemId, title: child.title, status: child.status })),
+    plan_items: context.planItems.map((item) => ({ item_id: item.id, title: item.title, status: item.status })),
+    proposed_child: { title: proposal.title, details: proposal.details ?? null, reason: proposal.reason, priority: proposal.priority }
+  }, null, 2)
+
+/**
+ * Settles with the provider's answer, or rejects as soon as the signal aborts,
+ * so a provider that ignores cancellation cannot hold up Stop.
+ */
+const untilAborted = <T>(work: PromiseLike<T>, signal: AbortSignal): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const stop = () => reject(signal.reason)
+    // Subscribe first, so a rejection of the work after Stop is always handled.
+    Promise.resolve(work)
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", stop))
+    if (signal.aborted) stop()
+    else signal.addEventListener("abort", stop, { once: true })
+  })
+
+export interface ChildTodoReviewerDeps {
+  resolve: RoleResolver
+  timeoutMs?: number
+}
+
+/**
+ * Reviews an agent's child TODO proposal on the Feedback provider. It is the
+ * same provider and inference path as planning, not a second planning engine.
+ * Every failure returns `ok: false`, which the caller must treat as no authority to mutate.
+ */
+export class ChildTodoReviewer {
+  constructor(private readonly deps: ChildTodoReviewerDeps) {}
+
+  async review(proposal: ChildTodoProposal, context: ChildTodoContext, signal?: AbortSignal): Promise<ChildTodoReviewOutcome> {
+    const cancelled: ChildTodoReviewOutcome = { ok: false, error: "The child TODO review was cancelled." }
+    if (signal?.aborted) return cancelled
+    const resolution = await Promise.resolve(this.deps.resolve()).catch((error): RoleResolution => ({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
+    }))
+    if (!resolution.ok) return { ok: false, error: resolution.error }
+    const { endpoint } = resolution
+    const trace = createInferenceTrace({ operationKind: "feedback" })
+    trace.provider = endpoint.provider
+    const controller = new AbortController()
+    const forwardAbort = () => controller.abort(signal?.reason)
+    signal?.addEventListener("abort", forwardAbort, { once: true })
+    const clear = abortAfter(controller, this.deps.timeoutMs ?? DEFAULT_FEEDBACK_PLAN_TIMEOUT_MS, "The child TODO review timed out.")
+    try {
+      const user = childReviewPrompt(proposal, context)
+      const ask = (prompt: string) =>
+        untilAborted(endpoint.infer({ system: CHILD_TODO_PROTOCOL, user: prompt, json: true }, { signal: controller.signal, trace }), controller.signal)
+      let reply = await ask(user)
+      if (signal?.aborted) return cancelled
+      let parsed = parseChildTodoDecision(reply, context)
+      if (!parsed.ok) {
+        reply = await ask(correctionPrompt(user, parsed.error))
+        if (signal?.aborted) return cancelled
+        parsed = parseChildTodoDecision(reply, context)
+      }
+      if (!parsed.ok) return { ok: false, error: "Feedback could not review the child TODO: " + parsed.error }
+      return { ok: true, decision: parsed.decision }
+    } catch (error) {
+      if (signal?.aborted) return cancelled
+      const message = error instanceof Error ? error.message : String(error)
+      inferenceEvent("feedback.child_todo_failed", { operation_id: trace.operationId, provider: endpoint.provider, model: endpoint.model }, "warn")
+      return { ok: false, error: "Feedback could not review the child TODO: " + message }
+    } finally {
+      clear()
+      signal?.removeEventListener("abort", forwardAbort)
+    }
+  }
 }
 
 const correctionPrompt = (user: string, error: string) =>
@@ -281,7 +475,7 @@ export class FeedbackPlanner {
         ? `${request}\n\nExisting TODO plan (revise only if the request changes the work):\n${JSON.stringify(existing)}`
         : request
       const ask = (prompt: string) =>
-        endpoint.infer({ system: FEEDBACK_PLAN_PROTOCOL, user: prompt, json: true }, { signal: controller.signal, trace })
+        untilAborted(endpoint.infer({ system: FEEDBACK_PLAN_PROTOCOL, user: prompt, json: true }, { signal: controller.signal, trace }), controller.signal)
       let reply = await ask(user)
       if (controller.signal.reason instanceof RoleTimeoutError) throw controller.signal.reason
       if (!this.isCurrent(active)) {
@@ -289,7 +483,7 @@ export class FeedbackPlanner {
         inferenceEvent("feedback.late_response_discarded", { operation_id: trace.operationId }, "warn")
         return { status: "stale" }
       }
-      let parsed = parseFeedbackPlanResponse(reply)
+      let parsed = parseFeedbackPlanResponse(reply, request)
       diagnose(trace, endpoint, "initial", reply, parsed)
       // Bounded recovery: one correction with the same provider and request. Output-limit stops are not retried.
       if ("error" in parsed && parsed.failure !== "output-limit") {
@@ -301,7 +495,7 @@ export class FeedbackPlanner {
           inferenceEvent("feedback.late_response_discarded", { operation_id: trace.operationId }, "warn")
           return { status: "stale" }
         }
-        parsed = parseFeedbackPlanResponse(reply)
+        parsed = parseFeedbackPlanResponse(reply, request)
         diagnose(trace, endpoint, "correction", reply, parsed)
       }
       if ("error" in parsed) {
@@ -330,6 +524,10 @@ export class FeedbackPlanner {
         return { status: "failed", error: reason.message }
       }
       if (controller.signal.aborted || isAbortError(error)) {
+        if (this._sequence !== active.sequence) {
+          state = "stale"
+          return { status: "stale" }
+        }
         state = "cancelled"
         return { status: "cancelled" }
       }

@@ -53,6 +53,7 @@ export interface ReplyExtras {
 export class ChatGeneration {
   private _run?: GenerationRun
   private _cancelled = false
+  private _cancellationReason?: StopInitiator
   private _trace?: InferenceTraceContext
   /** Runs stopped because the user left their conversation: what they wrote is not kept. */
   private readonly _discarded = new WeakSet<GenerationRun>()
@@ -71,17 +72,28 @@ export class ChatGeneration {
     this._stopSubscription.dispose()
   }
 
-  /** True once the user has stopped generation, until the next request. */
+  /** True once the user has stopped generation, until the next operation starts. */
   public get cancelled() {
     return this._cancelled
   }
 
-  public reset() {
-    this._cancelled = false
+  /** Who stopped the operation, if anyone did. */
+  public get cancellationReason(): StopInitiator | undefined {
+    return this._cancellationReason
   }
 
+  public reset() {
+    this._cancelled = false
+    this._cancellationReason = undefined
+  }
+
+  /**
+   * Stop the request in flight. The operation that owns the requests reports
+   * its own terminal state to the webview, so this does not end it.
+   */
   public abort(initiator: StopInitiator = "user") {
     this._cancelled = true
+    this._cancellationReason ??= initiator
     if (this._trace) {
       cancelInferenceOperation(this._trace, initiator, "generation-stopped")
     }
@@ -89,10 +101,6 @@ export class ChatGeneration {
       `Twinny ${initiator === "user" ? "user stop" : "host cancellation"}`,
       "AbortError"
     ))
-    this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {
-      cancelled: true,
-      cancellationReason: initiator
-    })
   }
 
   /** Whether a reply is being written now. */
@@ -228,7 +236,6 @@ export class ChatGeneration {
       })
       if (this._trace === trace) this._trace = undefined
       if (this._run === run) this._run = undefined
-      this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {})
     }
   }
 

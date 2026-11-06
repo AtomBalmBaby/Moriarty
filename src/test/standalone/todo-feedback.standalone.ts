@@ -7,13 +7,14 @@ import initSqlJs from "sql.js"
 
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
-import { parseFeedbackPlanResponse } from "../../extension/chat/feedback-planner"
+import { parseFeedbackPlanResponse, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
-import { evaluateTodoReview, feedbackContext, parseTodoEvaluation, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput } from "../../extension/todos/feedback"
-import { renderPlanContext } from "../../extension/todos/plan-context"
+import { type CurrentSourceReader, evaluateTodoReview, feedbackContext, parseTodoEvaluation, reconcileCriteria, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput } from "../../extension/todos/feedback"
+import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import type { IntentPlanOutline, TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
+import type { ChildTodoDecision, ChildTodoReview, IntentPlanOutline, TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
 import { RUNTIME_INVENTORY_TOOL } from "../../extension/todos/types"
+import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
@@ -52,6 +53,8 @@ const fixture = async (tasks: { id: string; acceptance: string; dependencies?: s
   }
   return { directory, databasePath, scope, repository, items }
 }
+
+const acceptingReview: ChildTodoReview = async () => ({ ok: true, decision: { decision: "accepted", instruction: "Accepted under the parent." } })
 
 const responseFor = (review: TodoReviewPackage, options: {
   decision?: TodoEvaluation["decision"]
@@ -94,9 +97,10 @@ test("the executor receives the synchronized plan with stable IDs, versions, and
     verification: "not_checked",
     version: index + 3,
     unmetCriteria: index === 0 ? ["edited file shows the new identifier"] : [],
-    problems: []
+    problems: [],
+    awaitingDependencies: []
   }))
-  const rendered = renderPlanContext({ planId: "plan-1", revision: 4, tasks } as IntentPlanOutline)
+  const rendered = renderPlanContext({ planId: "plan-1", revision: 4, goal: "Verify the requested work", tasks, children: [] })
   assert.match(rendered, /plan plan-1, revision 4/)
   assert.match(rendered, /- item-0 \(in_review, verification not_checked, version 3\) Task 0/)
   assert.match(rendered, /needs evidence: edited file shows the new identifier/)
@@ -395,6 +399,181 @@ test("existing version-2 TODO databases migrate review tables without losing tas
   }
 })
 
+test("existing version-4 TODO databases gain child proposals without losing tasks", async () => {
+  const state = await fixture([{ id: "kept", acceptance: "Kept task is inspected" }])
+  try {
+    const sql = await initSqlJs({ locateFile: () => wasmPath })
+    const database = new sql.Database(fs.readFileSync(state.databasePath))
+    database.run("DROP TABLE todo_child_proposals; PRAGMA user_version = 4")
+    fs.writeFileSync(state.databasePath, Buffer.from(database.export()))
+    database.close()
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
+    const check = new sql.Database(fs.readFileSync(state.databasePath))
+    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 5)
+    assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_child_proposals'")[0].values[0][0], 1)
+    check.close()
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+const WORKSPACE_FILE = "src/extension/tools/workspace.ts"
+const workspaceText = Array.from({ length: 850 }, (_, index) => {
+  if (index === 168) return "  name: \"read_file\","
+  if (index === 779) return "    const tool = tools.find((candidate) => candidate.name === name)"
+  if (index === 799) return "    return tool.run(args)"
+  return `const filler${index + 1} = ${index + 1}`
+}).join("\n")
+const currentWorkspace: CurrentSourceReader = async (file) => (file === WORKSPACE_FILE ? workspaceText : undefined)
+type Harness = { repository: TodoRepository; scope: { projectFingerprint: string; conversationId: string } }
+
+/** A read_file observation whose fingerprint covers the whole document it read, as the host records it. */
+const observeWorkspaceWindow = async (state: Harness, itemId: string, requestId: string, start: number, end: number, text = workspaceText) => {
+  const lines = text.split("\n")
+  const hash = await fingerprintContent(text)
+  return state.repository.recordToolObservation(state.scope, {
+    itemId,
+    toolName: "read_file",
+    arguments: { path: WORKSPACE_FILE, start_line: String(start), end_line: String(end) },
+    output: `read \`${WORKSPACE_FILE}:${start}\` · ${end - start + 1} lines`,
+    failed: false,
+    requestId,
+    evidenceOutput: `${WORKSPACE_FILE} (lines ${start}–${end} of ${lines.length})\ncontent_hash: ${hash}; total_lines: ${lines.length}\n${numbered(start, lines.slice(start - 1, end))}`
+  })
+}
+
+test("the live read_file sequence reuses one set of observations across tasks without re-reading", async () => {
+  const state = await fixture([
+    { id: "registration", acceptance: "`read_file` is registered in `src/extension/tools/workspace.ts`" },
+    { id: "dispatch", acceptance: "`tools.find` dispatches in `src/extension/tools/workspace.ts`" },
+    { id: "validation", acceptance: "`read_file` argument validation is in `src/extension/tools/workspace.ts`" }
+  ], false)
+  try {
+    const [registration, dispatch, validation] = state.items
+    const registrationRead = await observeWorkspaceWindow(state, registration.id, "read-registration", 160, 181)
+    const dispatchRead = await observeWorkspaceWindow(state, registration.id, "read-dispatch", 780, 840)
+
+    await state.repository.claimCompletion(state.scope, { itemId: registration.id, expectedVersion: registration.version, requestId: "claim-registration" })
+    const first = reviewCandidates(await state.repository.getReviewPackages(state.scope), registration.id)[0]
+    const firstEvaluation = await evaluateTodoReview(state.repository, state.scope, first, async () => responseFor(first, { refs: [registrationRead.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace })
+    assert.equal(firstEvaluation.decision, "accept")
+
+    await state.repository.claimCompletion(state.scope, { itemId: dispatch.id, expectedVersion: dispatch.version, requestId: "claim-dispatch" })
+    const second = reviewCandidates(await state.repository.getReviewPackages(state.scope), dispatch.id)[0]
+    assert.ok(second.retainedEvidence.some((record) => record.observationId === registrationRead.id), "the registration read is retained for the dispatch task")
+    const dispatchOutcome = (await reconcileCriteria(second.acceptanceCriteria, second.retainedEvidence, currentWorkspace))[0]
+    assert.equal(dispatchOutcome.outcome, "proven", JSON.stringify(dispatchOutcome))
+    assert.ok(dispatchOutcome.supportingObservationIds.includes(dispatchRead.id), "the dispatch proof cites the earlier window")
+    const secondEvaluation = await evaluateTodoReview(state.repository, state.scope, second, async () => responseFor(second, { refs: [dispatchRead.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace })
+    assert.equal(secondEvaluation.decision, "accept")
+
+    await state.repository.claimCompletion(state.scope, { itemId: validation.id, expectedVersion: validation.version, requestId: "claim-validation" })
+    const third = reviewCandidates(await state.repository.getReviewPackages(state.scope), validation.id)[0]
+    const validationOutcome = (await reconcileCriteria(third.acceptanceCriteria, third.retainedEvidence, currentWorkspace))[0]
+    assert.equal(validationOutcome.outcome, "proven", JSON.stringify(validationOutcome))
+    assert.ok(validationOutcome.supportingObservationIds.includes(registrationRead.id), "validation reuses the registration read without a new read")
+    const thirdEvaluation = await evaluateTodoReview(state.repository, state.scope, third, async () => responseFor(third, { refs: [registrationRead.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace })
+    assert.equal(thirdEvaluation.decision, "accept")
+
+    for (const item of [registration, dispatch, validation]) {
+      assert.equal((await state.repository.getItem(state.scope, item.id)).item.status, "completed", item.id)
+    }
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a dependency-blocked claim keeps its evidence, skips Feedback, and is reviewed once its dependency verifies", async () => {
+  const state = await fixture([
+    { id: "registration", acceptance: "`read_file` is registered in `src/extension/tools/workspace.ts`" },
+    { id: "validation", acceptance: "`read_file` argument validation is in `src/extension/tools/workspace.ts`", dependencies: ["registration"] }
+  ], false)
+  try {
+    const [registration, validation] = state.items
+    const registrationRead = await observeWorkspaceWindow(state, registration.id, "read-registration", 160, 181)
+    const validationRead = await observeWorkspaceWindow(state, validation.id, "read-validation", 160, 181)
+    await state.repository.claimCompletion(state.scope, { itemId: validation.id, expectedVersion: validation.version, requestId: "claim-validation-early" })
+    assert.equal(reviewCandidates(await state.repository.getReviewPackages(state.scope)).length, 0, "a claim waiting on its prerequisite is not sent to Feedback")
+    assert.equal((await state.repository.getItem(state.scope, validation.id)).item.status, "in_review", "the claim is preserved")
+
+    await state.repository.claimCompletion(state.scope, { itemId: registration.id, expectedVersion: registration.version, requestId: "claim-registration" })
+    const ready = reviewCandidates(await state.repository.getReviewPackages(state.scope))
+    assert.deepEqual(ready.map((review) => review.task.id), [registration.id], "only the independent prerequisite is eligible")
+    const registrationReview = ready[0]
+    const registrationEvaluation = await evaluateTodoReview(state.repository, state.scope, registrationReview, async () => responseFor(registrationReview, { refs: [registrationRead.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace })
+    assert.equal(registrationEvaluation.decision, "accept")
+
+    const waiting = reviewCandidates(await state.repository.getReviewPackages(state.scope))
+    assert.deepEqual(waiting.map((review) => review.task.id), [validation.id], "the dependent claim becomes eligible once its prerequisite verifies")
+    const validationReview = waiting[0]
+    let calls = 0
+    const validationEvaluation = await evaluateTodoReview(state.repository, state.scope, validationReview, async () => {
+      calls++
+      return responseFor(validationReview, { refs: [validationRead.id] })
+    }, "mock-reviewer", { readCurrentSource: currentWorkspace })
+    assert.equal(validationEvaluation.decision, "accept")
+    assert.equal(calls, 1, "exactly one Feedback call reviews the dependent task")
+    assert.equal((await state.repository.getItem(state.scope, validation.id)).item.status, "completed")
+    assert.equal(reviewCandidates(await state.repository.getReviewPackages(state.scope)).length, 0, "a verified task is not reviewed again")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a stale source observation is unknown and a failed read proves nothing", async () => {
+  const stale = await fixture([{ id: "registration", acceptance: "`read_file` is registered in `src/extension/tools/workspace.ts`" }], false)
+  const failed = await fixture([{ id: "registration", acceptance: "`read_file` is registered in `src/extension/tools/workspace.ts`" }], false)
+  try {
+    await observeWorkspaceWindow(stale, stale.items[0].id, "stale-read", 160, 181, `${workspaceText}\n// edited after the read`)
+    await stale.repository.claimCompletion(stale.scope, { itemId: stale.items[0].id, expectedVersion: stale.items[0].version, requestId: "claim-stale" })
+    const staleReview = reviewCandidates(await stale.repository.getReviewPackages(stale.scope))[0]
+    const staleOutcome = (await reconcileCriteria(staleReview.acceptanceCriteria, staleReview.retainedEvidence, currentWorkspace))[0]
+    assert.equal(staleOutcome.outcome, "unknown", JSON.stringify(staleOutcome))
+    assert.deepEqual(staleOutcome.supportingObservationIds, [])
+    assert.match(staleOutcome.missing.join("\n"), /changed after/)
+
+    await failed.repository.recordToolObservation(failed.scope, {
+      itemId: failed.items[0].id, toolName: "read_file", arguments: { path: WORKSPACE_FILE }, output: "read failed: file is locked", failed: true, requestId: "failed-read"
+    })
+    await failed.repository.claimCompletion(failed.scope, { itemId: failed.items[0].id, expectedVersion: failed.items[0].version, requestId: "claim-failed" })
+    const failedReview = reviewCandidates(await failed.repository.getReviewPackages(failed.scope))[0]
+    const failedOutcome = (await reconcileCriteria(failedReview.acceptanceCriteria, failedReview.retainedEvidence, currentWorkspace))[0]
+    assert.equal(failedOutcome.outcome, "unknown", JSON.stringify(failedOutcome))
+    assert.deepEqual(failedOutcome.supportingObservationIds, [])
+  } finally {
+    fs.rmSync(stale.directory, { recursive: true, force: true })
+    fs.rmSync(failed.directory, { recursive: true, force: true })
+  }
+})
+
+test("the final report separates awaiting, review, and failed states from verified work", async () => {
+  const state = await fixture([
+    { id: "registration", acceptance: "`read_file` is registered in `src/extension/tools/workspace.ts`" },
+    { id: "validation", acceptance: "`read_file` argument validation is in `src/extension/tools/workspace.ts`", dependencies: ["registration"] }
+  ], false)
+  try {
+    const [registration, validation] = state.items
+    await observeWorkspaceWindow(state, registration.id, "read-registration", 160, 181)
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: validation.id, toolName: "run_command", arguments: { command: "npx tsc --noEmit" }, output: "tsc: 2 errors", failed: true, exitCode: 2, requestId: "failed-compile"
+    })
+    await state.repository.claimCompletion(state.scope, { itemId: registration.id, expectedVersion: registration.version, requestId: "claim-registration" })
+    await state.repository.claimCompletion(state.scope, { itemId: validation.id, expectedVersion: validation.version, requestId: "claim-validation" })
+
+    const outline = await state.repository.getPlanOutline(state.scope)
+    const report = authoritativeExecutionReport(outline!, await state.repository.failedToolOperations(state.scope))
+    assert.match(report, /Verified complete \(0\)/)
+    assert.match(report, /Awaiting Feedback review \(1\):\n- \S+ registration/)
+    assert.match(report, /Awaiting dependencies \(1\):\n- \S+ validation \(waiting on registration\)/)
+    assert.match(report, /Failed tool operations \(1\):\n- run_command \{"command":"npx tsc --noEmit"\} \(exit 2\)/)
+    assert.doesNotMatch(report, /No failed tool operations/)
+    assert.match(report, /overrides any progress claimed/)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("host runtime inventory proves tool exposure but never source registration", async () => {
   const exposed = await fixture([{ id: "read_file_exposed", acceptance: "`read_file` is exposed to the model in the outgoing tool inventory" }])
   const registered = await fixture([{ id: "read_file_registered", acceptance: "`read_file` is registered in src/extension/tools/workspace.ts" }])
@@ -636,6 +815,22 @@ test("an early file read remains evaluator-visible across later tool calls and a
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
+})
+
+test("a continuation names the next task and carries each unresolved criterion's established and missing facts", () => {
+  const text = continuationContext({
+    goal: "Investigate read_file",
+    constraints: [],
+    task: "item-2: Trace dispatch",
+    criteria: ["`tool.run(` is called from the dispatch path"],
+    unresolvedEvidence: ["`tool.run(` is called from the dispatch path — partial; established by [obs-dispatch]; missing: a successful invocation of read_file"],
+    feedback: [],
+    finalResponse: "Done."
+  })
+  assert.match(text, /Current unresolved task: item-2: Trace dispatch/)
+  assert.match(text, /Evidence for unresolved criteria:\n- `tool\.run\(` is called from the dispatch path — partial; established by \[obs-dispatch\]; missing: a successful invocation of read_file/)
+  const withoutEvidence = continuationContext({ goal: "g", constraints: [], task: "t", criteria: [], feedback: [], finalResponse: "" })
+  assert.doesNotMatch(withoutEvidence, /Evidence for unresolved criteria/)
 })
 
 test("an implementation cannot be accepted from prose without verified workspace changes", async () => {
@@ -960,7 +1155,7 @@ test("a numbered read keeps its path, line range, total, and every source line",
   const preserved = preserveEvidence(output)
   assert.equal(preserved.complete, true)
   assert.equal(preserved.content, output)
-  assert.deepEqual(preserved.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850 }])
+  assert.deepEqual(preserved.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: `sha256:${"a".repeat(64)}` }])
   assert.ok(preserved.content.split("\n").includes("169:   name: \"read_file\","))
 })
 
@@ -1219,7 +1414,7 @@ test("retained evidence survives reopening the store, as it does across an autom
     const review = await reviewFor({ ...state, repository: reopened }, item.id)
     const retained = review.retainedEvidence.find((entry) => entry.observationId === observation.id)
     assert.ok(retained?.content?.includes("169:   name: \"read_file\","))
-    assert.deepEqual(retained?.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850 }])
+    assert.deepEqual(retained?.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: `sha256:${"a".repeat(64)}` }])
     assert.equal(review.observations.find((entry) => entry.id === observation.id)?.evidence?.retained, true)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -1315,6 +1510,276 @@ test("a claimed plan task is reviewed through the candidate rule and sibling obs
   }
 })
 
+const childProposalFixture = () => fixture([
+  { id: "locate_source_definition", acceptance: "The definition is located" },
+  { id: "trace_source_dispatch", acceptance: "The dispatch path is traced" }
+], false)
+
+const countingReview = (decision: ChildTodoDecision): { review: ChildTodoReview; calls: () => number } => {
+  let calls = 0
+  return {
+    review: async () => {
+      calls += 1
+      return { ok: true, decision }
+    },
+    calls: () => calls
+  }
+}
+
+const childArgs = (parentId: string, title: string, requestId: string) => ({
+  title,
+  request_id: requestId,
+  todo_parent_id: parentId,
+  details: `Complete ${title.toLowerCase()} for the parent task.`,
+  reason: "The parent cannot finish without this step."
+})
+
+const createTool = (state: Awaited<ReturnType<typeof fixture>>, options: { review?: ChildTodoReview; isUserAuthorized?: () => boolean } = {}) =>
+  todoWorkspaceTools(state.repository, state.scope, () => undefined, options).tools.find((candidate) => candidate.name === "twinny_todo_create")!
+
+test("agent-created TODOs under a plan need a valid parent and never become root tasks", async () => {
+  const state = await childProposalFixture()
+  try {
+    const { review, calls } = countingReview({ decision: "accepted", instruction: "Create it." })
+    const tool = createTool(state, { review })
+    const before = await state.repository.getPlanOutline(state.scope)
+
+    const missing = await tool.run({ title: "Inspect the validation helper", request_id: "no-parent" })
+    assert.equal(missing.failed, true)
+    assert.match(missing.output, /todo_parent_id is required/)
+
+    const invalid = await tool.run(childArgs("not-a-plan-item", "Inspect the validation helper", "bad-parent"))
+    assert.equal(invalid.failed, true)
+    assert.match(invalid.output, /todo_parent_id must name an active TODO/)
+
+    assert.equal(calls(), 0, "Feedback is not consulted for an invalid proposal")
+    const after = await state.repository.getPlanOutline(state.scope)
+    assert.equal(after?.revision, before?.revision)
+    assert.equal(after?.children.length, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("an accepted proposal creates exactly one child, bumps the plan revision, and adds no dependency", async () => {
+  const state = await childProposalFixture()
+  try {
+    const { review, calls } = countingReview({ decision: "accepted", instruction: "Create it under the parent." })
+    const tool = createTool(state, { review })
+    const before = await state.repository.getPlanOutline(state.scope)
+
+    const output = JSON.parse((await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "accept-1"))).output)
+    assert.equal(output.ok, true)
+    assert.equal(output.result, "accepted")
+    assert.equal(output.next_action, "continue")
+    assert.equal(output.plan_revision, (before?.revision ?? 0) + 1)
+
+    const after = await state.repository.getPlanOutline(state.scope)
+    assert.equal(after?.children.length, 1)
+    assert.equal(after?.children[0].itemId, output.item_id)
+    assert.equal(after?.children[0].parentItemId, state.items[0].id)
+    assert.equal(after?.tasks.length, before?.tasks.length, "the child is not a plan task")
+    assert.equal(after?.tasks.every((task) => task.awaitingDependencies.length === 0), true, "parent/child adds no dependencies")
+    const nextRequestContext = renderPlanContext(after!)
+    assert.match(nextRequestContext, new RegExp(`revision ${output.plan_revision}\\b`))
+    assert.match(nextRequestContext, /Inspect the validation helper/)
+    assert.equal(calls(), 1)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("an existing-task decision returns the matching plan task and creates nothing", async () => {
+  const state = await childProposalFixture()
+  try {
+    const tool = createTool(state, { review: countingReview({ decision: "existing_task", itemId: state.items[1].id, instruction: "Covered by the dispatch task." }).review })
+    const before = await state.repository.getPlanOutline(state.scope)
+    const output = JSON.parse((await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "existing-1"))).output)
+    assert.equal(output.result, "existing_task")
+    assert.equal(output.item_id, state.items[1].id)
+    assert.equal(output.next_action, "use_existing_task")
+    const after = await state.repository.getPlanOutline(state.scope)
+    assert.equal(after?.children.length, 0)
+    assert.equal(after?.revision, before?.revision)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a rejected proposal creates no TODO and is a normal decision, not a tool failure", async () => {
+  const state = await childProposalFixture()
+  try {
+    const tool = createTool(state, { review: countingReview({ decision: "rejected", instruction: "Outside the investigation." }).review })
+    const run = await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "reject-1"))
+    assert.equal(run.failed, undefined)
+    const output = JSON.parse(run.output)
+    assert.equal(output.result, "rejected")
+    assert.equal(output.next_action, "do_not_create_task")
+    assert.equal((await state.repository.getPlanOutline(state.scope))?.children.length, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("unavailable Feedback never authorizes a mutation", async () => {
+  const state = await childProposalFixture()
+  try {
+    const failing = createTool(state, { review: async () => ({ ok: false, error: "the provider timed out" }) })
+    const unavailable = await failing.run(childArgs(state.items[0].id, "Inspect the validation helper", "unavailable-1"))
+    assert.equal(unavailable.failed, true)
+    assert.equal(JSON.parse(unavailable.output).result, "feedback_unavailable")
+
+    const unconfigured = await createTool(state).run(childArgs(state.items[0].id, "Inspect the validation helper", "unavailable-2"))
+    assert.equal(unconfigured.failed, true)
+
+    assert.equal((await state.repository.getPlanOutline(state.scope))?.children.length, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("duplicate proposals are idempotent and never reach Feedback twice", async () => {
+  const state = await childProposalFixture()
+  try {
+    const { review, calls } = countingReview({ decision: "accepted", instruction: "Create it." })
+    const tool = createTool(state, { review })
+    const first = JSON.parse((await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "dup-1"))).output)
+    const retry = JSON.parse((await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "dup-1"))).output)
+    const repeat = JSON.parse((await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "dup-2"))).output)
+    assert.equal(retry.item_id, first.item_id)
+    assert.equal(repeat.item_id, first.item_id)
+    assert.equal(calls(), 1)
+    assert.equal((await state.repository.getPlanOutline(state.scope))?.children.length, 1)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("stopping during Feedback review applies nothing even when Feedback accepts", async () => {
+  const state = await childProposalFixture()
+  try {
+    const controller = new AbortController()
+    const tool = createTool(state, {
+      review: async () => {
+        controller.abort()
+        return { ok: true, decision: { decision: "accepted", instruction: "Create it." } }
+      }
+    })
+    const run = await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "stop-1"), { signal: controller.signal })
+    assert.equal(run.failed, true)
+    assert.match(run.output, /nothing was created/)
+    assert.equal((await state.repository.getPlanOutline(state.scope))?.children.length, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a parent is not verified because its accepted child completed", async () => {
+  const state = await childProposalFixture()
+  try {
+    const tool = createTool(state, { review: countingReview({ decision: "accepted", instruction: "Create it." }).review })
+    const created = JSON.parse((await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "parent-1"))).output)
+    const child = (await state.repository.getItem(state.scope, created.item_id)).item
+    await state.repository.updateItem(state.scope, {
+      itemId: child.id,
+      expectedVersion: child.version,
+      patch: { status: "completed" },
+      actor: "model",
+      requestId: "child-claim"
+    })
+    const outline = await state.repository.getPlanOutline(state.scope)
+    const parent = outline?.tasks.find((task) => task.itemId === state.items[0].id)
+    assert.equal(parent?.verification, "not_checked")
+    assert.notEqual(parent?.status, "completed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("explicit user-directed TODO creation under a plan remains supported", async () => {
+  const state = await childProposalFixture()
+  try {
+    const { review, calls } = countingReview({ decision: "rejected", instruction: "Not used." })
+    const tool = createTool(state, { review, isUserAuthorized: () => true })
+    const output = JSON.parse((await tool.run({ title: "Add a TODO for the release notes", request_id: "user-todo" })).output)
+    assert.equal(output.result, "created")
+    assert.equal(calls(), 0, "a user-directed request bypasses the autonomous proposal review")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a plan revision made while a child proposal is under review is applied at the tool boundary, and a removed parent creates no child", async () => {
+  const state = await childProposalFixture()
+  try {
+    const parent = (await state.repository.getList(state.scope)).items.find((item) => item.title === "locate_source_definition")!
+    const tasks = (acceptance: string) => [
+      { id: "locate_source_definition", acceptance },
+      { id: "trace_source_dispatch", acceptance: "The dispatch path is traced" }
+    ]
+    const gated = () => {
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      let markStarted!: () => void
+      const started = new Promise<void>((resolve) => { markStarted = resolve })
+      const review: ChildTodoReview = async () => {
+        markStarted()
+        await gate
+        return { ok: true, decision: { decision: "accepted", instruction: "Accepted under the parent." } }
+      }
+      return { review, started, release }
+    }
+
+    const revisedGate = gated()
+    const revisedTool = createTool(state, { review: revisedGate.review })
+    const revisedRun = revisedTool.run(childArgs(parent.id, "Trace the definition caller", "race-revise"))
+    await revisedGate.started
+    const revisedPlan = { ...plan(tasks("The definition is located and its callers are listed")), revision: 2 }
+    await state.repository.synchronizeIntentPlan(state.scope, revisedPlan, { prompt: "Verify the requested work" })
+    revisedGate.release()
+    const accepted = JSON.parse((await revisedRun).output)
+    assert.equal(accepted.result, "accepted")
+    assert.equal(accepted.plan_revision, 3, "the child is applied against the revision current at the tool boundary")
+    const afterAccept = await state.repository.getList(state.scope)
+    assert.equal(afterAccept.items.filter((item) => item.title === "Trace the definition caller").length, 1)
+    assert.equal(afterAccept.items.find((item) => item.id === parent.id)?.title, "locate_source_definition")
+
+    const removedGate = gated()
+    const removedTool = createTool(state, { review: removedGate.review })
+    const removedRun = removedTool.run(childArgs(parent.id, "Trace the removed branch", "race-removed"))
+    await removedGate.started
+    const removedPlan = { ...plan([{ id: "trace_source_dispatch", acceptance: "The dispatch path is traced" }]), revision: 4 }
+    await state.repository.synchronizeIntentPlan(state.scope, removedPlan, { prompt: "Verify the requested work" })
+    removedGate.release()
+    const rejected = await removedRun
+    assert.equal(rejected.failed, true, "a parent removed from the plan during review cannot receive a child")
+    assert.equal((await state.repository.getList(state.scope)).items.some((item) => item.title === "Trace the removed branch"), false)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("workflow text about TODO tracking never authorizes a root-level task under a plan; the user's own request does", async () => {
+  const state = await childProposalFixture()
+  try {
+    const { review, calls } = countingReview({ decision: "accepted", instruction: "Create it." })
+    const workflowMessage = "Feedback and TODO requirements\nUse the available native TODO system to track this investigation.\nCreate actionable TODOs before beginning the investigation."
+    const workflowTool = createTool(state, { review, isUserAuthorized: () => userRequestsTodoCreation(workflowMessage) })
+    const rootAttempt = await workflowTool.run({ title: "Create actionable TODOs for the investigation", request_id: "workflow-root" })
+    assert.equal(rootAttempt.failed, true)
+    assert.match(rootAttempt.output, /todo_parent_id is required/)
+    assert.equal((await state.repository.getPlanOutline(state.scope))?.children.length, 0, "no root task was created")
+    assert.equal(calls(), 0)
+
+    const requestTool = createTool(state, { review, isUserAuthorized: () => userRequestsTodoCreation("Please create a TODO to track the release notes.") })
+    const created = JSON.parse((await requestTool.run({ title: "Track the release notes", request_id: "user-root" })).output)
+    assert.equal(created.result, "created")
+    assert.equal(calls(), 0, "the explicit user request is not a Feedback proposal")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("umbrella creates restating several plan tasks reuse the plan while distinct subtasks are created", async () => {
   const state = await fixture([
     { id: "locate_read_file_definition", acceptance: "The read_file definition is located" },
@@ -1322,16 +1787,20 @@ test("umbrella creates restating several plan tasks reuse the plan while distinc
     { id: "trace_dispatch_implementation", acceptance: "Dispatch reaches the implementation" }
   ], false)
   try {
-    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined).tools
-    const create = (title: string, requestId: string) => tools.find((candidate) => candidate.name === "twinny_todo_create")!.run({ title, request_id: requestId }).then((output) => JSON.parse(output.output))
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { review: acceptingReview }).tools
+    const create = (title: string, requestId: string, parentId?: string) => tools.find((candidate) => candidate.name === "twinny_todo_create")!.run({
+      title,
+      request_id: requestId,
+      ...(parentId ? { todo_parent_id: parentId, details: "Validate the argument types before the read.", reason: "The read path needs this check." } : {})
+    }).then((output) => JSON.parse(output.output))
 
     const umbrella = await create("Investigate read_file registration and dispatch", "umbrella-create")
     assert.equal(umbrella.result, "existing_task")
     assert.equal(umbrella.matched_by, "plan_umbrella")
     assert.equal(state.items.some((item) => item.id === umbrella.item_id), true)
 
-    const distinct = await create("Validate argument types before reading", "distinct-create")
-    assert.equal(distinct.result, "created")
+    const distinct = await create("Validate argument types before reading", "distinct-create", state.items[0].id)
+    assert.equal(distinct.result, "accepted")
     assert.equal(state.items.some((item) => item.id === distinct.item_id), false)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -1342,7 +1811,7 @@ test("native TODO tools acknowledge claims once, reuse plan tasks, and never let
   const state = await fixture([{ id: "locate_native_read_file_tool_definition", acceptance: "The read_file definition is located" }], false)
   try {
     const item = state.items[0]
-    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined).tools
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { review: acceptingReview }).tools
     const tool = (name: string) => tools.find((candidate) => candidate.name === name)!
     const update = (args: Record<string, string>) => tool("twinny_todo_update").run(args).then((output) => JSON.parse(output.output))
 
@@ -1372,8 +1841,8 @@ test("native TODO tools acknowledge claims once, reuse plan tasks, and never let
     assert.equal(duplicate.next_action, "use_existing_task")
     assert.equal(duplicate.matched_by, "plan_overlap")
 
-    const created = JSON.parse((await tool("twinny_todo_create").run({ title: "Trace dispatch to implementation", request_id: "new-subtask" })).output)
-    assert.equal(created.result, "created")
+    const created = JSON.parse((await tool("twinny_todo_create").run({ title: "Trace dispatch to implementation", request_id: "new-subtask", todo_parent_id: item.id, details: "Follow dispatch to the read_file implementation.", reason: "The read path needs this step." })).output)
+    assert.equal(created.result, "accepted")
     assert.notEqual(created.item_id, item.id)
 
     const stored = (await state.repository.getItem(state.scope, item.id)).item

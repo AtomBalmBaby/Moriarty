@@ -25,6 +25,7 @@ import {
 import { contentHash } from "../../extension/tools/line-edit"
 import {
   flattenToolHistory,
+  GENERATION_LIMIT_DEFAULTS,
   generationLimitsFrom,
   GenerationMonitor,
   NO_GENERATION_LIMITS,
@@ -203,6 +204,22 @@ test("no limits never stop a request, and configured limits are clamped to sane 
   )
 })
 
+test("each inference request is capped at 6144 output tokens by default, and a user's own cap is kept", () => {
+  assert.strictEqual(GENERATION_LIMIT_DEFAULTS.outputTokens, 6144)
+  assert.strictEqual(
+    generationLimitsFrom({ ...GENERATION_LIMIT_DEFAULTS }).maxOutputTokens,
+    6144
+  )
+  assert.strictEqual(
+    generationLimitsFrom({ durationSeconds: 900, noProgressSeconds: 300, outputTokens: 4096 }).maxOutputTokens,
+    4096
+  )
+  assert.strictEqual(
+    generationLimitsFrom({ durationSeconds: 900, noProgressSeconds: 300, outputTokens: 0 }).maxOutputTokens,
+    0
+  )
+})
+
 test("a request gone silent is stopped, the stop is reported, and it is not retried", async () => {
   const requests: ChatRequest[] = []
   const stops: string[] = []
@@ -323,6 +340,30 @@ test("stopping the reply does not wait for a tool that is still running", async 
   assert.ok(Date.now() - started < 2000)
   assert.ok(toolSawStop, "the tool is told, so a command can be interrupted")
   assert.deepStrictEqual(events, ["start wait", "notes undefined", "end"], "the host hears the reply is over")
+})
+
+test("a stop between two calls of one reply means the second is never dispatched", async () => {
+  const stop = new AbortController()
+  const dispatched: string[] = []
+  const tools = fakeTools((name) => {
+    dispatched.push(name)
+    return Promise.resolve({ output: "done", summary: "done" })
+  })
+  const { client, requests } = scripted([{
+    calls: [
+      { id: "1", name: "wait", arguments: "{\"n\":1}" },
+      { id: "2", name: "wait", arguments: "{\"n\":2}" }
+    ]
+  }])
+  await assert.rejects(
+    collect(withTools(client, tools, {
+      mode: "native",
+      onToolResult: () => stop.abort()
+    }).chat(ask("Wait twice."), { signal: stop.signal } as InferenceOptions)),
+    (error) => isCancelled(error)
+  )
+  assert.equal(dispatched.length, 1, "the second call is not dispatched after the stop")
+  assert.equal(requests.length, 1, "no further model request starts")
 })
 
 test("a stopped reply still keeps what its tools did, for the next turn", async () => {
@@ -561,6 +602,17 @@ test("a reply saved with a tool transcript by an earlier build goes back as it w
     { systemPrompt: async () => "s", additionalContext: async () => "" }
   )
   assert.deepStrictEqual(turn[2].content, [{ type: "text", text: "It is in a.ts." }])
+})
+
+test("a stop while the loop falls back to text mode sends no second request", async () => {
+  const root = workspace({ "a.ts": "export const a = 1\n" })
+  const { client, requests } = scripted([{ fail: "Invalid request: unknown field \"tools\"." }, "must not run"])
+  const stop = new AbortController()
+  await assert.rejects(
+    collect(withTools(client, workspaceTools(root), { mode: "native", onFallback: () => stop.abort() }).chat(ask("What is in a.ts?"), { signal: stop.signal })),
+    isCancelled
+  )
+  assert.equal(requests.length, 1, "the retry request never starts after Stop")
 })
 
 test("a gateway from before tools refuses the field by name, and the loop carries on in text", async () => {

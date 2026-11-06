@@ -1,7 +1,14 @@
 import { TodoRepository } from "../todos/repository"
-import { TodoActor,TodoListRequest, TodoPriority, TodoStatus } from "../todos/types"
+import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoListRequest, TodoPriority, TodoStatus } from "../todos/types"
 
-import { Tool, ToolResult } from "./workspace"
+import { Tool, ToolContext, ToolResult } from "./workspace"
+
+export interface TodoToolOptions {
+  /** Feedback review of agent-proposed children under an authoritative plan. Absent when Feedback is disabled. */
+  review?: ChildTodoReview
+  /** Whether the user's own message directly asked for TODO creation. Read from trusted conversation state. */
+  isUserAuthorized?: () => boolean
+}
 
 const result = (value: unknown, summary: string): ToolResult => ({
   output: JSON.stringify(value),
@@ -11,6 +18,47 @@ const result = (value: unknown, summary: string): ToolResult => ({
 const errorResult = (error: unknown): ToolResult => ({
   output: `Native TODO tool error: ${error instanceof Error ? error.message : String(error)}`,
   summary: "native TODO tool failed",
+  failed: true
+})
+
+const NEXT_ACTION: Record<ChildTodoOutcome["decision"], string> = {
+  accepted: "continue",
+  revised: "continue",
+  existing_task: "use_existing_task",
+  rejected: "do_not_create_task",
+  needs_clarification: "propose_narrower_task"
+}
+
+const childResult = (outcome: ChildTodoOutcome): ToolResult => result({
+  ok: true,
+  result: outcome.decision,
+  ...(outcome.itemId ? { item_id: outcome.itemId } : {}),
+  parent_id: outcome.parentId,
+  plan_revision: outcome.planRevision,
+  next_action: NEXT_ACTION[outcome.decision],
+  instruction: outcome.instruction
+}, `Feedback decided: ${outcome.decision}`)
+
+const existingTaskResult = (match: { item: TodoItem; matchedBy: string; planRevision: number }): ToolResult => result({
+  ok: true,
+  result: "existing_task",
+  item_id: match.item.id,
+  title: match.item.title,
+  plan_revision: match.planRevision,
+  matched_by: match.matchedBy,
+  next_action: "use_existing_task",
+  instruction: "An equivalent TODO already exists in the plan; use it instead of creating another."
+}, "matched an existing plan TODO")
+
+const feedbackUnavailable = (parentId: string, reason: string): ToolResult => ({
+  output: JSON.stringify({
+    ok: false,
+    result: "feedback_unavailable",
+    parent_id: parentId,
+    next_action: "do_not_assume_created",
+    instruction: `Feedback could not review this proposal (${reason}), so no TODO was created. Do not assume the task exists. Continue with the current plan, or retry this exact request later with the same request_id.`
+  }),
+  summary: "Feedback could not review a proposed TODO; nothing was created",
   failed: true
 })
 
@@ -46,7 +94,8 @@ const evidenceResult = (value: string): "observed" | "passed" | "failed" => {
 export const todoTools = (
   repository: TodoRepository,
   scope: TodoListRequest,
-  onChanged: () => void
+  onChanged: () => void,
+  options: TodoToolOptions = {}
 ): Tool[] => [
   {
     name: "twinny_todo_list",
@@ -78,12 +127,13 @@ export const todoTools = (
   },
   {
     name: "twinny_todo_create",
-    description: "Create a task in Twinny's canonical native TODO list for this conversation. If the authoritative plan already has an equivalent task, this returns that existing item (result existing_task) instead of creating a duplicate; update that item by item_id with twinny_todo_update. Create only genuinely new work.",
+    description: "Create a task in Twinny's canonical native TODO list for this conversation. When an authoritative plan exists, this proposes a child task: give todo_parent_id (an existing plan TODO), details, and reason, and Feedback decides whether it is created. The result is one of created, existing_task, revised, rejected, needs_clarification, or feedback_unavailable, with next_action. An existing_task or rejected result is a normal outcome, not a failure. Create only genuinely new work.",
     parameters: [
       { name: "title", description: "Short task title." },
       { name: "request_id", description: "Generate a non-empty unique ID; reuse it only when retrying the exact same mutation." },
-      { name: "details", description: "Task details and acceptance notes.", optional: true },
-      { name: "parent_id", description: "Parent TODO ID for a nested task.", optional: true },
+      { name: "todo_parent_id", description: "Existing plan TODO this task belongs under. Required when an authoritative plan exists.", optional: true },
+      { name: "details", description: "Task details and acceptance notes. Required when an authoritative plan exists.", optional: true },
+      { name: "reason", description: "Why this child task is needed for the parent. Required when an authoritative plan exists.", optional: true },
       { name: "priority", description: "low, normal, high, or urgent.", optional: true }
     ],
     schema: {
@@ -91,36 +141,65 @@ export const todoTools = (
       properties: {
         title: { type: "string", maxLength: 500 },
         request_id: { type: "string", maxLength: 200, description: "Generate a non-empty unique ID; reuse only for an exact retry." },
-        details: { type: "string", maxLength: 8000 },
-        parent_id: { type: "string" },
+        todo_parent_id: { type: "string", description: "Existing plan TODO ID. Required when an authoritative plan exists." },
+        details: { type: "string", maxLength: 8000, description: "Required when an authoritative plan exists." },
+        reason: { type: "string", maxLength: 2000, description: "Required when an authoritative plan exists." },
         priority: { type: "string", enum: ["low", "normal", "high", "urgent"] }
       },
       required: ["title", "request_id"],
       additionalProperties: false
     },
-    async run(args) {
+    async run(args, context?: ToolContext) {
       try {
         const priority = args.priority as TodoPriority | undefined
         if (priority && !priorities.has(priority)) throw new Error("Invalid priority")
-        const outcome = await repository.createItemOutcome(scope, {
-          title: args.title,
-          details: args.details,
-          parentId: args.parent_id,
-          priority
-        }, requestId(args))
+        const key = requestId(args)
+        const parentId = args.todo_parent_id?.trim() || undefined
+        if (!(await repository.hasAuthoritativePlan(scope)) || options.isUserAuthorized?.()) {
+          const outcome = await repository.createItemOutcome(scope, {
+            title: args.title,
+            details: args.details,
+            parentId,
+            priority
+          }, key)
+          onChanged()
+          const { item } = outcome
+          return result({
+            ok: true,
+            result: outcome.reused ? "existing_task" : "created",
+            item_id: item.id,
+            task_status: item.status,
+            version: item.version,
+            title: item.title,
+            ...(outcome.reused ? { matched_by: outcome.matchedBy } : {}),
+            next_action: outcome.reused ? "use_existing_task" : "continue",
+            item
+          }, outcome.reused ? "matched an existing native TODO" : "created a native TODO")
+        }
+        if (parentId) await repository.childTodoContext(scope, parentId)
+        const existing = await repository.existingTaskFor(scope, args.title, parentId)
+        if (existing) return existingTaskResult(existing)
+        if (!parentId) throw new Error("todo_parent_id is required: under the authoritative plan, add work only beneath an existing plan TODO")
+        if (!args.details?.trim()) throw new Error("details is required when an authoritative plan exists")
+        if (!args.reason?.trim()) throw new Error("reason is required when an authoritative plan exists")
+        const proposal: ChildTodoProposal = {
+          parentId,
+          title: args.title.trim(),
+          details: args.details.trim(),
+          reason: args.reason.trim(),
+          priority: priority ?? "normal",
+          requestId: key
+        }
+        const known = await repository.childTodoReplay(scope, proposal)
+        if (known) return childResult(known)
+        const parentContext = await repository.childTodoContext(scope, parentId)
+        if (!options.review) return feedbackUnavailable(parentId, "Feedback is disabled")
+        const reviewed = await options.review(proposal, parentContext, context?.signal)
+        if (context?.signal?.aborted) return { output: "Native TODO tool error: the operation was stopped before Feedback decided; nothing was created", summary: "stopped before a TODO decision", failed: true }
+        if (!reviewed.ok) return feedbackUnavailable(parentId, reviewed.error)
+        const outcome = await repository.applyChildTodo(scope, proposal, reviewed.decision)
         onChanged()
-        const { item } = outcome
-        return result({
-          ok: true,
-          result: outcome.reused ? "existing_task" : "created",
-          item_id: item.id,
-          task_status: item.status,
-          version: item.version,
-          title: item.title,
-          ...(outcome.reused ? { matched_by: outcome.matchedBy } : {}),
-          next_action: outcome.reused ? "use_existing_task" : "continue",
-          item
-        }, outcome.reused ? "matched an existing native TODO" : "created a native TODO")
+        return childResult(outcome)
       } catch (error) {
         return errorResult(error)
       }
@@ -249,12 +328,13 @@ export const todoTools = (
 export const todoWorkspaceTools = (
   repository: TodoRepository,
   scope: TodoListRequest,
-  onChanged: () => void
+  onChanged: () => void,
+  options: TodoToolOptions = {}
 ): import("./workspace").WorkspaceTools => {
-  const tools = todoTools(repository, scope, onChanged)
+  const tools = todoTools(repository, scope, onChanged, options)
   return {
     tools,
-    orientation: "Twinny's canonical TODO list for the current conversation is available through the native TODO tools, including in ordinary chats with Agent mode off. These tools cannot access another conversation's list. Optional parent_id values must be omitted when creating a top-level TODO. Model completion claims through twinny_todo_update remain in_review until evidence supports them or the user approves them in the TODO panel. Report every native TODO tool error; a later successful retry does not erase an earlier failure.",
+    orientation: "Twinny's canonical TODO list for the current conversation is available through the native TODO tools, including in ordinary chats with Agent mode off. These tools cannot access another conversation's list. When an authoritative plan exists, twinny_todo_create proposes a child task under todo_parent_id and Feedback decides whether it is created; a rejected or existing_task result is a decision to follow, not an error. Omit todo_parent_id only when no plan exists and you are creating a top-level TODO. Model completion claims through twinny_todo_update remain in_review until evidence supports them or the user approves them in the TODO panel. Report every native TODO tool error; a later successful retry does not erase an earlier failure.",
     instructionFiles: () => [],
     async run(call, context) {
       const tool = tools.find((candidate) => candidate.name === call.name)

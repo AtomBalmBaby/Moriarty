@@ -526,7 +526,9 @@
   "todo-acceptance-criteria": "Acceptance criteria"
 ,
   "todo-move-up": "Move task up",
-  "todo-move-down": "Move task down"
+  "todo-move-down": "Move task down",
+  "todo-expand-children": "Show subtasks",
+  "todo-collapse-children": "Hide subtasks"
 ,
   "todo-edit-details": "Task details",
   "todo-priority-label": "Priority"

@@ -17,7 +17,7 @@ import { test } from "node:test"
 import { z } from "zod"
 
 import { McpHost } from "../../extension/chat/mcp-host"
-import { ChatChunk, ChatRequest, InferenceClient } from "../../extension/inference"
+import { ChatChunk, ChatRequest, InferenceClient, InferenceOptions, isCancelled } from "../../extension/inference"
 import { withTools } from "../../extension/tools/loop"
 import { coerceArguments, McpClient, mcpToolSpecs, qualifiedToolName } from "../../extension/tools/mcp"
 import { toolDefinition } from "../../extension/tools/protocol"
@@ -94,6 +94,33 @@ test("a server that does not answer, or dies, fails the call and not the reply",
     await assert.rejects(call, /Stopped by the user/)
   } finally {
     slow.close()
+  }
+})
+
+test("stopping while an MCP tool runs cancels that call and starts no further request or tool", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-mcp-stop-"))
+  const host = new McpHost(() => ({ fake: fakeServer }), () => root)
+  const stop = new AbortController()
+  let markStarted!: () => void
+  const started = new Promise<void>((resolve) => (markStarted = resolve))
+  try {
+    await host.ready()
+    const sink = host.sink(async () => true)
+    const run = scripted([{ calls: [{ id: "1", name: "fake__slow", arguments: "{}" }] }, "never requested"])
+    const reply = (async () => {
+      for await (const chunk of withTools(run.client, workspaceTools(root, [], { mcp: sink }), {
+        mode: "native",
+        onToolStart: () => markStarted()
+      }).chat({ model: "m", messages: [{ role: "user", content: "wait" }] }, { signal: stop.signal } as InferenceOptions))
+        void chunk
+    })()
+    // The call is in flight once the loop has dispatched it; only then is the user's Stop pressed.
+    await started
+    stop.abort()
+    await assert.rejects(reply, (error) => isCancelled(error))
+    assert.strictEqual(run.requests.length, 1, "the reply is not continued after the stop")
+  } finally {
+    host.dispose()
   }
 })
 

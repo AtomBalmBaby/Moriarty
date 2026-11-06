@@ -1,5 +1,6 @@
-import React, { useState, useMemo } from 'react';
-import styles from './styles/tool-inventory-dialog.module.css';
+import React, { useMemo,useState } from "react";
+
+import styles from "./styles/tool-inventory-dialog.module.css";
 
 export interface ToolInfo {
   server: string;
@@ -15,7 +16,7 @@ export interface ToolInventoryDialogProps {
 }
 
 export const ToolInventoryDialog: React.FC<ToolInventoryDialogProps> = ({ inventory, onClose, onConfirm }) => {
-  const [search, setSearch] = useState('');
+  const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
@@ -117,7 +118,7 @@ export const ToolInventoryDialog: React.FC<ToolInventoryDialogProps> = ({ invent
             {expandedGroups.has(server) && tools.map(t => {
               const key = `${t.server}/${t.tool}`;
               return (
-                <div key={key} className={styles.toolItem} title={t.description ?? ''}>
+                <div key={key} className={styles.toolItem} title={t.description ?? ""}>
                   <input
                     type="checkbox"
                     className={styles.toolCheckbox}

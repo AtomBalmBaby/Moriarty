@@ -43,6 +43,7 @@ import { useWorkspaceContext } from "./hooks/useWorkspaceContext"
 import { useWorkspaceSearch } from "./hooks/useWorkspaceSearch"
 import { ProviderSelect } from "./providers/provider-select"
 import AgentSettings from "./agent-settings"
+import { composerIsBusy, ComposerOperationEvent, ComposerOperationPhase, reduceComposerOperation } from "./composer-operation"
 import { EmptyChat } from "./empty-chat"
 import { GhostText } from "./ghost-text"
 import { createCustomImageExtension } from "./image-extension"
@@ -134,7 +135,16 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const stopRef = useRef(false)
   const selection = useSelection()
   const { t } = useTranslation()
-  const [isLoading, setIsLoading] = useState(false)
+  const [operationPhase, setOperationPhase] = useState<ComposerOperationPhase>("idle")
+  const operationPhaseRef = useRef<ComposerOperationPhase>("idle")
+  const isLoading = composerIsBusy(operationPhase)
+  /** Stop and Send follow the host's operation events only; the ref keeps callbacks in step. */
+  const dispatchOperation = useCallback((event: ComposerOperationEvent) => {
+    const next = reduceComposerOperation(operationPhaseRef.current, event)
+    operationPhaseRef.current = next
+    generatingRef.current = composerIsBusy(next)
+    setOperationPhase(next)
+  }, [])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [messages, setMessages] = useState<ChatCompletionMessage[]>([])
   // Nothing can answer without a chat provider, so the composer is off
@@ -399,10 +409,9 @@ export const Chat = (props: ChatProps): JSX.Element => {
   })
 
   const handleAddMessage = (added: ChatCompletionMessage | undefined) => {
+    // A reply message does not end the operation; the host's terminal event does.
     if (!added) {
       setCompletion(null)
-      setIsLoading(false)
-      generatingRef.current = false
       return
     }
 
@@ -448,12 +457,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
     }, 200)
 
     setCompletion(null)
-    setIsLoading(false)
     resetReasoning()
   }
 
   useServerEvent(EVENT_NAME.twinnyAddMessage, (incoming) => {
-    generatingRef.current = true
     handleAddMessage(incoming)
   })
 
@@ -465,7 +472,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   useServerEvent(EVENT_NAME.twinnyOnLoading, (turn) => {
     resetReasoning()
     setContinuation(typeof turn === "object" ? turn.continuation ?? 0 : 0)
-    setIsLoading(true)
+    dispatchOperation({ type: "started" })
   })
 
   useServerEvent(EVENT_NAME.twinnyNewConversation, () => {
@@ -479,8 +486,6 @@ export const Chat = (props: ChatProps): JSX.Element => {
       title: t("chat-new-conversation-title"),
       messages: []
     })
-    generatingRef.current = false
-    setIsLoading(false)
     chatRef.current?.focus()
     setTimeout(() => {
       stopRef.current = false
@@ -488,10 +493,9 @@ export const Chat = (props: ChatProps): JSX.Element => {
   })
 
   useServerEvent(EVENT_NAME.twinnyStopGeneration, (stop) => {
-    setIsLoading(false)
+    dispatchOperation({ type: "terminal" })
     setCompletion(null)
     stopRef.current = false
-    generatingRef.current = false
     const stoppedByUser = userStoppedRef.current
     userStoppedRef.current = false
     const [next, ...rest] = queuedRef.current
@@ -536,15 +540,15 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
   const handleStopGeneration = useCallback(() => {
     userStoppedRef.current = true
+    dispatchOperation({ type: "stop-requested" })
     emit(EVENT_NAME.twinnyStopGeneration, {})
-  }, [])
+  }, [dispatchOperation])
 
   const handleRegenerateMessage = (
     index: number,
     mentions: MentionType[] | undefined
   ): void => {
-    generatingRef.current = true
-    setIsLoading(true)
+    dispatchOperation({ type: "started" })
     clearSearchReport()
     clearToolSteps()
     setMessages((prev) => {
@@ -599,8 +603,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
     mentions: MentionType[] | undefined,
     images?: ImageAttachment[]
   ): void => {
-    generatingRef.current = true
-    setIsLoading(true)
+    dispatchOperation({ type: "started" })
     clearSearchReport()
     clearToolSteps()
     setMessages((prev) => {
@@ -721,9 +724,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const stopIfGenerating = useCallback(() => {
     if (!generatingRef.current) return false
     userStoppedRef.current = true
+    dispatchOperation({ type: "stop-requested" })
     emit(EVENT_NAME.twinnyStopGeneration, {})
     return true
-  }, [])
+  }, [dispatchOperation])
 
   /*
    * Esc closes the shortcuts, else skips what a tool is waiting on, else
@@ -774,8 +778,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
   /** One message to the model: into the transcript and out to the extension. */
   const sendMessage = (message: QueuedMessage) => {
-    generatingRef.current = true
-    setIsLoading(true)
+    dispatchOperation({ type: "started" })
     clearSearchReport()
     clearToolSteps()
 
@@ -1019,8 +1022,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
    */
   const handleContinue = useCallback(() => {
     if (generatingRef.current || chatDisabled) return
-    generatingRef.current = true
-    setIsLoading(true)
+    dispatchOperation({ type: "started" })
     clearSearchReport()
     clearToolSteps()
     setMessages((prev) => {
@@ -1836,11 +1838,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
                 >
                   <span className="codicon codicon-device-camera" />
                 </VSCodeButton>
-                {generatingRef.current ? (
+                {isLoading ? (
                   <VSCodeButton
                     appearance="icon"
                     role="button"
-                    className={styles.stopButton}
+                    className={cx(styles.stopButton, { [styles.stopping]: operationPhase === "stopping" })}
+                    aria-busy={operationPhase === "stopping"}
                     onClick={handleStopGeneration}
                     title={t("stop-generation-esc")}
                     aria-label={t("stop-generation")}

@@ -14,11 +14,18 @@ interface TodoPanelProps {
 
 const newRequestId = () => window.crypto.randomUUID()
 
+interface TodoTreeRow {
+  item: TodoItem
+  depth: number
+  children: number
+}
+
 export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
   const { t } = useTranslation()
   const [snapshot, setSnapshot] = useState<TodoListSnapshot>()
   const [feedbackStatus, setFeedbackStatus] = useState<TodoFeedbackStatus>()
   const [expandedMap, setExpandedMap] = useState<Record<string, boolean>>({})
+  const [collapsedMap, setCollapsedMap] = useState<Record<string, boolean>>({})
   const [expanded, setExpanded] = useState(true)
   const [showCompleted, setShowCompleted] = useState(false)
   const [title, setTitle] = useState("")
@@ -79,6 +86,32 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     const items = snapshot?.items ?? []
     return showCompleted ? items : items.filter((item) => item.status !== "completed" && item.status !== "cancelled")
   }, [snapshot, showCompleted])
+
+  // Items whose parent is hidden by the completed filter surface as roots, so no visible task disappears.
+  const treeRows = useMemo(() => {
+    const ids = new Set(visibleItems.map((item) => item.id))
+    const childrenOf = new Map<string, TodoItem[]>()
+    const roots: TodoItem[] = []
+    for (const item of visibleItems) {
+      if (item.parentId && ids.has(item.parentId)) {
+        childrenOf.set(item.parentId, [...(childrenOf.get(item.parentId) ?? []), item])
+      } else {
+        roots.push(item)
+      }
+    }
+    const rows: TodoTreeRow[] = []
+    const seen = new Set<string>()
+    const visit = (item: TodoItem, depth: number) => {
+      if (seen.has(item.id)) return
+      seen.add(item.id)
+      const children = childrenOf.get(item.id) ?? []
+      rows.push({ item, depth, children: children.length })
+      if (!collapsedMap[item.id]) children.forEach((child) => visit(child, depth + 1))
+    }
+    roots.forEach((root) => visit(root, 0))
+    visibleItems.forEach((item) => visit(item, 0))
+    return rows
+  }, [visibleItems, collapsedMap])
   const completedCount = snapshot?.items.filter((item) => item.status === "completed").length ?? 0
   const pendingCount = snapshot?.items.filter((item) => item.status !== "completed" && item.status !== "cancelled").length ?? 0
   // Finished work leaves the active panel; its items stay in history behind the header toggle.
@@ -135,14 +168,30 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     void mutate(() => bridge.request(TODO_EVENT_NAME.evaluateItem, { conversationId, itemId: item.id }))
   }
 
-  const renderItem = (item: TodoItem) => (
-  <li key={item.id} className={styles.item} data-status={item.status} style={{ marginLeft: item.parentId ? 16 : 0 }}>
+  const renderItem = ({ item, depth, children }: TodoTreeRow) => (
+  <li key={item.id} className={styles.item} data-status={item.status} data-depth={depth} style={{ marginLeft: depth * 16 }}>
           <span className={styles.status} title={item.status.replace(/_/g, " ")} aria-label={item.status.replace(/_/g, " ")}>
             {item.status === "completed" ? "✓" : item.status === "blocked" ? "!" : "○"}
           </span>
           <div className={styles.itemHeader} onClick={() => setExpandedMap(prev => ({ ...prev, [item.id]: !prev[item.id] }))}>
             <span className={`codicon codicon-chevron-${expandedMap[item.id] ? "down" : "right"}`} aria-hidden="true" />
             <span className={styles.itemTitle}>{item.title}</span>
+            {!!children && (
+              <button
+                type="button"
+                className={styles.childToggle}
+                aria-expanded={!collapsedMap[item.id]}
+                aria-label={collapsedMap[item.id] ? t("todo-expand-children") : t("todo-collapse-children")}
+                title={collapsedMap[item.id] ? t("todo-expand-children") : t("todo-collapse-children")}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setCollapsedMap(prev => ({ ...prev, [item.id]: !prev[item.id] }))
+                }}
+              >
+                <span className={`codicon codicon-chevron-${collapsedMap[item.id] ? "right" : "down"}`} aria-hidden="true" />
+                <span className={styles.childCount}>{children}</span>
+              </button>
+            )}
           </div>
           {editing === item.id ? (
             <form className={styles.editForm} onSubmit={(event) => {
@@ -229,7 +278,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
                   <button type="button" disabled={busy || planning} onClick={retryFeedback}>{t("todo-retry")}</button>
                 </div>
               )}
-              {visibleItems.length ? <ul className={styles.list}>{visibleItems.map(renderItem)}</ul> : !retired && <p className={styles.empty}>{planning ? t("todo-planning-empty") : t("todo-empty")}</p>}
+              {treeRows.length ? <ul className={styles.list}>{treeRows.map(renderItem)}</ul> : !retired && <p className={styles.empty}>{planning ? t("todo-planning-empty") : t("todo-empty")}</p>}
               {!!completedCount && !retired && (
                 <button type="button" className={styles.showCompleted} onClick={() => setShowCompleted((value) => !value)}>
                   {showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}

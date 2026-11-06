@@ -12,7 +12,12 @@ import { test } from "node:test"
 import { logger } from "../../common/logger"
 import { ChatCompletionMessage, TwinnyProvider } from "../../common/types"
 import { ToolSteps } from "../../extension/chat/tool-steps"
-import { buildStreamingRequest, fluencyChat, parsableToolArguments } from "../../extension/inference/adapters/fluency"
+import {
+  buildBlockingRequest,
+  buildStreamingRequest,
+  fluencyChat,
+  parsableToolArguments
+} from "../../extension/inference/adapters/fluency"
 import {
   assumedContextWindow,
   contextWindowOf,
@@ -23,6 +28,22 @@ import { ChatChunk } from "../../extension/inference/types"
 
 const provider = (kind: string, extra: Partial<TwinnyProvider> = {}): TwinnyProvider =>
   ({ id: kind, label: kind, provider: kind, type: "chat", modelName: "m", ...extra }) as TwinnyProvider
+
+test("the output cap goes to Chat Completions-style servers as max_tokens, and is omitted when unset", () => {
+  for (const kind of ["ollama", "llamacpp", "openai-compatible", "lmstudio"]) {
+    const parameters = { maxTokens: 6144 }
+    const streamed = buildStreamingRequest(provider(kind), conversation, parameters) as unknown as {
+      max_tokens?: number
+    }
+    const blocking = buildBlockingRequest(provider(kind), conversation, parameters) as unknown as {
+      max_tokens?: number
+    }
+    assert.strictEqual(streamed.max_tokens, 6144, kind)
+    assert.strictEqual(blocking.max_tokens, 6144, kind)
+    const uncapped = buildStreamingRequest(provider(kind), conversation) as unknown as { max_tokens?: number }
+    assert.ok(!("max_tokens" in uncapped), kind)
+  }
+})
 
 const tool = { name: "grep", description: "search", parameters: { type: "object" } }
 const conversation = [

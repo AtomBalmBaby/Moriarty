@@ -64,15 +64,15 @@ import { describeProviderError, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { evaluateTodoReview, feedbackContext, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
-import { renderPlanContext } from "../todos/plan-context"
+import { type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, feedbackContext, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import type { ToolCall } from "../tools/protocol"
-import { todoTools, todoWorkspaceTools } from "../tools/todos"
+import { type TodoToolOptions, todoTools, todoWorkspaceTools } from "../tools/todos"
 import { WorkspaceView } from "../tools/view"
 import type { ToolResult } from "../tools/workspace"
 import { ToolExtras, WorkspaceSearchProvider, WorkspaceTools, workspaceTools } from "../tools/workspace"
@@ -81,9 +81,10 @@ import { getLanguage } from "../utils"
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
 import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, observationReference, requiresWorkspaceChanges } from "./execution-reconciliation"
-import { FeedbackGate, FeedbackPlanner, type FeedbackPlanOutcome, type FeedbackRetryOutcome } from "./feedback-planner"
+import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanOutcome, type FeedbackRetryOutcome, userRequestsTodoCreation } from "./feedback-planner"
 import { ChatGeneration } from "./generation"
 import { McpHost } from "./mcp-host"
+import { OperationLifecycle } from "./operation-lifecycle"
 import { PROMPT_COMPILER_PROTOCOL, PromptCompiler, PromptCompilerTraceRecord } from "./prompt-compiler"
 import { ChangeStore, ReplyChanges, viewOf } from "./reply-changes"
 import { ReplyChangesEditor } from "./reply-changes-editor"
@@ -308,6 +309,10 @@ export class Chat extends Base {
   )
   /** A typed message's context is being gathered; its reply has not started. */
   private _preparing = false
+  /** Whether the user's latest message directly asked for a TODO. Mycroft cannot set this. */
+  private _userRequestsTodo = false
+  /** Open operations (planning, replies, reviews, continuations); Stop stays available while any is open. */
+  private readonly _lifecycle: OperationLifecycle
   /**
    * Messages the user queued while an agent reply works, offered for the
    * model to read at its next step. Only taken while that reply runs: one
@@ -328,6 +333,8 @@ export class Chat extends Base {
   private readonly _feedbackPlanner: FeedbackPlanner
   /** Holds an agent turn until its message's Feedback plan is synchronized. */
   private readonly _feedbackGate: FeedbackGate
+  /** Reviews agent-proposed child TODOs on the Feedback provider. */
+  private readonly _childReviewer: ChildTodoReviewer
 
   constructor(
     generations: GenerationTracker,
@@ -365,6 +372,9 @@ export class Chat extends Base {
       onStatus: (status) => this._bridge.emit(TODO_EVENT_NAME.feedbackStatus, status),
       onFailure: (message) => this._bridge.emit(EVENT_NAME.twinnyNotification, message)
     })
+    this._childReviewer = new ChildTodoReviewer({
+      resolve: () => this.roleResolution("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny")))
+    })
     this._feedbackGate = new FeedbackGate({
       planner: this._feedbackPlanner,
       busy: () => this._generation.running || this._preparing,
@@ -373,6 +383,13 @@ export class Chat extends Base {
 
     // Initialize generation and context
     this._generation = new ChatGeneration(bridge, generations)
+    this._lifecycle = new OperationLifecycle(
+      () => this._bridge.emit(EVENT_NAME.twinnyOnLoading, { continuation: 0 }),
+      () => this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {
+        cancelled: this._generation.cancelled,
+        ...(this._generation.cancellationReason ? { cancellationReason: this._generation.cancellationReason } : {})
+      })
+    )
     this._context = new ChatContextBuilder(extensionContext, bridge, new TemplateProvider(templateDir), search)
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
 
@@ -577,8 +594,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    */
   private startFeedbackPlanning(messages: ChatCompletionMessage[]): Promise<FeedbackPlanOutcome> | undefined {
     const scope = this.activeTodoScope()
+    const text = this.latestUserText(messages)
+    if (!scope || !text) return undefined
+    return this._feedbackPlanner.start(scope, text)
+  }
+
+  /** The text of the latest user message, as the user typed it. */
+  private latestUserText(messages: ChatCompletionMessage[]): string | undefined {
     const latest = messages.at(-1)
-    if (!scope || latest?.role !== USER) return undefined
+    if (latest?.role !== USER) return undefined
     const source = typeof latest.prompt === "string" && latest.prompt.trim() ? latest.prompt : latest.content
     const text = (typeof source === "string" ? source : normalizeText(source))
       .replace(/<br\s*\/?>/gi, "\n")
@@ -588,8 +612,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       .replace(/&gt;/g, ">")
       .replace(/&amp;/g, "&")
       .trim()
-    if (!text) return undefined
-    return this._feedbackPlanner.start(scope, text)
+    return text || undefined
+  }
+
+  /** Options for the native TODO tools: Feedback reviews child proposals only when Feedback is on. */
+  private todoToolOptions(): TodoToolOptions {
+    return {
+      review: isFeedbackEnabled(workspace.getConfiguration("twinny"))
+        ? (proposal, context, signal) => this._childReviewer.review(proposal, context, signal)
+        : undefined,
+      isUserAuthorized: () => this._userRequestsTodo
+    }
   }
 
   /**
@@ -716,6 +749,16 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     this._activeConversationId = conversationId
     const provider = this.start()
     if (!provider) return undefined
+    return this.operate(() => this.completionReply(provider, messages, mentions, requestedSelection, conversationId))
+  }
+
+  private async completionReply(
+    provider: TwinnyProvider,
+    messages: ChatCompletionMessage[],
+    mentions?: MentionType[],
+    requestedSelection?: AgentSelection,
+    conversationId?: string
+  ): Promise<string | undefined> {
     // Gathering context can take a while (a workspace search, the team's
     // policy); a conversation left meanwhile stops this reply too.
     this._preparing = true
@@ -798,6 +841,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
       // Mycroft starts only after Feedback has produced an authoritative plan
       // (or Feedback is off). The gate holds the turn on any other outcome.
+      this._userRequestsTodo = userRequestsTodoCreation(this.latestUserText(messages) ?? "")
       const planning = isFeedbackEnabled(workspace.getConfiguration("twinny"))
         ? this.startFeedbackPlanning(messages)
         : undefined
@@ -810,17 +854,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
               const base = snapshot.prompt
               const baseLayers = [snapshot.hasTeamPolicy ? "team-policy" : "", snapshot.instructions.content.trim() ? "chat-base" : ""].filter(Boolean)
               const agentId = this._activeAgent?.summary.id ?? this._requestAgentSelection
-              const taskContext = await this.activeIntentTaskProjection()
+              // The active task is not part of this turn-start prompt: every request
+              // of the turn adds it through planRequestContext, so a revision made
+              // during the reply reaches the next request.
               if (this._requestAgentSelection === "off") {
-                logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=off order=" + [...baseLayers, ...(taskContext ? ["active-intent-task"] : []), "runtime-user-context", ...(view ? ["provider-tool-definitions"] : [])].join(","))
-                return taskContext ? base + "\n\n" + taskContext : base
+                logger.debug("[Prompt] chat mode=" + snapshot.instructions.mode + " agent=off order=" + [...baseLayers, "runtime-user-context", ...(view ? ["provider-tool-definitions"] : [])].join(","))
+                return base
               }
-              const workspaceContext = await this.agentWorkspaceContext(view)
-              const context = [workspaceContext, taskContext].filter(Boolean).join("\n\n")
+              const context = await this.agentWorkspaceContext(view)
               const layers = [...baseLayers]
               if (this._activeAgent?.profile.instructions.trim()) layers.push("agent-profile")
-              if (workspaceContext.trim()) layers.push("workspace-context")
-              if (taskContext) layers.push("active-intent-task")
+              if (context.trim()) layers.push("workspace-context")
               if (this._missingMcpCapabilities.length) layers.push("mcp-capability-notes")
               layers.push("runtime-user-context")
               if (view) layers.push("provider-tool-definitions")
@@ -850,8 +894,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   public async templateCompletion(template: string, context?: string) {
     const provider = this.start()
     if (!provider) return ""
-    this._conversation = await this.buildTemplateConversation(template, context)
-    return this.run(provider)
+    return this.operate(async () => {
+      this._conversation = await this.buildTemplateConversation(template, context)
+      return this.run(provider)
+    })
   }
 
   /**
@@ -866,24 +912,26 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   ): Promise<string> {
     const provider = this.start()
     if (!provider) return ""
-    const code = formatContextEntries(attached)
-    const content = (code ? `${prompt}\n\nAttached code:\n\n${code}` : prompt).trim()
-    this._bridge.emit(EVENT_NAME.twinnySetTab, WEBUI_TABS.chat)
-    this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
-      role: USER,
-      content: display,
-      prompt: content
-    })
-    if (!this._conversation.length) {
+    return this.operate(async () => {
+      const code = formatContextEntries(attached)
+      const content = (code ? `${prompt}\n\nAttached code:\n\n${code}` : prompt).trim()
+      this._bridge.emit(EVENT_NAME.twinnySetTab, WEBUI_TABS.chat)
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
+        role: USER,
+        content: display,
+        prompt: content
+      })
+      if (!this._conversation.length) {
+        this._conversation = [
+          { role: SYSTEM, content: await this._context.systemPrompt() }
+        ]
+      }
       this._conversation = [
-        { role: SYSTEM, content: await this._context.systemPrompt() }
+        ...this._conversation,
+        { role: USER, content }
       ]
-    }
-    this._conversation = [
-      ...this._conversation,
-      { role: USER, content }
-    ]
-    return this.run(provider)
+      return this.run(provider)
+    })
   }
 
   /**
@@ -897,8 +945,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   ): Promise<string> {
     const provider = this.start()
     if (!provider) return ""
-    this._conversation = messages
-    return this.run(provider, prefix)
+    return this.operate(() => {
+      this._conversation = messages
+      return this.run(provider, prefix)
+    })
   }
 
   /** One-shot, no UI: used for conversation titles and commit messages. */
@@ -1000,9 +1050,24 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
   /** Common preamble: clear the stop flag, tell the webview the language. */
   private start(): TwinnyProvider | undefined {
-    this._generation.reset()
+    // A new stop flag must not undo a stop of an operation still finishing.
+    if (!this._lifecycle.active) this._generation.reset()
     this._bridge.emit(EVENT_NAME.twinnySendLanguage, getLanguage())
     return this.getProvider()
+  }
+
+  /**
+   * Runs one whole operation: Feedback planning, every model turn and automatic
+   * continuation, and reviews. The webview keeps Stop until the operation's
+   * terminal `twinnyStopGeneration` is emitted.
+   */
+  private operate<T>(body: () => Promise<T>): Promise<T> {
+    return this._lifecycle.run(body)
+  }
+
+  /** A reconnected webview has lost its composer state; re-announce an open operation. */
+  public announceOperation() {
+    this._lifecycle.reannounce()
   }
 
   /**
@@ -1149,16 +1214,33 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       .catch((error: unknown) => logger.error("[Todo] could not record the runtime tool inventory: " + String(error)))
   }
 
+  private currentSourceReader(): CurrentSourceReader | undefined {
+    const view = this.toolsView()
+    if (!view) return undefined
+    return async (path) => {
+      try {
+        return await view.text(view.resolve(path, "file"))
+      } catch {
+        return undefined
+      }
+    }
+  }
+
   private async reviewTodoTasks(
     scope: TodoListRequest,
     itemId?: string,
     changes?: ReplyChangesView,
-    options: { strict?: boolean; finalResponse?: string; requireWorkspaceChanges?: boolean; signal?: AbortSignal } = {}
+    options: { strict?: boolean; finalResponse?: string; requireWorkspaceChanges?: boolean; signal?: AbortSignal; attempted?: Set<string> } = {}
   ): Promise<TodoEvaluation[]> {
     if (!this._todoRepository) return []
+    const attempted = options.attempted ?? new Set<string>()
     const reviews = await this._todoRepository.getReviewPackages(scope)
-    const candidates = reviewCandidates(reviews, itemId)
+    const candidates = reviewCandidates(reviews, itemId).filter((review) => !attempted.has(review.task.id + "@" + review.task.version))
     if (!candidates.length) {
+      if (itemId && reviews.some((review) => review.task.id === itemId && !dependenciesComplete(review))) {
+        logger.info("[Feedback] TODO " + itemId + " is awaiting completed dependencies before review")
+        return []
+      }
       if (itemId) throw new Error("This TODO is not awaiting evaluation")
       return []
     }
@@ -1171,9 +1253,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return []
     }
     let providerFailure: string | undefined
+    const readCurrentSource = this.currentSourceReader()
     const evaluations = await Promise.all(candidates.map(async (review) => {
+      attempted.add(review.task.id + "@" + review.task.version)
       try {
-        const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async (correction) => {
+        const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async (correction, reconciliations) => {
           const controller = new AbortController()
           let timeout: ReturnType<typeof setTimeout>
           const abortFromExecution = () => controller.abort(options.signal?.reason)
@@ -1186,15 +1270,19 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
               reject(error)
             }, 30_000)
           })
+          const stopped = new Promise<never>((_, reject) => {
+            if (controller.signal.aborted) reject(controller.signal.reason)
+            else controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true })
+          })
           try {
             try {
               return await Promise.race([readText(resolveInferenceProvider(provider).chat({
               model: provider.modelName,
               messages: [
                 { role: SYSTEM, content: todoReviewSystemPrompt },
-                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse) + (correction ? "\n\nCorrection required: " + correction : "") }
+                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse, reconciliations) + (correction ? "\n\nCorrection required: " + correction : "") }
               ] as ChatCompletionMessage[]
-            }, { signal: controller.signal, trace: { operationId: `feedback-evaluation-${randomUUID()}`, operationKind: "feedback", requestId: `request-${randomUUID()}`, provider: provider.provider } })), timedOut])
+            }, { signal: controller.signal, trace: { operationId: `feedback-evaluation-${randomUUID()}`, operationKind: "feedback", requestId: `request-${randomUUID()}`, provider: provider.provider } })), timedOut, stopped])
             } catch (error) {
               throw new TodoEvaluationProviderError(redact(isCancelled(error) ? "Feedback evaluation was cancelled" : describeProviderError(error, provider)))
             }
@@ -1205,7 +1293,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         }, provider.modelName, {
           requireWorkspaceChanges: options.requireWorkspaceChanges && taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria),
           hasVerifiedFileChanges: !!changes?.files.length,
-          allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal)
+          allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal),
+          readCurrentSource
         })
         logger.info("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
         const snapshot = await this._todoRepository!.getList(scope)
@@ -1219,7 +1308,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }))
     if (providerFailure) this._bridge.emit(EVENT_NAME.twinnyNotification, "Feedback evaluation failed (" + provider.label + "): " + providerFailure)
-    return evaluations.filter((evaluation): evaluation is TodoEvaluation => !!evaluation)
+    const results = evaluations.filter((evaluation): evaluation is TodoEvaluation => !!evaluation)
+    if (!itemId && !options.signal?.aborted && results.some((evaluation) => evaluation.decision === "accept")) {
+      // A verified task can unblock dependents; review them once, without repeating tasks already attempted in this call.
+      return [...results, ...(await this.reviewTodoTasks(scope, undefined, changes, { ...options, attempted }))]
+    }
+    return results
   }
 
   private async reconcileIntentTurn(
@@ -1248,6 +1342,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const requireChanges = requiresWorkspaceChanges(goal)
     let evaluation: TodoEvaluation | undefined
     let reviewFailure: string | undefined
+    let awaitingDependencies: string[] = []
     const before = await this._todoRepository.getList({ ...scope, includeCompleted: true })
     let current = before.items.find((item) => item.id === intent.task.id)
 
@@ -1262,16 +1357,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         })
       }
       const reviewId = "feedback.review." + intent.planTaskId
-      this._steps.review(reviewId, `Feedback reviewing \`${intent.task.title}\``, "running")
+      awaitingDependencies = intent.dependencies.filter((dependency) => dependency.status !== "completed").map((dependency) => dependency.title)
+      if (!awaitingDependencies.length) this._steps.review(reviewId, `Feedback reviewing \`${intent.task.title}\``, "running")
       try {
-        const results = await this.reviewTodoTasks(scope, current.id, changes, {
+        // A claim with unfinished prerequisites keeps its evidence and waits; Feedback is not consulted until they complete.
+        const results = awaitingDependencies.length ? [] : await this.reviewTodoTasks(scope, current.id, changes, {
           strict: true,
           finalResponse,
           requireWorkspaceChanges: requireChanges,
           signal: this._executionAbort?.signal
         })
         evaluation = results.find((result) => result.taskId === intent.planTaskId)
-        if (!evaluation) throw new Error("Independent evaluator returned no decision for the active task")
+        if (!evaluation && !awaitingDependencies.length) throw new Error("Independent evaluator returned no decision for the active task")
       } catch (error) {
         reviewFailure = error instanceof Error ? error.message : String(error)
         logger.error("[Execution] independent evaluation failed (" + (error instanceof TodoEvaluationProviderError ? "provider" : "validation/parsing") + "): " + redact(reviewFailure))
@@ -1279,10 +1376,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       const accepted = !reviewFailure && evaluation?.decision === "accept"
       const verdict = reviewFailure
         ? `Feedback could not evaluate \`${intent.task.title}\`: ${reviewFailure}`
-        : accepted
-          ? `Feedback accepted \`${intent.task.title}\``
-          : `Feedback ${evaluation?.decision === "blocked" ? "blocked" : "rejected"} \`${intent.task.title}\`${evaluation?.explanation ? `: ${evaluation.explanation}` : ""}`
-      this._steps.review(reviewId, verdict.slice(0, 300), accepted ? "done" : "failed", verdict.length > 300 ? verdict : undefined)
+        : awaitingDependencies.length
+          ? `Awaiting dependencies for \`${intent.task.title}\`: ${awaitingDependencies.join(", ")}`
+          : accepted
+            ? `Feedback accepted \`${intent.task.title}\``
+            : `Feedback ${evaluation?.decision === "blocked" ? "blocked" : "rejected"} \`${intent.task.title}\`${evaluation?.explanation ? `: ${evaluation.explanation}` : ""}`
+      if (!awaitingDependencies.length) this._steps.review(reviewId, verdict.slice(0, 300), accepted ? "done" : "failed", verdict.length > 300 ? verdict : undefined)
     }
 
     if (this.cancelled || workflow.state === "cancelled") {
@@ -1371,7 +1470,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const progress = `${next.planTaskId}|${next.task.status}`
     const decision = evaluation?.decision === "revise" ? "revise" : "needs_evidence"
     const passedCriteria = evaluation?.criteria.filter((criterion) => criterion.status === "passed").map((criterion) => criterion.criterion) ?? []
-    const outcome = evaluation?.decision === "accept"
+    const outcome = evaluation?.decision === "accept" || awaitingDependencies.length
       ? workflow.advanceAcceptedTask(progress)
       : workflow.reconcile(decision, progress, workflow.recordEvidence({ observations: next.observations ?? [], passedCriteria }))
     if (!outcome.continue) {
@@ -1386,7 +1485,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ? [recovery.reason, "Diagnostics: " + recovery.diagnostics, "The regression was rolled back. Reinspect diagnostics before making a corrected edit."]
       : reviewFailure
         ? [`Independent evaluation failed: ${reviewFailure}. Do not treat this as approval; continue with verifiable work.`]
-        : evaluation?.decision === "accept"
+        : awaitingDependencies.length
+          ? [`The completion claim for ${intent.task.title} is preserved and waits for its prerequisites (${awaitingDependencies.join(", ")}). It is reviewed automatically once they verify, so do not resubmit it. Continue with the next unresolved task.`]
+          : evaluation?.decision === "accept"
         ? [`The prior task was accepted. Begin the next unresolved task now: ${next.task.title}. Use the verified observations below instead of repeating source discovery.`]
         : [
             ...(evaluation?.problems ?? ["The requested outcome is not yet demonstrated."]),
@@ -1403,12 +1504,24 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         const problem = task.problems.length ? ` — problem: ${task.problems[0]}` : ""
         return `${task.itemId} (version ${task.version}, ${task.status}): ${task.title}${needs}${problem}`
       })
+    const nextOutline = outline?.tasks.find((task) => task.itemId === next.planTaskId)
+    const unmetCriteria = nextOutline?.unmetCriteria.length ? nextOutline.unmetCriteria : next.acceptanceCriteria
+    const unresolvedEvidence = next.planTaskId === intent.planTaskId
+      ? (evaluation?.criteria ?? []).flatMap((criterion) => {
+          if (criterion.status === "passed" || !criterion.reconciliation) return []
+          const { outcome, supportingObservationIds, missing } = criterion.reconciliation
+          const established = supportingObservationIds.length ? `established by [${supportingObservationIds.join("], [")}]` : "no trusted observation establishes it"
+          const gap = missing.length ? `; missing: ${missing.slice(0, 3).join("; ")}` : ""
+          return [`${criterion.criterion} — ${outcome}; ${established}${gap}`]
+        })
+      : []
     return continuationContext({
       goal,
       constraints: intent.constraints,
-      task: `${next.task.title}${next.task.details ? ` — ${next.task.details}` : ""}`,
+      task: `${next.planTaskId}: ${next.task.title}${next.task.details ? ` — ${next.task.details}` : ""}`,
       todoTargets,
-      criteria: next.acceptanceCriteria,
+      criteria: unmetCriteria,
+      unresolvedEvidence,
       feedback,
       verifiedObservations: [
         ...(intent.observations ?? []).filter((observation) => !observation.failed).slice(0, 5).map((observation) => {
@@ -1423,6 +1536,21 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     })
   }
 
+  /** Post the TODO repository's status when the plan is incomplete or any tool operation failed. */
+  private async emitAuthoritativeReport(scope: TodoListRequest): Promise<void> {
+    if (!this._todoRepository) return
+    try {
+      const outline = await this._todoRepository.getPlanOutline(scope)
+      if (!outline || !outline.tasks.length) return
+      const failed = await this._todoRepository.failedToolOperations(scope)
+      const complete = outline.tasks.every((task) => task.status === "completed" || task.status === "cancelled")
+      if (complete && !failed.length) return
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: authoritativeExecutionReport(outline, failed) })
+    } catch (error) {
+      logger.warn(`[Execution] Could not build the authoritative TODO report: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   private activeTodoScope(): TodoListRequest | undefined {
     if (!this._todoRepository || !this._activeConversationId) return undefined
     return {
@@ -1431,12 +1559,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
+  /** Host state for one request: the active task and the plan, read as of this request. */
   private async planRequestContext(): Promise<string | undefined> {
     const scope = this.activeTodoScope()
     if (!scope || !this._todoRepository) return undefined
     try {
       const outline = await this._todoRepository.getPlanOutline(scope)
-      return outline && outline.tasks.length ? renderPlanContext(outline) : undefined
+      const plan = outline && outline.tasks.length ? renderPlanContext(outline) : ""
+      const task = await this.activeIntentTaskProjection()
+      return [task, plan].filter(Boolean).join("\n\n") || undefined
     } catch (error) {
       logger.warn(`[Intent] Could not load the TODO plan for this request: ${error instanceof Error ? error.message : String(error)}`)
       return undefined
@@ -1684,6 +1815,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       })
     }
     if (!this.cancelled && (!recoveryNotice || recoveryNotice.restored)) await activeCheckpoints?.clear()
+    if (reply !== undefined && feedbackEnabled && todoScope) await this.emitAuthoritativeReport(todoScope)
     if (this._activeExecution === execution) {
       this._executionAbort = undefined
       this._activeExecution = undefined
@@ -1714,7 +1846,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       void this._todoRepository!.getList(scope).then((snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)).catch((error) => {
         logger.error(`Native TODO snapshot refresh failed: ${error}`)
       })
-    })
+    }, this.todoToolOptions())
     // TODO tools are always offered: agent profile tool restrictions must not hide task tracking.
     logger.info(`[ToolTrace] outgoing=${available.tools.length} native TODO tools: ${available.tools.map((tool) => tool.name).join(", ")}`)
     hooks.onTools(available)
@@ -1819,6 +1951,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       todos: this._todoRepository && todoScope ? {
         repository: this._todoRepository,
         scope: todoScope,
+        options: this.todoToolOptions(),
         onChanged: () => {
           void this._todoRepository!.getList(todoScope).then((snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)).catch((error) => {
             logger.error(`Native TODO snapshot refresh failed: ${error}`)
