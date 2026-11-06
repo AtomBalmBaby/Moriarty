@@ -20,6 +20,7 @@ export const FEEDBACK_PLAN_PROTOCOL =
   "Use {\"track\": false, \"plan\": null} when the message needs no tracked work (a question, greeting, or a follow-up that the existing plan already covers). " +
   "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, acceptanceCriteria: string[], dependencies: string[]}]}. " +
   "Include 1-100 ordered tasks with stable IDs and no unknown or cyclic dependencies. Ground every task in the user's request; do not invent requirements. " +
+  "Each task must be user work. Do not include tasks that create, initialize, or organize the TODO list itself; Twinny records the plan automatically. " +
   "When an existing plan is supplied, preserve its planId and unchanged task IDs, and increase revision only when task definitions change."
 
 export const DEFAULT_FEEDBACK_PLAN_TIMEOUT_MS = 60_000
@@ -29,6 +30,29 @@ export type FeedbackPlanParse =
   | { track: true; plan: IntentTaskPlan }
   | { error: string }
 
+const BOOKKEEPING_TASK = /\b(?:initiali[sz]e|set\s+up|populate|create|record|track|maintain)\s+(?:the\s+|a\s+|an\s+|our\s+)?(?:(?:investigation|planning|progress|plan|task)\s+)?(?:todos?|todo\s+list|task\s+list|plan\s+items?|tracking\s+items?)\b/i
+
+/**
+ * Removes plan-management tasks that Twinny already performs itself. Dependencies on a removed task are dropped with it.
+ */
+export const removeBookkeepingTasks = (plan: unknown): unknown => {
+  if (!plan || typeof plan !== "object" || !Array.isArray((plan as { tasks?: unknown }).tasks)) return plan
+  const candidate = plan as { tasks: { id?: unknown; title?: unknown; description?: unknown; dependencies?: unknown }[] }
+  const isBookkeeping = (task: { title?: unknown; description?: unknown }) => {
+    const text = [task.title, task.description].filter((part): part is string => typeof part === "string").join(" ")
+    return BOOKKEEPING_TASK.test(text)
+  }
+  const removed = new Set(candidate.tasks.filter(isBookkeeping).map((task) => String(task.id)))
+  if (!removed.size) return plan
+  const tasks = candidate.tasks
+    .filter((task) => !removed.has(String(task.id)))
+    .map((task) => ({
+      ...task,
+      dependencies: Array.isArray(task.dependencies) ? task.dependencies.filter((id) => !removed.has(String(id))) : task.dependencies
+    }))
+  return { ...candidate, tasks }
+}
+
 export const parseFeedbackPlanResponse = (output: string | undefined): FeedbackPlanParse => {
   const { value, error } = extractJsonObject(output)
   if (!value) return { error: error ?? "The provider response was not valid JSON." }
@@ -36,7 +60,7 @@ export const parseFeedbackPlanResponse = (output: string | undefined): FeedbackP
   if (unexpected.length) return { error: "Unexpected keys: " + unexpected.join(", ") + "." }
   if (typeof value.track !== "boolean") return { error: "track must be a boolean." }
   if (!value.track) return { track: false }
-  const validation = validateIntentTaskPlan(value.plan)
+  const validation = validateIntentTaskPlan(removeBookkeepingTasks(value.plan))
   if (!validation.plan) return { error: "Invalid task plan: " + (validation.diagnostic ?? "validation failed") }
   return { track: true, plan: validation.plan }
 }

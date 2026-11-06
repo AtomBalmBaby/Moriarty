@@ -67,7 +67,7 @@ const statusTransitions: Record<TodoStatus, Set<TodoStatus>> = {
   pending: new Set(["in_progress", "in_review", "blocked", "cancelled"]),
   in_progress: new Set(["pending", "in_review", "blocked", "cancelled"]),
   in_review: new Set(["in_progress", "blocked", "cancelled"]),
-  blocked: new Set(["pending", "in_progress", "cancelled"]),
+  blocked: new Set(["pending", "in_progress", "in_review", "cancelled"]),
   completed: new Set(["pending", "in_progress"]),
   cancelled: new Set(["pending", "in_progress"])
 }
@@ -190,6 +190,15 @@ export interface TrustedUserApproval {
 export const trustedTodoPanelApproval: TrustedUserApproval = Object.freeze({ source: "todo-panel" })
 
 const normalizeTodoTitle = (title: string) => title.toLowerCase().replace(/\s+/g, " ").replace(/[\s.!:;]+$/, "").trim()
+const normalizeTodoIdentity = (title: string) => normalizeTodoTitle(title)
+  .split(" ")
+  .filter((word) => word && word !== "the" && word !== "a" && word !== "an")
+  .join(" ")
+const PLACEHOLDER_BLOCK_REASONS = new Set(["no reason", "none", "n/a", "na", "tbd", "todo", "unknown", "blocked", "-"])
+const isPlaceholderBlockReason = (reason: string) => {
+  const normalized = normalizeTodoTitle(reason).replace(/[.!?]+$/, "")
+  return normalized.length < 8 || PLACEHOLDER_BLOCK_REASONS.has(normalized)
+}
 
 const validateRequestId = (requestId: string) => {
   if (!requestId.trim() || requestId.length > 200) throw new Error("A request ID between 1 and 200 characters is required")
@@ -661,12 +670,12 @@ export class TodoRepository {
         if (!parent) throw new Error("Parent TODO item must be in the active conversation")
       }
       if (actor === "model") {
-        const wanted = normalizeTodoTitle(title)
+        const wanted = normalizeTodoIdentity(title)
         const existing = rows<ItemRow>(
           database,
           "SELECT * FROM todo_items WHERE list_id = ? AND status != 'cancelled' AND COALESCE(parent_id, '') = ? ORDER BY sort_order, created_at",
           [list.id, parentId ?? ""]
-        ).find((row) => normalizeTodoTitle(row.title) === wanted)
+        ).find((row) => normalizeTodoIdentity(row.title) === wanted)
         if (existing) {
           const item = itemOf(existing)
           recordRequest(database, list.id, requestId, "create", item)
@@ -723,17 +732,34 @@ export class TodoRepository {
       let blockedReason = patch.blockedReason === undefined ? row.blocked_reason : patch.blockedReason
       if (!validStatuses.has(status)) throw new Error("Invalid TODO status")
       if (status === "completed") {
-        if (input.actor !== "user") status = "in_review"
+        if (input.actor !== "user") {
+          status = "in_review"
+        }
         else if (row.status === "completed") throw new Error("Reopen a completed TODO before updating it")
         else throw new Error("Use explicit user completion to approve a TODO")
       }
-      if (status === "blocked" && !blockedReason?.trim()) throw new Error("A blocked TODO requires a reason")
+      if (status === "blocked" && (!blockedReason?.trim() || isPlaceholderBlockReason(blockedReason))) {
+        throw new Error("A blocked TODO requires a specific reason describing the external condition that prevents progress")
+      }
       if (status !== "blocked") blockedReason = null
       const verification = row.status === "completed" ? "not_checked" : row.verification
       const allowed = statusTransitions[row.status]
       if (status !== row.status && !allowed.has(status)) throw new Error(`Invalid TODO transition: ${row.status} -> ${status}`)
 
       const updatedAt = now()
+      const unchangedState = title === row.title
+        && (details ?? null) === (row.details ?? null)
+        && status === row.status
+        && priority === row.priority
+        && sortOrder === row.sort_order
+        && (blockedReason ?? null) === (row.blocked_reason ?? null)
+        && verification === row.verification
+      if (unchangedState) {
+        const unchanged = itemOf(row)
+        recordRequest(database, list.id, input.requestId, "update", unchanged)
+        logTodoEvent("todo.update.noop", { operation_id: list.id, item_id: row.id, status: row.status, version: row.version, actor: input.actor, request_id: input.requestId })
+        return unchanged
+      }
       if (sortOrder !== row.sort_order) {
         const neighbor = rows<ItemRow>(database, "SELECT * FROM todo_items WHERE list_id = ? AND sort_order = ?", [list.id, sortOrder])[0]
         if (!neighbor) throw new Error("Cannot move TODO beyond the list boundary")

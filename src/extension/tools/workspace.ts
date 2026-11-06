@@ -677,7 +677,7 @@ const searchWorkspace = (view: WorkspaceView, index: WorkspaceSearchProvider): T
   parameters: [
     { name: "query", description: "Filename, symbol, exact source text, or regular expression." },
     { name: "mode", description: "auto, path, symbol, literal, or regex; defaults to auto.", optional: true },
-    { name: "path", description: "Optional workspace-relative path/glob filter.", optional: true },
+    { name: "path", description: "Optional workspace-relative file, directory prefix (for example src/extension), or glob (for example src/**/*.ts) filter.", optional: true },
     { name: "limit", description: "Maximum result count, 1-100.", optional: true, type: "integer" },
     { name: "offset", description: "Zero-based result offset for pagination.", optional: true, type: "integer" }
   ],
@@ -688,7 +688,7 @@ const searchWorkspace = (view: WorkspaceView, index: WorkspaceSearchProvider): T
     properties: {
       query: { type: "string", minLength: 1 },
       mode: { type: "string", enum: ["auto", "path", "symbol", "literal", "regex"], default: "auto" },
-      path: { type: "string" },
+      path: { type: "string", description: "Workspace-relative file, directory prefix (for example src/extension), or glob (for example src/**/*.ts)." },
       limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
       offset: { type: "integer", minimum: 0, default: 0 }
     }

@@ -1271,13 +1271,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
     if (evaluation?.decision === "blocked" || current?.status === "blocked") {
       const reason = evaluation?.explanation ?? current?.blockedReason ?? "The active task is blocked."
-      workflow.reconcile("blocked", "blocked:" + intent.planTaskId)
-      this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
-        role: ASSISTANT,
-        content: `Execution is blocked: ${reason.slice(0, 800)}`
-      })
-      logger.warn("[Execution] blocked: " + reason)
-      return undefined
+      const alternative = evaluation?.decision === "blocked" ? undefined : await this._todoRepository.getActiveIntentContext(scope)
+      if (!alternative || alternative.planTaskId === intent.planTaskId) {
+        workflow.reconcile("blocked", "blocked:" + intent.planTaskId)
+        this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
+          role: ASSISTANT,
+          content: `Execution is blocked: ${reason.slice(0, 800)}`
+        })
+        logger.warn("[Execution] blocked: " + reason)
+        return undefined
+      }
+      logger.warn("[Execution] task blocked; continuing with independent task " + alternative.planTaskId + ": " + reason)
     }
 
     if (allIntentTasksComplete(allPlanTasks.map((task) => task.status))) {

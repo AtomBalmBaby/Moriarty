@@ -181,6 +181,32 @@ const globRegex = (glob: string): RegExp => {
   return new RegExp(`${source}$`, "i")
 }
 const matches = (value: string, filter: string | undefined): boolean => !filter || minimatch(value, filter, { dot: true, nocase: true })
+const pathFilterMatches = (value: string, filter: string | undefined): boolean => {
+  const wanted = filter?.trim().replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/\/+$/, "") ?? ""
+  if (!wanted) return true
+  if (/[*?[\]{}]/.test(wanted)) return minimatch(value, wanted, { dot: true, nocase: true, matchBase: !wanted.includes("/") })
+  const lowerValue = value.toLowerCase()
+  const lowerWanted = wanted.toLowerCase()
+  return lowerValue === lowerWanted || lowerValue.startsWith(`${lowerWanted}/`)
+}
+const NON_SOURCE_PATH = /(^|\/)(tests?|__tests__|docs?)\/|\.(test|spec)\.|\.md$/i
+const contentRank = (query: string, relativePath: string, text: string, offset: number): { offset: number; rank: number } => {
+  let rank = 0
+  let position = offset
+  if (/^[A-Za-z_$][\w$]*$/.test(query)) {
+    const name = query.replace(/\$/g, "\\$")
+    const definition = new RegExp(`\\b(?:function|class|interface|type|enum|const|let|var|def|fn)\\s+${name}\\b|\\b${name}\\s*[:=]\\s*(?:async\\s+)?(?:function\\b|\\(|\\[)`).exec(text)
+    const registration = definition ? null : new RegExp(`\\bname\\s*:\\s*["'\`]${name}["'\`]`).exec(text)
+    if (definition) {
+      position = definition.index
+      rank = 2
+    } else if (registration) {
+      position = registration.index
+      rank = 1
+    }
+  }
+  return { offset: position, rank: rank * 2 + (NON_SOURCE_PATH.test(relativePath) ? 0 : 1) }
+}
 interface GitIgnoreRule {
   basePath: string
   pattern: string
@@ -596,7 +622,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       const scoped = !selectedScope || folder?.uri.toString() === selectedScope || doc.workspace_uri === selectedScope || folder?.uri.fsPath === selectedScope
       const included = include.some((pattern) => matches(localPath, pattern) || matches(doc.relative_path, pattern))
       const excluded = exclude.some((pattern) => matches(localPath, pattern) || matches(doc.relative_path, pattern))
-      return scoped && included && !excluded && matches(doc.relative_path, request.path)
+      return scoped && included && !excluded && (pathFilterMatches(localPath, request.path) || pathFilterMatches(doc.relative_path, request.path))
     })
     const documentsByUri = new Map(documents.map((doc) => [doc.uri, doc]))
     const offset = Math.max(0, Math.floor(request.offset ?? 0))
@@ -651,6 +677,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         }
       }
     }
+    const contentHits: Array<{ rank: number; hit: WorkspaceSearchHit }> = []
     if (mode === "literal" || mode === "regex" || mode === "auto") {
       let regex: RegExp | undefined
       if (mode === "regex") regex = new RegExp(query, "g")
@@ -672,11 +699,13 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         let offset = regex ? regex.exec(row.text)?.index ?? -1 : row.text.indexOf(query)
         if (offset < 0 && mode === "auto") offset = row.text.toLowerCase().indexOf(firstTerm.toLowerCase())
         if (offset < 0) return
+        const ranked = contentRank(query, doc.relative_path, row.text, offset)
+        offset = ranked.offset
         const position = lineColumn(row.text, offset)
         const lineStart = row.text.lastIndexOf("\n", offset - 1) + 1
         const lineEnd = row.text.indexOf("\n", offset)
         const preview = row.text.slice(lineStart, lineEnd < 0 ? undefined : lineEnd).trim().slice(0, 240)
-        add({ uri: row.uri, path: doc.relative_path, line: position.line, column: position.column, category: "content", preview, source: "index" })
+        contentHits.push({ rank: ranked.rank, hit: { uri: row.uri, path: doc.relative_path, line: position.line, column: position.column, category: "content", preview, source: "index" } })
       }
       try {
         await eachRow<{ uri: string; text: string }>(database, sql, values, visitContent)
@@ -694,12 +723,17 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         let offset = regex ? regex.exec(text)?.index ?? -1 : text.indexOf(query)
         if (offset < 0 && mode === "auto") offset = text.toLowerCase().indexOf(firstTerm.toLowerCase())
         if (offset < 0) continue
+        const ranked = contentRank(query, indexed.relative_path, text, offset)
+        offset = ranked.offset
         const position = lineColumn(text, offset)
         const lineStart = text.lastIndexOf("\n", offset - 1) + 1
         const lineEnd = text.indexOf("\n", offset)
         const preview = text.slice(lineStart, lineEnd < 0 ? undefined : lineEnd).trim().slice(0, 240)
-        add({ uri, path: indexed.relative_path, line: position.line, column: position.column, category: "content", preview, source: "live" })
+        contentHits.push({ rank: ranked.rank, hit: { uri, path: indexed.relative_path, line: position.line, column: position.column, category: "content", preview, source: "live" } })
       }
+      contentHits
+        .sort((a, b) => b.rank - a.rank || a.hit.path.localeCompare(b.hit.path) || (a.hit.line ?? 0) - (b.hit.line ?? 0))
+        .forEach(({ hit }) => add(hit))
     }
     this.throwIfSignalAborted(signal)
     return { results: hits, total }

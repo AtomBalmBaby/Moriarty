@@ -7,6 +7,7 @@ import initSqlJs from "sql.js"
 
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
+import { parseFeedbackPlanResponse } from "../../extension/chat/feedback-planner"
 import { compactEvidenceText, compactToolEvidence, MAX_EVIDENCE_TEXT } from "../../extension/todos/evidence"
 import { evaluateTodoReview, feedbackContext, parseTodoEvaluation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput } from "../../extension/todos/feedback"
 import { renderPlanContext } from "../../extension/todos/plan-context"
@@ -834,4 +835,23 @@ test("the native TODO tools are offered to the agent by default and dispatch to 
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }
+})
+
+test("feedback plans omit TODO bookkeeping tasks but keep distinct user work", () => {
+  const plan = {
+    planId: "plan-bookkeeping",
+    version: 1,
+    revision: 1,
+    goal: "Index the workspace search",
+    constraints: [],
+    tasks: [
+      { id: "init", title: "Initialize investigation TODOs", description: "Create the TODO entries for this plan", acceptanceCriteria: ["TODOs exist"], dependencies: [] },
+      { id: "locate", title: "Locate read_file definition", description: "Find the native tool", acceptanceCriteria: ["Path identified"], dependencies: ["init"] },
+      { id: "task-list-ui", title: "Add task list component", description: "Render the task list panel", acceptanceCriteria: ["Panel renders"], dependencies: ["locate"] }
+    ]
+  }
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan }))
+  assert.ok("plan" in parsed, "the plan must remain valid after removing bookkeeping")
+  assert.deepEqual(parsed.plan.tasks.map((task) => task.id), ["locate", "task-list-ui"])
+  assert.deepEqual(parsed.plan.tasks[0].dependencies, [])
 })

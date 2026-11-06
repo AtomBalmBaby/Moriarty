@@ -303,3 +303,60 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test("native TODO transitions reject placeholder blocks, recover blocked tasks, and ignore repeated completion claims", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-transition-todos-"))
+  try {
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-transitions"]), conversationId: "chat-transitions" }
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const item = await repository.createItem(scope, { title: "Locate the parser" }, "request-create-transition")
+
+    await assert.rejects(
+      repository.updateItem(scope, { itemId: item.id, expectedVersion: item.version, patch: { status: "blocked", blockedReason: "No reason" }, actor: "model", requestId: "block-placeholder" }),
+      /specific reason/
+    )
+    await assert.rejects(
+      repository.updateItem(scope, { itemId: item.id, expectedVersion: item.version, patch: { status: "blocked", blockedReason: "tbd" }, actor: "model", requestId: "block-tbd" }),
+      /specific reason/
+    )
+
+    const blocked = await repository.updateItem(scope, {
+      itemId: item.id, expectedVersion: item.version,
+      patch: { status: "blocked", blockedReason: "The parser module is missing from the workspace" }, actor: "model", requestId: "block-real"
+    })
+    assert.equal(blocked.status, "blocked")
+
+    const claimed = await repository.updateItem(scope, {
+      itemId: item.id, expectedVersion: blocked.version, patch: { status: "completed" }, actor: "model", requestId: "claim-1"
+    })
+    assert.equal(claimed.status, "in_review")
+    const repeated = await repository.updateItem(scope, {
+      itemId: item.id, expectedVersion: claimed.version, patch: { status: "completed" }, actor: "model", requestId: "claim-2"
+    })
+    assert.equal(repeated.status, "in_review")
+    assert.equal(repeated.version, claimed.version, "a repeated completion claim must not bump the version")
+
+    const recovered = await repository.updateItem(scope, {
+      itemId: item.id, expectedVersion: repeated.version, patch: { status: "in_progress" }, actor: "model", requestId: "recover"
+    })
+    assert.equal(recovered.status, "in_progress")
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("model-created TODO reconciliation ignores articles but keeps distinct tasks separate", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-dedupe-todos-"))
+  try {
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-dedupe"]), conversationId: "chat-dedupe" }
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const planned = await repository.createItem(scope, { title: "Locate and verify the native read_file definition" }, "plan-item", "user")
+    const recreated = await repository.createItem(scope, { title: "Locate and verify native read_file definition" }, "model-recreate")
+    assert.equal(recreated.id, planned.id)
+    const distinct = await repository.createItem(scope, { title: "Locate and verify native edit_lines definition" }, "model-distinct")
+    assert.notEqual(distinct.id, planned.id)
+    assert.equal((await repository.getList(scope)).items.length, 2)
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})

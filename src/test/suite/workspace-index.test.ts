@@ -183,6 +183,28 @@ suite("Persistent workspace intelligence index", () => {
     assert.ok((await index.search({ query: "workspaceSearchAcceptanceMarker = 'after'", mode: "literal" }, root)).total > 0)
     assert.equal(fs.readFileSync(path.join(storage, "twinny-state.sqlite"), "utf8"), "durable TODO database sentinel")
 
+    fs.mkdirSync(path.join(root, "test"), { recursive: true })
+    fs.writeFileSync(path.join(root, "src", "extension", "tools", "registry.ts"), "export function read_file(path: string) { return path }\nexport const tools = [{ name: \"read_file\" }]\n")
+    fs.writeFileSync(path.join(root, "test", "registry.test.ts"), "read_file('a')\nread_file('b')\n")
+    await index.rebuild()
+
+    const scoped = await index.search({ query: "read_file", mode: "auto", path: "src" }, root)
+    assert.ok(scoped.total > 0, "a bare directory filter must match nested files")
+    assert.ok(scoped.results.every((hit) => /(^|\/)src\//.test(hit.path)), "directory filter keeps only its subtree")
+    assert.ok(scoped.results.some((hit) => hit.path.endsWith("src/extension/tools/registry.ts")))
+    assert.ok((await index.search({ query: "read_file", mode: "auto", path: "src/extension/tools/" }, root)).total > 0, "trailing slash is accepted")
+    assert.ok((await index.search({ query: "read_file", mode: "auto", path: "./src/**/*.ts" }, root)).total > 0, "glob filters still apply")
+    assert.ok((await index.search({ query: "read_file", mode: "auto", path: "src/extension" }, root)).total > 0)
+
+    const unfiltered = await index.search({ query: "read_file", mode: "auto" }, root)
+    assert.ok(unfiltered.total > scoped.total, "unfiltered search still includes test files")
+    const firstContent = unfiltered.results.find((hit) => hit.category === "content")
+    assert.ok(firstContent && !/(^|\/)test\//.test(firstContent.path), "source definitions rank above test references")
+
+    const pageOne = await index.search({ query: "read_file", mode: "auto", path: "src", limit: 1 }, root)
+    assert.equal(pageOne.results.length, 1)
+    assert.equal(pageOne.total, scoped.total, "pagination keeps the filtered total")
+
     const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right)
     const globalState: vscode.Memento & { setKeysForSync(keys: readonly string[]): void } = {
       keys: () => [],

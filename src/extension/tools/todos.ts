@@ -117,7 +117,7 @@ export const todoTools = (
   },
   {
     name: "twinny_todo_update",
-    description: "Update a native TODO with optimistic concurrency. Setting status to completed is treated as a model completion claim and moves it to in_review. Only the user can approve completion, in the TODO panel; the model cannot complete or waive verification.",
+    description: "Update a native TODO with optimistic concurrency. Setting status to completed is treated as a model completion claim and moves it to in_review; repeating an identical claim changes nothing. Only the user can approve completion, in the TODO panel; the model cannot complete or waive verification. A blocked TODO can move to in_review when its blocker is resolved and the completion claim is supported by evidence, or back to pending or in_progress.",
     parameters: [
       { name: "item_id", description: "ID of the TODO item." },
       { name: "expected_version", description: "Current item version from twinny_todo_list or twinny_todo_get.", type: "integer" },
@@ -126,7 +126,7 @@ export const todoTools = (
       { name: "details", description: "Replacement details (empty clears details).", optional: true },
       { name: "status", description: "pending, in_progress, in_review, blocked, completed, or cancelled.", optional: true },
       { name: "priority", description: "low, normal, high, or urgent.", optional: true },
-      { name: "blocked_reason", description: "Required when setting status to blocked.", optional: true }
+      { name: "blocked_reason", description: "Required when setting status to blocked. Must name the specific external condition preventing progress (for example, 'the file is locked by another process'); placeholders such as 'No reason' are rejected.", optional: true }
     ],
     schema: {
       type: "object",
