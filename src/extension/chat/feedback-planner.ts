@@ -16,7 +16,8 @@ import type {
   ChildTodoProposal,
   ChildTodoReviewOutcome,
   IntentTaskPlan,
-  TodoListRequest
+  TodoListRequest,
+  TodoWriteRequest
 } from "../todos/types"
 import { TodoConflictError } from "../todos/types"
 
@@ -190,7 +191,7 @@ export interface AdministrativeRepair {
  * observations, and verification are not touched, because synchronization keeps them. A task whose title or description
  * is administrative, or that would be left with no criteria, is reported for a Feedback replan and left unchanged.
  */
-export const reconcileAdministrativeCriteria = async (repository: FeedbackPlanRepository, scope: TodoListRequest): Promise<AdministrativeRepair | undefined> => {
+export const reconcileAdministrativeCriteria = async (repository: FeedbackPlanRepository, scope: TodoWriteRequest): Promise<AdministrativeRepair | undefined> => {
   const stored = await repository.getIntentTaskPlan(scope)
   if (!stored) return undefined
   const offending = findAdministrativeClauses(stored)
@@ -411,7 +412,7 @@ const diagnose = (
 
 export interface FeedbackPlanRepository {
   getIntentTaskPlan(request: TodoListRequest): Promise<IntentTaskPlan | undefined>
-  synchronizeIntentPlan(request: TodoListRequest, candidate: unknown, intentResult: unknown): Promise<TodoListSnapshot>
+  synchronizeIntentPlan(request: TodoWriteRequest, candidate: unknown, intentResult: unknown): Promise<TodoListSnapshot>
 }
 
 export type FeedbackPlanStatus =
@@ -444,7 +445,7 @@ export interface FeedbackPlannerDeps {
 
 interface ActivePlanning {
   sequence: number
-  scope: TodoListRequest
+  scope: TodoWriteRequest
   controller: AbortController
   trace: InferenceTraceContext
   done: Promise<FeedbackPlanOutcome>
@@ -459,7 +460,7 @@ interface ActivePlanning {
 export class FeedbackPlanner {
   private _sequence = 0
   private _active?: ActivePlanning
-  private _last?: { scope: TodoListRequest; prompt: string }
+  private _last?: { scope: TodoWriteRequest; prompt: string }
 
   constructor(private readonly _deps: FeedbackPlannerDeps) {}
 
@@ -478,7 +479,7 @@ export class FeedbackPlanner {
     return this.start(last.scope, last.prompt)
   }
 
-  public start(scope: TodoListRequest, prompt: string, parentOperationId?: string): Promise<FeedbackPlanOutcome> {
+  public start(scope: TodoWriteRequest, prompt: string, parentOperationId?: string): Promise<FeedbackPlanOutcome> {
     if (!this._deps.enabled()) return Promise.resolve({ status: "disabled" })
     const repository = this._deps.repository()
     if (!repository) return Promise.resolve({ status: "unavailable", error: "TODO storage is unavailable." })
@@ -531,7 +532,7 @@ export class FeedbackPlanner {
 
   private async plan(
     active: ActivePlanning,
-    scope: TodoListRequest,
+    scope: TodoWriteRequest,
     request: string,
     repository: FeedbackPlanRepository
   ): Promise<FeedbackPlanOutcome> {
@@ -641,7 +642,7 @@ export class FeedbackPlanner {
    */
   private async synchronize(
     repository: FeedbackPlanRepository,
-    scope: TodoListRequest,
+    scope: TodoWriteRequest,
     proposed: IntentTaskPlan,
     seen: IntentTaskPlan | undefined,
     active: ActivePlanning

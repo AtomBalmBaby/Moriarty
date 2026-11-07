@@ -10,7 +10,7 @@
  * model's context fills after a couple of whole files.
  */
 import { TodoRepository } from "../todos/repository"
-import { TodoListRequest } from "../todos/types"
+import { TodoWriteRequest } from "../todos/types"
 
 import { planReplacement, Replacement } from "./edit"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
@@ -737,7 +737,7 @@ export interface ToolExtras {
   /** Whether the project's `AGENTS.md` files are read; on by default. */
   instructions?: boolean
   /** The canonical native TODO service and host-trusted chat scope. */
-  todos?: { repository: TodoRepository; scope: TodoListRequest; onChanged: () => void; options?: TodoToolOptions }
+  todos?: { repository: TodoRepository; scope: TodoWriteRequest; onChanged: () => void; options?: TodoToolOptions }
   /** Tools from MCP servers the user set up, and how to call one. */
   mcp?: McpSink
 }

@@ -4,8 +4,8 @@ import { logger, redact } from "../../common/logger"
 import type { ReplyChangesView, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TodoSourceFact } from "../../common/types"
 import { verifyContentFingerprint } from "../tools/fingerprint"
 
-import { describeGap, evidenceAnchors, evidenceGaps, type EvidenceSource, evidenceWindows, propositionNeedles, redactEvidence, samePath } from "./evidence"
-import { type AcceptedFact, type IntentPlanContext, type RetainedObservationEvidence, RUNTIME_INVENTORY_TOOL, type TodoReviewPackage } from "./types"
+import { codeIdentifiers, describeGap, evidenceAnchors, evidenceGaps, type EvidenceSource, evidenceWindows, isDefinitionCriterion, propositionNeedles, redactEvidence, samePath } from "./evidence"
+import { type AcceptedFact, type IntentPlanContext, type RetainedObservationEvidence, RUNTIME_INVENTORY_TOOL, type SymbolAlias, type TodoReviewPackage } from "./types"
 
 export const taskRequiresWorkspaceChanges = (task: Pick<TodoReviewPackage["task"], "title" | "details">, criteria: string[]): boolean => {
   const taskText = [task.title, task.details ?? "", ...criteria].join("\n")
@@ -244,7 +244,6 @@ const inventoryOutcome = (symbols: string[], records: RetainedObservationEvidenc
  * changed, or whose source cannot be read now, is not proof about the current file.
  */
 const NUMBERED_SOURCE_LINE = /^(\d+): (.*)$/
-const DEFINITION_CRITERION = /\b(defin\w*|declar\w*|implement\w*|locat\w*|where)\b/i
 
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
@@ -280,13 +279,55 @@ const symbolLocations = (record: RetainedObservationEvidence, symbol: string, de
   })
 }
 
+const NAME_PROPERTY_LINE = /\bname\s*:\s*["'`]([A-Za-z_$][\w$-]*)["'`]/
+const DECLARATION_LINE = /^\s*(?:export\s+)?(?:async\s+)?(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)\b/
+const DECLARATION_SEARCH_LINES = 40
+
+const indentOf = (text: string): number => text.length - text.trimStart().length
+
+/**
+ * Tool registrations (`name: "read_file"`) paired with the declaration that encloses them.
+ * Walking upward, each step must reach a strictly shallower line, so the first declaration
+ * reached is the enclosing one, not a sibling above it. Both lines must be inside the read's
+ * captured range. The pairing is a source-shape heuristic, so it is only stored with the
+ * fingerprint of the file it was read from.
+ */
+const implementationAliases = (record: RetainedObservationEvidence): Array<{ tool: string; implementation: string; startLine: number; endLine: number }> => {
+  if (!record.content) return []
+  const ranges = record.sources
+    .filter((source) => source.startLine !== undefined && source.endLine !== undefined)
+    .map((source) => [source.startLine as number, source.endLine as number])
+  const inRange = (line: number): boolean => ranges.some(([start, end]) => line >= start && line <= end)
+  const lines = record.content.split("\n").flatMap((line) => {
+    const match = NUMBERED_SOURCE_LINE.exec(line)
+    return match ? [{ line: Number(match[1]), text: match[2] }] : []
+  })
+  const aliases: Array<{ tool: string; implementation: string; startLine: number; endLine: number }> = []
+  lines.forEach((registration, index) => {
+    const name = NAME_PROPERTY_LINE.exec(registration.text)
+    if (!name || !inRange(registration.line)) return
+    let depth = indentOf(registration.text)
+    for (let above = index - 1; above >= Math.max(0, index - DECLARATION_SEARCH_LINES); above--) {
+      const candidate = lines[above]
+      if (!candidate.text.trim() || indentOf(candidate.text) >= depth) continue
+      depth = indentOf(candidate.text)
+      const declaration = DECLARATION_LINE.exec(candidate.text)
+      if (declaration) {
+        if (inRange(candidate.line) && declaration[1] !== name[1]) aliases.push({ tool: name[1], implementation: declaration[1], startLine: candidate.line, endLine: registration.line })
+        return
+      }
+    }
+  })
+  return aliases
+}
+
 const sourceOutcome = async (
   anchors: { paths: string[]; symbols: string[] },
   records: RetainedObservationEvidence[],
   current: (path: string) => Promise<string | undefined>,
   criterion: string
 ): Promise<TodoCriterionReconciliation> => {
-  const definition = DEFINITION_CRITERION.test(criterion.replace(BACKTICKED_TEXT, " "))
+  const definition = isDefinitionCriterion(criterion)
   const supporting: string[] = []
   const missing: string[] = []
   const contradictions: string[] = []
@@ -316,6 +357,27 @@ const sourceOutcome = async (
     if (!usable.some((record) => record.sources.some((source) => samePath(source.path, path)))) missing.push(...pathMissing)
   }
   const facts: TodoSourceFact[] = []
+  const aliasTools = new Set<string>()
+  if (definition) {
+    for (const record of usable) {
+      const path = anchors.paths.find((candidate) => record.sources.some((source) => samePath(source.path, candidate)))
+      const sourceHash = path ? record.sources.find((source) => samePath(source.path, path))?.contentHash : undefined
+      if (!path || !sourceHash) continue
+      for (const alias of implementationAliases(record)) {
+        if (!anchors.symbols.some((symbol) => symbol === alias.tool || symbol === alias.implementation)) continue
+        aliasTools.add(alias.tool)
+        facts.push({
+          symbol: alias.tool,
+          implementation: alias.implementation,
+          path,
+          startLine: alias.startLine,
+          endLine: alias.endLine,
+          observationId: record.observationId,
+          sourceHash
+        })
+      }
+    }
+  }
   for (const symbol of anchors.symbols) {
     let hit: { record: RetainedObservationEvidence; lines: number[] } | undefined
     for (const record of usable) {
@@ -330,7 +392,7 @@ const sourceOutcome = async (
       supporting.push(record.observationId)
       const path = anchors.paths.find((candidate) => record.sources.some((source) => samePath(source.path, candidate)))
       const sourceHash = path ? record.sources.find((source) => samePath(source.path, path))?.contentHash : undefined
-      if (definition && path && sourceHash) {
+      if (definition && path && sourceHash && !aliasTools.has(symbol)) {
         facts.push({
           symbol,
           path,
@@ -361,6 +423,30 @@ const sourceOutcome = async (
 }
 
 /**
+ * Locates a definition criterion that names no path. Each file that a fresh, successful read
+ * showed is tried, and the criterion is proven only when exactly one file declares every named
+ * symbol. Several declaring files are ambiguous, and a file that does not declare the symbol is
+ * not evidence against the criterion. Returns undefined so the criterion goes to Feedback.
+ */
+const discoveredOutcome = async (
+  symbols: string[],
+  records: RetainedObservationEvidence[],
+  current: (path: string) => Promise<string | undefined>,
+  criterion: string
+): Promise<TodoCriterionReconciliation | undefined> => {
+  if (!symbols.length) return undefined
+  const candidates = [...new Set(records
+    .filter((record) => !record.failed && record.retained && record.content !== undefined)
+    .flatMap((record) => record.sources.map((source) => source.path)))].slice(0, 12)
+  const proven: TodoCriterionReconciliation[] = []
+  for (const path of candidates) {
+    const outcome = await sourceOutcome({ paths: [path], symbols }, records, current, criterion)
+    if (outcome.outcome === "proven") proven.push(outcome)
+  }
+  return proven.length === 1 ? proven[0] : undefined
+}
+
+/**
  * Reuses accepted source facts for a definition criterion when every named symbol
  * has a non-superseded fact in one of the criterion's paths and the file still matches
  * the fact's fingerprint. Returns undefined otherwise, so the criterion falls back to
@@ -370,13 +456,17 @@ const acceptedOutcome = async (
   anchors: { paths: string[]; symbols: string[] },
   accepted: AcceptedFact[],
   current: (path: string) => Promise<string | undefined>,
-  criterion: string
+  criterion: string,
+  aliases: SymbolAlias[] = []
 ): Promise<TodoCriterionReconciliation | undefined> => {
   if (!anchors.symbols.length || !anchors.paths.length) return undefined
-  if (!DEFINITION_CRITERION.test(criterion.replace(BACKTICKED_TEXT, " "))) return undefined
+  if (!isDefinitionCriterion(criterion)) return undefined
   const supporting: string[] = []
   for (const symbol of anchors.symbols) {
-    const fact = accepted.find((candidate) => !candidate.supersededBy && candidate.symbol === symbol && anchors.paths.some((path) => samePath(candidate.path, path)))
+    const linked = (candidate: AcceptedFact): boolean => candidate.symbol === symbol || aliases.some((alias) =>
+      samePath(alias.path, candidate.path)
+      && ((alias.toolName === candidate.symbol && alias.implementation === symbol) || (alias.toolName === symbol && alias.implementation === candidate.symbol)))
+    const fact = accepted.find((candidate) => !candidate.supersededBy && linked(candidate) && anchors.paths.some((path) => samePath(candidate.path, path)))
     if (!fact) return undefined
     const text = await current(fact.path)
     if (text === undefined || !(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) return undefined
@@ -424,15 +514,17 @@ export const assessAcceptedFacts = async (facts: AcceptedFact[], readCurrent?: C
 
 /**
  * Deterministic pass over acceptance criteria. Only narrow, anchored presence
- * facts (paths, backticked symbols, runtime tool exposure) are decided here.
- * Behavioral, command, and mutation criteria stay `semantic` for the Feedback AI,
+ * facts (paths, backticked symbols, runtime tool exposure) are decided here, and a
+ * path-free definition criterion is located only when exactly one fresh read declares
+ * it. Behavioral, command, and mutation criteria stay `semantic` for the Feedback AI,
  * and a presence match alone never proves a behavioral relationship.
  */
 export const reconcileCriteria = async (
   criteria: string[],
   records: RetainedObservationEvidence[],
   readCurrent?: CurrentSourceReader,
-  accepted: AcceptedFact[] = []
+  accepted: AcceptedFact[] = [],
+  aliases: SymbolAlias[] = []
 ): Promise<TodoCriterionReconciliation[]> => {
   const current = cachedCurrentReader(readCurrent)
   const outcomes: TodoCriterionReconciliation[] = []
@@ -440,7 +532,10 @@ export const reconcileCriteria = async (
     const anchors = evidenceAnchors(criterion)
     const prose = criterion.replace(BACKTICKED_TEXT, " ")
     const unanchoredJudgment = anchors.paths.length > 0 && !anchors.symbols.length && !LOCATION_CLAIM.test(prose)
-    const semantic = !anchors.paths.length && !anchors.symbols.length
+    const discoverable = !anchors.paths.length && isDefinitionCriterion(criterion)
+      ? [...new Set([...anchors.symbols, ...codeIdentifiers(criterion)])].slice(0, 12)
+      : []
+    const semantic = !anchors.paths.length && !anchors.symbols.length && !discoverable.length
       || COMMAND_OR_MUTATION.test(prose)
       || BEHAVIOR.test(prose)
       || unanchoredJudgment
@@ -448,9 +543,11 @@ export const reconcileCriteria = async (
       outcomes.push(reconciled("semantic", [], []))
     } else if (!anchors.paths.length) {
       const exposure = /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(prose)
-      outcomes.push(exposure ? inventoryOutcome(anchors.symbols, records) : reconciled("semantic", [], []))
+      outcomes.push(exposure
+        ? inventoryOutcome(anchors.symbols, records)
+        : await discoveredOutcome(discoverable, records, current, criterion) ?? reconciled("semantic", [], []))
     } else {
-      outcomes.push(await acceptedOutcome(anchors, accepted, current, criterion) ?? await sourceOutcome(anchors, records, current, criterion))
+      outcomes.push(await acceptedOutcome(anchors, accepted, current, criterion, aliases) ?? await sourceOutcome(anchors, records, current, criterion))
     }
   }
   return outcomes
@@ -887,7 +984,7 @@ export const reviewCandidates = (reviews: TodoReviewPackage[], itemId?: string):
 
 export const evaluateTodoReview = (
   repository: import("./repository").TodoRepository,
-  scope: import("./types").TodoListRequest,
+  scope: import("./types").TodoWriteRequest,
   review: TodoReviewPackage,
   evaluator: (correction?: string, reconciliations?: TodoCriterionReconciliation[]) => Promise<string>,
   evaluatorName: string,
@@ -897,7 +994,7 @@ export const evaluateTodoReview = (
   const inFlight = reviewsInFlight.get(key)
   if (inFlight) return inFlight
   const operation = (async () => {
-    const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource, review.acceptedEvidence)
+    const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource, review.acceptedEvidence, review.symbolAliases)
     const deterministic = deterministicTodoEvaluation(review, reconciliations)
     let result: TodoEvaluation
     if (deterministic) {

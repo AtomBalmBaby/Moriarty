@@ -4,16 +4,52 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 
-import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
+
+test("the repository rejects TODO writes whose writer is not the target conversation, and leaves the list unchanged", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-write-isolation-"))
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    const project = workspaceProjectFingerprint(["file:///write-isolation"])
+    const owner = { projectFingerprint: project, conversationId: "owner-chat", writer: "owner-chat" }
+    const intruder = { ...owner, writer: "intruder-chat" }
+    const repository = new TodoRepository(databasePath, wasmPath)
+    const item = await repository.createItem(owner, { title: "Owner task" }, "owner-create")
+    const itemCountBefore = (await repository.getList(owner)).items.length
+    const before = JSON.stringify(await repository.getList(owner))
+
+    await assert.rejects(async () => repository.createItem(intruder, { title: "Injected task" }, "intruder-create"), TodoWriteDeniedError)
+    await assert.rejects(async () => repository.updateItem(intruder, {
+      itemId: item.id, expectedVersion: item.version, patch: { title: "Rewritten" }, actor: "model", requestId: "intruder-update"
+    }), TodoWriteDeniedError)
+    await assert.rejects(async () => repository.addEvidence(intruder, {
+      itemId: item.id, kind: "forged", summary: "Forged evidence", result: "passed", requestId: "intruder-evidence"
+    }), TodoWriteDeniedError)
+
+    assert.equal(JSON.stringify(await repository.getList(owner)), before, "a denied write must not change the owner's list")
+    assert.equal((await repository.getList(owner)).items.length, itemCountBefore)
+
+    const intruderOwnList = { ...intruder, conversationId: "intruder-chat" }
+    assert.equal((await repository.getList(intruderOwnList)).items.length, 0, "the intruder's own list is untouched")
+
+    const read = await repository.getList(intruder)
+    assert.equal(read.items[0].title, "Owner task", "reading another conversation's TODO list stays allowed")
+
+    const ownWrite = await repository.createItem(owner, { title: "Owner follow-up" }, "owner-followup")
+    assert.equal(ownWrite.title, "Owner follow-up", "the owner can still write to its own list")
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
 
 test("native TODO SQLite repository persists scoped lists, idempotency, and user completion", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-todos-"))
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-a"]), conversationId: "chat-a" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-a"]), conversationId: "chat-a", writer: "chat-a" }
     const repository = new TodoRepository(databasePath, wasmPath)
 
     const firstSnapshot = await repository.getList(scope)
@@ -27,7 +63,7 @@ test("native TODO SQLite repository persists scoped lists, idempotency, and user
     assert.equal(otherChat.items.length, 0)
     assert.equal(otherProject.items.length, 0)
     assert.notEqual(otherChat.id, firstSnapshot.id)
-    const sameRequestInOtherChat = await repository.createItem({ ...scope, conversationId: "chat-b" }, { title: "Isolated retry token" }, "request-create")
+    const sameRequestInOtherChat = await repository.createItem({ ...scope, conversationId: "chat-b", writer: "chat-b" }, { title: "Isolated retry token" }, "request-create")
     assert.notEqual(sameRequestInOtherChat.id, created.id)
     assert.notEqual(otherChat.id, firstSnapshot.id)
 
@@ -101,7 +137,7 @@ test("native TODO repository serializes concurrent writers across repository ins
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-todos-concurrent-"))
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
-    const scope = { projectFingerprint: "project", conversationId: "chat" }
+    const scope = { projectFingerprint: "project", conversationId: "chat", writer: "chat" }
     const first = new TodoRepository(databasePath, wasmPath)
     const second = new TodoRepository(databasePath, wasmPath)
 
@@ -121,7 +157,7 @@ test("native TODO repository serializes concurrent writers across repository ins
 test("native TODO toolset is namespaced, scoped, and sends authoritative snapshots", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-todos-tools-"))
   try {
-    const scope = { projectFingerprint: "tool-project", conversationId: "tool-chat" }
+    const scope = { projectFingerprint: "tool-project", conversationId: "tool-chat", writer: "tool-chat" }
     const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
     let changed = 0
     const tools = (await import("../../extension/tools/todos")).todoWorkspaceTools(repository, scope, () => { changed += 1 })
@@ -213,7 +249,7 @@ test("concurrent and stale plan revisions are resolved transactionally without l
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-revision-todos-"))
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-revision"]), conversationId: "chat-revision" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-revision"]), conversationId: "chat-revision", writer: "chat-revision" }
     const repository = new TodoRepository(databasePath, wasmPath)
     const makePlan = (revision: number, title = "Inspect parser") => ({
       planId: "plan-revision",
@@ -284,7 +320,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-intent-todos-"))
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-a"]), conversationId: "chat-plan-a" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-a"]), conversationId: "chat-plan-a", writer: "chat-plan-a" }
     const repository = new TodoRepository(databasePath, wasmPath)
     const makePlan = (revision: number, title = "Inspect parser") => ({
       planId: "plan-parser",
@@ -342,7 +378,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
     assert.equal(completedTask.verification, "waived")
     assert.equal((await repository.getItem(scope, inspect.id)).evidence.length, 1)
 
-    const otherScope = { ...scope, conversationId: "chat-plan-b" }
+    const otherScope = { ...scope, conversationId: "chat-plan-b", writer: "chat-plan-b" }
     const otherPlan = { ...makePlan(1), planId: "other-plan", goal: "Different chat goal", tasks: [
       { id: "other-task", title: "Other chat task", description: "Keep chat plans isolated", acceptanceCriteria: ["Only this chat sees the task"], dependencies: [] }
     ] }
@@ -379,7 +415,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
 test("native TODO transitions reject placeholder blocks, recover blocked tasks, and ignore repeated completion claims", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-transition-todos-"))
   try {
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-transitions"]), conversationId: "chat-transitions" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-transitions"]), conversationId: "chat-transitions", writer: "chat-transitions" }
     const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
     const item = await repository.createItem(scope, { title: "Locate the parser" }, "request-create-transition")
 
@@ -420,7 +456,7 @@ test("native TODO transitions reject placeholder blocks, recover blocked tasks, 
 test("model-created TODO reconciliation ignores articles but keeps distinct tasks separate", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-dedupe-todos-"))
   try {
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-dedupe"]), conversationId: "chat-dedupe" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-dedupe"]), conversationId: "chat-dedupe", writer: "chat-dedupe" }
     const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
     const planned = await repository.createItem(scope, { title: "Locate and verify the native read_file definition" }, "plan-item", "user")
     const recreated = await repository.createItem(scope, { title: "Locate and verify native read_file definition" }, "model-recreate")
@@ -436,7 +472,7 @@ test("model-created TODO reconciliation ignores articles but keeps distinct task
 test("the first completion claim is accepted once and repeats are acknowledged without version churn", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-claim-todos-"))
   try {
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-claims"]), conversationId: "chat-claims" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-claims"]), conversationId: "chat-claims", writer: "chat-claims" }
     const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
     const item = await repository.createItem(scope, { title: "Locate the read_file definition" }, "create-claim")
 
@@ -476,7 +512,7 @@ test("the first completion claim is accepted once and repeats are acknowledged w
 test("eleven repeated completion requests produce one accepted claim, one review lifecycle, and no version churn", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-repeat-claims-"))
   try {
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-repeat-claims"]), conversationId: "chat-repeat-claims" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-repeat-claims"]), conversationId: "chat-repeat-claims", writer: "chat-repeat-claims" }
     const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
     const item = await repository.createItem(scope, { title: "Locate the native read_file definition" }, "create-repeat")
 

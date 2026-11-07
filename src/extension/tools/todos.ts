@@ -1,6 +1,6 @@
 import { assessAcceptedFacts, type CurrentSourceReader } from "../todos/feedback"
 import { TodoRepository } from "../todos/repository"
-import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoListRequest, TodoPriority, TodoStatus } from "../todos/types"
+import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
 
 import { Tool, ToolContext, ToolResult } from "./workspace"
 
@@ -97,7 +97,7 @@ const evidenceResult = (value: string): "observed" | "passed" | "failed" => {
 
 export const todoTools = (
   repository: TodoRepository,
-  scope: TodoListRequest,
+  scope: TodoWriteRequest,
   onChanged: () => void,
   options: TodoToolOptions = {}
 ): Tool[] => [
@@ -379,7 +379,7 @@ export const todoTools = (
 
 export const todoWorkspaceTools = (
   repository: TodoRepository,
-  scope: TodoListRequest,
+  scope: TodoWriteRequest,
   onChanged: () => void,
   options: TodoToolOptions = {}
 ): import("./workspace").WorkspaceTools => {

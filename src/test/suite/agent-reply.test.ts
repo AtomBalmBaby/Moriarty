@@ -157,7 +157,8 @@ const feedbackRig = async (
   const goal = "Make the requested change to the cancellation fixture."
   const scope = {
     projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-    conversationId: name
+    conversationId: name,
+    writer: name
   }
   const plan = {
     planId: `${name}-plan`,
@@ -255,7 +256,7 @@ suite("Agent reply, end to end", function () {
       subscriptions: []
     } as unknown as vscode.ExtensionContext
     const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
-    const scope = { projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))), conversationId: "feedback-disabled-chat" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))), conversationId: "feedback-disabled-chat", writer: "feedback-disabled-chat" }
     const plan = { planId: "feedback-disabled-plan", version: 1 as const, revision: 1, goal: "Verify one task", constraints: [], tasks: [
       { id: "review-me", title: "Review me", description: "A task to remain in review", acceptanceCriteria: ["Source inspected"], dependencies: [] as string[] }
     ] }
@@ -299,7 +300,8 @@ suite("Agent reply, end to end", function () {
     )
     const scope = {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-      conversationId: "bounded-task-chat"
+      conversationId: "bounded-task-chat",
+      writer: "bounded-task-chat"
     }
     const plan = {
       planId: "bounded-context-plan",
@@ -389,7 +391,8 @@ suite("Agent reply, end to end", function () {
     const goal = "Implement the requested TODO panel improvements."
     const scope = {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-      conversationId: "premature-surrender-regression"
+      conversationId: "premature-surrender-regression",
+      writer: "premature-surrender-regression"
     }
     const plan = {
       planId: "premature-surrender-plan",
@@ -584,7 +587,8 @@ suite("Agent reply, end to end", function () {
     const goal = "Modify src/webview/todo-panel.tsx with collapsible TODO cards; do not delete the component."
     const scope = {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-      conversationId: "destructive-recovery-regression"
+      conversationId: "destructive-recovery-regression",
+      writer: "destructive-recovery-regression"
     }
     const plan = {
       planId: "destructive-recovery-plan",

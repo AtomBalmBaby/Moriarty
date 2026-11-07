@@ -59,7 +59,7 @@ const withRepository = async (run: (repository: TodoRepository) => Promise<void>
   }
 }
 
-const scope = { projectFingerprint: "project", conversationId: "chat" }
+const scope = { projectFingerprint: "project", conversationId: "chat", writer: "chat" }
 
 test("the Feedback plan response is validated before it can write TODOs", () => {
   assert.deepEqual(parseFeedbackPlanResponse("{\"track\":false,\"plan\":null}"), { track: false })

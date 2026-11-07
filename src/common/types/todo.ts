@@ -45,6 +45,8 @@ export interface TodoSourceFact {
   endLine: number
   observationId: string
   sourceHash: string
+  /** Set when the criterion names a tool (for example read_file) whose registered name is implemented by this symbol (readFile). */
+  implementation?: string
 }
 
 export interface TodoCriterionReconciliation {

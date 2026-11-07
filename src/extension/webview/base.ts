@@ -46,7 +46,7 @@ import type { TeamPlugins } from "../team/plugins-page"
 import { TeamShare } from "../team/share"
 import { TemplateProvider } from "../templates/provider"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../todos/repository"
-import type { CreateTodoInput, UpdateTodoInput } from "../todos/types"
+import type { CreateTodoInput, TodoWriteRequest, UpdateTodoInput } from "../todos/types"
 import type { WorkspaceSearchProvider } from "../tools/workspace"
 import { getLanguage, getTerminal, getTextSelection, getTheme } from "../utils"
 
@@ -145,11 +145,16 @@ export class BaseProvider {
     this._disposables = []
   }
 
-  private todoScope(conversationId: string) {
-    if (!conversationId || this.activeConversationId() !== conversationId) {
+  /**
+   * Scope for mutations. The writer is the active conversation from host state, never the message payload,
+   * and the repository rejects any write whose writer is not the target list's conversation.
+   */
+  private todoScope(conversationId: string): TodoWriteRequest {
+    const writer = this.activeConversationId()
+    if (!conversationId || writer !== conversationId) {
       throw new Error("TODO operations are limited to the active conversation")
     }
-    return this.todoReadScope(conversationId)
+    return { ...this.todoReadScope(conversationId), writer }
   }
 
   /** Scope for read-only access: any conversation in this workspace's project. Writes must use todoScope. */

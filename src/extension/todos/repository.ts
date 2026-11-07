@@ -30,6 +30,7 @@ import {
   type IntentPlanOutlineChild,
   type IntentTaskPlan,
   type RetainedObservationEvidence,
+  type SymbolAlias,
   type TodoCompletionClaim,
   TodoConflictError,
   type TodoCreateOutcome,
@@ -47,6 +48,7 @@ import {
   type TodoToolObservation,
   type TodoToolObservationInput,
   type TodoVerification,
+  type TodoWriteRequest,
   type UpdateTodoInput} from "./types"
 
 interface ProjectRow {
@@ -141,6 +143,18 @@ const recordRequest = (database: Database, listId: string, requestId: string, op
     "INSERT INTO todo_requests(list_id, request_id, operation, result_json, created_at) VALUES (?, ?, ?, ?, ?)",
     [listId, requestId, operation, JSON.stringify(result), now()]
   )
+}
+
+/** Raised when a conversation other than the list's own tries to change that list. Reads are never restricted. */
+export class TodoWriteDeniedError extends Error {
+  constructor(conversationId: string) {
+    super(`Conversation ${conversationId.trim()} cannot change another conversation's TODO list`)
+    this.name = "TodoWriteDeniedError"
+  }
+}
+
+const assertWriter = (request: TodoWriteRequest): void => {
+  if (request.writer.trim() !== request.conversationId.trim()) throw new TodoWriteDeniedError(request.conversationId)
 }
 
 const findList = (database: Database, request: TodoListRequest): ListRow | undefined => {
@@ -435,10 +449,11 @@ interface AcceptedFactRow {
   superseded_by: string | null
   plan_id: string
   plan_revision: number
+  implementation: string | null
   created_at: string
 }
 
-const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item_id, evidence.criterion_index, evidence.criterion, evidence.observation_id, evidence.tool_name, evidence.symbol, evidence.path, evidence.start_line, evidence.end_line, evidence.source_hash, evidence.superseded_by, evidence.plan_id, evidence.plan_revision, evidence.created_at"
+const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item_id, evidence.criterion_index, evidence.criterion, evidence.observation_id, evidence.tool_name, evidence.symbol, evidence.path, evidence.start_line, evidence.end_line, evidence.source_hash, evidence.superseded_by, evidence.plan_id, evidence.plan_revision, aliases.implementation, evidence.created_at"
 
 /**
  * Accepted facts for a project, across all its conversations. "Current" is decided per
@@ -457,7 +472,9 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
     params.push(options.path)
   }
   const facts = rows<AcceptedFactRow>(database,
-    `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id WHERE ${clauses.join(" AND ")} ORDER BY evidence.created_at DESC, evidence.id`,
+    `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id ` +
+    "LEFT JOIN todo_symbol_aliases AS aliases ON aliases.list_id = evidence.list_id AND aliases.observation_id = evidence.observation_id AND aliases.tool_name = evidence.symbol AND aliases.path = evidence.path " +
+    `WHERE ${clauses.join(" AND ")} ORDER BY evidence.created_at DESC, evidence.id`,
     params
   ).map((row) => ({
     id: row.id,
@@ -469,6 +486,7 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
     planId: row.plan_id,
     planRevision: row.plan_revision,
     symbol: row.symbol,
+    implementation: row.implementation ?? undefined,
     path: row.path,
     startLine: row.start_line,
     endLine: row.end_line,
@@ -487,6 +505,27 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
   }
   return options.includeSuperseded ? facts : facts.filter((fact) => !fact.supersededBy)
 }
+
+/**
+ * Tool-name to implementation links verified from source, across all conversations of a project.
+ */
+const symbolAliasesFor = (database: Database, projectId: string): SymbolAlias[] =>
+  rows<{ id: string; conversation_id: string; tool_name: string; implementation: string; path: string; start_line: number; end_line: number; observation_id: string; source_hash: string; created_at: string }>(database,
+    "SELECT aliases.id, lists.conversation_id, aliases.tool_name, aliases.implementation, aliases.path, aliases.start_line, aliases.end_line, aliases.observation_id, aliases.source_hash, aliases.created_at " +
+    "FROM todo_symbol_aliases AS aliases JOIN todo_lists AS lists ON lists.id = aliases.list_id WHERE lists.project_id = ? ORDER BY aliases.created_at DESC, aliases.id",
+    [projectId]
+  ).map((row) => ({
+    id: row.id,
+    conversationId: row.conversation_id,
+    toolName: row.tool_name,
+    implementation: row.implementation,
+    path: row.path,
+    startLine: row.start_line,
+    endLine: row.end_line,
+    observationId: row.observation_id,
+    sourceHash: row.source_hash,
+    createdAt: row.created_at
+  }))
 
 /**
  * Stores host-verified source facts from an accepted evaluation, in the reviewed conversation's list only.
@@ -519,6 +558,14 @@ const recordAcceptedFacts = (
         "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
         [id, listId, fact.symbol, fact.path, id]
       )
+      if (fact.implementation !== undefined) {
+        if (!fact.implementation.trim()) throw new Error(`criteria[${index}] alias has no implementation name`)
+        database.run("DELETE FROM todo_symbol_aliases WHERE list_id = ? AND tool_name = ? AND path = ?", [listId, fact.symbol, fact.path])
+        database.run(
+          "INSERT INTO todo_symbol_aliases(id, list_id, tool_name, implementation, path, start_line, end_line, observation_id, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [randomUUID(), listId, fact.symbol, fact.implementation, fact.path, fact.startLine, fact.endLine, fact.observationId, fact.sourceHash, acceptedAt]
+        )
+      }
     }
   }
 }
@@ -630,7 +677,8 @@ export class TodoRepository {
     })
   }
 
-  synchronizeIntentPlan(request: TodoListRequest, candidate: unknown, intentResult: unknown): Promise<TodoListSnapshot> {
+  synchronizeIntentPlan(request: TodoWriteRequest, candidate: unknown, intentResult: unknown): Promise<TodoListSnapshot> {
+    assertWriter(request)
     const validation = validateIntentTaskPlan(candidate)
     if (!validation.plan) throw new Error("Invalid intent plan: " + validation.diagnostic)
     const plan = validation.plan
@@ -877,6 +925,7 @@ export class TodoRepository {
       )
       const taskMap = new Map(tasks.map((task) => [task.task_id, task]))
       const acceptedEvidence = acceptedFactsFor(database, list.project_id)
+      const symbolAliases = symbolAliasesFor(database, list.project_id)
       return tasks.filter((task) => task.status === "in_review").map((row) => {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
@@ -915,13 +964,15 @@ export class TodoRepository {
           observations,
           retainedEvidence,
           acceptedEvidence,
+          symbolAliases,
           lastEvaluation: lastEvaluation ? JSON.parse(lastEvaluation.evaluation_json) as TodoEvaluation : undefined
         }
       })
     })
   }
 
-  recordToolObservation(request: TodoListRequest, input: TodoToolObservationInput): Promise<TodoToolObservation> {
+  recordToolObservation(request: TodoWriteRequest, input: TodoToolObservationInput): Promise<TodoToolObservation> {
+    assertWriter(request)
     validateRequestId(input.requestId)
     const toolName = input.toolName.trim()
     if (!toolName || toolName.length > 120) throw new Error("Tool observation has an invalid tool name")
@@ -974,7 +1025,8 @@ export class TodoRepository {
     })
   }
 
-  applyEvaluation(request: TodoListRequest, itemId: string, expectedVersion: number, evaluation: TodoEvaluation, requestId: string): Promise<TodoEvaluation> {
+  applyEvaluation(request: TodoWriteRequest, itemId: string, expectedVersion: number, evaluation: TodoEvaluation, requestId: string): Promise<TodoEvaluation> {
+    assertWriter(request)
     validateRequestId(requestId)
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
@@ -1063,6 +1115,14 @@ export class TodoRepository {
     })
   }
 
+  listSymbolAliases(request: TodoListRequest): Promise<SymbolAlias[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      return symbolAliasesFor(database, project.id)
+    })
+  }
+
   getEvaluationHistory(request: TodoListRequest, itemId: string): Promise<TodoEvaluation[]> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
@@ -1115,7 +1175,7 @@ export class TodoRepository {
     })
   }
 
-  createItem(request: TodoListRequest, input: CreateTodoInput, requestId: string, actor: "user" | "model" = "model"): Promise<TodoItem> {
+  createItem(request: TodoWriteRequest, input: CreateTodoInput, requestId: string, actor: "user" | "model" = "model"): Promise<TodoItem> {
     return this.createItemOutcome(request, input, requestId, actor).then((outcome) => outcome.item)
   }
 
@@ -1125,7 +1185,8 @@ export class TodoRepository {
    * authoritative intent plan, a clear word overlap also matches. Ambiguous or
    * weak overlaps create a new item rather than merging distinct work.
    */
-  createItemOutcome(request: TodoListRequest, input: CreateTodoInput, requestId: string, actor: "user" | "model" = "model"): Promise<TodoCreateOutcome> {
+  createItemOutcome(request: TodoWriteRequest, input: CreateTodoInput, requestId: string, actor: "user" | "model" = "model"): Promise<TodoCreateOutcome> {
+    assertWriter(request)
     validateRequestId(requestId)
     const title = input.title.trim()
     const parentId = input.parentId?.trim() || undefined
@@ -1256,7 +1317,8 @@ export class TodoRepository {
    * revised proposals insert exactly one child and advance the plan revision;
    * other decisions leave the TODO list untouched.
    */
-  applyChildTodo(request: TodoListRequest, proposal: ChildTodoProposal, decision: ChildTodoDecision): Promise<ChildTodoOutcome> {
+  applyChildTodo(request: TodoWriteRequest, proposal: ChildTodoProposal, decision: ChildTodoDecision): Promise<ChildTodoOutcome> {
+    assertWriter(request)
     validateRequestId(proposal.requestId)
     return this.sqlite.write((database) => {
       const list = findList(database, request)
@@ -1319,7 +1381,8 @@ export class TodoRepository {
     })
   }
 
-  updateItem(request: TodoListRequest, input: UpdateTodoInput): Promise<TodoItem> {
+  updateItem(request: TodoWriteRequest, input: UpdateTodoInput): Promise<TodoItem> {
+    assertWriter(request)
     validateRequestId(input.requestId)
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
@@ -1404,7 +1467,8 @@ export class TodoRepository {
    * review is pending are acknowledged without changing the version. Only
    * Feedback or a trusted user action can complete the TODO.
    */
-  claimCompletion(request: TodoListRequest, input: { itemId: string; expectedVersion: number; requestId: string }): Promise<TodoCompletionClaim> {
+  claimCompletion(request: TodoWriteRequest, input: { itemId: string; expectedVersion: number; requestId: string }): Promise<TodoCompletionClaim> {
+    assertWriter(request)
     validateRequestId(input.requestId)
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
@@ -1462,7 +1526,8 @@ export class TodoRepository {
     })
   }
 
-  async completeByUser(request: TodoListRequest, itemId: string, expectedVersion: number, reason: string, requestId: string, approval: TrustedUserApproval): Promise<TodoItem> {
+  async completeByUser(request: TodoWriteRequest, itemId: string, expectedVersion: number, reason: string, requestId: string, approval: TrustedUserApproval): Promise<TodoItem> {
+    assertWriter(request)
     validateRequestId(requestId)
     if (approval?.source !== "todo-panel") throw new Error("Only an explicit user action in the TODO panel can complete a TODO")
     const completionReason = reason.trim()
@@ -1498,7 +1563,8 @@ export class TodoRepository {
     })
   }
 
-  addEvidence(request: TodoListRequest, input: AddTodoEvidenceInput): Promise<TodoEvidence> {
+  addEvidence(request: TodoWriteRequest, input: AddTodoEvidenceInput): Promise<TodoEvidence> {
+    assertWriter(request)
     validateRequestId(input.requestId)
     const kind = input.kind.trim()
     const summary = input.summary.trim()

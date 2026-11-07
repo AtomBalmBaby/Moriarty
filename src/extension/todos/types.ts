@@ -107,6 +107,15 @@ export interface TodoListRequest {
   includeCompleted?: boolean
 }
 
+/**
+ * A mutation of one conversation's list. `writer` is the conversation acting, supplied by host context
+ * (the active chat or the session that invoked the tool), never by model output. The repository rejects
+ * any write whose writer is not the list's own conversation.
+ */
+export interface TodoWriteRequest extends TodoListRequest {
+  writer: string
+}
+
 export interface CreateTodoInput {
   title: string
   details?: string
@@ -180,6 +189,23 @@ export interface AcceptedFact extends TodoSourceFact {
   acceptedAt: string
 }
 
+/**
+ * A proven relationship between a registered tool name (read_file) and the symbol that implements it (readFile),
+ * with the observation and fingerprint that proved it. Project knowledge, like accepted facts.
+ */
+export interface SymbolAlias {
+  id: string
+  conversationId: string
+  toolName: string
+  implementation: string
+  path: string
+  startLine: number
+  endLine: number
+  observationId: string
+  sourceHash: string
+  createdAt: string
+}
+
 export interface TodoReviewPackage {
   projectFingerprint: string
   conversationId: string
@@ -196,6 +222,8 @@ export interface TodoReviewPackage {
   retainedEvidence: RetainedObservationEvidence[]
   /** Current accepted source facts for this conversation, so verification can reuse them across TODOs. */
   acceptedEvidence: AcceptedFact[]
+  /** Proven tool-name to implementation relationships in this project. */
+  symbolAliases: SymbolAlias[]
   lastEvaluation?: TodoEvaluation
 }
 

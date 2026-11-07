@@ -162,6 +162,21 @@ CREATE INDEX IF NOT EXISTS todo_accepted_evidence_item ON todo_accepted_evidence
 CREATE INDEX IF NOT EXISTS todo_accepted_evidence_observation ON todo_accepted_evidence(observation_id);
 CREATE INDEX IF NOT EXISTS todo_accepted_evidence_revision ON todo_accepted_evidence(list_id, plan_id, plan_revision);
 PRAGMA user_version = 6;
+CREATE TABLE IF NOT EXISTS todo_symbol_aliases (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  tool_name TEXT NOT NULL,
+  implementation TEXT NOT NULL,
+  path TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  source_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS todo_symbol_aliases_tool ON todo_symbol_aliases(tool_name, path);
+CREATE INDEX IF NOT EXISTS todo_symbol_aliases_list ON todo_symbol_aliases(list_id);
+PRAGMA user_version = 7;
 `
 
 export class SqliteFile {
@@ -193,7 +208,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 6) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 7) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -217,6 +232,10 @@ export class SqliteFile {
         }
         if (version > 0 && version < 6) {
           database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence"), SCHEMA.indexOf("PRAGMA user_version = 6;") + "PRAGMA user_version = 6;".length))
+          await this.persist(database)
+        }
+        if (version > 0 && version < 7) {
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_symbol_aliases"), SCHEMA.indexOf("PRAGMA user_version = 7;") + "PRAGMA user_version = 7;".length))
           await this.persist(database)
         }
       } finally {

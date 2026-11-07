@@ -219,11 +219,17 @@ export interface EvidenceAnchors {
   symbols: string[]
 }
 
+/** Criteria that ask where something is declared or located. Their prose identifiers name the symbol to find. */
+export const DEFINITION_CRITERION = /\b(defin\w*|declar\w*|implement\w*|locat\w*|where)\b/i
+
+export const isDefinitionCriterion = (criterion: string): boolean => DEFINITION_CRITERION.test(criterion.replace(/`[^`\n]*`/g, " "))
+
 /**
  * Paths and identifiers a criterion names; these decide what evidence must exist.
- * Backticked identifiers always count. A criterion that names a file also anchors
- * its code-like prose identifiers (see codeIdentifiers), so "Locate the read_file
- * tool definition in <path>" is checked against that file the same as "`read_file`".
+ * Backticked identifiers always count. A criterion that names a file also anchors its
+ * code-like prose identifiers (see codeIdentifiers). So "Locate the read_file tool definition
+ * in <path>" is checked against that file the same as "`read_file`". A definition criterion
+ * without a path is located by reconcileCriteria from fresh reads instead.
  */
 export const evidenceAnchors = (criterion: string): EvidenceAnchors => {
   const paths = unique([...criterion.matchAll(CODE_PATH)].map((match) => match[0]), 12)
@@ -317,7 +323,7 @@ export const propositionNeedles = (criterion: string): string[] => {
 }
 
 /** Identifiers that read as code: snake_case, camelCase, or containing a digit. Sentence capitals do not count. */
-const codeIdentifiers = (criterion: string): string[] =>
+export const codeIdentifiers = (criterion: string): string[] =>
   [...criterion.replace(CODE_PATH, " ").matchAll(IDENTIFIER)]
     .map((match) => match[0])
     .filter((word) => /_|[a-z][A-Z]|\d/.test(word))

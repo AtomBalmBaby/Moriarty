@@ -67,7 +67,7 @@ import { compactArguments, compactEvidenceText, compactToolEvidence } from "../t
 import { assessAcceptedFacts, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, feedbackContext, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
-import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest } from "../todos/types"
+import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
@@ -430,11 +430,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }));
     }
     const activeConversation = this._extensionContext.globalState.get<Conversation>(ACTIVE_CONVERSATION_STORAGE_KEY)
+    const inventoryConversationId = activeConversation?.id ?? "__todo-inventory__"
     const todoInventory = this._todoRepository ? todoTools(
       this._todoRepository,
       {
         projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-        conversationId: activeConversation?.id ?? "__todo-inventory__"
+        conversationId: inventoryConversationId,
+        writer: inventoryConversationId
       },
       () => undefined
     ).map((tool) => ({ name: tool.name, description: tool.description, server: "native", tool: tool.name })) : []
@@ -1175,7 +1177,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     )
   }
 
-  public async evaluateTodoTask(scope: TodoListRequest, itemId: string): Promise<TodoListSnapshot> {
+  public async evaluateTodoTask(scope: TodoWriteRequest, itemId: string): Promise<TodoListSnapshot> {
     await this.reviewTodoTasks(scope, itemId)
     return this._todoRepository!.getList(scope)
   }
@@ -1197,7 +1199,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
-  private async recordRuntimeInventory(scope: TodoListRequest, itemId: string, tools: WorkspaceTools): Promise<void> {
+  private async recordRuntimeInventory(scope: TodoWriteRequest, itemId: string, tools: WorkspaceTools): Promise<void> {
     const names = tools.tools.map((tool) => tool.name).sort()
     const signature = names.join("\n")
     const key = `${scope.projectFingerprint}\n${scope.conversationId}\n${itemId}`
@@ -1228,7 +1230,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   }
 
   private async reviewTodoTasks(
-    scope: TodoListRequest,
+    scope: TodoWriteRequest,
     itemId?: string,
     changes?: ReplyChangesView,
     options: { strict?: boolean; finalResponse?: string; requireWorkspaceChanges?: boolean; signal?: AbortSignal; attempted?: Set<string> } = {}
@@ -1319,7 +1321,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   }
 
   private async reconcileIntentTurn(
-    scope: TodoListRequest,
+    scope: TodoWriteRequest,
     intent: NonNullable<Awaited<ReturnType<TodoRepository["getActiveIntentContext"]>>>,
     finalResponse: string,
     changes: ReplyChangesView | undefined,
@@ -1553,16 +1555,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
-  private activeTodoScope(): TodoListRequest | undefined {
+  private activeTodoScope(): TodoWriteRequest | undefined {
     if (!this._todoRepository || !this._activeConversationId) return undefined
     return {
       projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-      conversationId: this._activeConversationId
+      conversationId: this._activeConversationId,
+      writer: this._activeConversationId
     }
   }
 
   /** Host reconciliation: an active plan that still holds administrative criteria is repaired before anything reads it. */
-  private async repairAdministrativePlan(scope: TodoListRequest): Promise<void> {
+  private async repairAdministrativePlan(scope: TodoWriteRequest): Promise<void> {
     if (!this._todoRepository) return
     try {
       await reconcileAdministrativeCriteria(this._todoRepository, scope)
@@ -1850,7 +1853,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    */
   private todoToolsClient(
     provider: TwinnyProvider,
-    scope: TodoListRequest,
+    scope: TodoWriteRequest,
     hooks: {
       onNotes(notes: string | undefined): void
       onUsage(usage: ToolLoopUsage): void
@@ -1960,7 +1963,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     )
     const todoScope = this._todoRepository && this._activeConversationId ? {
       projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
-      conversationId: this._activeConversationId
+      conversationId: this._activeConversationId,
+      writer: this._activeConversationId
     } : undefined
     let available = workspaceTools(view, [], {
       workspaceSearch: this._workspaceSearch,

@@ -193,7 +193,7 @@ suite("Prompt Compiler and Feedback", () => {
     const context = makeContext()
     const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined, undefined, repository)
-    const scope = { projectFingerprint: "isolation-project", conversationId: "isolation-chat" }
+    const scope = { projectFingerprint: "isolation-project", conversationId: "isolation-chat", writer: "isolation-chat" }
     try {
       const compiled = await chat.compilePrompt({ requestId: "compile-missing", prompt: "Fix the parser." })
       assert.equal(compiled.status, "failed")
@@ -215,7 +215,7 @@ suite("Prompt Compiler and Feedback", () => {
     const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
     const emitted: Array<{ event: string; data: unknown }> = []
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
-    const scope = { projectFingerprint: "feedback-project", conversationId: "feedback-chat" }
+    const scope = { projectFingerprint: "feedback-project", conversationId: "feedback-chat", writer: "feedback-chat" }
     try {
       assert.equal(isPromptCompilerEnabled(vscode.workspace.getConfiguration("twinny")), false)
       const first = await feedbackPlanner(chat).start(scope, "Fix the parser.")
@@ -287,7 +287,7 @@ suite("Prompt Compiler and Feedback", () => {
     const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined, undefined, repository)
     try {
-      assert.equal((await feedbackPlanner(chat).start({ projectFingerprint: "p", conversationId: "c" }, "Fix it.")).status, "disabled")
+      assert.equal((await feedbackPlanner(chat).start({ projectFingerprint: "p", conversationId: "c", writer: "c" }, "Fix it.")).status, "disabled")
       assert.deepEqual(model.requests, [])
     } finally {
       chat.dispose()
@@ -303,7 +303,7 @@ suite("Prompt Compiler and Feedback", () => {
     const emitted: Array<{ event: string; data: unknown }> = []
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
     try {
-      const outcome = await feedbackPlanner(chat).start({ projectFingerprint: "p", conversationId: "auth" }, "Fix it.")
+      const outcome = await feedbackPlanner(chat).start({ projectFingerprint: "p", conversationId: "auth", writer: "auth" }, "Fix it.")
       assert.equal(outcome.status, "failed")
       assert.match(outcome.error ?? "", /Feedback \(Scripted feedback\)/)
       assert.ok(emitted.some(({ event }) => event === EVENT_NAME.twinnyNotification))

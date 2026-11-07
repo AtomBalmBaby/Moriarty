@@ -12,7 +12,7 @@ import { compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors,
 import { assessAcceptedFacts, type CurrentSourceReader, evaluateTodoReview, feedbackContext, parseTodoEvaluation, reconcileCriteria, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import type { ChildTodoDecision, ChildTodoReview, IntentPlanOutline, TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
+import type { ChildTodoDecision, ChildTodoReview, IntentPlanOutline, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
 import { RUNTIME_INVENTORY_TOOL } from "../../extension/todos/types"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
@@ -36,7 +36,7 @@ const plan = (tasks: { id: string; acceptance: string; dependencies?: string[] }
 const fixture = async (tasks: { id: string; acceptance: string; dependencies?: string[] }[], complete = true) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-feedback-"))
   const databasePath = path.join(directory, "twinny-state.sqlite")
-  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///feedback-project"]), conversationId: "feedback-chat" }
+  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///feedback-project"]), conversationId: "feedback-chat", writer: "feedback-chat" }
   const repository = new TodoRepository(databasePath, wasmPath)
   const initial = await repository.synchronizeIntentPlan(scope, plan(tasks), { prompt: "Verify the requested work" })
   const items = complete ? [] : initial.items
@@ -77,7 +77,7 @@ const responseFor = (review: TodoReviewPackage, options: {
   scores: { completion: 7, correctness: 7, alignment: 8 }
 })
 
-const addObservation = (repository: TodoRepository, scope: { projectFingerprint: string; conversationId: string }, itemId: string, toolName = "read_file", exitCode?: number) =>
+const addObservation = (repository: TodoRepository, scope: TodoWriteRequest, itemId: string, toolName = "read_file", exitCode?: number) =>
   repository.recordToolObservation(scope, {
     itemId,
     toolName,
@@ -340,14 +340,14 @@ test("manual completion and independent project/chat scopes remain isolated", as
     const item = state.items[0]
     await state.repository.completeByUser(state.scope, item.id, item.version, "Explicitly approved by user", "user-complete", trustedTodoPanelApproval)
     assert.deepEqual(await state.repository.getReviewPackages(state.scope), [])
-    const otherScope = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "feedback-chat" }
+    const otherScope = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "feedback-chat", writer: "feedback-chat" }
     const otherPlan = { ...plan([{ id: "other", acceptance: "Other task is inspected" }]), planId: "other-plan" }
     await state.repository.synchronizeIntentPlan(otherScope, otherPlan, { prompt: "Other project" })
     const other = (await state.repository.getList(otherScope)).items[0]
     await state.repository.updateItem(otherScope, { itemId: other.id, expectedVersion: other.version, patch: { status: "completed" }, actor: "model", requestId: "other-claim" })
     assert.equal((await state.repository.getReviewPackages(otherScope)).length, 1)
     assert.deepEqual(await state.repository.getReviewPackages(state.scope), [])
-    const otherChat = { ...otherScope, conversationId: "other-chat" }
+    const otherChat = { ...otherScope, conversationId: "other-chat", writer: "other-chat" }
     assert.deepEqual(await state.repository.getReviewPackages(otherChat), [])
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -410,9 +410,10 @@ test("existing version-4 TODO databases gain child proposals and accepted eviden
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
     const check = new sql.Database(fs.readFileSync(state.databasePath))
-    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 6)
+    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 7)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_child_proposals'")[0].values[0][0], 1)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0].values[0][0], 1)
+    assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_symbol_aliases'")[0].values[0][0], 1)
     check.close()
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -421,13 +422,16 @@ test("existing version-4 TODO databases gain child proposals and accepted eviden
 
 const WORKSPACE_FILE = "src/extension/tools/workspace.ts"
 const workspaceText = Array.from({ length: 850 }, (_, index) => {
-  if (index === 168) return "  name: \"read_file\","
+  if (index === 168) return "const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink): Tool => {"
+  if (index === 169) return "  const limit = clampReadLines(maxLines)"
+  if (index === 170) return "  return {"
+  if (index === 171) return "    name: \"read_file\","
   if (index === 779) return "    const tool = tools.find((candidate) => candidate.name === name)"
   if (index === 799) return "    return tool.run(args)"
   return `const filler${index + 1} = ${index + 1}`
 }).join("\n")
 const currentWorkspace: CurrentSourceReader = async (file) => (file === WORKSPACE_FILE ? workspaceText : undefined)
-type Harness = { repository: TodoRepository; scope: { projectFingerprint: string; conversationId: string } }
+type Harness = { repository: TodoRepository; scope: TodoWriteRequest }
 
 /** A read_file observation whose fingerprint covers the whole document it read, as the host records it. */
 const observeWorkspaceWindow = async (state: Harness, itemId: string, requestId: string, start: number, end: number, text = workspaceText) => {
@@ -985,7 +989,7 @@ test("accepted source inspection persists and unlocks implementation without acc
   }
 })
 
-const recordTool = (repository: TodoRepository, scope: { projectFingerprint: string; conversationId: string }, itemId: string, toolName: string, failed = false) =>
+const recordTool = (repository: TodoRepository, scope: TodoWriteRequest, itemId: string, toolName: string, failed = false) =>
   repository.recordToolObservation(scope, {
     itemId,
     toolName,
@@ -1070,7 +1074,7 @@ test("workspace-index regression: claimed create, edit, and delete without tool 
 test("the native TODO tools are offered to the agent by default and dispatch to the repository", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-todo-tools-"))
   try {
-    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///todo-tools"]), conversationId: "todo-tools-chat" }
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///todo-tools"]), conversationId: "todo-tools-chat", writer: "todo-tools-chat" }
     const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
     const workspace = todoWorkspaceTools(repository, scope, () => undefined)
     const names = workspace.tools.map((tool) => tool.name)
@@ -1123,7 +1127,13 @@ test("feedback plans with TODO bookkeeping tasks are rejected, while distinct us
 })
 
 const EVIDENCE_FILE = "src/extension/tools/workspace.ts"
-const sourceLines = Array.from({ length: 850 }, (_, index) => index === 168 ? "  name: \"read_file\"," : `const filler${index + 1} = ${index + 1}`)
+const sourceLines = Array.from({ length: 850 }, (_, index) => {
+  if (index === 168) return "const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink): Tool => {"
+  if (index === 169) return "  const limit = clampReadLines(maxLines)"
+  if (index === 170) return "  return {"
+  if (index === 171) return "    name: \"read_file\","
+  return `const filler${index + 1} = ${index + 1}`
+})
 const numbered = (start: number, lines: string[]) => lines.map((text, index) => `${start + index}: ${text}`).join("\n")
 const readOutput = async (file: string, start: number, lines: string[]) =>
   `${file} (lines ${start}–${start + lines.length - 1} of 850)\ncontent_hash: ${await fingerprintContent(workspaceText)}; total_lines: 850\n${numbered(start, lines)}`
@@ -1131,7 +1141,7 @@ const readOutput = async (file: string, start: number, lines: string[]) =>
 const evidenceFixtureFor = async (tasks: { id: string; acceptance: string }[], listChars?: number) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-evidence-"))
   const databasePath = path.join(directory, "twinny-state.sqlite")
-  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///evidence-project"]), conversationId: "evidence-chat" }
+  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///evidence-project"]), conversationId: "evidence-chat", writer: "evidence-chat" }
   const repository = new TodoRepository(databasePath, wasmPath, { listChars: listChars ?? 2_000_000 })
   const synchronized = await repository.synchronizeIntentPlan(scope, plan(tasks), { prompt: "Explain how read_file is registered" })
   return { directory, databasePath, scope, repository, itemIds: synchronized.items.map((item) => item.id) }
@@ -1170,18 +1180,18 @@ test("a numbered read keeps its path, line range, total, and every source line",
   assert.equal(preserved.complete, true)
   assert.equal(preserved.content, output)
   assert.deepEqual(preserved.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText) }])
-  assert.ok(preserved.content.split("\n").includes("169:   name: \"read_file\","))
+  assert.ok(preserved.content.split("\n").includes("172:     name: \"read_file\","))
 })
 
 test("search output keeps each hit's path, line, and preview", () => {
   const output = JSON.stringify({
     query: "read_file", mode: "text", total: 1, offset: 0, limit: 20,
-    results: [{ path: EVIDENCE_FILE, line: 169, column: 3, category: "symbol", symbol: "read_file", kind: "property", preview: "name: \"read_file\",", source: "ts" }]
+    results: [{ path: EVIDENCE_FILE, line: 172, column: 5, category: "symbol", symbol: "read_file", kind: "property", preview: "name: \"read_file\",", source: "ts" }]
   })
   const hits = preserveEvidence(output).hits
   assert.equal(hits.length, 1)
   assert.equal(hits[0].path, EVIDENCE_FILE)
-  assert.equal(hits[0].line, 169)
+  assert.equal(hits[0].line, 172)
   assert.match(hits[0].preview, /read_file/)
 })
 
@@ -1201,7 +1211,7 @@ test("excerpts of a long source stay within budget, keep matching lines, and do 
   const excerpt = excerptEvidence(content, ["read_file"])
   assert.equal(excerpt.matched, true)
   assert.ok(excerpt.text.length <= MAX_EXCERPT_CHARS)
-  assert.ok(excerpt.text.split("\n").includes("169:   name: \"read_file\","))
+  assert.ok(excerpt.text.split("\n").includes("172:     name: \"read_file\","))
   assert.ok(!excerpt.text.includes("500: const filler500"))
   assert.equal(excerptEvidence(content, ["registerNativeTool"]).matched, false)
 })
@@ -1221,7 +1231,7 @@ test("coverage separates covered, absent, missing, failed, incomplete, and inacc
     arguments: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" },
     retained: true,
     complete: true,
-    content: "169:   name: \"read_file\",",
+    content: "172:     name: \"read_file\",",
     sources: [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850 }]
   }
   assert.deepEqual(evidenceGaps(evidenceAnchors("`read_file` is defined in src/extension/tools/workspace.ts"), [read]), [])
@@ -1267,13 +1277,13 @@ test("retained read evidence lets Feedback approve an investigation whose final 
       output: "search_workspace read_file: 1 hit",
       failed: false,
       requestId: "search-read-file",
-      evidenceOutput: JSON.stringify({ query: "read_file", mode: "text", total: 1, offset: 0, limit: 20, results: [{ path: EVIDENCE_FILE, line: 169, column: 3, category: "symbol", symbol: "read_file", kind: "property", preview: "name: \"read_file\",", source: "ts" }] })
+      evidenceOutput: JSON.stringify({ query: "read_file", mode: "text", total: 1, offset: 0, limit: 20, results: [{ path: EVIDENCE_FILE, line: 172, column: 5, category: "symbol", symbol: "read_file", kind: "property", preview: "name: \"read_file\",", source: "ts" }] })
     })
     const review = await reviewFor(state, item.id)
     const input = JSON.parse(todoReviewInput(review, undefined, "Found it."))
     const excerpt = input.trustedEvidenceExcerpts.find((entry: { observationId: string }) => entry.observationId === observation.id)
     assert.ok(excerpt, "the source read is offered to Feedback as an excerpt")
-    assert.ok(excerpt.text.includes("169:   name: \"read_file\","))
+    assert.ok(excerpt.text.includes("172:     name: \"read_file\","))
     assert.deepEqual(input.deterministicCoverage, [], "the stored evidence covers every anchor")
 
     const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria), hasVerifiedFileChanges: false })
@@ -1297,7 +1307,8 @@ test("a prose criterion that names a code identifier still promotes its verified
     assert.equal(facts.length, 1, "the verified declaration is promoted even though the criterion has no backticks")
     assert.equal(facts[0].observationId, observation.id)
     assert.equal(facts[0].startLine, 169)
-    assert.equal(facts[0].endLine, 169)
+    assert.equal(facts[0].endLine, 172)
+    assert.equal(facts[0].implementation, "readFile")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -1313,7 +1324,7 @@ test("accepted source facts are project knowledge: a second chat reads them afte
     const origin = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator(originCalls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
     assert.equal(origin.decision, "accept", JSON.stringify(origin.problems))
 
-    const secondScope = { ...state.scope, conversationId: "second-chat" }
+    const secondScope = { ...state.scope, conversationId: "second-chat", writer: "second-chat" }
     const secondPlan = await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance }]), { prompt: "Where is read_file defined?" })
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     const facts = await reopened.listAcceptedEvidence(secondScope, { symbol: "read_file", path: EVIDENCE_FILE })
@@ -1344,7 +1355,7 @@ test("a fact accepted in another chat of the project supersedes this chat's fact
     const first = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, startItem.id), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
     assert.equal(first.decision, "accept", JSON.stringify(first.problems))
 
-    const secondScope = { ...state.scope, conversationId: "second-chat" }
+    const secondScope = { ...state.scope, conversationId: "second-chat", writer: "second-chat" }
     const secondPlan = await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance }]), { prompt: "Where is read_file defined?" })
     const secondItem = secondPlan.items[0]
     await startItemInReview(state.repository, secondScope, secondItem.id)
@@ -1379,7 +1390,7 @@ test("a fact accepted in another chat of the project supersedes this chat's fact
 test("another conversation's TODO list in the project is readable read-only, and reads never create or change it", async () => {
   const state = await evidenceFixture("`read_file` is defined in src/extension/tools/workspace.ts")
   try {
-    const other = { projectFingerprint: state.scope.projectFingerprint, conversationId: "other-chat" }
+    const other = { projectFingerprint: state.scope.projectFingerprint, conversationId: "other-chat", writer: "other-chat" }
     assert.equal(await state.repository.readList(other), undefined, "a conversation with no list reads as absent")
     assert.equal(await state.repository.readList(other), undefined, "reading an absent list does not create it")
     await state.repository.createItem(other, { title: "Survey the parser" }, "other-create", "user")
@@ -1388,7 +1399,7 @@ test("another conversation's TODO list in the project is readable read-only, and
     assert.equal(snapshot?.items.length, 1)
     snapshot?.items.splice(0)
     assert.equal((await state.repository.readList(other))?.items.length, 1, "a returned snapshot is a copy, not the stored list")
-    const foreignProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "other-chat" }
+    const foreignProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "other-chat", writer: "other-chat" }
     assert.equal(await state.repository.readList(foreignProject), undefined, "a conversation in another project is not readable")
 
     const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined)
@@ -1438,7 +1449,8 @@ test("a deterministically accepted source fact is persisted and reused by a late
     assert.equal(facts.length, 1)
     assert.equal(facts[0].observationId, observation.id)
     assert.equal(facts[0].startLine, 169)
-    assert.equal(facts[0].endLine, 169)
+    assert.equal(facts[0].endLine, 172)
+    assert.equal(facts[0].implementation, "readFile", "the registered name is stored with the function that implements it")
     assert.equal(facts[0].sourceHash, await fingerprintContent(workspaceText))
     assert.equal(facts[0].supersededBy, undefined)
 
@@ -1471,7 +1483,7 @@ test("repeating an accepted review adds no duplicate fact, and another project r
     await evaluateTodoReview(state.repository, state.scope, review, countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false }).catch(() => undefined)
     assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })).length, 1, "a repeated acceptance must not duplicate the fact")
 
-    const otherProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "other-chat" }
+    const otherProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "other-chat", writer: "other-chat" }
     assert.deepEqual(await state.repository.listAcceptedEvidence(otherProject, { symbol: "read_file", path: EVIDENCE_FILE }), [], "a fact is never visible to another project")
     assert.equal(calls.count, 0)
   } finally {
@@ -1554,6 +1566,242 @@ test("accepted facts survive repository reopen and are reused without the origin
 })
 
 
+const workspaceRecord = async (start: number, end: number) => ({
+  observationId: "obs-window",
+  itemId: "registration",
+  toolName: "read_file",
+  arguments: { path: EVIDENCE_FILE, start_line: String(start), end_line: String(end) },
+  failed: false,
+  retained: true,
+  complete: true,
+  originalChars: 0,
+  preservedChars: 0,
+  content: numbered(start, sourceLines.slice(start - 1, end)),
+  sources: [{ path: EVIDENCE_FILE, startLine: start, endLine: end, totalLines: 850, contentHash: await fingerprintContent(workspaceText) }],
+  hits: []
+})
+
+test("a tool name and the function that encloses its registration are stored as one alias with both line ranges", async () => {
+  const [outcome] = await reconcileCriteria(["Locate the `read_file` tool definition in src/extension/tools/workspace.ts"], [await workspaceRecord(160, 181)], currentWorkspace)
+  assert.equal(outcome.outcome, "proven", JSON.stringify(outcome))
+  assert.deepEqual(outcome.facts, [{
+    symbol: "read_file",
+    implementation: "readFile",
+    path: EVIDENCE_FILE,
+    startLine: 169,
+    endLine: 172,
+    observationId: "obs-window",
+    sourceHash: await fingerprintContent(workspaceText)
+  }])
+})
+
+test("a registration whose enclosing declaration is outside the read stores no alias", async () => {
+  const [outcome] = await reconcileCriteria(["Locate the `read_file` tool definition in src/extension/tools/workspace.ts"], [await workspaceRecord(171, 181)], currentWorkspace)
+  assert.equal(outcome.outcome, "proven", JSON.stringify(outcome))
+  assert.deepEqual(outcome.facts, [{
+    symbol: "read_file",
+    path: EVIDENCE_FILE,
+    startLine: 172,
+    endLine: 172,
+    observationId: "obs-window",
+    sourceHash: await fingerprintContent(workspaceText)
+  }])
+})
+
+test("a stored alias lets a criterion naming the implementation reuse the fact without reading, and only with the alias", async () => {
+  const sourceHash = await fingerprintContent(workspaceText)
+  const fact = {
+    id: "fact-registration",
+    conversationId: "chat-a",
+    itemId: "item-a",
+    criterionIndex: 0,
+    criterion: "Locate the `read_file` tool definition in src/extension/tools/workspace.ts",
+    toolName: "read_file",
+    planId: "plan-a",
+    planRevision: 1,
+    acceptedAt: "2024-01-01T00:00:00.000Z",
+    symbol: "read_file",
+    implementation: "readFile",
+    path: EVIDENCE_FILE,
+    startLine: 169,
+    endLine: 172,
+    observationId: "obs-window",
+    sourceHash
+  }
+  const alias = {
+    id: "alias-registration",
+    conversationId: "chat-a",
+    toolName: "read_file",
+    implementation: "readFile",
+    path: EVIDENCE_FILE,
+    startLine: 169,
+    endLine: 172,
+    observationId: "obs-window",
+    sourceHash,
+    createdAt: "2024-01-01T00:00:00.000Z"
+  }
+  const criteria = ["Locate the `readFile` function in src/extension/tools/workspace.ts"]
+  const [reused] = await reconcileCriteria(criteria, [], currentWorkspace, [fact], [alias])
+  assert.equal(reused.outcome, "proven", JSON.stringify(reused))
+  assert.equal(reused.reuse, "accepted")
+  assert.deepEqual(reused.supportingObservationIds, ["obs-window"])
+  const [withoutAlias] = await reconcileCriteria(criteria, [], currentWorkspace, [fact], [])
+  assert.notEqual(withoutAlias.outcome, "proven", "the fact proves the implementation name only through the stored alias")
+})
+
+test("a registration alias proven in one chat is stored, survives reopen, and proves the implementation name in a later chat", async () => {
+  const state = await evidenceFixtureFor([
+    { id: "registration", acceptance: "`read_file` is defined in src/extension/tools/workspace.ts" },
+    { id: "implementation", acceptance: "`readFile` is defined in src/extension/tools/workspace.ts" }
+  ])
+  try {
+    const [registration, implementation] = state.itemIds
+    await startItemInReview(state.repository, state.scope, registration)
+    await observeRead(state, registration, "read-registration", EVIDENCE_FILE, 160, sourceLines.slice(159, 181))
+    const calls = { count: 0 }
+    const first = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, registration), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(first.decision, "accept", JSON.stringify(first.problems))
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const aliases = await reopened.listSymbolAliases(state.scope)
+    assert.deepEqual(aliases.map((alias) => [alias.toolName, alias.implementation, alias.startLine, alias.endLine]), [["read_file", "readFile", 169, 172]])
+
+    await startItemInReview(reopened, state.scope, implementation)
+    const review = (await reopened.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === implementation)!
+    assert.equal(review.symbolAliases.length, 1, "the later chat sees the stored alias")
+    const second = await evaluateTodoReview(reopened, state.scope, review, countingEvaluator(calls), "different-provider-model", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(second.decision, "accept", JSON.stringify(second.problems))
+    assert.equal(second.criteria[0].reconciliation?.reuse, "accepted")
+    assert.equal(calls.count, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+const COPY_FILE = "src/extension/tools/workspace-copy.ts"
+const twoCopiesWorkspace: CurrentSourceReader = async (file) => (file === EVIDENCE_FILE || file === COPY_FILE ? workspaceText : undefined)
+
+test("a definition criterion that names no path is located by the one fresh read that declares it", async () => {
+  const state = await evidenceFixture("Locate the read_file tool definition")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-discover", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal(calls.count, 0)
+    const facts = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(facts.length, 1)
+    assert.equal(facts[0].observationId, observation.id)
+    assert.equal(facts[0].implementation, "readFile")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a path-free definition criterion goes to Feedback when two fresh reads each declare the symbol", async () => {
+  const state = await evidenceFixture("Locate the read_file tool definition")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-one", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    await observeRead(state, item.id, "read-two", COPY_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const review = await reviewFor(state, item.id)
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => {
+      calls.count += 1
+      return responseFor(review, { refs: [observation.id] })
+    }, "mock-reviewer", { readCurrentSource: twoCopiesWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal(calls.count, 1, "two declaring files are ambiguous, so Feedback decides")
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file" })).length, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a path-free definition criterion is neither proven nor disproven by a fresh read that does not declare the symbol", async () => {
+  const state = await evidenceFixture("Locate the read_file tool definition")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-filler", EVIDENCE_FILE, 1, sourceLines.slice(0, 50))
+    const calls = { count: 0 }
+    const review = await reviewFor(state, item.id)
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => {
+      calls.count += 1
+      return responseFor(review, { refs: [observation.id] })
+    }, "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.notEqual(evaluation.decision, "revise", JSON.stringify(evaluation.problems))
+    assert.equal(calls.count, 1, "the criterion is left for Feedback rather than judged by absence")
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file" })).length, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a failed read or a read without its content fingerprint proves nothing and stores no accepted fact", async () => {
+  const state = await evidenceFixture("Locate the read_file tool definition in src/extension/tools/workspace.ts")
+  try {
+    const item = await startInvestigation(state)
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: item.id,
+      toolName: "read_file",
+      arguments: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" },
+      output: "read failed: file is locked",
+      failed: true,
+      requestId: "read-failed"
+    })
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: item.id,
+      toolName: "read_file",
+      arguments: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" },
+      output: `read \`${EVIDENCE_FILE}:150\` · 51 lines`,
+      failed: false,
+      requestId: "read-without-fingerprint",
+      evidenceOutput: `${EVIDENCE_FILE} (lines 150–200 of 850)\n${numbered(150, sourceLines.slice(149, 200))}`
+    })
+    const review = await reviewFor(state, item.id)
+    const outcomes = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, currentWorkspace)
+    assert.notEqual(outcomes[0].outcome, "proven", JSON.stringify(outcomes[0]))
+    assert.deepEqual(outcomes[0].supportingObservationIds, [])
+
+    const calls = { count: 0 }
+    await evaluateTodoReview(state.repository, state.scope, review, async () => {
+      calls.count += 1
+      return responseFor(review, { decision: "revise", status: "failed", correctiveInstructions: ["Read the source again with its fingerprint."] })
+    }, "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false }).catch(() => undefined)
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file" })).length, 0, "unprovable evidence must not be accepted")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("accepted facts and TODO writes stay inside the project that recorded them, even under a forged project fingerprint", async () => {
+  const state = await evidenceFixture("Locate the read_file tool definition in src/extension/tools/workspace.ts")
+  try {
+    const item = await startInvestigation(state)
+    await observeRead(state, item.id, "read-own", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })).length, 1)
+
+    const forged = { ...state.scope, projectFingerprint: workspaceProjectFingerprint(["file:///evidence-project-forged"]) }
+    assert.deepEqual(await state.repository.listAcceptedEvidence(forged, { symbol: "read_file" }), [], "a forged project reads no accepted fact")
+    await assert.rejects(async () => state.repository.updateItem(forged, {
+      itemId: item.id, expectedVersion: item.version, patch: { title: "Rewritten from another project" }, actor: "model", requestId: "forged-update"
+    }))
+    assert.equal((await state.repository.getList(state.scope)).items.find((candidate) => candidate.id === item.id)?.title, item.title, "another project cannot rewrite this item")
+
+    const created = await state.repository.createItem(forged, { title: "Task in a forged project" }, "forged-create")
+    assert.equal(created.title, "Task in a forged project")
+    assert.equal((await state.repository.getList(state.scope)).items.some((candidate) => candidate.title === "Task in a forged project"), false, "a write under a forged project stays in its own project")
+    assert.deepEqual(await state.repository.listAcceptedEvidence(forged, { symbol: "read_file" }), [])
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })).length, 1, "the recorded fact is unchanged")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 const lookupEvidence = async (state: EvidenceFixture, args: Record<string, string>, readCurrent?: CurrentSourceReader) => {
   const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: readCurrent })
   const response = await tools.run({ name: "twinny_evidence_lookup", args })
@@ -1580,7 +1828,7 @@ test("twinny_evidence_lookup returns a current accepted fact with its observatio
     assert.equal(fact.symbol, "read_file")
     assert.equal(fact.path, EVIDENCE_FILE)
     assert.equal(fact.start_line, 169)
-    assert.equal(fact.end_line, 169)
+    assert.equal(fact.end_line, 172)
     assert.equal(fact.source_hash, await fingerprintContent(workspaceText))
     assert.equal(fact.freshness, "current")
     assert.equal(fact.refresh, undefined, "a current fact needs no refresh")
@@ -1603,7 +1851,7 @@ test("twinny_evidence_lookup reports a changed source as historical with a refre
     assert.equal(stale.body!.facts.length, 1)
     assert.equal(stale.body!.facts[0].freshness, "historical")
     assert.ok(typeof stale.body!.facts[0].reason === "string", "staleness is explained")
-    assert.equal(stale.body!.facts[0].refresh, `read ${EVIDENCE_FILE} lines 169-169 again`)
+    assert.equal(stale.body!.facts[0].refresh, `read ${EVIDENCE_FILE} lines 169-172 again`)
 
     await startItemInReview(state.repository, state.scope, second)
     const fresh = await state.repository.recordToolObservation(state.scope, {
@@ -1636,7 +1884,7 @@ test("planning, observation, deterministic verification, persistence, context re
   const OBJECTIVE = "Locate the native read_file tool definition."
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-integration-"))
   const databasePath = path.join(directory, "twinny-state.sqlite")
-  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///integration-project"]), conversationId: "integration-chat" }
+  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///integration-project"]), conversationId: "integration-chat", writer: "integration-chat" }
   try {
     const task = (id: string, title: string, dependencies: string[]) => ({ id, title, description: `Work for ${id}.`, acceptanceCriteria: ["`read_file` is defined in src/extension/tools/workspace.ts"], dependencies })
     const reply = JSON.stringify({ track: true, plan: { planId: "feedback-plan", version: 1, revision: 1, goal: OBJECTIVE, constraints: [], tasks: [
@@ -1954,10 +2202,10 @@ test("one window that supports two criteria is shown once and attributed to both
   const state = await evidenceFixture("`readFile` dispatch in src/extension/tools/workspace.ts")
   try {
     const item = await startInvestigation(state)
-    await observeRead(state, item.id, "read-shared", EVIDENCE_FILE, 1, sourceLines.map((line, index) => index === 168 ? "  name: \"readFile\"," : line))
+    await observeRead(state, item.id, "read-shared", EVIDENCE_FILE, 1, sourceLines.map((line, index) => index === 171 ? "    name: \"readFile\"," : line))
     const review = await reviewFor(state, item.id)
     const input = JSON.parse(todoReviewInput({ ...review, acceptanceCriteria: ["`readFile` dispatch in src/extension/tools/workspace.ts", "`readFile` is named in src/extension/tools/workspace.ts"] }))
-    const shared = input.trustedEvidenceExcerpts.filter((entry: { text: string }) => entry.text.includes("169:   name: \"readFile\","))
+    const shared = input.trustedEvidenceExcerpts.filter((entry: { text: string }) => entry.text.includes("172:     name: \"readFile\","))
     assert.equal(shared.length, 1, "the window is not duplicated")
     assert.equal(shared[0].criteria.length, 2, "the window supports both criteria")
   } finally {
@@ -1977,16 +2225,16 @@ test("search hits become windows of their own with path and line, and unrelated 
       failed: false,
       requestId: "search-hits",
       evidenceOutput: searchHits([
-        { path: EVIDENCE_FILE, line: 169, preview: "name: \"read_file\"," },
+        { path: EVIDENCE_FILE, line: 172, preview: "name: \"read_file\"," },
         { path: "src/other/unrelated.ts", line: 12, preview: "const unrelated = 1" }
       ])
     })
     const input = JSON.parse(todoReviewInput(await reviewFor(state, item.id)))
     assert.equal(input.trustedEvidenceExcerpts.length, 1, "only the matching hit is offered")
     const [excerpt] = input.trustedEvidenceExcerpts
-    assert.equal(excerpt.text, `${EVIDENCE_FILE}:169 name: "read_file",`)
-    assert.deepEqual(excerpt.lines, { start: 169, end: 169 })
-    assert.deepEqual(excerpt.sources, [{ path: EVIDENCE_FILE, startLine: 169, endLine: 169 }])
+    assert.equal(excerpt.text, `${EVIDENCE_FILE}:172 name: "read_file",`)
+    assert.deepEqual(excerpt.lines, { start: 172, end: 172 })
+    assert.deepEqual(excerpt.sources, [{ path: EVIDENCE_FILE, startLine: 172, endLine: 172 }])
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -2015,7 +2263,7 @@ test("retained evidence survives reopening the store, as it does across an autom
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     const review = await reviewFor({ ...state, repository: reopened }, item.id)
     const retained = review.retainedEvidence.find((entry) => entry.observationId === observation.id)
-    assert.ok(retained?.content?.includes("169:   name: \"read_file\","))
+    assert.ok(retained?.content?.includes("172:     name: \"read_file\","))
     assert.deepEqual(retained?.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText) }])
     assert.equal(review.observations.find((entry) => entry.id === observation.id)?.evidence?.retained, true)
   } finally {
