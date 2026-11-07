@@ -394,7 +394,7 @@ export class Chat extends Base {
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
 
 this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
-  logger.info("twinny-tool-inventory requested");
+  logger.debug("twinny-tool-inventory requested");
   try {
     // Ensure MCP is ready before accessing its tools
     await this._mcp.ready();
@@ -448,7 +448,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       tool: t.tool,
     }));
     const inventory = [...nativeList, ...mcpList];
-    logger.info(`twinny-tool-inventory: native=${nativeList.length} mcp=${mcpList.length} total=${inventory.length}`);
+    logger.debug(`twinny-tool-inventory: native=${nativeList.length} mcp=${mcpList.length} total=${inventory.length}`);
     return inventory;
   } catch (e) {
     logger.error(`twinny-tool-inventory error: ${e}`);
@@ -597,7 +597,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   private startFeedbackPlanning(messages: ChatCompletionMessage[]): Promise<FeedbackPlanOutcome> | undefined {
     const scope = this.activeTodoScope()
     const text = this.latestUserText(messages)
-    if (!scope || !text) return undefined
+    if (!scope || !text) {
+      logger.debug(`[Feedback] planning not started: ${scope ? "the latest message has no text" : "this conversation has no TODO scope"}`)
+      return undefined
+    }
     return this._feedbackPlanner.start(scope, text)
   }
 
@@ -845,9 +848,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       // Mycroft starts only after Feedback has produced an authoritative plan
       // (or Feedback is off). The gate holds the turn on any other outcome.
       this._userRequestsTodo = userRequestsTodoCreation(this.latestUserText(messages) ?? "")
-      const planning = isFeedbackEnabled(workspace.getConfiguration("twinny"))
-        ? this.startFeedbackPlanning(messages)
-        : undefined
+      const feedbackOn = isFeedbackEnabled(workspace.getConfiguration("twinny"))
+      if (!feedbackOn) logger.debug("[Feedback] planning not started: Feedback is off")
+      const planning = feedbackOn ? this.startFeedbackPlanning(messages) : undefined
       const dispatch = async (): Promise<string | undefined> => {
         this._preparing = true
         try {
@@ -1242,7 +1245,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const candidates = reviewCandidates(reviews, itemId).filter((review) => !attempted.has(review.task.id + "@" + review.task.version))
     if (!candidates.length) {
       if (itemId && reviews.some((review) => review.task.id === itemId && !dependenciesComplete(review))) {
-        logger.info("[Feedback] TODO " + itemId + " is awaiting completed dependencies before review")
+        logger.debug("[Feedback] TODO " + itemId + " is awaiting completed dependencies before review")
         return []
       }
       if (itemId) throw new Error("This TODO is not awaiting evaluation")
@@ -1300,7 +1303,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal),
           readCurrentSource
         })
-        logger.info("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
+        logger.debug("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
         const snapshot = await this._todoRepository!.getList(scope)
         this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
         return evaluation
@@ -1827,7 +1830,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       this._steps.handOff()
       if (continuation && execution.claimContinuation() && !this.cancelled) {
         this._conversation = [...this._conversation, { role: USER, content: continuation }]
-        logger.info("[Execution] continuing automatically after independent reconciliation")
+        logger.debug("[Execution] continuing automatically after independent reconciliation")
         execution.continuationStarted()
         return this.run(provider, CONTINUATION_PREFIX, view, execution, activeCheckpoints)
       }
@@ -1870,7 +1873,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       })
     }, this.todoToolOptions())
     // TODO tools are always offered: agent profile tool restrictions must not hide task tracking.
-    logger.info(`[ToolTrace] outgoing=${available.tools.length} native TODO tools: ${available.tools.map((tool) => tool.name).join(", ")}`)
+    logger.debug(`[ToolTrace] outgoing=${available.tools.length} native TODO tools: ${available.tools.map((tool) => tool.name).join(", ")}`)
     hooks.onTools(available)
     const maxResultChars = clampNumericSetting(
       this.config.get<number>("chatToolsMaxResultChars", DEFAULT_RESULT_CHARS),
@@ -1899,14 +1902,14 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onOutOfSteps: hooks.onOutOfSteps,
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,
-      onRequest: (chars, step, mode, tokens) => logger.info(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`),
+      onRequest: (chars, step, mode, tokens) => logger.debug(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
       onStep: (step) => {
         this._steps.finish(step)
-        logger.info(`Chat TODO tools · ${step.summary}`)
+        logger.debug(`Chat TODO tools · ${step.summary}`)
       },
-      onTrim: (results, tokens) => logger.info(`Chat TODO tools · trimmed ${results} older result${results === 1 ? "" : "s"} (now about ${formatCount(tokens)} tokens)`),
+      onTrim: (results, tokens) => logger.debug(`Chat TODO tools · trimmed ${results} older result${results === 1 ? "" : "s"} (now about ${formatCount(tokens)} tokens)`),
       onFallback: (reason) => logger.warn(`Chat TODO tools · provider fell back to text tool calls: ${reason}`),
       onEnd: () => this._steps.settle()
     })
@@ -2025,7 +2028,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ...nativeTools.map((tool) => tool.name),
       ...this._activeMcpTools.map((tool) => `${tool.server}/${tool.tool}`)
     ]
-    logger.info(`[ToolTrace] discovered=${nativeTools.length} native, ${this._activeMcpTools.length} MCP`)
+    logger.debug(`[ToolTrace] discovered=${nativeTools.length} native, ${this._activeMcpTools.length} MCP`)
 
     // This override ignores only the selected profile's tool list. Workspace,
     // team, MCP enablement, and execution-approval restrictions still apply.
@@ -2033,7 +2036,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ? undefined
       : this._activeAgent?.profile.tools
     const selection = resolveAgentToolSelection(requestedTools, nativeTools, this._activeMcpTools)
-    logger.info("[ToolTrace] eligible=" + selection.native.length + " native, " + selection.mcp.length + " MCP")
+    logger.debug("[ToolTrace] eligible=" + selection.native.length + " native, " + selection.mcp.length + " MCP")
     const adaptiveExposure = this.config.get<boolean>("chatToolsAdaptiveExposureEnabled", false)
     const projection = projectTaskRelevantTools(selection.native, selection.mcp, intentGoal ?? "", adaptiveExposure)
     const permittedNames = new Set([...selection.native, ...selection.mcp].map((tool) => tool.name))
@@ -2071,8 +2074,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     // subsequently choose native or text-mode tool serialization.
     const outgoingNames = available.tools.map((tool) => tool.name)
     const outgoingSchemaChars = schemaChars(available.tools)
-    logger.info(`[ToolTrace] outgoing=${outgoingNames.length} tools: ${outgoingNames.join(", ")}`)
-    if (adaptiveExposure) logger.info("[ToolTrace] adaptive projection retained " + projection.native.length + " native, " + projection.mcp.length + " MCP; excluded=" + (projection.excluded.map((entry) => entry.name + " (" + entry.reason + ")").join(", ") || "none") + "; schema chars " + beforeSchemaChars + " (~" + Math.ceil(beforeSchemaChars / 4) + " tokens) -> " + outgoingSchemaChars + " (~" + Math.ceil(outgoingSchemaChars / 4) + " tokens)")
+    logger.debug(`[ToolTrace] outgoing=${outgoingNames.length} tools: ${outgoingNames.join(", ")}`)
+    if (adaptiveExposure) logger.debug("[ToolTrace] adaptive projection retained " + projection.native.length + " native, " + projection.mcp.length + " MCP; excluded=" + (projection.excluded.map((entry) => entry.name + " (" + entry.reason + ")").join(", ") || "none") + "; schema chars " + beforeSchemaChars + " (~" + Math.ceil(beforeSchemaChars / 4) + " tokens) -> " + outgoingSchemaChars + " (~" + Math.ceil(outgoingSchemaChars / 4) + " tokens)")
     const missingFromOutgoing = [...selectedNames].filter((name) => !outgoingNames.includes(name))
     if (missingFromOutgoing.length) {
       logger.warn(`[ToolTrace] selected tools absent from outgoing definitions: ${missingFromOutgoing.join(", ")}`)
@@ -2106,7 +2109,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,
       onRequest: (chars, step, mode, tokens) =>
-        logger.info(
+        logger.debug(
           `Chat tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`
         ),
       onToolStart: (start) => this._steps.start(start),
@@ -2114,10 +2117,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       shouldStop: () => !safety.canMutate(),
       onStep: (step) => {
         this._steps.finish(step)
-        logger.info(`Chat tools · ${step.summary}`)
+        logger.debug(`Chat tools · ${step.summary}`)
       },
       onTrim: (results, tokens) =>
-        logger.info(
+        logger.debug(
           `Chat tools · trimmed ${results} older tool result${results === 1 ? "" : "s"} to fit the context (now about ${formatCount(tokens)} tokens)`
         ),
       onFallback: (reason, what) =>

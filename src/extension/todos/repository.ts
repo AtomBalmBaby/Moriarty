@@ -84,7 +84,11 @@ interface ItemRow {
 
 const now = () => new Date().toISOString()
 type TodoLogField = string | number | boolean | null
-const logTodoEvent = (event: string, fields: Record<string, TodoLogField>) => logger.info("[Todo] " + event + " " + JSON.stringify(fields))
+const logTodoEvent = (event: string, fields: Record<string, TodoLogField>, level: "info" | "debug" = "info") => {
+  const line = "[Todo] " + event + " " + JSON.stringify(fields)
+  if (level === "debug") logger.debug(line)
+  else logger.info(line)
+}
 const validStatuses = new Set<TodoStatus>(["pending", "in_progress", "in_review", "blocked", "completed", "cancelled"])
 const validPriorities = new Set<TodoPriority>(["low", "normal", "high", "urgent"])
 const statusTransitions: Record<TodoStatus, Set<TodoStatus>> = {
@@ -460,22 +464,17 @@ const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item
  * symbol and path on read: the newest current fact wins, and older ones report it as
  * `supersededBy`. Rows are never rewritten here, so another conversation's record stays intact.
  */
+/**
+ * Project facts, newest first. Supersession is decided over the whole project before any
+ * symbol or path filter, so a filtered query never revives a fact that a newer one replaced.
+ * A symbol matches the fact's own symbol or its verified implementation name.
+ */
 const acceptedFactsFor = (database: Database, projectId: string, options: { symbol?: string; path?: string; includeSuperseded?: boolean } = {}): AcceptedFact[] => {
-  const clauses = ["lists.project_id = ?"]
-  const params: string[] = [projectId]
-  if (options.symbol !== undefined) {
-    clauses.push("evidence.symbol = ?")
-    params.push(options.symbol)
-  }
-  if (options.path !== undefined) {
-    clauses.push("evidence.path = ?")
-    params.push(options.path)
-  }
   const facts = rows<AcceptedFactRow>(database,
     `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id ` +
     "LEFT JOIN todo_symbol_aliases AS aliases ON aliases.list_id = evidence.list_id AND aliases.observation_id = evidence.observation_id AND aliases.tool_name = evidence.symbol AND aliases.path = evidence.path " +
-    `WHERE ${clauses.join(" AND ")} ORDER BY evidence.created_at DESC, evidence.id`,
-    params
+    "WHERE lists.project_id = ? ORDER BY evidence.created_at DESC, evidence.id",
+    [projectId]
   ).map((row) => ({
     id: row.id,
     conversationId: row.conversation_id,
@@ -503,7 +502,10 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
     if (current) fact.supersededBy = current
     else newest.set(key, fact.id)
   }
-  return options.includeSuperseded ? facts : facts.filter((fact) => !fact.supersededBy)
+  const matches = facts.filter((fact) =>
+    (options.symbol === undefined || fact.symbol === options.symbol || fact.implementation === options.symbol)
+    && (options.path === undefined || fact.path === options.path))
+  return options.includeSuperseded ? matches : matches.filter((fact) => !fact.supersededBy)
 }
 
 /**
@@ -569,6 +571,12 @@ const recordAcceptedFacts = (
     }
   }
 }
+
+/** A stored plan is closed when every task it still has is finished; its history stays, and new work may replace it. */
+const intentPlanClosed = (database: Database, listId: string): boolean =>
+  rows<{ open_tasks: number }>(database,
+    `SELECT COUNT(*) AS open_tasks FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
+     WHERE tasks.list_id = ? AND tasks.active = 1 AND items.status NOT IN ('completed', 'cancelled')`, [listId])[0].open_tasks === 0
 
 const retainedEvidenceFor = (database: Database, itemId: string, withContent: boolean, sharedListId?: string): RetainedObservationEvidence[] =>
   rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
@@ -666,6 +674,13 @@ export class TodoRepository {
     })
   }
 
+  intentPlanClosed(request: TodoListRequest): Promise<boolean> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      return list ? intentPlanClosed(database, list.id) : false
+    })
+  }
+
   getIntentResult(request: TodoListRequest): Promise<unknown | undefined> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
@@ -690,9 +705,14 @@ export class TodoRepository {
       const existing = rows<{
         plan_id: string; revision: number; goal: string; constraints_json: string; intent_result_json: string
       }>(database, "SELECT plan_id, revision, goal, constraints_json, intent_result_json FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
-      if (existing) {
+      // A closed plan is finished work: new work replaces it under a new planId, and its items and history stay.
+      const replacing = !!existing && intentPlanClosed(database, list.id)
+      if (existing && !replacing) {
         if (existing.plan_id !== plan.planId) throw new TodoConflictError("Intent plan ID changed for this conversation; preserve the existing planId when revising it")
         if (plan.revision < existing.revision) throw new TodoConflictError("Intent plan revision is older than the stored revision")
+      }
+      if (replacing && plan.revision <= existing.revision) {
+        throw new TodoConflictError(`A plan replacing a completed plan needs a revision above ${existing.revision}`)
       }
 
       const priorTasks = rows<{
@@ -703,8 +723,9 @@ export class TodoRepository {
                 items.title, items.details, items.sort_order
          FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
          WHERE tasks.list_id = ?`, [list.id])
-      const priorById = new Map(priorTasks.map((task) => [task.task_id, task]))
-      const unchanged = !!existing && plan.revision === existing.revision
+      // Task identities of a replaced plan belong to finished items, so the new plan's tasks start new items.
+      const priorById = new Map(priorTasks.filter(() => !replacing).map((task) => [task.task_id, task]))
+      const unchanged = !!existing && !replacing && plan.revision === existing.revision
       if (unchanged) {
         if (existing.goal !== plan.goal || existing.constraints_json !== JSON.stringify(plan.constraints)) {
           throw new TodoConflictError("Intent plan definitions changed without increasing plan.revision")
@@ -752,7 +773,7 @@ export class TodoRepository {
         database.run(
           `INSERT INTO todo_intent_tasks(list_id, task_id, item_id, acceptance_json, dependencies_json, active)
            VALUES (?, ?, ?, ?, ?, 1)
-           ON CONFLICT(list_id, task_id) DO UPDATE SET acceptance_json = excluded.acceptance_json,
+           ON CONFLICT(list_id, task_id) DO UPDATE SET item_id = excluded.item_id, acceptance_json = excluded.acceptance_json,
              dependencies_json = excluded.dependencies_json, active = 1`,
           [list.id, task.id, itemId, JSON.stringify(task.acceptanceCriteria), JSON.stringify(task.dependencies)]
         )
@@ -766,8 +787,8 @@ export class TodoRepository {
       }
       if (existing) {
         database.run(
-          "UPDATE todo_intent_plans SET revision = ?, goal = ?, constraints_json = ?, intent_result_json = ?, updated_at = ? WHERE list_id = ?",
-          [plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, createdAt, list.id]
+          "UPDATE todo_intent_plans SET plan_id = ?, revision = ?, goal = ?, constraints_json = ?, intent_result_json = ?, updated_at = ? WHERE list_id = ?",
+          [plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, createdAt, list.id]
         )
       } else {
         database.run(
@@ -1020,7 +1041,7 @@ export class TodoRepository {
       }
       if (row.status === "in_review") database.run("UPDATE todo_items SET version = version + 1, updated_at = ? WHERE id = ?", [observation.createdAt, row.id])
       bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
-      logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId })
+      logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
       return observation
     })
   }
@@ -1441,7 +1462,7 @@ export class TodoRepository {
       if (unchangedState) {
         const unchanged = itemOf(row)
         recordRequest(database, list.id, input.requestId, "update", unchanged)
-        logTodoEvent("todo.update.noop", { operation_id: list.id, item_id: row.id, status: row.status, version: row.version, actor: input.actor, request_id: input.requestId })
+        logTodoEvent("todo.update.noop", { operation_id: list.id, item_id: row.id, status: row.status, version: row.version, actor: input.actor, request_id: input.requestId }, "debug")
         return unchanged
       }
       if (sortOrder !== row.sort_order) {
@@ -1491,7 +1512,7 @@ export class TodoRepository {
         }
         const claim: TodoCompletionClaim = { disposition: "already_submitted", item: itemOf(row), review }
         recordRequest(database, list.id, input.requestId, "claim", claim)
-        logTodoEvent("todo.claim.already_submitted", { operation_id: list.id, item_id: row.id, version: row.version, request_id: input.requestId })
+        logTodoEvent("todo.claim.already_submitted", { operation_id: list.id, item_id: row.id, version: row.version, request_id: input.requestId }, "debug")
         return claim
       }
 

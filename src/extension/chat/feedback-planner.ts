@@ -52,9 +52,9 @@ const EXCERPT_CHARS = 240
 /** Twinny's own TODO machinery: the list, its items, and their statuses. */
 const TODO_MACHINERY = /\b(?:todos?|to-dos?|task\s+list|plan\s+items?|tracking\s+items?|task\s+(?:statuses?|entries))(?![-\w])/i
 /** A verb that would direct Mycroft to write, maintain, use, or report on a TODO record. */
-const ADMINISTRATIVE_VERB = /\b(?:create|add|make|open|initiali[sz]e|set\s+up|populate|record|log|track|maintain|update|mark|verify|confirm|report|submit|complete|close|move|set|keep|use|document|file|write)\b/gi
+const ADMINISTRATIVE_VERB = /\b(?:create|created|add|added|make|open|opened|initiali[sz]e|initiali[sz]ed|set\s+up|populate|populated|record|recorded|log|logged|track|tracked|maintain|maintained|update|updated|mark|marked|verify|verified|confirm|confirmed|report|reported|submit|submitted|complete|completed|close|closed|move|moved|set|keep|kept|use|used|document|documented|file|filed|write|written|entered|noted)\b/gi
 /** Words right after a TODO noun that name Twinny's code rather than its records, e.g. "TODO filter" or "TODO scanner". */
-const CODE_REFERENT_AFTER = /^\s*(?:[\w.'"`/-]+\s+){0,2}(?:path|paths|code|scanner|panel|filter|view|handler|handling|function|implementation|module|source|logic|component|command|feature|webview|parser|schema|migration|tests?|files?|regex|tool)\b/i
+const CODE_REFERENT_AFTER = /^\s*(?:[\w.'"`/-]+\s+)?(?:path|paths|code|scanner|panel|filter|view|handler|handling|function|implementation|module|source|logic|component|command|feature|webview|parser|schema|migration|tests?|files?|regex|tool)\b/i
 /** A criterion that requires a TODO record to exist or to have a status. */
 const RECORD_STATE_AFTER = /^\s*(?:[\w'-]+\s+){0,3}?(?:exists?|existing|present|recorded|marked|status(?:es)?|reflects?|updated|created|is\s+(?:open|done|closed|complete|completed|in\s+progress|pending|verified))\b/i
 /**
@@ -120,6 +120,9 @@ export interface AdministrativeClause {
  * Finds every title, description, and acceptance criterion that makes Mycroft administer the TODO list. Plans for an
  * objective about the TODO machinery itself are exempt. Nothing is removed: the plan must be corrected and resubmitted.
  */
+/** Whether a child TODO's title or details would record or manage TODO entries rather than do concrete work. */
+export const isAdministrativeChildText = (text: string, objective: string): boolean => !requestsTodoMachineryWork(objective) && isAdministrativeText(text, false)
+
 export const findAdministrativeClauses = (plan: unknown, objective = ""): AdministrativeClause[] => {
   if (!plan || typeof plan !== "object" || !Array.isArray((plan as { tasks?: unknown }).tasks)) return []
   const candidate = plan as { goal?: unknown; tasks: unknown[] }
@@ -280,6 +283,13 @@ export const parseChildTodoDecision = (reply: string | RoleReply | undefined, co
   if (kind === "revised" && !title && !details && !parentId) return { ok: false, error: "revised must change title, details, or parent_id." }
   if (kind === "revised" && parentId && !planIds.has(parentId)) return { ok: false, error: "parent_id must name a TODO listed in the plan." }
   if (title && title.length > 500) return { ok: false, error: "title must be 500 characters or fewer." }
+  if (kind === "accepted" || kind === "revised") {
+    for (const [key, value] of [["title", title], ["details", details]] as const) {
+      if (value && isAdministrativeChildText(value, context.goal)) {
+        return { ok: false, error: `${key} is TODO administration, not concrete work; name the code, behavior, or fact the child delivers.` }
+      }
+    }
+  }
   return {
     ok: true,
     decision: {
@@ -340,6 +350,9 @@ export class ChildTodoReviewer {
   async review(proposal: ChildTodoProposal, context: ChildTodoContext, signal?: AbortSignal): Promise<ChildTodoReviewOutcome> {
     const cancelled: ChildTodoReviewOutcome = { ok: false, error: "The child TODO review was cancelled." }
     if (signal?.aborted) return cancelled
+    if ([proposal.title, proposal.details].some((text) => text !== undefined && isAdministrativeChildText(text, context.goal))) {
+      return { ok: false, error: "The proposed child is TODO administration, not concrete work; name the code, behavior, or fact the child delivers." }
+    }
     const resolution = await Promise.resolve(this.deps.resolve()).catch((error): RoleResolution => ({
       ok: false,
       error: error instanceof Error ? error.message : String(error)
@@ -412,6 +425,8 @@ const diagnose = (
 
 export interface FeedbackPlanRepository {
   getIntentTaskPlan(request: TodoListRequest): Promise<IntentTaskPlan | undefined>
+  intentPlanClosed(request: TodoListRequest): Promise<boolean>
+
   synchronizeIntentPlan(request: TodoWriteRequest, candidate: unknown, intentResult: unknown): Promise<TodoListSnapshot>
 }
 
@@ -484,7 +499,10 @@ export class FeedbackPlanner {
     const repository = this._deps.repository()
     if (!repository) return Promise.resolve({ status: "unavailable", error: "TODO storage is unavailable." })
     const request = prompt.trim()
-    if (!request) return Promise.resolve({ status: "untracked" })
+    if (!request) {
+      logger.debug("[Feedback] planning not started: the message is empty")
+      return Promise.resolve({ status: "untracked" })
+    }
     this.cancel("superseded")
     const sequence = ++this._sequence
     const controller = new AbortController()
@@ -562,9 +580,13 @@ export class FeedbackPlanner {
     let state = "completed"
     try {
       const existing = await repository.getIntentTaskPlan(scope)
-      const user = existing
-        ? `${request}\n\nExisting TODO plan (revise only if the request changes the work):\n${JSON.stringify(existing)}`
-        : request
+      // A finished plan is not offered for revision: the request gets its own planning decision.
+      const closed = !!existing && await repository.intentPlanClosed(scope)
+      const user = !existing
+        ? request
+        : closed
+          ? `${request}\n\nThe earlier TODO plan is complete: every task in it is finished. Plan this request on its own; it needs a new plan only if it asks for tracked work.`
+          : `${request}\n\nExisting TODO plan (revise only if the request changes the work):\n${JSON.stringify(existing)}`
       const ask = (prompt: string) =>
         untilAborted(endpoint.infer({ system: FEEDBACK_PLAN_PROTOCOL, user: prompt, json: true }, { signal: controller.signal, trace }), controller.signal)
       let reply = await ask(user)
@@ -597,16 +619,18 @@ export class FeedbackPlanner {
       }
       if (!parsed.track) {
         state = "untracked"
+        logger.debug("[Feedback] request needs no TODO plan (track:false)")
         return { status: "untracked" }
       }
-      const snapshot = await this.synchronize(repository, scope, parsed.plan, existing, active)
-      if (!snapshot) {
+      const synced = await this.synchronize(repository, scope, parsed.plan, existing, active)
+      if (!synced) {
         state = "stale"
         return { status: "stale" }
       }
-      this._deps.onSnapshot?.(snapshot)
-      logger.info(`[Feedback] TODO plan ${parsed.plan.planId} synchronized with ${parsed.plan.tasks.length} task(s)`)
-      return { status: "planned", snapshot }
+      this._deps.onSnapshot?.(synced.snapshot)
+      const replaced = synced.replaced ? `; replaces completed plan ${synced.replaced}` : ""
+      logger.info(`[Feedback] TODO plan ${synced.planId} synchronized with ${parsed.plan.tasks.length} task(s)${replaced}`)
+      return { status: "planned", snapshot: synced.snapshot }
     } catch (error) {
       const reason = controller.signal.reason
       if (reason instanceof RoleTimeoutError) {
@@ -646,20 +670,29 @@ export class FeedbackPlanner {
     proposed: IntentTaskPlan,
     seen: IntentTaskPlan | undefined,
     active: ActivePlanning
-  ): Promise<TodoListSnapshot | undefined> {
+  ): Promise<{ snapshot: TodoListSnapshot; planId: string; replaced?: string } | undefined> {
     const stored = await repository.getIntentTaskPlan(scope)
     // Someone else revised the plan while this one was being written.
     if (stored && seen && stored.revision !== seen.revision) return undefined
     if (!this.isCurrent(active)) return undefined
     const result = { source: "feedback", goal: proposed.goal }
-    const plan = stored ? { ...proposed, planId: stored.planId, revision: Math.max(proposed.revision, stored.revision) } : proposed
+    // A completed plan is replaced by the new work under its own planId; an open plan keeps its identity.
+    const replacing = !!stored && await repository.intentPlanClosed(scope)
+    const plan = !stored
+      ? proposed
+      : replacing
+        ? { ...proposed, revision: Math.max(proposed.revision, stored.revision + 1) }
+        : { ...proposed, planId: stored.planId, revision: Math.max(proposed.revision, stored.revision) }
     try {
-      return await repository.synchronizeIntentPlan(scope, plan, result)
+      const snapshot = await repository.synchronizeIntentPlan(scope, plan, result)
+      return { snapshot, planId: plan.planId, replaced: replacing ? stored?.planId : undefined }
     } catch (error) {
       if (!(error instanceof TodoConflictError) || !stored) throw error
-      return repository.synchronizeIntentPlan(scope, { ...plan, revision: stored.revision + 1 }, result)
+      const snapshot = await repository.synchronizeIntentPlan(scope, { ...plan, revision: stored.revision + 1 }, result)
+      return { snapshot, planId: plan.planId, replaced: replacing ? stored.planId : undefined }
     }
   }
+
 }
 
 export type FeedbackRetryOutcome = FeedbackPlanOutcome | { status: "busy" }

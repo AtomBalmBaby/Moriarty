@@ -447,6 +447,15 @@ const discoveredOutcome = async (
 }
 
 /**
+ * Whether an accepted fact establishes a symbol: its own symbol, or a stored tool-to-implementation
+ * alias for the fact's path that links the symbol to the fact's symbol in either direction.
+ */
+const factMatchesSymbol = (candidate: AcceptedFact, symbol: string, aliases: SymbolAlias[]): boolean =>
+  candidate.symbol === symbol || aliases.some((alias) =>
+    samePath(alias.path, candidate.path)
+    && ((alias.toolName === candidate.symbol && alias.implementation === symbol) || (alias.toolName === symbol && alias.implementation === candidate.symbol)))
+
+/**
  * Reuses accepted source facts for a definition criterion when every named symbol
  * has a non-superseded fact in one of the criterion's paths and the file still matches
  * the fact's fingerprint. Returns undefined otherwise, so the criterion falls back to
@@ -463,16 +472,40 @@ const acceptedOutcome = async (
   if (!isDefinitionCriterion(criterion)) return undefined
   const supporting: string[] = []
   for (const symbol of anchors.symbols) {
-    const linked = (candidate: AcceptedFact): boolean => candidate.symbol === symbol || aliases.some((alias) =>
-      samePath(alias.path, candidate.path)
-      && ((alias.toolName === candidate.symbol && alias.implementation === symbol) || (alias.toolName === symbol && alias.implementation === candidate.symbol)))
-    const fact = accepted.find((candidate) => !candidate.supersededBy && linked(candidate) && anchors.paths.some((path) => samePath(candidate.path, path)))
+    const fact = accepted.find((candidate) => !candidate.supersededBy && factMatchesSymbol(candidate, symbol, aliases) && anchors.paths.some((path) => samePath(candidate.path, path)))
     if (!fact) return undefined
     const text = await current(fact.path)
     if (text === undefined || !(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) return undefined
     supporting.push(fact.observationId)
   }
   return { ...reconciled("proven", supporting, []), reuse: "accepted" }
+}
+
+/**
+ * Reuses project accepted facts for a path-free definition criterion, from any conversation
+ * of the project. Every named symbol must resolve, and all of them must resolve to one current
+ * location. Several locations are ambiguous, so this returns undefined rather than choosing one.
+ */
+const acceptedSymbolOutcome = async (
+  symbols: string[],
+  accepted: AcceptedFact[],
+  current: (path: string) => Promise<string | undefined>,
+  criterion: string,
+  aliases: SymbolAlias[] = []
+): Promise<TodoCriterionReconciliation | undefined> => {
+  if (!symbols.length || !isDefinitionCriterion(criterion)) return undefined
+  const live = accepted.filter((candidate) => !candidate.supersededBy)
+  const supporting: string[] = []
+  for (const symbol of symbols) {
+    const matches = live.filter((candidate) => factMatchesSymbol(candidate, symbol, aliases))
+    const locations = new Map(matches.map((fact) => [`${fact.path}:${fact.startLine}-${fact.endLine}`, fact]))
+    if (locations.size !== 1) return undefined
+    const [fact] = locations.values()
+    const text = await current(fact.path)
+    if (text === undefined || !(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) return undefined
+    supporting.push(...matches.map((match) => match.observationId))
+  }
+  return { ...reconciled("proven", [...new Set(supporting)], []), reuse: "accepted" }
 }
 
 const cachedCurrentReader = (readCurrent?: CurrentSourceReader): ((path: string) => Promise<string | undefined>) => {
@@ -496,6 +529,21 @@ export interface AcceptedFactStatus {
 }
 
 /**
+ * Whether a set of matching facts names one current location. Several distinct locations are
+ * ambiguous and never resolved by picking one. A single location that is historical is reported
+ * as historical so the caller re-reads it rather than citing it as proof.
+ */
+export type AcceptedResolution = "unique" | "ambiguous" | "historical" | "none"
+
+export const resolveAcceptedFacts = (statuses: AcceptedFactStatus[]): AcceptedResolution => {
+  const live = statuses.filter((status) => !status.fact.supersededBy)
+  const locations = new Set(live.map(({ fact }) => `${fact.path}:${fact.startLine}-${fact.endLine}`))
+  if (locations.size === 0) return "none"
+  if (locations.size > 1) return "ambiguous"
+  return live.some((status) => status.freshness === "current") ? "unique" : "historical"
+}
+
+/**
  * Classifies accepted facts without changing them. Superseded and source-changed facts
  * stay in the repository as historical evidence with an explanation.
  */
@@ -510,6 +558,42 @@ export const assessAcceptedFacts = async (facts: AcceptedFact[], readCurrent?: C
     }
     return { fact, freshness: "current" }
   }))
+}
+
+const BACKTICKED_CONTENT = /`([^`\n]+)`/g
+const EXIT_OR_SUCCESS_CLAIM = /\b(exit\w*|succe\w*|pass(?:es|ed|ing)?)\b/i
+const CHANGE_OR_CONDITION = /\b(creat\w*|edit\w*|modif\w*|replac\w*|updat\w*|delet\w*|remov\w*|renam\w*|when|whenever|if|unless|only|never|before|after)\b/i
+const normalizeCommand = (command: string) => command.trim().replace(/\s+/g, " ")
+
+/**
+ * A criterion that names exactly one backticked command or tool and claims its
+ * exit status or success is decided by the most recent trusted observation of
+ * that command or tool. Records are ordered oldest first, so the latest run is
+ * the current state. Criteria that also ask for a change or a condition stay
+ * semantic.
+ */
+const directOutcome = (criterion: string, records: RetainedObservationEvidence[]): TodoCriterionReconciliation | undefined => {
+  if (!EXIT_OR_SUCCESS_CLAIM.test(criterion.replace(BACKTICKED_TEXT, " ")) || CHANGE_OR_CONDITION.test(criterion.replace(BACKTICKED_TEXT, " "))) return undefined
+  const named = [...criterion.matchAll(BACKTICKED_CONTENT)].map((match) => match[1].trim())
+  if (named.length !== 1 || !named[0]) return undefined
+  const [anchor] = named
+  const toolRuns = records.filter((record) => record.toolName === anchor && anchor !== "run_command")
+  if (toolRuns.length) {
+    const latest = toolRuns[toolRuns.length - 1]
+    return latest.failed
+      ? reconciled("disproven", [latest.observationId], [`the latest \`${anchor}\` call failed`])
+      : reconciled("proven", [latest.observationId], [])
+  }
+  const key = normalizeCommand(anchor)
+  const runs = records.filter((record) => record.toolName === "run_command" && normalizeCommand(record.arguments.command ?? "") === key)
+  const latest = runs[runs.length - 1]
+  if (!latest) return reconciled("unknown", [], [`no trusted run of \`${anchor}\``])
+  if (latest.exitCode === undefined || (latest.failed && latest.exitCode === 0)) {
+    return reconciled("unknown", [latest.observationId], [`the latest run of \`${anchor}\` has no trusted exit status`])
+  }
+  return latest.exitCode === 0
+    ? reconciled("proven", [latest.observationId], [])
+    : reconciled("disproven", [latest.observationId], [`the latest run of \`${anchor}\` exited ${latest.exitCode}`])
 }
 
 /**
@@ -529,6 +613,11 @@ export const reconcileCriteria = async (
   const current = cachedCurrentReader(readCurrent)
   const outcomes: TodoCriterionReconciliation[] = []
   for (const criterion of criteria) {
+    const direct = directOutcome(criterion, records)
+    if (direct) {
+      outcomes.push(direct)
+      continue
+    }
     const anchors = evidenceAnchors(criterion)
     const prose = criterion.replace(BACKTICKED_TEXT, " ")
     const unanchoredJudgment = anchors.paths.length > 0 && !anchors.symbols.length && !LOCATION_CLAIM.test(prose)
@@ -545,7 +634,9 @@ export const reconcileCriteria = async (
       const exposure = /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(prose)
       outcomes.push(exposure
         ? inventoryOutcome(anchors.symbols, records)
-        : await discoveredOutcome(discoverable, records, current, criterion) ?? reconciled("semantic", [], []))
+        : await acceptedSymbolOutcome(discoverable, accepted, current, criterion, aliases)
+          ?? await discoveredOutcome(discoverable, records, current, criterion)
+          ?? reconciled("semantic", [], []))
     } else {
       outcomes.push(await acceptedOutcome(anchors, accepted, current, criterion, aliases) ?? await sourceOutcome(anchors, records, current, criterion))
     }
@@ -998,7 +1089,6 @@ export const evaluateTodoReview = (
     const deterministic = deterministicTodoEvaluation(review, reconciliations)
     let result: TodoEvaluation
     if (deterministic) {
-      logger.info("[Feedback] todo.verified deterministic decision=" + deterministic.decision + " task=" + review.task.id)
       result = deterministic
     } else {
       let raw = await evaluator(undefined, reconciliations)
@@ -1024,6 +1114,8 @@ export const evaluateTodoReview = (
       result.problems.push("No verified workspace file changes were recorded for this implementation request.")
       result.correctiveInstructions.push("Implement the requested source changes and provide trusted verification evidence.")
     }
+    const verdictSource = deterministic ? "deterministic" : "feedback evaluator=" + evaluatorName
+    logger.info("[Feedback] todo.verdict source=" + verdictSource + " decision=" + result.decision + " task=" + review.task.id)
     return repository.applyEvaluation(scope, review.task.id, review.task.version, result, evaluationRequestId(review))
   })().finally(() => reviewsInFlight.delete(key))
   reviewsInFlight.set(key, operation)

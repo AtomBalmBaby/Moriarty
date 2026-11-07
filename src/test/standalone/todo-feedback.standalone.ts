@@ -5,14 +5,15 @@ import path from "node:path"
 import { test } from "node:test"
 import initSqlJs from "sql.js"
 
+import { logger } from "../../common/logger"
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
-import { CHILD_TODO_PROTOCOL, FEEDBACK_PLAN_PROTOCOL, parseFeedbackPlanResponse, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
+import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, parseFeedbackPlanResponse, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
-import { assessAcceptedFacts, type CurrentSourceReader, evaluateTodoReview, feedbackContext, parseTodoEvaluation, reconcileCriteria, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
+import { assessAcceptedFacts, type CurrentSourceReader, DETERMINISTIC_EVALUATOR, evaluateTodoReview, feedbackContext, parseTodoEvaluation, reconcileCriteria, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import type { ChildTodoDecision, ChildTodoReview, IntentPlanOutline, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
+import type { ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
 import { RUNTIME_INVENTORY_TOOL } from "../../extension/todos/types"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
@@ -229,6 +230,95 @@ test("trusted passing observations accept a task and persist verification", asyn
     assert.equal((await state.repository.getEvaluationHistory(state.scope, item.id)).length, 1)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+const commandObservation = (repository: TodoRepository, scope: TodoWriteRequest, itemId: string, command: string, exitCode: number) =>
+  repository.recordToolObservation(scope, {
+    itemId,
+    toolName: "run_command",
+    arguments: { command },
+    output: exitCode === 0 ? "Command completed." : "Command reported an error.",
+    failed: false,
+    exitCode,
+    requestId: `command-${itemId}-${exitCode}`
+  })
+
+test("a backticked exit-status criterion is decided deterministically, without any evaluator call, from the recorded exit status", async () => {
+  const command = "npx tsc --noEmit"
+  const state = await fixture([{ id: "verify", acceptance: `\`${command}\` exits with status 0` }])
+  try {
+    const item = state.items[0]
+    const observation = await commandObservation(state.repository, state.scope, item.id, command, 0)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    let evaluatorCalls = 0
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => { evaluatorCalls++; return "{}" }, "mock-reviewer")
+    assert.equal(evaluatorCalls, 0)
+    assert.equal(evaluation.decision, "accept")
+    assert.equal(evaluation.metadata?.evaluator, DETERMINISTIC_EVALUATOR)
+    assert.deepEqual(evaluation.criteria[0].evidenceRefs, [observation.id])
+    assert.equal((await state.repository.getList(state.scope)).items[0].status, "completed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a recorded nonzero exit fails a backticked exit-status criterion deterministically and returns to work", async () => {
+  const command = "npx tsc --noEmit"
+  const state = await fixture([{ id: "verify", acceptance: `\`${command}\` exits with status 0` }])
+  try {
+    const item = state.items[0]
+    await commandObservation(state.repository, state.scope, item.id, command, 1)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    let evaluatorCalls = 0
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => { evaluatorCalls++; return "{}" }, "mock-reviewer")
+    assert.equal(evaluatorCalls, 0)
+    assert.equal(evaluation.decision, "revise")
+    assert.equal(evaluation.criteria[0].status, "failed")
+    assert.equal((await state.repository.getList(state.scope)).items[0].status, "in_progress")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("an exit-status criterion without a recorded run is never passed, and no evaluator is asked to supply the missing fact", async () => {
+  const command = "npx tsc --noEmit"
+  const state = await fixture([{ id: "verify", acceptance: `\`${command}\` exits with status 0` }])
+  try {
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    let evaluatorCalls = 0
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => { evaluatorCalls++; return "{}" }, "mock-reviewer")
+    assert.equal(evaluatorCalls, 0)
+    assert.equal(evaluation.decision, "needs_evidence")
+    assert.notEqual((await state.repository.getList(state.scope)).items[0].status, "completed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("every verdict logs whether the host decided it deterministically or Feedback reviewed it", async () => {
+  const lines: string[] = []
+  const originalInfo = logger.info
+  logger.info = (message: string) => { lines.push(message) }
+  const command = "npx tsc --noEmit"
+  const deterministic = await fixture([{ id: "exact", acceptance: `\`${command}\` exits with status 0` }])
+  const reviewed = await fixture([{ id: "semantic", acceptance: "Focused tests pass" }])
+  try {
+    await commandObservation(deterministic.repository, deterministic.scope, deterministic.items[0].id, command, 0)
+    const exactReview = (await deterministic.repository.getReviewPackages(deterministic.scope))[0]
+    await evaluateTodoReview(deterministic.repository, deterministic.scope, exactReview, async () => "{}", "mock-reviewer")
+    const observation = await addObservation(reviewed.repository, reviewed.scope, reviewed.items[0].id, "run_command", 0)
+    const semanticReview = (await reviewed.repository.getReviewPackages(reviewed.scope))[0]
+    await evaluateTodoReview(reviewed.repository, reviewed.scope, semanticReview,
+      async () => responseFor(semanticReview, { refs: [observation.id] }), "mock-reviewer")
+    const verdicts = lines.filter((line) => line.includes("todo.verdict"))
+    assert.equal(verdicts.length, 2, lines.join("\n"))
+    assert.match(verdicts[0], /source=deterministic decision=accept/)
+    assert.match(verdicts[1], /source=feedback evaluator=mock-reviewer decision=accept/)
+  } finally {
+    logger.info = originalInfo
+    fs.rmSync(deterministic.directory, { recursive: true, force: true })
+    fs.rmSync(reviewed.directory, { recursive: true, force: true })
   }
 })
 
@@ -1581,6 +1671,80 @@ const workspaceRecord = async (start: number, end: number) => ({
   hits: []
 })
 
+const commandRecord = (command: string, exitCode: number | undefined, observationId = "obs-command", failed = false): RetainedObservationEvidence => ({
+  observationId,
+  itemId: "verify",
+  toolName: "run_command",
+  arguments: { command },
+  failed,
+  exitCode,
+  retained: true,
+  complete: true,
+  originalChars: 0,
+  preservedChars: 0,
+  sources: [],
+  hits: []
+})
+
+const toolRecord = (toolName: string, failed: boolean, observationId = "obs-tool"): RetainedObservationEvidence => ({
+  observationId,
+  itemId: "verify",
+  toolName,
+  arguments: {},
+  failed,
+  retained: true,
+  complete: true,
+  originalChars: 0,
+  preservedChars: 0,
+  sources: [],
+  hits: []
+})
+
+test("a backticked command with an exit-status claim is proven only by a non-failed zero-exit run of that command", async () => {
+  const [outcome] = await reconcileCriteria(["`npm run build-tests` exits with status 0"], [commandRecord("npm run build-tests", 0)], currentWorkspace)
+  assert.equal(outcome.outcome, "proven", JSON.stringify(outcome))
+  assert.deepEqual(outcome.supportingObservationIds, ["obs-command"])
+  const [failedRun] = await reconcileCriteria(["`npm run build-tests` exits with status 0"], [commandRecord("npm run build-tests", 0, "obs-command", true)], currentWorkspace)
+  assert.equal(failedRun.outcome, "unknown", JSON.stringify(failedRun))
+  const [otherCommand] = await reconcileCriteria(["`npm run build-tests` exits with status 0"], [commandRecord("npm test", 0)], currentWorkspace)
+  assert.equal(otherCommand.outcome, "unknown", JSON.stringify(otherCommand))
+})
+
+test("a nonzero exit of the cited command disproves the criterion and is recorded as the supporting observation", async () => {
+  const [outcome] = await reconcileCriteria(["`npm run build-tests` exits with status 0"], [commandRecord("npm run build-tests", 1)], currentWorkspace)
+  assert.equal(outcome.outcome, "disproven", JSON.stringify(outcome))
+  assert.deepEqual(outcome.supportingObservationIds, ["obs-command"])
+})
+
+test("a command exit claim without any matching run is unknown, so the task cannot pass on it", async () => {
+  const [outcome] = await reconcileCriteria(["`npm run build-tests` exits with status 0"], [], currentWorkspace)
+  assert.equal(outcome.outcome, "unknown", JSON.stringify(outcome))
+  assert.deepEqual(outcome.supportingObservationIds, [])
+})
+
+test("a backticked command criterion that also asks for a mutation or a condition stays semantic", async () => {
+  const records = [commandRecord("npm test", 0)]
+  const [mutation] = await reconcileCriteria(["`npm test` passes after editing the parser"], records, currentWorkspace)
+  assert.equal(mutation.outcome, "semantic", JSON.stringify(mutation))
+  const [conditional] = await reconcileCriteria(["`npm test` passes only when the cache is cold"], records, currentWorkspace)
+  assert.equal(conditional.outcome, "semantic", JSON.stringify(conditional))
+})
+
+test("an unanchored success claim stays semantic for Feedback review", async () => {
+  const [outcome] = await reconcileCriteria(["Compile succeeds"], [commandRecord("npm run build-tests", 0)], currentWorkspace)
+  assert.equal(outcome.outcome, "semantic", JSON.stringify(outcome))
+})
+
+test("a backticked tool name with a success claim is proven by a non-failed observation of that tool", async () => {
+  const [outcome] = await reconcileCriteria(["The `read_file` tool call succeeds"], [toolRecord("read_file", false)], currentWorkspace)
+  assert.equal(outcome.outcome, "proven", JSON.stringify(outcome))
+  assert.deepEqual(outcome.supportingObservationIds, ["obs-tool"])
+  const [failed] = await reconcileCriteria(["The `read_file` tool call succeeds"], [toolRecord("read_file", true)], currentWorkspace)
+  assert.equal(failed.outcome, "disproven", JSON.stringify(failed))
+  const [absent] = await reconcileCriteria(["The `read_file` tool call succeeds"], [toolRecord("write_file", false)], currentWorkspace)
+  assert.equal(absent.outcome, "unknown", JSON.stringify(absent))
+})
+
 test("a tool name and the function that encloses its registration are stored as one alias with both line ranges", async () => {
   const [outcome] = await reconcileCriteria(["Locate the `read_file` tool definition in src/extension/tools/workspace.ts"], [await workspaceRecord(160, 181)], currentWorkspace)
   assert.equal(outcome.outcome, "proven", JSON.stringify(outcome))
@@ -1775,6 +1939,146 @@ test("a failed read or a read without its content fingerprint proves nothing and
   }
 })
 
+test("conversation B resolves a path-free tool name from accepted project facts with zero model reads and the origin's provenance", async () => {
+  const state = await evidenceFixture("`read_file` is defined in src/extension/tools/workspace.ts")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-origin", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const originCalls = { count: 0 }
+    const origin = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator(originCalls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(origin.decision, "accept", JSON.stringify(origin.problems))
+    const originItems = JSON.stringify((await state.repository.getList({ ...state.scope, includeCompleted: true })).items)
+
+    const secondScope = { ...state.scope, conversationId: "second-chat", writer: "second-chat" }
+    const secondPlan = await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance: "Locate the `read_file` tool definition" }]), { prompt: "Where is the read_file tool implemented?" })
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const lookupId = secondPlan.items[0].id
+    await startItemInReview(reopened, secondScope, lookupId)
+    const hostReads: string[] = []
+    const countedReader: CurrentSourceReader = async (file) => {
+      hostReads.push(file)
+      return currentWorkspace(file)
+    }
+    const secondCalls = { count: 0 }
+    const review = (await reopened.getReviewPackages(secondScope)).find((candidate) => candidate.task.id === lookupId)!
+    const second = await evaluateTodoReview(reopened, secondScope, review, countingEvaluator(secondCalls), "mock-reviewer", { readCurrentSource: countedReader, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(second.decision, "accept", JSON.stringify(second.problems))
+    assert.equal(secondCalls.count, 0, "no model evaluation")
+    assert.equal(second.criteria[0].reconciliation?.reuse, "accepted")
+    assert.deepEqual(second.criteria[0].evidenceRefs, [observation.id], "the origin observation is cited")
+    assert.deepEqual(hostReads, [EVIDENCE_FILE], "the host fingerprint check is the only read, and it is not a model tool call")
+    assert.equal(review.observations.length, 0, "conversation B made no source observations of its own")
+    assert.equal(JSON.stringify((await state.repository.getList({ ...state.scope, includeCompleted: true })).items), originItems, "conversation A's TODOs are unchanged")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("twinny_evidence_lookup resolves a tool name or its implementation without a path, reports unique resolution, and mutates nothing", async () => {
+  const state = await evidenceFixture("`read_file` is defined in src/extension/tools/workspace.ts")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-origin", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    const originItems = JSON.stringify((await state.repository.getList({ ...state.scope, includeCompleted: true })).items)
+
+    const secondScope = { ...state.scope, conversationId: "second-chat", writer: "second-chat" }
+    await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance: "Locate the `read_file` tool definition" }]), { prompt: "Where is read_file implemented?" })
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const second = { ...state, repository: reopened, scope: secondScope }
+
+    for (const symbol of ["read_file", "readFile"]) {
+      const lookup = await lookupEvidence(second, { symbol }, currentWorkspace)
+      assert.equal(lookup.failed, false)
+      assert.equal(lookup.body!.resolution, "unique", symbol)
+      assert.equal(lookup.body!.facts.length, 1, symbol)
+      const [fact] = lookup.body!.facts
+      assert.equal(fact.tool_name, "read_file")
+      assert.equal(fact.implementation, "readFile")
+      assert.equal(fact.path, EVIDENCE_FILE)
+      assert.equal(fact.observation_id, observation.id)
+      assert.equal(fact.conversation_id, state.scope.conversationId, "provenance keeps the origin conversation")
+      assert.equal(fact.freshness, "current")
+    }
+
+    const forged = await lookupEvidence({ ...second, scope: { ...secondScope, projectFingerprint: workspaceProjectFingerprint(["file:///evidence-project-forged"]) } }, { symbol: "read_file" }, currentWorkspace)
+    assert.equal(forged.body!.facts.length, 0, "a different project resolves nothing")
+    assert.equal(forged.body!.resolution, "none")
+
+    assert.equal(JSON.stringify((await state.repository.getList({ ...state.scope, includeCompleted: true })).items), originItems, "lookups change no TODO")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a changed source makes the project fact historical, so a path-free criterion is not proven from it", async () => {
+  const state = await evidenceFixture("`read_file` is defined in src/extension/tools/workspace.ts")
+  try {
+    const item = await startInvestigation(state)
+    await observeRead(state, item.id, "read-origin", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+
+    const changedWorkspace: CurrentSourceReader = async (file) => (file === EVIDENCE_FILE ? workspaceText.replace("name: \"read_file\"", "name: \"read_files\"") : undefined)
+    const secondScope = { ...state.scope, conversationId: "second-chat", writer: "second-chat" }
+    const secondPlan = await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance: "Locate the `read_file` tool definition" }]), { prompt: "Where is read_file implemented?" })
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const second = { ...state, repository: reopened, scope: secondScope }
+
+    const lookup = await lookupEvidence(second, { symbol: "read_file" }, changedWorkspace)
+    assert.equal(lookup.body!.resolution, "historical")
+    assert.equal(lookup.body!.facts[0].freshness, "historical")
+    assert.match(String(lookup.body!.facts[0].refresh), /read src\/extension\/tools\/workspace\.ts lines 169-172 again/)
+
+    const lookupId = secondPlan.items[0].id
+    await startItemInReview(reopened, secondScope, lookupId)
+    const calls = { count: 0 }
+    const review = (await reopened.getReviewPackages(secondScope)).find((candidate) => candidate.task.id === lookupId)!
+    await evaluateTodoReview(reopened, secondScope, review, async () => {
+      calls.count += 1
+      return responseFor(review, { refs: [] })
+    }, "mock-reviewer", { readCurrentSource: changedWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(calls.count, 1, "a historical fact is not evidence of the current source, so Feedback decides")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("two project facts that name different locations for one tool are ambiguous, and no path-free criterion picks one", async () => {
+  const state = await evidenceFixtureFor([
+    { id: "origin", acceptance: "`read_file` is defined in src/extension/tools/workspace.ts" },
+    { id: "copy", acceptance: "`read_file` is defined in src/extension/tools/workspace-copy.ts" }
+  ])
+  try {
+    for (const itemId of state.itemIds) {
+      await startItemInReview(state.repository, state.scope, itemId)
+      await observeRead(state, itemId, `read-${itemId}`, itemId === state.itemIds[0] ? EVIDENCE_FILE : COPY_FILE, 150, sourceLines.slice(149, 200))
+      const review = await reviewFor(state, itemId)
+      const evaluation = await evaluateTodoReview(state.repository, state.scope, review, countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: twoCopiesWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+      assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    }
+    const lookup = await lookupEvidence(state, { symbol: "read_file" }, twoCopiesWorkspace)
+    assert.equal(lookup.body!.resolution, "ambiguous")
+    assert.equal(lookup.body!.facts.length, 2)
+    assert.equal((await lookupEvidence(state, { symbol: "readFile" }, twoCopiesWorkspace)).body!.resolution, "ambiguous")
+
+    const secondScope = { ...state.scope, conversationId: "second-chat", writer: "second-chat" }
+    const secondPlan = await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance: "Locate the `read_file` tool definition" }]), { prompt: "Where is read_file implemented?" })
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const lookupId = secondPlan.items[0].id
+    await startItemInReview(reopened, secondScope, lookupId)
+    const calls = { count: 0 }
+    const review = (await reopened.getReviewPackages(secondScope)).find((candidate) => candidate.task.id === lookupId)!
+    const second = await evaluateTodoReview(reopened, secondScope, review, async () => {
+      calls.count += 1
+      return responseFor(review, { refs: [] })
+    }, "mock-reviewer", { readCurrentSource: twoCopiesWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(calls.count, 1, "ambiguous project knowledge goes to Feedback rather than choosing a file")
+    assert.notEqual(second.criteria[0].reconciliation?.reuse, "accepted")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("accepted facts and TODO writes stay inside the project that recorded them, even under a forged project fingerprint", async () => {
   const state = await evidenceFixture("Locate the read_file tool definition in src/extension/tools/workspace.ts")
   try {
@@ -1805,7 +2109,7 @@ test("accepted facts and TODO writes stay inside the project that recorded them,
 const lookupEvidence = async (state: EvidenceFixture, args: Record<string, string>, readCurrent?: CurrentSourceReader) => {
   const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: readCurrent })
   const response = await tools.run({ name: "twinny_evidence_lookup", args })
-  return { failed: response.failed === true, body: response.failed ? undefined : JSON.parse(response.output) as { facts: Record<string, unknown>[] } }
+  return { failed: response.failed === true, body: response.failed ? undefined : JSON.parse(response.output) as { facts: Record<string, unknown>[]; resolution?: string } }
 }
 
 test("twinny_evidence_lookup returns a current accepted fact with its observation and freshness, and is read-only", async () => {
@@ -1833,6 +2137,30 @@ test("twinny_evidence_lookup returns a current accepted fact with its observatio
     assert.equal(fact.freshness, "current")
     assert.equal(fact.refresh, undefined, "a current fact needs no refresh")
     assert.equal(calls.count, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a conversation with no TODO plan still reads the project's accepted evidence, so an untracked turn loses no lookup", async () => {
+  const state = await evidenceFixture("`read_file` is defined in src/extension/tools/workspace.ts")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-origin", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+
+    const untrackedScope = { ...state.scope, conversationId: "untracked-chat", writer: "untracked-chat" }
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    assert.equal(await reopened.getIntentTaskPlan(untrackedScope), undefined, "this conversation has no plan")
+    const untracked = { ...state, repository: reopened, scope: untrackedScope }
+
+    const lookup = await lookupEvidence(untracked, { symbol: "read_file" }, currentWorkspace)
+    assert.equal(lookup.failed, false)
+    assert.equal(lookup.body!.resolution, "unique")
+    assert.equal(lookup.body!.facts.length, 1)
+    assert.equal(lookup.body!.facts[0].observation_id, observation.id, "the origin conversation's fact is reused")
+    assert.equal(lookup.body!.facts[0].freshness, "current")
+    assert.equal((await reopened.getList({ ...untrackedScope, includeCompleted: true })).items.length, 0, "the lookup creates no TODO in the untracked conversation")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -2625,6 +2953,40 @@ test("workflow text about TODO tracking never authorizes a root-level task under
     const created = JSON.parse((await requestTool.run({ title: "Track the release notes", request_id: "user-root" })).output)
     assert.equal(created.result, "created")
     assert.equal(calls(), 0, "the explicit user request is not a Feedback proposal")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("an administrative child proposal is refused before any model review and creates nothing", async () => {
+  const state = await childProposalFixture()
+  try {
+    let modelCalls = 0
+    const reviewer = new ChildTodoReviewer({
+      resolve: () => ({
+        ok: true,
+        endpoint: {
+          infer: async () => {
+            modelCalls += 1
+            return JSON.stringify({ decision: "accepted", instruction: "Create it." })
+          },
+          provider: "scripted",
+          model: "feedback-model",
+          label: "Scripted"
+        }
+      })
+    })
+    const tool = createTool(state, { review: (proposal, context, signal) => reviewer.review(proposal, context, signal) })
+    const before = (await state.repository.getPlanOutline(state.scope))?.children.length
+    const refused = await tool.run(childArgs(state.items[0].id, "Log the definition location as a TODO entry", "admin-child"))
+    assert.equal(refused.failed, true)
+    assert.match(refused.output, /TODO administration/)
+    assert.equal(modelCalls, 0, "the administrative proposal never reaches the model")
+    assert.equal((await state.repository.getPlanOutline(state.scope))?.children.length, before, "no child was created")
+
+    const concrete = await tool.run(childArgs(state.items[0].id, "Inspect the validation helper", "concrete-child"))
+    assert.equal(concrete.failed, undefined)
+    assert.equal(modelCalls, 1, "a concrete proposal is reviewed by Feedback")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }

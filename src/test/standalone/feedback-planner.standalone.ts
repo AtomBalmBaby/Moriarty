@@ -10,7 +10,7 @@ import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanRepo
 import { replyText, type RoleInference, type RoleReply, type RoleResolution, structuredReply } from "../../extension/chat/role-inference"
 import { readReply } from "../../extension/inference/stream"
 import type { ChatChunk } from "../../extension/inference/types"
-import { TodoRepository } from "../../extension/todos/repository"
+import { TodoRepository, trustedTodoPanelApproval } from "../../extension/todos/repository"
 import type { ChildTodoContext, ChildTodoProposal } from "../../extension/todos/types"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
@@ -103,6 +103,130 @@ test("an administrative plan gets one corrective retry that names the offending 
     assert.equal(result.status, "failed")
     assert.equal(calls, 2, "the first reply and one corrective retry, then no further attempts")
     assert.equal(await repository.getIntentTaskPlan(scope), undefined, "an invalid plan is never written")
+  })
+})
+
+const followUpPlan = (overrides: Record<string, unknown> = {}) => plan({
+  planId: "plan-b",
+  revision: 1,
+  goal: "Write the release notes",
+  tasks: [{ id: "notes", title: "Write release notes", description: "Draft the notes", acceptanceCriteria: ["The notes name each change."], dependencies: [] }],
+  ...overrides
+})
+
+const completeAll = async (repository: TodoRepository) => {
+  for (const item of (await repository.getList({ ...scope, includeCompleted: true })).items) {
+    await repository.completeByUser(scope, item.id, item.version, "Verified by user", `complete-${item.id}`, trustedTodoPanelApproval)
+  }
+}
+
+test("a follow-up after a completed plan gets an independent planning decision and a new plan, and the completed plan keeps its history", async () => {
+  await withRepository(async (repository) => {
+    const sent: string[] = []
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      resolve: () => endpoint(async ({ user }) => {
+        sent.push(user)
+        return JSON.stringify({ track: true, plan: sent.length === 1 ? plan() : followUpPlan() })
+      })
+    })
+    assert.equal((await quietly(() => planner.start(scope, "Fix the parser."))).result.status, "planned")
+    await completeAll(repository)
+    const { result, records } = await quietly(() => planner.start(scope, "Now write the release notes."))
+    assert.equal(result.status, "planned")
+    assert.doesNotMatch(sent[1], /plan-a/, "the completed plan is not offered for revision")
+    assert.match(sent[1], /complete/i, "the planner is told the earlier plan is finished")
+    assert.match(records.join("\n"), /replaces completed plan plan-a/)
+    const stored = await repository.getIntentTaskPlan(scope)
+    assert.equal(stored?.planId, "plan-b")
+    assert.deepEqual(stored?.tasks.map((task) => task.title), ["Write release notes"])
+    const items = (await repository.getList({ ...scope, includeCompleted: true })).items
+    assert.deepEqual(items.map((item) => [item.title, item.status]), [
+      ["Inspect parser", "completed"],
+      ["Fix parser", "completed"],
+      ["Write release notes", "pending"]
+    ])
+  })
+})
+
+test("a simple question after a completed plan may be untracked, with the reason logged and the completed plan unchanged", async () => {
+  await withRepository(async (repository) => {
+    let calls = 0
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      resolve: () => endpoint(async () => {
+        calls += 1
+        return JSON.stringify(calls === 1 ? { track: true, plan: plan() } : { track: false, plan: null })
+      })
+    })
+    await quietly(() => planner.start(scope, "Fix the parser."))
+    await completeAll(repository)
+    const { result, records } = await quietly(() => planner.start(scope, "What does the parser export?"))
+    assert.equal(result.status, "untracked")
+    assert.equal(calls, 2, "planning was invoked for the follow-up")
+    assert.match(records.join("\n"), /track:false/)
+    assert.equal((await repository.getIntentTaskPlan(scope))?.planId, "plan-a")
+    const items = (await repository.getList({ ...scope, includeCompleted: true })).items
+    assert.deepEqual(items.map((item) => item.status), ["completed", "completed"])
+  })
+})
+
+test("an empty message is never planned, and the skip is logged with its reason", async () => {
+  await withRepository(async (repository) => {
+    let calls = 0
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      resolve: () => endpoint(async () => {
+        calls += 1
+        return JSON.stringify({ track: false, plan: null })
+      })
+    })
+    const { result, records } = await quietly(() => planner.start(scope, "   "))
+    assert.equal(result.status, "untracked")
+    assert.equal(calls, 0)
+    assert.match(records.join("\n"), /not started: the message is empty/)
+  })
+})
+
+test("a follow-up while the plan is still open revises that plan and cannot replace it", async () => {
+  await withRepository(async (repository) => {
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      resolve: () => endpoint(async ({ user }) => JSON.stringify({ track: true, plan: user.includes("Now") ? plan({ planId: "plan-b", revision: 2 }) : plan() }))
+    })
+    await quietly(() => planner.start(scope, "Fix the parser."))
+    assert.equal((await quietly(() => planner.start(scope, "Now also check the lexer."))).result.status, "planned")
+    const stored = await repository.getIntentTaskPlan(scope)
+    assert.equal(stored?.planId, "plan-a")
+    assert.equal(stored?.revision, 2)
+    await assert.rejects(
+      repository.synchronizeIntentPlan(scope, followUpPlan({ revision: 3 }), {}),
+      /preserve the existing planId/
+    )
+  })
+})
+
+test("a completed plan is replaced only by a plan with a higher revision", async () => {
+  await withRepository(async (repository) => {
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      resolve: () => endpoint(async () => JSON.stringify({ track: true, plan: plan() }))
+    })
+    await quietly(() => planner.start(scope, "Fix the parser."))
+    await completeAll(repository)
+    await assert.rejects(repository.synchronizeIntentPlan(scope, followUpPlan(), {}), /revision/)
+    const snapshot = await repository.synchronizeIntentPlan(scope, followUpPlan({ revision: 2 }), {})
+    assert.deepEqual(snapshot.items.map((item) => [item.title, item.status]), [
+      ["Inspect parser", "completed"],
+      ["Fix parser", "completed"],
+      ["Write release notes", "pending"]
+    ])
+    assert.equal((await repository.getIntentTaskPlan(scope))?.planId, "plan-b")
   })
 })
 
@@ -360,6 +484,7 @@ const deferred = <T>() => {
 /** Records the order in which the repository is asked to write the plan. */
 const spied = (repository: TodoRepository, order: string[]): FeedbackPlanRepository => ({
   getIntentTaskPlan: (request) => repository.getIntentTaskPlan(request),
+  intentPlanClosed: (request) => repository.intentPlanClosed(request),
   synchronizeIntentPlan: (request, candidate, result) => {
     order.push("sync")
     return repository.synchronizeIntentPlan(request, candidate, result)
@@ -826,6 +951,60 @@ const childContext: ChildTodoContext = {
   children: [],
   planItems: [{ id: "parent-task", title: "Trace read_file", status: "pending" }, { id: "sibling-task", title: "Locate definition", status: "pending" }]
 }
+
+test("administrative child TODO titles and details are refused deterministically, with one bounded correction", async () => {
+  const reply = (value: unknown) => JSON.stringify(value)
+  const adminAccepted = parseChildTodoDecision(reply({ decision: "accepted", title: "Create a TODO documenting the read_file definition", instruction: "Create it." }), childContext)
+  assert.equal(adminAccepted.ok, false, "an accepted child may not carry an administrative title")
+  const adminRevised = parseChildTodoDecision(reply({ decision: "revised", details: "Record the handler location in a TODO.", instruction: "Use it." }), childContext)
+  assert.equal(adminRevised.ok, false, "a revision may not carry administrative details")
+  const concrete = parseChildTodoDecision(reply({ decision: "revised", title: "Trace the read handler dispatch", instruction: "Create it." }), childContext)
+  assert.equal(concrete.ok, true)
+  const rejected = parseChildTodoDecision(reply({ decision: "rejected", instruction: "Not needed; it only manages TODO records." }), childContext)
+  assert.equal(rejected.ok, true, "a rejection applies no title, so it is not administrative work")
+
+  const proposal: ChildTodoProposal = {
+    parentId: "parent-task",
+    title: "Log the read_file location as a TODO entry",
+    details: "Find the handler that serves read_file.",
+    reason: "Needed to trace read_file.",
+    priority: "normal",
+    requestId: "admin-proposal"
+  }
+  let modelCalls = 0
+  const refusing = new ChildTodoReviewer({
+    resolve: () => endpoint(async () => {
+      modelCalls += 1
+      return reply({ decision: "accepted", instruction: "Create it." })
+    })
+  })
+  const refused = await refusing.review(proposal, childContext)
+  assert.equal(refused.ok, false)
+  assert.match(refused.ok ? "" : refused.error, /TODO administration/)
+  assert.equal(modelCalls, 0, "an administrative proposal is refused without a model call")
+
+  const replies = [
+    reply({ decision: "accepted", title: "Create a TODO documenting the handler", instruction: "Create it." }),
+    reply({ decision: "accepted", title: "Trace the read handler dispatch", instruction: "Create it." })
+  ]
+  const corrected = new ChildTodoReviewer({ resolve: () => endpoint(async () => replies.shift() ?? "") })
+  const outcome = await corrected.review({ ...proposal, title: "Trace the read handler" }, childContext)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.ok && outcome.decision.decision === "accepted" ? outcome.decision.decision : "", "accepted")
+
+  const stuck = new ChildTodoReviewer({ resolve: () => endpoint(async () => reply({ decision: "accepted", title: "Create a TODO documenting the handler", instruction: "Create it." })) })
+  assert.equal((await stuck.review({ ...proposal, title: "Trace the read handler" }, childContext)).ok, false, "a second administrative decision fails visibly")
+
+  const exempt = parseChildTodoDecision(reply({ decision: "accepted", title: "Create a TODO fixture for the completion check", instruction: "Create it." }), { ...childContext, goal: "Implement the TODO completion check" })
+  assert.equal(exempt.ok, true, "a request about the TODO machinery itself keeps its TODO work")
+})
+
+test("past-tense TODO record wording is detected as administrative", () => {
+  const plan = { tasks: [{ id: "locate", title: "Locate the read_file definition", description: "", acceptanceCriteria: ["The location is logged as a TODO entry"], dependencies: [] }] }
+  assert.equal(findAdministrativeClauses(plan, "Where is read_file implemented?").length, 1)
+  const concrete = { tasks: [{ id: "locate", title: "Locate the read_file definition", description: "", acceptanceCriteria: ["The definition is located at a line range"], dependencies: [] }] }
+  assert.equal(findAdministrativeClauses(concrete, "Where is read_file implemented?").length, 0)
+})
 
 test("child TODO decisions are accepted only in the schema Feedback was given", () => {
   const reply = (value: unknown) => JSON.stringify(value)

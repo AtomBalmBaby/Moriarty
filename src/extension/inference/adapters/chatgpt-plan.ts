@@ -346,7 +346,7 @@ export class ChatGPTPlanInferenceProvider implements InferenceProvider {
               if (firstDeltaAt === undefined) {
                 firstDeltaAt = Date.now()
                 attempt.firstResponse("response.output_text.delta")
-                logger.debug(
+                logger.trace(
                   `ChatGPT Plan FIM first text in ${firstDeltaAt - started}ms`
                 )
               }
@@ -372,7 +372,7 @@ export class ChatGPTPlanInferenceProvider implements InferenceProvider {
                   }
                 : {})
             }
-            logger.debug(
+            logger.trace(
               `ChatGPT Plan FIM completed in ${Date.now() - started}ms`
             )
             return

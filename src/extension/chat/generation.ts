@@ -197,7 +197,7 @@ export class ChatGeneration {
       }
 
       const reply = text.trim()
-      logger.info(
+      logger.debug(
         `Chat ← ${elapsed()} · ${formatCount(reply.length)} chars` +
           (run.signal.aborted ? " · stopped by the user" : "")
       )
@@ -258,7 +258,7 @@ export class ChatGeneration {
     provider: TwinnyProvider
   ) {
     const chars = messages.reduce((sum, m) => sum + contentLength(m.content), 0)
-    logger.info(
+    logger.debug(
       `Chat → ${provider.modelName} (${provider.label}) · ` +
         `${messages.length} message${messages.length === 1 ? "" : "s"}, ` +
         `${formatCount(chars)} chars`

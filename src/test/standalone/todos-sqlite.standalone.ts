@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 
+import { logger } from "../../common/logger"
 import { TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
 
@@ -408,6 +409,75 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
     assert.deepEqual(context?.acceptanceCriteria, ["Regression test passes"])
     assert.equal(context?.goal, "Make parser behavior reliable")
   } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("a replacement for a completed plan relinks reused task IDs to new items and leaves the completed items intact", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-replacement-todos-"))
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-replace"]), conversationId: "chat-replace", writer: "chat-replace" }
+    const repository = new TodoRepository(databasePath, wasmPath)
+    const planWith = (planId: string, revision: number, tasks: { id: string; title: string }[]) => ({
+      planId,
+      version: 1 as const,
+      revision,
+      goal: "Keep the parser working",
+      constraints: [],
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, description: `${task.title} details`, acceptanceCriteria: [`${task.title} is done`], dependencies: [] }))
+    })
+    const first = planWith("plan-first", 1, [{ id: "inspect", title: "Inspect parser" }, { id: "verify", title: "Verify parser" }])
+    await repository.synchronizeIntentPlan(scope, first, { objective: "Keep the parser working", prompt: "Fix the parser", plan: first })
+    for (const item of (await repository.getList({ ...scope, includeCompleted: true })).items) {
+      await repository.completeByUser(scope, item.id, item.version, "Verified by user", `complete-${item.id}`, trustedTodoPanelApproval)
+    }
+
+    const second = planWith("plan-second", 2, [{ id: "inspect", title: "Inspect renderer" }, { id: "render", title: "Render check" }])
+    await repository.synchronizeIntentPlan(scope, second, { objective: "Keep the parser working", prompt: "Check the renderer", plan: second })
+
+    const stored = await repository.getIntentTaskPlan(scope)
+    assert.equal(stored?.planId, "plan-second")
+    assert.deepEqual(stored?.tasks.map((task) => [task.id, task.title]), [["inspect", "Inspect renderer"], ["render", "Render check"]], "a reused task ID shows its new item")
+    const items = (await repository.getList({ ...scope, includeCompleted: true })).items
+    assert.deepEqual(items.map((item) => [item.title, item.status]).sort(), [
+      ["Inspect parser", "completed"],
+      ["Inspect renderer", "pending"],
+      ["Render check", "pending"],
+      ["Verify parser", "completed"]
+    ], "the completed plan's items keep their status and nothing is deleted")
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("evidence records log successes at DEBUG and failures at INFO, so routine evidence stays out of INFO", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-evidence-log-"))
+  const lines: { level: "info" | "debug"; message: string }[] = []
+  const { info, debug } = logger
+  logger.info = (message) => lines.push({ level: "info", message })
+  logger.debug = (message) => lines.push({ level: "debug", message })
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-evidence-log"]), conversationId: "chat-evidence-log", writer: "chat-evidence-log" }
+    const repository = new TodoRepository(databasePath, wasmPath)
+    const plan = {
+      planId: "plan-evidence-log", version: 1 as const, revision: 1, goal: "Locate the parser", constraints: [],
+      tasks: [{ id: "locate", title: "Locate the parser", description: "Find the parser", acceptanceCriteria: ["Parser located"], dependencies: [] }]
+    }
+    const [item] = (await repository.synchronizeIntentPlan(scope, plan, { objective: "Locate the parser", prompt: "Where is the parser?", plan })).items
+    lines.length = 0
+    const observe = (requestId: string, failed: boolean) => repository.recordToolObservation(scope, {
+      itemId: item.id, toolName: "read_file", arguments: { path: "src/parser.ts" }, output: failed ? "not found" : "parser body", failed, requestId
+    })
+    await observe("observe-ok", false)
+    await observe("observe-failed", true)
+
+    const recorded = lines.filter((line) => line.message.includes("todo.evidence.recorded"))
+    assert.deepEqual(recorded.map((line) => [line.level, line.message.includes("\"failed\":true")]), [["debug", false], ["info", true]])
+  } finally {
+    logger.info = info
+    logger.debug = debug
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })
