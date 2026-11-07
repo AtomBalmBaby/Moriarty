@@ -199,7 +199,8 @@ export class McpHost {
         if (!autoApprove() && !(await approve(`${label} ${JSON.stringify(args)}`, tool))) {
           return {
             output: "The user chose not to run this tool. Carry on without it, or ask the user.",
-            summary: `\`${label}\` skipped`
+            summary: `\`${label}\` skipped`,
+            failed: true
           }
         }
         const running = this._running.get(tool.server)

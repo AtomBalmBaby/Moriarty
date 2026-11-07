@@ -21,7 +21,7 @@ import { ChatChunk, ChatRequest, InferenceClient, InferenceOptions, isCancelled 
 import { withTools } from "../../extension/tools/loop"
 import { coerceArguments, McpClient, mcpToolSpecs, qualifiedToolName } from "../../extension/tools/mcp"
 import { toolDefinition } from "../../extension/tools/protocol"
-import { workspaceTools } from "../../extension/tools/workspace"
+import { ToolResult, workspaceTools } from "../../extension/tools/workspace"
 
 const fakeServer = { command: process.execPath, args: [path.join(__dirname, "..", "suite", "support", "fake-mcp-server.js")] }
 const cwd = os.tmpdir()
@@ -119,6 +119,29 @@ test("stopping while an MCP tool runs cancels that call and starts no further re
     stop.abort()
     await assert.rejects(reply, (error) => isCancelled(error))
     assert.strictEqual(run.requests.length, 1, "the reply is not continued after the stop")
+  } finally {
+    host.dispose()
+  }
+})
+
+test("a declined MCP call reaches the loop as a failed result, so it can never prove a success", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-mcp-declined-"))
+  const host = new McpHost(() => ({ fake: fakeServer }), () => root)
+  try {
+    await host.ready()
+    const sink = host.sink(async () => false)
+    const run = scripted([{ calls: [{ id: "1", name: "fake__echo", arguments: JSON.stringify({ text: "hi" }) }] }, "done"])
+    const results: ToolResult[] = []
+    for await (const chunk of withTools(run.client, workspaceTools(root, [], { mcp: sink }), {
+      mode: "native",
+      onToolResult: (_call, result) => {
+        results.push(result)
+      }
+    }).chat({ model: "m", messages: [{ role: "user", content: "run" }] }))
+      void chunk
+    assert.strictEqual(results.length, 1)
+    assert.strictEqual(results[0].failed, true)
+    assert.match(results[0].output, /The user chose not to run this tool/)
   } finally {
     host.dispose()
   }

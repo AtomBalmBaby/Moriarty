@@ -64,7 +64,7 @@ import { describeProviderError, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { assessAcceptedFacts, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, feedbackContext, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, evidencePreflight, feedbackContext, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest } from "../todos/types"
@@ -289,6 +289,10 @@ export class Chat extends Base {
   private readonly _context: ChatContextBuilder
   private readonly _generation: ChatGeneration
   private _executionAbort?: AbortController
+  /** Start of the current reply; only observations made after it may prove fresh-demand criteria. */
+  private _replyStartedAt?: string
+  /** The request this reply answers; it selects which accepted facts are most relevant to show. */
+  private _replyText = ""
   private _activeExecution?: ExecutionReconciliationController
   private readonly _search: WorkspaceSearch | undefined
   private readonly _workspaceSearch: WorkspaceSearchProvider | undefined
@@ -312,6 +316,8 @@ export class Chat extends Base {
   private _preparing = false
   /** Whether the user's latest message directly asked for a TODO. Mycroft cannot set this. */
   private _userRequestsTodo = false
+  /** The host evidence preflight for this turn's explicit evidence-first request, injected into every request of the turn. */
+  private _evidencePreflight: string | undefined
   /** Open operations (planning, replies, reviews, continuations); Stop stays available while any is open. */
   private readonly _lifecycle: OperationLifecycle
   /**
@@ -754,6 +760,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     conversationId?: string
   ): Promise<string | undefined> {
     this._activeConversationId = conversationId
+    this._evidencePreflight = undefined
     const provider = this.start()
     if (!provider) return undefined
     return this.operate(() => this.completionReply(provider, messages, mentions, requestedSelection, conversationId))
@@ -853,6 +860,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (!feedbackOn) logger.debug("[Feedback] planning not started: Feedback is off")
       const planning = feedbackOn ? this.startFeedbackPlanning(messages) : undefined
       const dispatch = async (): Promise<string | undefined> => {
+        this._replyStartedAt = new Date().toISOString()
+        this._replyText = this.latestUserText(messages) ?? ""
+        this._evidencePreflight = await this.runEvidencePreflight(this.latestUserText(messages) ?? "")
+        const scope = this.activeTodoScope()
+        if (scope && !this.cancelled) await this.completeProvenTodos(scope, { since: this._replyStartedAt, isCancelled: () => this.cancelled })
         this._preparing = true
         try {
           this._conversation = await buildChatTurn(messages, {
@@ -1246,7 +1258,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     scope: TodoWriteRequest,
     itemId?: string,
     changes?: ReplyChangesView,
-    options: { strict?: boolean; finalResponse?: string; requireWorkspaceChanges?: boolean; signal?: AbortSignal; attempted?: Set<string> } = {}
+    options: { strict?: boolean; finalResponse?: string; requireWorkspaceChanges?: boolean; signal?: AbortSignal; attempted?: Set<string>; since?: string } = {}
   ): Promise<TodoEvaluation[]> {
     if (!this._todoRepository) return []
     const attempted = options.attempted ?? new Set<string>()
@@ -1311,7 +1323,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           requireWorkspaceChanges: options.requireWorkspaceChanges && taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria),
           hasVerifiedFileChanges: !!changes?.files.length,
           allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal),
-          readCurrentSource
+          readCurrentSource,
+          since: options.since
         })
         logger.debug("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
         const snapshot = await this._todoRepository!.getList(scope)
@@ -1382,7 +1395,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           strict: true,
           finalResponse,
           requireWorkspaceChanges: requireChanges,
-          signal: this._executionAbort?.signal
+          signal: this._executionAbort?.signal,
+          since: this._replyStartedAt
         })
         evaluation = results.find((result) => result.taskId === intent.planTaskId)
         if (!evaluation && !awaitingDependencies.length) throw new Error("Independent evaluator returned no decision for the active task")
@@ -1412,13 +1426,16 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         await this.reviewTodoTasks(scope, undefined, changes, {
           finalResponse,
           requireWorkspaceChanges: requireChanges,
-          signal: this._executionAbort?.signal
+          signal: this._executionAbort?.signal,
+          since: this._replyStartedAt
         })
       } catch (error) {
         logger.warn("[Execution] turn-end Feedback sweep failed; pending claims remain in review: " + redact(error instanceof Error ? error.message : String(error)))
       }
     }
 
+    // Facts established by this turn's trusted observations complete their TODOs before the continuation decision.
+    if (!this.cancelled && !workflow.isCancelled()) await this.completeProvenTodos(scope, { since: this._replyStartedAt, isCancelled: () => this.cancelled || workflow.isCancelled() })
     const after = await this._todoRepository.getList({ ...scope, includeCompleted: true })
     current = after.items.find((item) => item.id === intent.task.id)
     if (reviewFailure && current?.status === "in_review") {
@@ -1590,22 +1607,61 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
   /** Host state for one request: the active task and the plan, read as of this request. */
   private async planRequestContext(): Promise<string | undefined> {
+    const preflight = this._evidencePreflight
     const scope = this.activeTodoScope()
-    if (!scope || !this._todoRepository) return undefined
+    if (!scope || !this._todoRepository) return preflight
     try {
       await this.repairAdministrativePlan(scope)
       const outline = await this._todoRepository.getPlanOutline(scope)
-      const accepted = outline && outline.tasks.length
-        ? await assessAcceptedFacts(
-          (await this._todoRepository.listAcceptedEvidence(scope)).filter((fact) => !fact.supersededBy).slice(0, MAX_ACCEPTED_CONTEXT_FACTS),
-          this.currentSourceReader()
+      const selection = outline && outline.tasks.length
+        ? await selectAcceptedFacts(
+          { text: this._replyText, planItemIds: outline.tasks.map((task) => task.itemId) },
+          await this._todoRepository.listAcceptedEvidence(scope),
+          await this._todoRepository.listSymbolAliases(scope),
+          this.currentSourceReader(),
+          MAX_ACCEPTED_CONTEXT_FACTS
         )
-        : []
-      const plan = outline && outline.tasks.length ? renderPlanContext(outline, accepted) : ""
+        : { selected: [], omitted: 0 }
+      const plan = outline && outline.tasks.length ? renderPlanContext(outline, selection.selected, selection.omitted) : ""
       const task = await this.activeIntentTaskProjection()
-      return [task, plan].filter(Boolean).join("\n\n") || undefined
+      return [preflight, task, plan].filter(Boolean).join("\n\n") || undefined
     } catch (error) {
       logger.warn(`[Intent] Could not load the TODO plan for this request: ${error instanceof Error ? error.message : String(error)}`)
+      return preflight
+    }
+  }
+
+  /**
+   * Completes pending TODOs whose every objective criterion is proven by trusted, current facts. Feedback is never
+   * consulted here; a TODO with any unproven or semantic criterion is left for the implementer or Feedback.
+   */
+  private async completeProvenTodos(scope: TodoWriteRequest, options: { since?: string; isCancelled?: () => boolean } = {}): Promise<void> {
+    if (!this._todoRepository) return
+    try {
+      await this.repairAdministrativePlan(scope)
+      await completeProvenReviews(this._todoRepository, scope, this.currentSourceReader(), options)
+    } catch (error) {
+      logger.warn(`[Evidence] lazy completion skipped: ${redact(error instanceof Error ? error.message : String(error))}`)
+    }
+  }
+
+  /** Host preflight for an explicit evidence-first request. Only persisted, project-scoped facts reach the model. */
+  private async runEvidencePreflight(text: string): Promise<string | undefined> {
+    if (!this._todoRepository || !workspace.workspaceFolders?.length || !isEvidenceFirstRequest(text)) return undefined
+    const request = {
+      projectFingerprint: workspaceProjectFingerprint(workspace.workspaceFolders.map((folder) => folder.uri.toString(true))),
+      conversationId: this._activeConversationId ?? ""
+    }
+    try {
+      const [facts, aliases] = await Promise.all([
+        this._todoRepository.listAcceptedEvidence(request),
+        this._todoRepository.listSymbolAliases(request)
+      ])
+      const preflight = await evidencePreflight(text, facts, aliases, this.currentSourceReader())
+      logger.debug(`[Preflight] project=${request.projectFingerprint.slice(0, 12)} status=${preflight.status} subjects=${preflight.subjects.join(",") || "-"} facts=${preflight.facts.map((fact) => `${fact.path}:${fact.startLine}-${fact.endLine}/${fact.verification}`).join(" ") || "-"} reason=${preflight.reason}`)
+      return renderEvidencePreflight(preflight)
+    } catch (error) {
+      logger.warn(`[Preflight] Evidence preflight failed; the implementer falls back to twinny_evidence_lookup: ${error instanceof Error ? error.message : String(error)}`)
       return undefined
     }
   }
@@ -1847,7 +1903,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         return this.run(provider, CONTINUATION_PREFIX, view, execution, activeCheckpoints)
       }
     } else if (reply !== undefined && feedbackEnabled && todoScope) {
-      void this.reviewTodoTasks(todoScope, undefined, changed).catch((error) => {
+      void this.reviewTodoTasks(todoScope, undefined, changed, { since: this._replyStartedAt }).catch((error) => {
         logger.error("Automatic TODO evaluation could not load review tasks: " + (error instanceof Error ? error.message : String(error)))
       })
     }

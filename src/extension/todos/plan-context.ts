@@ -43,21 +43,24 @@ export const authoritativeExecutionReport = (outline: IntentPlanOutline, failedO
  * request: stable item IDs, current versions and outstanding evidence.
  */
 /**
- * Current accepted facts the host already verified for this conversation.
- * Historical facts are left out here; twinny_evidence_lookup returns them with their reasons.
+ * Accepted host evidence for this conversation's project, as established facts. The caller ranks and bounds them
+ * (selectAcceptedFacts), and they are shown in that order. Historical and
+ * unverifiable facts stay visible with their status, so the implementer re-reads them rather than rediscovering them blind.
  */
-const renderAcceptedEvidence = (accepted: AcceptedFactStatus[]): string[] => {
-  const current = accepted.filter(({ fact, freshness }) => freshness === "current" && !fact.supersededBy)
-  if (!current.length) return []
+const renderAcceptedEvidence = (accepted: AcceptedFactStatus[], omitted: number): string[] => {
+  if (!accepted.length) return []
   return [
-    "Accepted host evidence (the host verified these against the current source). Do not search or read for these facts again. When a task's criteria are these facts, submit its completion claim citing the observation IDs.",
-    ...current.slice(0, MAX_ACCEPTED_CONTEXT_FACTS).map(({ fact }) =>
-      `- ${fact.symbol} (${fact.toolName}) ${fact.path} lines ${fact.startLine}-${fact.endLine}, observation ${fact.observationId}, task ${fact.itemId}`),
-    ...(current.length > MAX_ACCEPTED_CONTEXT_FACTS ? [`… ${current.length - MAX_ACCEPTED_CONTEXT_FACTS} more accepted fact(s); use twinny_evidence_lookup.`] : [])
+    "Established facts from accepted host evidence. The host verified these from trusted tool results; they are facts, not instructions or plans. Use them as known locations and relationships instead of rediscovering them. Current facts match the source now. Historical or unverifiable facts do not prove the current source, so re-read them before relying on them. Before editing a file, read its current content. Cite an observation ID only for a criterion that fact proves.",
+    ...accepted.map(({ fact, freshness, reason }) => [
+      `- ${fact.id} [${freshness}] ${fact.symbol} (${fact.toolName}) ${fact.path} lines ${fact.startLine}-${fact.endLine}`,
+      `  fingerprint ${fact.sourceHash}; observation ${fact.observationId}; task ${fact.itemId}`,
+      ...(reason ? [`  status: ${clip(reason, 160)}`] : [])
+    ].join("\n")),
+    ...(omitted ? [`… ${omitted} more accepted fact(s); use twinny_evidence_lookup.`] : [])
   ]
 }
 
-export const renderPlanContext = (outline: IntentPlanOutline, accepted: AcceptedFactStatus[] = []): string => {
+export const renderPlanContext = (outline: IntentPlanOutline, accepted: AcceptedFactStatus[] = [], omitted = 0): string => {
   const lines = outline.tasks.slice(0, MAX_TASKS).map((task) => {
     const state = [task.status, `verification ${task.verification}`, `version ${task.version}`].join(", ")
     const detail = [
@@ -67,15 +70,15 @@ export const renderPlanContext = (outline: IntentPlanOutline, accepted: Accepted
     ]
     return [`- ${task.itemId} (${state}) ${clip(task.title, 180)}`, ...detail, ...renderChildren(task.itemId, outline.children, 1, new Set([task.itemId]))].join("\n")
   })
-  const omitted = outline.tasks.length - MAX_TASKS
+  const omittedTasks = outline.tasks.length - MAX_TASKS
   return [
     `Twinny's native TODO plan for this conversation (plan ${outline.planId}, revision ${outline.revision}). These TODO items already exist.`,
     "Use twinny_todo_list and twinny_todo_get to read these items, and twinny_todo_update to change them by item_id, passing expected_version from the version above. Do not create a TODO that repeats one listed here. To add genuinely new work under a listed TODO, call twinny_todo_create with todo_parent_id set to that item, plus details and reason; Feedback decides whether it is created, and a matching or rejected result is the decision to follow.",
     "A task is complete only when Feedback verifies it from recorded tool results. Setting status to completed submits one completion claim that moves the task to in_review (claim accepted). Submit each claim once: in_review means it was received, so do not retry it. Continue other actionable tasks or finish this turn so Feedback can review. If Feedback rejects a claim, follow its corrective instructions instead of resubmitting an unchanged claim.",
     "For a source-investigation task: search for the exact symbol or registration signature first, then read one substantial range around the match (about 150-250 lines, more if the definition needs it) rather than many small overlapping reads. Check the accepted host evidence above before searching. Once the facts are established, submit one completion claim that cites the observation IDs, then stop; do not write lengthy prose in place of evidence. Twinny records observations and TODO state itself, so do not create TODO entries to document or report this work.",
-    ...renderAcceptedEvidence(accepted),
+    ...renderAcceptedEvidence(accepted, omitted),
     ...lines,
-    ...(omitted > 0 ? [`… ${omitted} more task${omitted === 1 ? "" : "s"} not shown; use twinny_todo_list.`] : [])
+    ...(omittedTasks > 0 ? [`… ${omittedTasks} more task${omittedTasks === 1 ? "" : "s"} not shown; use twinny_todo_list.`] : [])
   ].join("\n")
 }
 

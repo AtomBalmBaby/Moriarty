@@ -584,15 +584,15 @@ const intentPlanClosed = (database: Database, listId: string): boolean =>
      WHERE tasks.list_id = ? AND tasks.active = 1 AND items.status NOT IN ('completed', 'cancelled')`, [listId])[0].open_tasks === 0
 
 const retainedEvidenceFor = (database: Database, itemId: string, withContent: boolean, sharedListId?: string): RetainedObservationEvidence[] =>
-  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
-    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, evidence.retained, " +
+  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; observed_at: string; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
+    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, observations.created_at AS observed_at, evidence.retained, " +
     (withContent ? "evidence.content" : "NULL AS content") +
     ", evidence.complete, evidence.original_chars, evidence.preserved_chars, evidence.metadata_json " +
     "FROM todo_tool_observations AS observations LEFT JOIN todo_tool_evidence AS evidence ON evidence.observation_id = observations.id " +
     (sharedListId
       ? "WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) "
       : "WHERE observations.item_id = ? ") +
-    "ORDER BY observations.created_at, observations.id", sharedListId ? [sharedListId, sharedListId] : [itemId]).map((row) => {
+    "ORDER BY observations.created_at, observations.rowid", sharedListId ? [sharedListId, sharedListId] : [itemId]).map((row) => {
       const metadata = row.metadata_json
         ? JSON.parse(row.metadata_json) as { sources: EvidenceSource[]; hits: EvidenceHit[] }
         : { sources: [], hits: [] }
@@ -603,6 +603,7 @@ const retainedEvidenceFor = (database: Database, itemId: string, withContent: bo
         arguments: JSON.parse(row.arguments_json) as Record<string, string>,
         failed: row.failed !== 0,
         ...(row.exit_code === null || row.exit_code === undefined ? {} : { exitCode: row.exit_code }),
+        observedAt: row.observed_at,
         retained: row.retained === 1,
         complete: row.complete === 1,
         originalChars: row.original_chars ?? 0,
@@ -934,7 +935,7 @@ export class TodoRepository {
     })
   }
 
-  getReviewPackages(request: TodoListRequest): Promise<TodoReviewPackage[]> {
+  getReviewPackages(request: TodoListRequest, options: { includeOpen?: boolean } = {}): Promise<TodoReviewPackage[]> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
       if (!project) return []
@@ -952,7 +953,8 @@ export class TodoRepository {
       const taskMap = new Map(tasks.map((task) => [task.task_id, task]))
       const acceptedEvidence = acceptedFactsFor(database, list.project_id)
       const symbolAliases = symbolAliasesFor(database, list.project_id)
-      return tasks.filter((task) => task.status === "in_review").map((row) => {
+      const reviewable = (status: string) => status === "in_review" || (options.includeOpen === true && (status === "pending" || status === "in_progress"))
+      return tasks.filter((task) => reviewable(task.status)).map((row) => {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
         const retainedEvidence = retainedEvidenceFor(database, row.id, true, list.id)

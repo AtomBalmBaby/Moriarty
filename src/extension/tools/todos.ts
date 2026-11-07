@@ -147,7 +147,7 @@ export const todoTools = (
       { name: "symbol", description: "Exact symbol name, such as readFile.", optional: true },
       { name: "path", description: "Workspace-relative source path, such as src/extension/tools/workspace.ts.", optional: true }
     ],
-    guidance: "Call this before searching or reading source for a fact that a previous task may already have established. A current fact is proven: cite its observation_id in your completion claim instead of searching again. A historical fact no longer matches the source; read only the listed lines again. Provide at least one of symbol or path.",
+    guidance: "Call this before searching or reading source for a fact that a previous task may already have established. A current fact is proven: cite its observation_id in your completion claim instead of searching again, or attach it to the TODO with twinny_todo_evidence using accepted_fact_id set to its evidence_id. A historical fact no longer matches the source; read only the listed lines again. Provide at least one of symbol or path.",
     readOnly: true,
     async run(args) {
       try {
@@ -160,6 +160,7 @@ export const todoTools = (
         logger.debug(`[Evidence] lookup project=${scope.projectFingerprint.slice(0, 12)} symbol=${symbol ?? "-"} path=${path ?? "-"} matches=${statuses.length} resolution=${resolution}`)
         if (!statuses.length) logger.trace("[Evidence] lookup found no accepted fact for this project; facts are recorded only after a deterministic proof, so a missing fact means none was proven yet")
         const found = statuses.map(({ fact, freshness, reason }) => ({
+          evidence_id: fact.id,
           symbol: fact.symbol,
           tool_name: fact.toolName,
           ...(fact.implementation ? { implementation: fact.implementation } : {}),
@@ -174,7 +175,7 @@ export const todoTools = (
           accepted_at: fact.acceptedAt,
           freshness,
           ...(reason ? { reason } : {}),
-          ...(freshness === "historical" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again` } : {})
+          ...(freshness !== "current" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again` } : {})
         }))
         return result({ ok: true, resolution, facts: found, total: found.length, limit: EVIDENCE_LOOKUP_LIMIT }, `found ${found.length} accepted evidence fact(s), resolution ${resolution}`)
       } catch (error) {
@@ -346,7 +347,8 @@ export const todoTools = (
       { name: "kind", description: "Evidence kind, such as test, build, observation, or failure." },
       { name: "summary", description: "Short, bounded evidence summary." },
       { name: "result", description: "Use observed when unverified, passed for success, or failed for failure. success/successful/pass and failure/failing/fail are accepted aliases." },
-      { name: "request_id", description: "Generate a non-empty unique ID; reuse it only when retrying the exact same mutation." }
+      { name: "request_id", description: "Generate a non-empty unique ID; reuse it only when retrying the exact same mutation." },
+      { name: "accepted_fact_id", description: "Optional evidence_id from twinny_evidence_lookup. The host validates the fact and records it as this TODO's evidence, setting kind, summary, and result itself.", optional: true }
     ],
     schema: {
       type: "object",
@@ -359,13 +361,19 @@ export const todoTools = (
           enum: ["observed", "passed", "failed"],
           description: "Use observed when unverified, passed for success, or failed for failure. success/successful/pass and failure/failing/fail are accepted aliases."
         },
-        request_id: { type: "string", maxLength: 200, description: "Generate a non-empty unique ID; reuse only for an exact retry." }
+        request_id: { type: "string", maxLength: 200, description: "Generate a non-empty unique ID; reuse only for an exact retry." },
+        accepted_fact_id: { type: "string", maxLength: 200, description: "Optional evidence_id of an accepted fact; the host validates it." }
       },
       required: ["item_id", "kind", "summary", "result", "request_id"],
       additionalProperties: false
     },
     async run(args) {
       try {
+        if (args.accepted_fact_id?.trim()) {
+          const reference = await acceptedFactReference(repository, scope, options, args.item_id, args.accepted_fact_id.trim(), requestId(args))
+          onChanged()
+          return result(reference, "recorded a host-verified accepted fact as native TODO evidence")
+        }
         const evidence = await repository.addEvidence(scope, {
           itemId: args.item_id,
           kind: args.kind,
@@ -381,6 +389,40 @@ export const todoTools = (
     }
   }
 ]
+
+/**
+ * Validates a model's reference to an accepted fact on the host, then records it as this TODO's evidence. The fact must
+ * belong to this project, not be superseded, be current in the workspace, and be named by one of the TODO's criteria.
+ * It attaches provenance only: the TODO's status and criterion outcomes are decided by the reviewer, not here.
+ */
+const acceptedFactReference = async (
+  repository: TodoRepository,
+  scope: TodoWriteRequest,
+  options: TodoToolOptions,
+  itemId: string,
+  factId: string,
+  requestId: string
+) => {
+  const fact = (await repository.listAcceptedEvidence(scope)).find((candidate) => candidate.id === factId)
+  if (!fact) throw new Error("accepted fact was not found in this project")
+  if (fact.supersededBy) throw new Error(`accepted fact ${factId} was superseded by ${fact.supersededBy}; cite the replacement instead`)
+  const [status] = await assessAcceptedFacts([fact], options.readCurrentSource)
+  if (status.freshness !== "current") {
+    throw new Error(`accepted fact ${factId} is ${status.freshness}${status.reason ? `: ${status.reason}` : ""}; read ${fact.path} lines ${fact.startLine}-${fact.endLine} again`)
+  }
+  const { item } = await repository.getItem(scope, itemId)
+  const criteria = [item.title, ...(item.acceptanceCriteria ?? [])]
+  if (!criteria.some((text) => text.includes(fact.symbol) || text.includes(fact.path))) {
+    throw new Error(`accepted fact ${factId} is not named by a criterion of this TODO`)
+  }
+  return repository.addEvidence(scope, {
+    itemId,
+    kind: "accepted_fact",
+    summary: `Host-verified accepted fact ${fact.id}: ${fact.symbol} in ${fact.path} lines ${fact.startLine}-${fact.endLine}, fingerprint ${fact.sourceHash}, observation ${fact.observationId}, from conversation ${fact.conversationId}, accepted ${fact.acceptedAt}.`,
+    result: "observed",
+    requestId
+  })
+}
 
 export const todoWorkspaceTools = (
   repository: TodoRepository,

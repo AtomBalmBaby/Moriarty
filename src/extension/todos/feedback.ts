@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
 import { logger, redact } from "../../common/logger"
 import type { ReplyChangesView, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TodoSourceFact } from "../../common/types"
@@ -7,10 +7,17 @@ import { verifyContentFingerprint } from "../tools/fingerprint"
 import { codeIdentifiers, describeGap, evidenceAnchors, evidenceGaps, type EvidenceSource, evidenceWindows, isDefinitionCriterion, propositionNeedles, redactEvidence, samePath } from "./evidence"
 import { type AcceptedFact, type IntentPlanContext, type RetainedObservationEvidence, RUNTIME_INVENTORY_TOOL, type SymbolAlias, type TodoReviewPackage } from "./types"
 
+/** Mutation vocabulary shared by task gating, criterion classification, and evidence requirements. */
+const CREATE_VERB = /\b(creat(?:e|es|ed|ing)|new file)\b/i
+const DELETE_VERB = /\b(delet(?:e|es|ed|ing))\b/i
+const EDIT_VERB = /\b(add(?:s|ed|ing)?|chang(?:e|es|ed|ing)|edit(?:s|ed|ing)?|fix(?:es|ed|ing)?|implement(?:s|ed|ing)?|improv(?:e|es|ed|ing)|insert(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|refactor(?:s|ed|ing)?|remov(?:e|es|ed|ing)|renam(?:e|es|ed|ing)|replac(?:e|es|ed|ing)|rewrit(?:e|es|ed|ing)|updat(?:e|es|ed|ing))\b/i
+const WRITE_VERB = /\bwrit(?:e|es|ing|ten)\b/i
+const MUTATION_VERB = new RegExp([CREATE_VERB, DELETE_VERB, EDIT_VERB, WRITE_VERB].map((verb) => verb.source).join("|"), "i")
+
 export const taskRequiresWorkspaceChanges = (task: Pick<TodoReviewPackage["task"], "title" | "details">, criteria: string[]): boolean => {
   const taskText = [task.title, task.details ?? "", ...criteria].join("\n")
-  if (/\b(inspect|identify|list|locate|map|note|document|report|review|summari[sz]e|understand)\b/i.test(taskText) && !/\b(add|change|create|delete|edit|fix|implement(?:ed|ing)?|improve|modify|refactor|remove|rewrite|update|write)\b/i.test(taskText)) return false
-  return /\b(add|change|create|delete|edit|fix|implement(?:ed|ing)?|improve|modify|refactor|remove|rewrite|update|write)\b/i.test(taskText)
+  if (/\b(inspect|identify|list|locate|map|note|document|report|review|summari[sz]e|understand)\b/i.test(taskText) && !MUTATION_VERB.test(taskText)) return false
+  return MUTATION_VERB.test(taskText)
 }
 
 export const isAnalysisOnlyIntent = (goal: string): boolean => {
@@ -134,12 +141,14 @@ const sharedObservationRecords = (review: TodoReviewPackage, visible: TodoReview
 const FILE_CREATE_TOOLS = ["create_file"]
 const FILE_EDIT_TOOLS = ["edit_lines", "edit_file"]
 const FILE_DELETE_TOOLS = ["delete_file"]
+const MUTATING_TOOLS = [...FILE_CREATE_TOOLS, ...FILE_EDIT_TOOLS, ...FILE_DELETE_TOOLS]
 
 export const requiredFileMutations = (criterion: string): string[][] => {
   const groups: string[][] = []
-  if (/\b(creat(?:e|es|ed|ing)|new file)\b/i.test(criterion)) groups.push(FILE_CREATE_TOOLS)
-  if (/\b(edit|edits|edited|editing|modif(?:y|ies|ied|ying)|replac(?:e|es|ed|ing)|updat(?:e|es|ed|ing))\b/i.test(criterion)) groups.push(FILE_EDIT_TOOLS)
-  if (/\b(delet(?:e|es|ed|ing))\b/i.test(criterion)) groups.push(FILE_DELETE_TOOLS)
+  if (CREATE_VERB.test(criterion)) groups.push(FILE_CREATE_TOOLS)
+  if (EDIT_VERB.test(criterion)) groups.push(FILE_EDIT_TOOLS)
+  if (DELETE_VERB.test(criterion)) groups.push(FILE_DELETE_TOOLS)
+  if (!groups.length && WRITE_VERB.test(criterion)) groups.push(FILE_EDIT_TOOLS)
   return groups
 }
 
@@ -192,7 +201,7 @@ export const RECONCILIATION_VERSION = 1
 export const DETERMINISTIC_EVALUATOR = "host:deterministic"
 
 const BACKTICKED_TEXT = /`[^`\n]*`/g
-const COMMAND_OR_MUTATION = /\b(tests?|assertions?|compil\w*|build|type.?check|commands?|execut\w*|run|creat\w*|edit\w*|modif\w*|replac\w*|updat\w*|delet\w*|remov\w*|renam\w*)\b/i
+const COMMAND_OR_MUTATION = new RegExp(`\\b(tests?|assertions?|compil\\w*|build|type.?check|commands?|execut\\w*|run)\\b|${MUTATION_VERB.source}`, "i")
 const BEHAVIOR = /\b(when|whenever|if|unless|before|after|only|never|always|must|should|returns?|throws?|rejects?|validates?|ensures?|fails?|succeeds?|propagates?|retries|persists?|prevents?|guarantees?|rolls?\s+back)\b/i
 /** A path-only criterion that asserts a location, existence, or presence fact, rather than a judgment about the file's content. */
 const LOCATION_CLAIM = /\b(exist\w*|present|identif\w*|locat\w*|find|found|contain\w*|defin\w*|declar\w*|registered|registration)\b/i
@@ -470,7 +479,7 @@ const discoveredOutcome = async (
  * Whether an accepted fact establishes a symbol: its own symbol, or a stored tool-to-implementation
  * alias for the fact's path that links the symbol to the fact's symbol in either direction.
  */
-const factMatchesSymbol = (candidate: AcceptedFact, symbol: string, aliases: SymbolAlias[]): boolean =>
+export const factMatchesSymbol = (candidate: AcceptedFact, symbol: string, aliases: SymbolAlias[]): boolean =>
   candidate.symbol === symbol || aliases.some((alias) =>
     samePath(alias.path, candidate.path)
     && ((alias.toolName === candidate.symbol && alias.implementation === symbol) || (alias.toolName === symbol && alias.implementation === candidate.symbol)))
@@ -528,6 +537,47 @@ const acceptedSymbolOutcome = async (
   return { ...reconciled("proven", [...new Set(supporting)], []), reuse: "accepted" }
 }
 
+/** A criterion that asks only to retrieve source content, its fingerprint, or its location: no behavior, command, or mutation. */
+const RETRIEVAL_VERB = /\b(read\w*|obtain\w*|retriev\w*|fingerprint\w*|hash\w*|content_hash)\b/i
+const RETRIEVAL_VOCABULARY = new Set([
+  "read", "reads", "reading", "obtain", "obtains", "obtained", "retrieve", "retrieved", "report", "reports", "return", "returns", "returned",
+  "give", "state", "cite", "provide", "fingerprint", "fingerprints", "hash", "content", "contents", "implementation", "definition", "declaration",
+  "source", "code", "native", "tool", "function", "file", "files", "authoritative", "current", "exact", "entire", "whole", "its", "the", "a", "an",
+  "and", "or", "of", "for", "in", "by", "to", "from", "with", "that", "is", "as", "it", "lines", "line", "range", "number", "numbers", "filename",
+  "path", "location", "where"
+])
+
+const retrievalOnly = (judged: string, anchors: { paths: string[]; symbols: string[] }): boolean => {
+  if (!RETRIEVAL_VERB.test(judged)) return false
+  const named = new Set([...anchors.paths, ...anchors.symbols].flatMap((value) => value.toLowerCase().split(/[^a-z0-9_]+/)))
+  return judged.toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean).every((word) =>
+    named.has(word) || RETRIEVAL_VOCABULARY.has(word) || PROVENANCE_FIELDS.has(word) || PROVENANCE_FILLER.has(word) || /^\d+$/.test(word))
+}
+
+/**
+ * Resolves an unnamed retrieval criterion from the one source target that same-plan accepted facts establish.
+ * Several targets are ambiguous and return undefined. A target whose fingerprint no longer matches is unknown,
+ * because its content must be read again.
+ */
+const planTargetOutcome = async (
+  planAccepted: AcceptedFact[],
+  current: (path: string) => Promise<string | undefined>
+): Promise<TodoCriterionReconciliation | undefined> => {
+  const live = planAccepted.filter((fact) => !fact.supersededBy)
+  const targets = new Map<string, AcceptedFact[]>()
+  for (const fact of live) {
+    const key = JSON.stringify([fact.symbol, fact.path])
+    targets.set(key, [...(targets.get(key) ?? []), fact])
+  }
+  if (targets.size !== 1) return undefined
+  const [fact] = [...targets.values()][0]
+  const text = await current(fact.path)
+  if (text === undefined || !(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) {
+    return reconciled("unknown", [], [`the accepted source of \`${fact.symbol}\` in ${fact.path} changed or cannot be read now; read it again`])
+  }
+  return { ...reconciled("proven", [fact.observationId], []), reuse: "accepted" }
+}
+
 const cachedCurrentReader = (readCurrent?: CurrentSourceReader): ((path: string) => Promise<string | undefined>) => {
   const cache = new Map<string, Promise<string | undefined>>()
   return (path: string) => {
@@ -543,7 +593,7 @@ const cachedCurrentReader = (readCurrent?: CurrentSourceReader): ((path: string)
 
 export interface AcceptedFactStatus {
   fact: AcceptedFact
-  freshness: "current" | "historical"
+  freshness: "current" | "historical" | "unverifiable"
   /** Why the fact no longer proves the current source; absent when current. */
   reason?: string
 }
@@ -572,7 +622,7 @@ export const assessAcceptedFacts = async (facts: AcceptedFact[], readCurrent?: C
   return Promise.all(facts.map(async (fact): Promise<AcceptedFactStatus> => {
     if (fact.supersededBy) return { fact, freshness: "historical", reason: `superseded by accepted fact ${fact.supersededBy}` }
     const text = await current(fact.path)
-    if (text === undefined) return { fact, freshness: "historical", reason: `${fact.path} could not be read to confirm its fingerprint` }
+    if (text === undefined) return { fact, freshness: "unverifiable", reason: `${fact.path} could not be read to confirm its fingerprint` }
     if (!(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) {
       return { fact, freshness: "historical", reason: `${fact.path} changed after this fact was accepted` }
     }
@@ -580,9 +630,130 @@ export const assessAcceptedFacts = async (facts: AcceptedFact[], readCurrent?: C
   }))
 }
 
+const RELEVANCE_SYMBOL = 4
+const RELEVANCE_PATH = 3
+const RELEVANCE_PLAN = 2
+const FRESHNESS_ORDER: Record<AcceptedFactStatus["freshness"], number> = { current: 0, historical: 1, unverifiable: 2 }
+
+/**
+ * Chooses the accepted facts shown for this request, within a fixed budget. Relevance decides what is kept: an exact
+ * symbol or alias named by the request, then a source path it names, then a task of the active plan. Freshness and
+ * recency only order facts with equal relevance, so a stale exact match is kept over an unrelated current fact.
+ */
+export const selectAcceptedFacts = async (
+  request: { text: string; planItemIds: string[] },
+  facts: AcceptedFact[],
+  aliases: SymbolAlias[],
+  readCurrent: CurrentSourceReader | undefined,
+  budget: number
+): Promise<{ selected: AcceptedFactStatus[]; omitted: number }> => {
+  const live = facts.filter((fact) => !fact.supersededBy)
+  const subjects = [...new Set(codeIdentifiers(request.text))]
+  const planItems = new Set(request.planItemIds)
+  const relevance = (fact: AcceptedFact): number =>
+    (subjects.some((subject) => factMatchesSymbol(fact, subject, aliases)) ? RELEVANCE_SYMBOL : 0)
+    + (request.text.includes(fact.path) ? RELEVANCE_PATH : 0)
+    + (planItems.has(fact.itemId) ? RELEVANCE_PLAN : 0)
+  const ranked = (await assessAcceptedFacts(live, readCurrent))
+    .map((status) => ({ status, score: relevance(status.fact) }))
+    .sort((left, right) => right.score - left.score
+      || FRESHNESS_ORDER[left.status.freshness] - FRESHNESS_ORDER[right.status.freshness]
+      || right.status.fact.acceptedAt.localeCompare(left.status.fact.acceptedAt)
+      || left.status.fact.id.localeCompare(right.status.fact.id))
+  const selected = ranked.slice(0, budget).map(({ status }) => status)
+  return { selected, omitted: ranked.length - selected.length }
+}
+
+/** An explicit request to reuse existing accepted evidence before searching or reading. Other messages never trigger the preflight. */
+const EVIDENCE_FIRST_REQUEST = /\b(accepted|existing|prior|previous|persisted|recorded|project[- ]wide)\s+(source\s+)?(evidence|facts?)\b|\bevidence[- ]first\b|\b(check|reuse|consult|look\s+up)\b[^.\n]{0,60}\b(evidence|accepted facts?)\b/i
+
+export const isEvidenceFirstRequest = (text: string): boolean => EVIDENCE_FIRST_REQUEST.test(text)
+
+export type EvidencePreflightStatus = "fresh" | "stale" | "ambiguous" | "missing" | "unverifiable"
+
+export interface EvidencePreflightFact {
+  symbol: string
+  implementation?: string
+  toolName: string
+  path: string
+  startLine: number
+  endLine: number
+  sourceHash: string
+  observationId: string
+  itemId: string
+  conversationId: string
+  planRevision: number
+  verification: "verified" | "changed" | "unreadable"
+}
+
+export interface EvidencePreflight {
+  status: EvidencePreflightStatus
+  reason: string
+  subjects: string[]
+  facts: EvidencePreflightFact[]
+}
+
+/**
+ * Host-side evidence preflight for an explicit evidence-first request. It resolves the request's symbols and paths
+ * against live project facts, then verifies each source fingerprint. A record alone never establishes freshness.
+ */
+export const evidencePreflight = async (
+  text: string,
+  facts: AcceptedFact[],
+  aliases: SymbolAlias[],
+  readCurrent?: CurrentSourceReader
+): Promise<EvidencePreflight> => {
+  const subjects = [...new Set(codeIdentifiers(text))].slice(0, 12)
+  const matched = facts.filter((fact) => !fact.supersededBy && (subjects.some((subject) => factMatchesSymbol(fact, subject, aliases)) || text.includes(fact.path)))
+  if (!matched.length) return { status: "missing", reason: "no live accepted fact names this request's symbols or paths", subjects, facts: [] }
+  const statuses = await assessAcceptedFacts(matched, readCurrent)
+  const projected = statuses.map(({ fact, freshness }): EvidencePreflightFact => ({
+    symbol: fact.symbol,
+    ...(fact.implementation ? { implementation: fact.implementation } : {}),
+    toolName: fact.toolName,
+    path: fact.path,
+    startLine: fact.startLine,
+    endLine: fact.endLine,
+    sourceHash: fact.sourceHash,
+    observationId: fact.observationId,
+    itemId: fact.itemId,
+    conversationId: fact.conversationId,
+    planRevision: fact.planRevision,
+    verification: freshness === "current" ? "verified" : freshness === "unverifiable" ? "unreadable" : "changed"
+  }))
+  const resolution = resolveAcceptedFacts(statuses)
+  if (resolution === "ambiguous") {
+    const locations = new Set(matched.map((fact) => `${fact.path}:${fact.startLine}-${fact.endLine}`)).size
+    return { status: "ambiguous", reason: `${locations} accepted source locations match; the request does not select one`, subjects, facts: projected }
+  }
+  if (resolution === "unique" && statuses.some((status) => status.freshness === "current")) {
+    return { status: "fresh", reason: "the accepted source fingerprint matches the current source", subjects, facts: projected }
+  }
+  const unreadable = statuses.find((status) => status.freshness === "unverifiable")
+  if (unreadable) return { status: "unverifiable", reason: unreadable.reason ?? "source could not be read", subjects, facts: projected }
+  return { status: "stale", reason: statuses.find((status) => status.reason)?.reason ?? "accepted source changed", subjects, facts: projected }
+}
+
+const PREFLIGHT_GUIDANCE: Record<EvidencePreflightStatus, string> = {
+  fresh: "Answer from these verified facts and cite their observation_id. Do not search or read this source again.",
+  stale: "The accepted source changed. Read only the listed lines again before claiming them.",
+  ambiguous: "Several accepted locations match. Do not choose one silently; state the ambiguity or resolve it from the request.",
+  missing: "No accepted fact exists yet. Search and read as needed, then complete the task with observation IDs.",
+  unverifiable: "The source could not be read, so freshness is unknown. Do not describe these facts as current."
+}
+
+/** The preflight as compact structured context for the implementer. */
+export const renderEvidencePreflight = (preflight: EvidencePreflight): string => [
+  "Host evidence preflight (deterministic, from persisted accepted facts; the host ran it before your first request):",
+  JSON.stringify({ status: preflight.status, reason: preflight.reason, subjects: preflight.subjects, facts: preflight.facts }),
+  PREFLIGHT_GUIDANCE[preflight.status]
+].join("\n")
+
 const BACKTICKED_CONTENT = /`([^`\n]+)`/g
 const EXIT_OR_SUCCESS_CLAIM = /\b(exit\w*|succe\w*|pass(?:es|ed|ing)?)\b/i
-const CHANGE_OR_CONDITION = /\b(creat\w*|edit\w*|modif\w*|replac\w*|updat\w*|delet\w*|remov\w*|renam\w*|when|whenever|if|unless|only|never|before|after)\b/i
+const CHANGE_OR_CONDITION = new RegExp(`${MUTATION_VERB.source}|\\b(when|whenever|if|unless|only|never|before|after)\\b`, "i")
+/** Wording that demands a new observation rather than one already on record. */
+const REOBSERVE_DEMAND = /\b(again|re-?run|re-?read|re-?check|fresh\w*|new (?:run|read|check|observation))\b/i
 const normalizeCommand = (command: string) => command.trim().replace(/\s+/g, " ")
 
 /**
@@ -592,11 +763,15 @@ const normalizeCommand = (command: string) => command.trim().replace(/\s+/g, " "
  * the current state. Criteria that also ask for a change or a condition stay
  * semantic.
  */
-const directOutcome = (criterion: string, records: RetainedObservationEvidence[]): TodoCriterionReconciliation | undefined => {
+const directOutcome = (criterion: string, allRecords: RetainedObservationEvidence[], since?: string): TodoCriterionReconciliation | undefined => {
   if (!EXIT_OR_SUCCESS_CLAIM.test(criterion.replace(BACKTICKED_TEXT, " ")) || CHANGE_OR_CONDITION.test(criterion.replace(BACKTICKED_TEXT, " "))) return undefined
   const named = [...criterion.matchAll(BACKTICKED_CONTENT)].map((match) => match[1].trim())
   if (named.length !== 1 || !named[0]) return undefined
   const [anchor] = named
+  /** A criterion that asks for a new run or read is decided only by observations made at or after `since`. */
+  const records = REOBSERVE_DEMAND.test(criterion)
+    ? allRecords.filter((record) => since !== undefined && record.observedAt >= since)
+    : allRecords
   const toolRuns = records.filter((record) => record.toolName === anchor && anchor !== "run_command")
   if (toolRuns.length) {
     const latest = toolRuns[toolRuns.length - 1]
@@ -608,6 +783,9 @@ const directOutcome = (criterion: string, records: RetainedObservationEvidence[]
   const runs = records.filter((record) => record.toolName === "run_command" && normalizeCommand(record.arguments.command ?? "") === key)
   const latest = runs[runs.length - 1]
   if (!latest) return reconciled("unknown", [], [`no trusted run of \`${anchor}\``])
+  if (records.slice(records.indexOf(latest) + 1).some((record) => !record.failed && MUTATING_TOOLS.includes(record.toolName))) {
+    return reconciled("unknown", [latest.observationId], [`a file changed after the latest run of \`${anchor}\``])
+  }
   if (latest.exitCode === undefined || (latest.failed && latest.exitCode === 0)) {
     return reconciled("unknown", [latest.observationId], [`the latest run of \`${anchor}\` has no trusted exit status`])
   }
@@ -615,6 +793,14 @@ const directOutcome = (criterion: string, records: RetainedObservationEvidence[]
     ? reconciled("proven", [latest.observationId], [])
     : reconciled("disproven", [latest.observationId], [`the latest run of \`${anchor}\` exited ${latest.exitCode}`])
 }
+
+/** Plan identity plus the goal and task wording that name the tools a retrieval criterion refers to. */
+const planScope = (review: TodoReviewPackage, since?: string) => ({
+  planId: review.planId,
+  conversationId: review.conversationId,
+  context: [review.goal, review.task.title, ...review.acceptanceCriteria].join("\n"),
+  since
+})
 
 /**
  * Deterministic pass over acceptance criteria. Only narrow, anchored presence
@@ -628,12 +814,18 @@ export const reconcileCriteria = async (
   records: RetainedObservationEvidence[],
   readCurrent?: CurrentSourceReader,
   accepted: AcceptedFact[] = [],
-  aliases: SymbolAlias[] = []
+  aliases: SymbolAlias[] = [],
+  plan?: { planId: string; conversationId: string; context?: string; since?: string }
 ): Promise<TodoCriterionReconciliation[]> => {
   const current = cachedCurrentReader(readCurrent)
+  const contextWords = new Set((plan?.context ?? "").toLowerCase().split(/[^a-z0-9_]+/))
+  const retrievalCandidates = accepted.filter((fact) => !fact.supersededBy && (
+    (plan !== undefined && fact.planId === plan.planId && fact.conversationId === plan.conversationId)
+    || contextWords.has(fact.toolName.toLowerCase())
+    || contextWords.has(fact.symbol.toLowerCase())))
   const outcomes: TodoCriterionReconciliation[] = []
   for (const criterion of criteria) {
-    const direct = directOutcome(criterion, records)
+    const direct = directOutcome(criterion, records, plan?.since)
     if (direct) {
       outcomes.push(direct)
       continue
@@ -649,7 +841,14 @@ export const reconcileCriteria = async (
       || COMMAND_OR_MUTATION.test(judged)
       || BEHAVIOR.test(judged)
       || unanchoredJudgment
-    if (semantic) {
+    const planRetrieval = plan !== undefined
+      && !anchors.paths.length && !anchors.symbols.length && !discoverable.length
+      && !COMMAND_OR_MUTATION.test(judged) && !BEHAVIOR.test(judged)
+      && retrievalOnly(judged, anchors)
+    if (planRetrieval) {
+      outcomes.push(await planTargetOutcome(retrievalCandidates, current)
+        ?? reconciled("semantic", [], []))
+    } else if (semantic) {
       outcomes.push(reconciled("semantic", [], []))
     } else if (!anchors.paths.length) {
       const exposure = /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(judged)
@@ -814,7 +1013,7 @@ export const parseTodoEvaluation = (
     for (const criterion of criteria) {
       const commandEvidenceRequired = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
       const mutationRequired = requiredFileMutations(criterion.criterion).length > 0
-      if (criterion.status === "passed" && criterion.reconciliation?.outcome !== "proven" && !hasTrustedEvidenceForCriterion(criterion.criterion, criterion.evidenceRefs, trustedRecords) && (!allowEvidenceFreeAnalysis || commandEvidenceRequired || mutationRequired)) {
+      if (criterion.status === "passed" && (criterion.reconciliation?.outcome !== "proven" || mutationRequired) && !hasTrustedEvidenceForCriterion(criterion.criterion, criterion.evidenceRefs, trustedRecords) && (!allowEvidenceFreeAnalysis || commandEvidenceRequired || mutationRequired)) {
         criterion.status = "unverified"
         const requiresCommand = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
         problems.push(requiresCommand
@@ -916,7 +1115,9 @@ const candidatesForCriterion = (review: TodoReviewPackage, criterion: string, vi
   const needles = propositionNeedles(criterion)
   const criterionPaths = evidenceAnchors(criterion).paths
   return review.retainedEvidence.flatMap((entry): EvidenceCandidate[] => {
-    if (entry.failed || !visible.has(entry.observationId)) return []
+    // Records from sibling tasks of this plan are admitted even when the observation cap dropped them. Windows still
+    // need a criterion needle or path match, and the excerpt budgets still apply.
+    if (entry.failed || !(visible.has(entry.observationId) || entry.itemId !== review.task.id)) return []
     const base = {
       observationId: entry.observationId,
       toolName: entry.toolName,
@@ -1094,19 +1295,79 @@ export const reviewCandidates = (reviews: TodoReviewPackage[], itemId?: string):
     : reviews.filter((review) => !review.lastEvaluation || review.lastEvaluation.metadata.taskVersion !== review.task.version - 1)
   ).filter(dependenciesComplete)
 
+/** Completes pending reviews whose every objective criterion is proven by trusted, current facts. Feedback is never consulted. */
+export const completeProvenReviews = async (
+  repository: import("./repository").TodoRepository,
+  scope: import("./types").TodoWriteRequest,
+  readCurrentSource?: CurrentSourceReader,
+  options: { since?: string; isCancelled?: () => boolean } = {}
+): Promise<string[]> => {
+  const completed: string[] = []
+  for (const review of await repository.getReviewPackages(scope, { includeOpen: true })) {
+    if (options.isCancelled?.()) break
+    if (review.task.status !== "pending" && review.task.status !== "in_progress") continue
+    if (!dependenciesComplete(review) || taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria)) continue
+    if (!(await provenTodoEvaluation(review, readCurrentSource, options.since))) continue
+    if (options.isCancelled?.()) break
+    const claimed = await repository.updateItem(scope, {
+      itemId: review.task.id,
+      expectedVersion: review.task.version,
+      patch: { status: "in_review" },
+      actor: "model",
+      requestId: randomUUID()
+    })
+    const fresh = (await repository.getReviewPackages(scope)).find((candidate) => candidate.task.id === review.task.id)
+
+    const verdict = fresh ? await provenTodoEvaluation(fresh, readCurrentSource, options.since) : undefined
+    if (!fresh || !verdict) {
+      logger.warn(`[Evidence] lazy completion of ${review.planTaskId} was not reproduced on re-check; the turn-end review will decide`)
+      continue
+    }
+    if (options.isCancelled?.()) {
+      // A claim made before cancellation is released so the task is not left in review without a verdict.
+      await repository.updateItem(scope, {
+        itemId: claimed.id,
+        expectedVersion: claimed.version,
+        patch: { status: "in_progress" },
+        actor: "model",
+        requestId: randomUUID()
+      })
+      break
+    }
+    await repository.applyEvaluation(scope, fresh.task.id, fresh.task.version, verdict, evaluationRequestId(fresh))
+    logger.info(`[Evidence] completed ${review.planTaskId} from trusted facts without Feedback or implementer investigation (criteria=${review.acceptanceCriteria.length}, claimedVersion=${claimed.version})`)
+    completed.push(review.planTaskId)
+  }
+  return completed
+}
+
+/**
+ * Host-only proof: a verdict exists only when every criterion is proven by trusted, current facts. Never consults Feedback.
+ * Partial or unproven work returns undefined, so the normal review path investigates only what is still missing.
+ */
+export const provenTodoEvaluation = async (
+  review: TodoReviewPackage,
+  readCurrentSource?: CurrentSourceReader,
+  since?: string
+): Promise<TodoEvaluation | undefined> => {
+  const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, readCurrentSource, review.acceptedEvidence, review.symbolAliases, planScope(review, since))
+  const evaluation = deterministicTodoEvaluation(review, reconciliations)
+  return evaluation?.decision === "accept" ? evaluation : undefined
+}
+
 export const evaluateTodoReview = (
   repository: import("./repository").TodoRepository,
   scope: import("./types").TodoWriteRequest,
   review: TodoReviewPackage,
   evaluator: (correction?: string, reconciliations?: TodoCriterionReconciliation[]) => Promise<string>,
   evaluatorName: string,
-  requirements: { requireWorkspaceChanges?: boolean; hasVerifiedFileChanges?: boolean; allowEvidenceFreeAnalysis?: boolean; readCurrentSource?: CurrentSourceReader } = {}
+  requirements: { requireWorkspaceChanges?: boolean; hasVerifiedFileChanges?: boolean; allowEvidenceFreeAnalysis?: boolean; readCurrentSource?: CurrentSourceReader; since?: string } = {}
 ): Promise<TodoEvaluation> => {
   const key = `${scope.projectFingerprint}\n${scope.conversationId}\n${review.task.id}\n${review.task.version}`
   const inFlight = reviewsInFlight.get(key)
   if (inFlight) return inFlight
   const operation = (async () => {
-    const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource, review.acceptedEvidence, review.symbolAliases)
+  const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource, review.acceptedEvidence, review.symbolAliases, planScope(review, requirements.since))
     const deterministic = deterministicTodoEvaluation(review, reconciliations)
     logger.debug("[Feedback] criteria task=" + review.task.id + " " + reconciliations.map((item, i) => `${i}=${item.outcome}${item.facts?.length ? `(facts=${item.facts.length})` : ""}${item.reuse ? "(reuse)" : ""}`).join(" ") + " path=" + (deterministic ? "deterministic" : "feedback"))
     reconciliations.forEach((item, i) => {

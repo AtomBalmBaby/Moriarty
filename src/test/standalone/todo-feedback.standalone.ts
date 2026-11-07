@@ -10,36 +10,38 @@ import { resolveAgentToolSelection } from "../../extension/agents/tool-selection
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
 import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, parseFeedbackPlanResponse, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
-import { assessAcceptedFacts, type CurrentSourceReader, DETERMINISTIC_EVALUATOR, evaluateTodoReview, feedbackContext, parseTodoEvaluation, reconcileCriteria, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
+import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, DETERMINISTIC_EVALUATOR, evaluateTodoReview, evidencePreflight, feedbackContext, parseTodoEvaluation, provenTodoEvaluation, reconcileCriteria, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import type { ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
+import type { AcceptedFact, ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, SymbolAlias, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
 import { RUNTIME_INVENTORY_TOOL } from "../../extension/todos/types"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
+import { contentHash, planLineEdits } from "../../extension/tools/line-edit"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
+import { type EditSink, type ToolResult,workspaceTools } from "../../extension/tools/workspace"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
-const plan = (tasks: { id: string; acceptance: string; dependencies?: string[] }[]) => ({
+const plan = (tasks: { id: string; acceptance: string | string[]; dependencies?: string[] }[], goal = "Verify the requested work") => ({
   planId: "feedback-plan",
   version: 1 as const,
   revision: 1,
-  goal: "Verify the requested work",
+  goal,
   constraints: ["Preserve existing behavior"],
   tasks: tasks.map((task) => ({
     id: task.id,
     title: task.id,
     description: `Work for ${task.id}`,
-    acceptanceCriteria: [task.acceptance],
+    acceptanceCriteria: Array.isArray(task.acceptance) ? task.acceptance : [task.acceptance],
     dependencies: task.dependencies ?? []
   }))
 })
 
-const fixture = async (tasks: { id: string; acceptance: string; dependencies?: string[] }[], complete = true) => {
+const fixture = async (tasks: { id: string; acceptance: string | string[]; dependencies?: string[] }[], complete = true, goal = "Verify the requested work") => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-feedback-"))
   const databasePath = path.join(directory, "twinny-state.sqlite")
   const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///feedback-project"]), conversationId: "feedback-chat", writer: "feedback-chat" }
   const repository = new TodoRepository(databasePath, wasmPath)
-  const initial = await repository.synchronizeIntentPlan(scope, plan(tasks), { prompt: "Verify the requested work" })
+  const initial = await repository.synchronizeIntentPlan(scope, plan(tasks, goal), { prompt: goal })
   const items = complete ? [] : initial.items
   if (complete) {
     for (const item of initial.items) {
@@ -1657,6 +1659,7 @@ test("accepted facts survive repository reopen and are reused without the origin
 
 
 const workspaceRecord = async (start: number, end: number) => ({
+  observedAt: "2026-01-01T00:00:00.000Z",
   observationId: "obs-window",
   itemId: "registration",
   toolName: "read_file",
@@ -1672,6 +1675,7 @@ const workspaceRecord = async (start: number, end: number) => ({
 })
 
 const commandRecord = (command: string, exitCode: number | undefined, observationId = "obs-command", failed = false): RetainedObservationEvidence => ({
+  observedAt: "2026-01-01T00:00:00.000Z",
   observationId,
   itemId: "verify",
   toolName: "run_command",
@@ -1687,6 +1691,7 @@ const commandRecord = (command: string, exitCode: number | undefined, observatio
 })
 
 const toolRecord = (toolName: string, failed: boolean, observationId = "obs-tool"): RetainedObservationEvidence => ({
+  observedAt: "2026-01-01T00:00:00.000Z",
   observationId,
   itemId: "verify",
   toolName,
@@ -2459,11 +2464,12 @@ test("the plan context Mycroft receives lists current accepted facts before the 
     const current = renderPlanContext(outline, await assessAcceptedFacts(facts, currentWorkspace))
     assert.ok(current.includes(`observation ${observation.id}`), "the current fact is offered to the next request")
     assert.ok(current.indexOf("Accepted host evidence") < current.indexOf(`- ${first}`), "accepted evidence precedes the task list")
-    assert.ok(current.includes("Do not search or read for these facts again"))
+    assert.ok(current.includes("Before editing a file, read its current content"))
 
     const stale = renderPlanContext(outline, await assessAcceptedFacts(facts, changedWorkspace))
-    assert.equal(stale.includes(observation.id), false, "a historical fact is not offered as current")
-    assert.equal(stale.includes("Accepted host evidence"), false)
+    assert.equal(stale.includes("[current]"), false, "a changed source is never offered as current")
+    assert.ok(stale.includes("[historical]"), "the stale fact stays visible as labelled historical context")
+    assert.ok(stale.includes(observation.id), "its provenance is preserved")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -3083,5 +3089,805 @@ test("native TODO tools acknowledge claims once, reuse plan tasks, and never let
     assert.equal(stored.version, claim.version)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+const EVIDENCE_REQUEST = "Check the project's accepted evidence first, then locate the native read_file implementation and report its path, line range, and fingerprint."
+const READ_FILE_SOURCE = "src/extension/tools/workspace.ts"
+const LOCATE_CRITERION = "The native `read_file` tool is declared and registered in src/extension/tools/workspace.ts"
+const READ_CRITERION = "Read the implementation and obtain its fingerprint"
+const realWorkspaceSource = fs.readFileSync(path.join(process.cwd(), READ_FILE_SOURCE), "utf8")
+const overlappingPlan = [{ id: "locate", acceptance: LOCATE_CRITERION }, { id: "read", acceptance: READ_CRITERION }]
+type FeedbackFixture = Awaited<ReturnType<typeof fixture>>
+
+const sourceWorkspace = (text = realWorkspaceSource) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-read-file-"))
+  fs.mkdirSync(path.join(root, path.dirname(READ_FILE_SOURCE)), { recursive: true })
+  fs.writeFileSync(path.join(root, READ_FILE_SOURCE), text)
+  return root
+}
+const sourceReader = (root: string): CurrentSourceReader => async (file) => {
+  const absolute = path.join(root, file)
+  return fs.existsSync(absolute) ? fs.readFileSync(absolute, "utf8") : undefined
+}
+/** Runs the production native read_file tool, the only source of trusted read output. */
+const runReadFile = async (root: string, reads: { count: number }, start = "169", end = "219") => {
+  reads.count += 1
+  const tool = workspaceTools(root).tools.find((candidate) => candidate.name === "read_file")!
+  const args = { path: READ_FILE_SOURCE, start_line: start, end_line: end }
+  return { args, result: await tool.run(args) }
+}
+/** Records the observation the way the chat loop does: the raw tool output is kept as evidenceOutput. */
+const recordRead = (state: FeedbackFixture, itemId: string, requestId: string, read: Awaited<ReturnType<typeof runReadFile>>) =>
+  state.repository.recordToolObservation(state.scope, {
+    itemId,
+    toolName: "read_file",
+    arguments: read.args,
+    output: read.result.summary ?? "read",
+    failed: false,
+    requestId,
+    evidenceOutput: read.result.output
+  })
+const itemTitled = (state: FeedbackFixture, title: string) => state.items.find((item) => item.title === title)!
+const claimTask = (state: FeedbackFixture, title: string, requestId: string) => {
+  const item = itemTitled(state, title)
+  return state.repository.updateItem(state.scope, { itemId: item.id, expectedVersion: item.version, patch: { status: "in_review" }, actor: "model", requestId })
+}
+const reviewOf = async (state: FeedbackFixture, itemId: string) =>
+  (await state.repository.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === itemId)!
+const statusOf = async (state: FeedbackFixture, title: string) => (await state.repository.getItem(state.scope, itemTitled(state, title).id)).item.status
+/** One real read of the registration, then the host's deterministic verdict on the locate TODO. Feedback must never be asked. */
+const establishFact = async (state: FeedbackFixture, workspace: string, reads: { count: number }) => {
+  await claimTask(state, "locate", "locate-claim")
+  const read = await runReadFile(workspace, reads)
+  const observation = await recordRead(state, itemTitled(state, "locate").id, "locate-read", read)
+  const verdict = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, "locate").id), async () => {
+    throw new Error("Feedback must not judge objective source criteria")
+  }, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+  return { observation, verdict }
+}
+const removeAll = (...paths: string[]) => paths.forEach((target) => fs.rmSync(target, { recursive: true, force: true }))
+
+test("Scenario A: one trusted read_file observation establishes the locate fact and completes the overlapping read TODO without another read", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  const logs: string[] = []
+  const originalInfo = logger.info
+  logger.info = (message: string) => { logs.push(message) }
+  try {
+    const preflight = await evidencePreflight(EVIDENCE_REQUEST, await state.repository.listAcceptedEvidence(state.scope), await state.repository.listSymbolAliases(state.scope), sourceReader(workspace))
+    assert.equal(preflight.status, "missing")
+
+    const { observation, verdict } = await establishFact(state, workspace, reads)
+    assert.equal(verdict.decision, "accept")
+    assert.ok(logs.some((line) => line.includes("source=deterministic")), "the locate TODO is judged by the host")
+    assert.equal(await statusOf(state, "locate"), "completed")
+
+    const fact = (await state.repository.listAcceptedEvidence(state.scope)).find((candidate) => candidate.path === READ_FILE_SOURCE)
+    assert.ok(fact, "the trusted observation is promoted to a persisted accepted fact")
+    assert.equal(fact.observationId, observation.id)
+    assert.equal(fact.sourceHash, await fingerprintContent(realWorkspaceSource), "the fingerprint is the one read_file reported")
+    assert.ok(fact.startLine >= 169 && fact.endLine <= 219, `fact lies within the requested read: ${fact.startLine}-${fact.endLine}`)
+
+    const completed = await completeProvenReviews(state.repository, state.scope, sourceReader(workspace))
+    assert.deepEqual(completed, ["read"])
+    assert.equal(await statusOf(state, "read"), "completed")
+    assert.equal(reads.count, 1, "the overlapping TODO needs no second read")
+    assert.ok(logs.some((line) => line.includes("[Evidence] completed read")), "completion is attributed to trusted facts")
+  } finally {
+    logger.info = originalInfo
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("Scenario B: a reopened repository in a new conversation resolves the persisted fact before any search", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const first = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  try {
+    const { observation } = await establishFact(first, workspace, reads)
+
+    const reopened = new TodoRepository(first.databasePath, wasmPath)
+    const scope = { projectFingerprint: first.scope.projectFingerprint, conversationId: "second-chat", writer: "second-chat" }
+    await reopened.synchronizeIntentPlan(scope, plan(overlappingPlan, EVIDENCE_REQUEST), { prompt: EVIDENCE_REQUEST })
+    const facts = await reopened.listAcceptedEvidence(scope)
+    const preflight = await evidencePreflight(EVIDENCE_REQUEST, facts, await reopened.listSymbolAliases(scope), sourceReader(workspace))
+    assert.equal(preflight.status, "fresh")
+    const fact = facts.find((candidate) => candidate.path === READ_FILE_SOURCE)!
+    assert.equal(fact.observationId, observation.id, "original provenance is preserved")
+    assert.equal(fact.conversationId, first.scope.conversationId)
+    assert.ok(renderEvidencePreflight(preflight).includes(fact.sourceHash), "the injected preflight carries the fingerprint")
+
+    const completed = await completeProvenReviews(reopened, scope, sourceReader(workspace))
+    assert.deepEqual(completed.sort(), ["locate", "read"])
+    assert.equal(reads.count, 1, "the new conversation issues no read")
+  } finally {
+    removeAll(first.directory, workspace)
+  }
+})
+
+test("negative: a changed source makes the fact stale and leaves the overlapping TODO open", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  try {
+    await establishFact(state, workspace, reads)
+    fs.writeFileSync(path.join(workspace, READ_FILE_SOURCE), realWorkspaceSource.replace("name: \"read_file\",", "name: \"read_file_renamed\","))
+    const preflight = await evidencePreflight(EVIDENCE_REQUEST, await state.repository.listAcceptedEvidence(state.scope), await state.repository.listSymbolAliases(state.scope), sourceReader(workspace))
+    assert.equal(preflight.status, "stale")
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.equal(await statusOf(state, "read"), "pending")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("negative: an unavailable source is unverifiable, never fresh", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  try {
+    await establishFact(state, workspace, reads)
+    fs.rmSync(path.join(workspace, READ_FILE_SOURCE))
+    const preflight = await evidencePreflight(EVIDENCE_REQUEST, await state.repository.listAcceptedEvidence(state.scope), await state.repository.listSymbolAliases(state.scope), sourceReader(workspace))
+    assert.equal(preflight.status, "unverifiable")
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.equal(await statusOf(state, "read"), "pending")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("negative: a failed or out-of-range read never becomes accepted evidence", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, "locate", "locate-claim")
+    await assert.rejects(runReadFile(workspace, reads, "9999", "9999"))
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "locate").id,
+      toolName: "read_file",
+      arguments: { path: READ_FILE_SOURCE, start_line: "9999", end_line: "9999" },
+      output: "read_file failed",
+      failed: true,
+      requestId: "locate-read-failed"
+    })
+    const review = await reviewOf(state, itemTitled(state, "locate").id)
+    assert.equal(await provenTodoEvaluation(review, sourceReader(workspace)), undefined)
+    assert.deepEqual(await state.repository.listAcceptedEvidence(state.scope), [])
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("negative: a valid fact never certifies a criterion it does not prove, nor a semantic criterion", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture([
+    ...overlappingPlan,
+    { id: "other", acceptance: "`runCommand` is declared in src/extension/tools/workspace.ts" },
+    { id: "semantic", acceptance: "The change reads well to a reviewer" }
+  ], false, EVIDENCE_REQUEST)
+  try {
+    await establishFact(state, workspace, reads)
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), ["read"])
+    assert.equal(await statusOf(state, "other"), "pending")
+    assert.equal(await statusOf(state, "semantic"), "pending")
+    assert.equal(reads.count, 1)
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("negative: ambiguous symbol resolution is reported and another project's facts are never reused", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  try {
+    await establishFact(state, workspace, reads)
+    const [fact] = await state.repository.listAcceptedEvidence(state.scope)
+    const twin = { ...fact, id: "twin-fact", path: "src/extension/tools/other-workspace.ts" }
+    const ambiguous = await evidencePreflight(EVIDENCE_REQUEST, [fact, twin], await state.repository.listSymbolAliases(state.scope), sourceReader(workspace))
+    assert.equal(ambiguous.status, "ambiguous")
+
+    const foreign = new TodoRepository(state.databasePath, wasmPath)
+    const foreignScope = { projectFingerprint: workspaceProjectFingerprint(["file:///other-project"]), conversationId: "foreign-chat", writer: "foreign-chat" }
+    await foreign.synchronizeIntentPlan(foreignScope, plan(overlappingPlan, EVIDENCE_REQUEST), { prompt: EVIDENCE_REQUEST })
+    const foreignFacts = await foreign.listAcceptedEvidence(foreignScope)
+    assert.deepEqual(foreignFacts, [])
+    assert.equal((await evidencePreflight(EVIDENCE_REQUEST, foreignFacts, [], sourceReader(workspace))).status, "missing")
+    assert.deepEqual(await completeProvenReviews(foreign, foreignScope, sourceReader(workspace)), [])
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("information reuse: a modification TODO receives the established fact with its ID and fingerprint, and is not completed from it", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture([
+    { id: "locate", acceptance: LOCATE_CRITERION },
+    { id: "modify", acceptance: `${LOCATE_CRITERION}, and its read_file implementation is updated to report the line count` }
+  ], false, EVIDENCE_REQUEST)
+  try {
+    await establishFact(state, workspace, reads)
+    const facts = await assessAcceptedFacts(await state.repository.listAcceptedEvidence(state.scope), sourceReader(workspace))
+    const [status] = facts
+    const context = renderPlanContext((await state.repository.getPlanOutline(state.scope))!, facts)
+    assert.ok(context.includes(`${status.fact.id} [current]`), "the established fact is offered by its stable ID")
+    assert.ok(context.includes(status.fact.sourceHash), "the fingerprint travels with the fact")
+    assert.ok(context.includes(`observation ${status.fact.observationId}`), "original provenance is preserved")
+
+    await completeProvenReviews(state.repository, state.scope, sourceReader(workspace))
+    assert.equal(await statusOf(state, "modify"), "pending", "a change task is never completed from read-only facts")
+    assert.equal(await statusOf(state, "locate"), "completed")
+    assert.equal(reads.count, 1, "reuse issues no further read")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("partial reuse: a TODO with one proven and one unproven criterion keeps the proven fact and is not completed", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const UNRELATED_CRITERION = "`runCommand` is declared in src/extension/tools/workspace.ts"
+  const state = await fixture([
+    { id: "locate", acceptance: LOCATE_CRITERION },
+    { id: "read", acceptance: [LOCATE_CRITERION, UNRELATED_CRITERION] }
+  ], false, EVIDENCE_REQUEST)
+  try {
+    await establishFact(state, workspace, reads)
+    const readId = itemTitled(state, "read").id
+    const review = (await state.repository.getReviewPackages(state.scope, { includeOpen: true })).find((candidate) => candidate.task.id === readId)!
+    const [proven, unproven] = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, sourceReader(workspace), review.acceptedEvidence, review.symbolAliases, { planId: review.planId, conversationId: review.conversationId })
+    assert.equal(proven.outcome, "proven", "the established fact covers the criterion it proves")
+    assert.notEqual(unproven.outcome, "proven", "the unrelated criterion is not carried by the fact")
+    assert.equal(await provenTodoEvaluation(review, sourceReader(workspace)), undefined, "a partly proven TODO is not completed")
+
+    await completeProvenReviews(state.repository, state.scope, sourceReader(workspace))
+    assert.equal(await statusOf(state, "read"), "pending")
+    assert.equal(reads.count, 1)
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("stale evidence stays visible as historical context with its status, never as current proof", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  try {
+    await establishFact(state, workspace, reads)
+    fs.writeFileSync(path.join(workspace, READ_FILE_SOURCE), realWorkspaceSource.replace("name: \"read_file\",", "name: \"read_file_renamed\","))
+    const facts = await assessAcceptedFacts(await state.repository.listAcceptedEvidence(state.scope), sourceReader(workspace))
+    const [status] = facts
+    assert.equal(status.freshness, "historical")
+    const context = renderPlanContext((await state.repository.getPlanOutline(state.scope))!, facts)
+    assert.ok(context.includes(`${status.fact.id} [historical]`), "the historical fact keeps its ID and status")
+    assert.ok(context.includes("re-read them before relying on them"))
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.equal(await statusOf(state, "read"), "pending")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("negative: a historical read never proves a criterion that adds, changes, or implements source", async () => {
+  const workspace = sourceWorkspace()
+  const criteria = [
+    "`read_file` is added to src/extension/tools/workspace.ts",
+    "`read_file` is changed in src/extension/tools/workspace.ts",
+    "`read_file` is implemented in src/extension/tools/workspace.ts"
+  ]
+  for (const acceptance of criteria) {
+    const reads = { count: 0 }
+    const state = await fixture([{ id: "mutate", acceptance }], false, EVIDENCE_REQUEST)
+    try {
+      await recordRead(state, itemTitled(state, "mutate").id, "mutate-read", await runReadFile(workspace, reads))
+      assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [], acceptance)
+      assert.equal(await statusOf(state, "mutate"), "pending", acceptance)
+    } finally {
+      removeAll(state.directory)
+    }
+  }
+  removeAll(workspace)
+})
+
+test("negative: a passing run that predates a later successful edit does not prove the run criterion", async () => {
+  const state = await fixture([{ id: "verify", acceptance: "`npm test` exits 0" }], false, EVIDENCE_REQUEST)
+  try {
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "verify").id,
+      toolName: "run_command",
+      arguments: { command: "npm test" },
+      output: "pass",
+      failed: false,
+      exitCode: 0,
+      requestId: "verify-run"
+    })
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "verify").id,
+      toolName: "edit_lines",
+      arguments: { path: "src/extension/tools/workspace.ts" },
+      output: "edited",
+      failed: false,
+      requestId: "verify-edit"
+    })
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.equal(await statusOf(state, "verify"), "pending")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("negative: a criterion that asks for a new run is never proven by an earlier passing run", async () => {
+  const state = await fixture([{ id: "again", acceptance: "`npm test` is run again and exits 0" }], false, EVIDENCE_REQUEST)
+  try {
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "again").id,
+      toolName: "run_command",
+      arguments: { command: "npm test" },
+      output: "pass",
+      failed: false,
+      exitCode: 0,
+      requestId: "again-run"
+    })
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.equal(await statusOf(state, "again"), "pending")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("cancellation: a stopped reply completes no TODO even when its evidence proves the criterion", async () => {
+  const state = await fixture([{ id: "verify", acceptance: "`npm test` exits 0" }], false, EVIDENCE_REQUEST)
+  try {
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "verify").id,
+      toolName: "run_command",
+      arguments: { command: "npm test" },
+      output: "pass",
+      failed: false,
+      exitCode: 0,
+      requestId: "verify-run"
+    })
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined, { isCancelled: () => true }), [])
+    assert.equal(await statusOf(state, "verify"), "pending")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("cancellation: a stop after the claim releases it to in_progress and completes nothing", async () => {
+  const state = await fixture([{ id: "verify", acceptance: "`npm test` exits 0" }], false, EVIDENCE_REQUEST)
+  try {
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "verify").id,
+      toolName: "run_command",
+      arguments: { command: "npm test" },
+      output: "pass",
+      failed: false,
+      exitCode: 0,
+      requestId: "verify-run"
+    })
+    // Checks run before the scan, before the claim, and before the apply: the third check stops after the claim.
+    let checks = 0
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined, { isCancelled: () => ++checks >= 3 }), [])
+    assert.equal(checks, 3)
+    assert.equal(await statusOf(state, "verify"), "in_progress")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("approval: a failed or declined edit never satisfies a criterion that requires a change", async () => {
+  const state = await fixture([{ id: "modify", acceptance: "Add a `diagnosticsField` to the native read_file implementation in src/extension/tools/workspace.ts" }], false, EVIDENCE_REQUEST)
+  try {
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "modify").id,
+      toolName: "edit_lines",
+      arguments: { path: "src/extension/tools/workspace.ts" },
+      output: "The user chose not to apply this edit",
+      failed: true,
+      requestId: "declined-edit"
+    })
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.equal(await statusOf(state, "modify"), "pending")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("approval: a run recorded as failed never proves a passing run criterion", async () => {
+  const state = await fixture([{ id: "verify", acceptance: "`npm test` exits 0" }], false, EVIDENCE_REQUEST)
+  try {
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "verify").id,
+      toolName: "run_command",
+      arguments: { command: "npm test" },
+      output: "The user chose not to run this command",
+      failed: true,
+      exitCode: 0,
+      requestId: "declined-run"
+    })
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.equal(await statusOf(state, "verify"), "pending")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("prerequisite only: a proven location leaves the broader modification task pending", async () => {
+  const state = await fixture([{ id: "locate", acceptance: [LOCATE_CRITERION, "Add a `diagnosticsField` to the native read_file implementation in src/extension/tools/workspace.ts"] }], false, EVIDENCE_REQUEST)
+  const workspace = sourceWorkspace()
+  try {
+    const read = await runReadFile(workspace, { count: 0 })
+    await recordRead(state, itemTitled(state, "locate").id, "locate-read", read)
+    const review = (await state.repository.getReviewPackages(state.scope, { includeOpen: true })).find((candidate) => candidate.task.id === itemTitled(state, "locate").id)!
+    const [location, modification] = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, sourceReader(workspace), review.acceptedEvidence, review.symbolAliases)
+    assert.equal(location.outcome, "proven", "the trusted read proves the location prerequisite")
+    assert.notEqual(modification.outcome, "proven", "the location never proves the change")
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.equal(await statusOf(state, "locate"), "pending")
+  } finally {
+    removeAll(workspace, state.directory)
+  }
+})
+
+test("fresh demand: a re-run after the reply started proves a re-run criterion, and an earlier run does not", async () => {
+  const state = await fixture([{ id: "again", acceptance: "`npm test` is run again and exits 0" }], false, EVIDENCE_REQUEST)
+  try {
+    const runNpmTest = (requestId: string) => state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, "again").id,
+      toolName: "run_command",
+      arguments: { command: "npm test" },
+      output: "pass",
+      failed: false,
+      exitCode: 0,
+      requestId
+    })
+    await runNpmTest("again-earlier")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const since = new Date().toISOString()
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined, { since }), [])
+    await runNpmTest("again-fresh")
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined, { since }), ["again"])
+    assert.equal(await statusOf(state, "again"), "completed")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+const relevanceFact = async (id: string, symbol: string, file: string, text: string, overrides: Partial<AcceptedFact> = {}): Promise<AcceptedFact> => ({
+  id,
+  symbol,
+  path: file,
+  startLine: 1,
+  endLine: 10,
+  observationId: `obs-${id}`,
+  sourceHash: await fingerprintContent(text),
+  conversationId: "relevance-chat",
+  itemId: `item-${id}`,
+  criterionIndex: 0,
+  criterion: `criterion for ${id}`,
+  toolName: "read_file",
+  planId: "relevance-plan",
+  planRevision: 1,
+  acceptedAt: "2024-01-01T00:00:00.000Z",
+  ...overrides
+})
+
+test("relevance: an exact symbol match is kept, and ranks first, when unrelated current facts fill the budget", async () => {
+  const files: Record<string, string> = { "src/exact.ts": "changed after acceptance" }
+  const exact = await relevanceFact("exact", "readFile", "src/exact.ts", "original text")
+  const unrelated: AcceptedFact[] = []
+  for (let index = 0; index < 20; index += 1) {
+    const file = `src/unrelated-${index}.ts`
+    files[file] = `unrelated body ${index}`
+    unrelated.push(await relevanceFact(`unrelated-${index}`, `helper${index}`, file, files[file], {
+      acceptedAt: `2024-02-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`
+    }))
+  }
+  const { selected, omitted } = await selectAcceptedFacts(
+    { text: "Fix readFile so it reports its fingerprint", planItemIds: [] },
+    [...unrelated, exact],
+    [],
+    async (file) => files[file],
+    12
+  )
+  assert.equal(selected.length, 12)
+  assert.equal(omitted, 9, "the budget omits the unrelated remainder, not the exact match")
+  assert.equal(selected[0].fact.id, "exact")
+  assert.equal(selected[0].freshness, "historical", "a stale exact match is still reported as stale")
+})
+
+test("relevance: an alias of the requested tool name ranks the aliased implementation's fact", async () => {
+  const files: Record<string, string> = { "src/impl.ts": "impl body", "src/other.ts": "other body" }
+  const aliased = await relevanceFact("aliased", "readFileImpl", "src/impl.ts", "impl body")
+  const unrelated = await relevanceFact("unrelated", "writeThing", "src/other.ts", "other body", {
+    acceptedAt: "2024-06-01T00:00:00.000Z"
+  })
+  const alias: SymbolAlias = {
+    id: "alias-1",
+    conversationId: "relevance-chat",
+    toolName: "read_file",
+    implementation: "readFileImpl",
+    path: "src/impl.ts",
+    startLine: 1,
+    endLine: 10,
+    observationId: "obs-alias",
+    sourceHash: aliased.sourceHash,
+    createdAt: "2024-01-01T00:00:00.000Z"
+  }
+  const { selected } = await selectAcceptedFacts(
+    { text: "Check the read_file tool", planItemIds: [] },
+    [unrelated, aliased],
+    [alias],
+    async (file) => files[file],
+    1
+  )
+  assert.equal(selected[0].fact.id, "aliased", "the alias relationship outranks a newer unrelated fact")
+})
+
+test("relevance: with equal relevance, a current fact ranks before a newer historical one", async () => {
+  const files: Record<string, string> = { "src/a.ts": "current a", "src/b.ts": "changed b" }
+  const current = await relevanceFact("current", "alpha", "src/a.ts", "current a", { acceptedAt: "2024-01-01T00:00:00.000Z" })
+  const historical = await relevanceFact("historical", "beta", "src/b.ts", "original b", { acceptedAt: "2024-03-01T00:00:00.000Z" })
+  const { selected, omitted } = await selectAcceptedFacts(
+    { text: "Summarize the module", planItemIds: [] },
+    [historical, current],
+    [],
+    async (file) => files[file],
+    1
+  )
+  assert.equal(selected[0].fact.id, "current")
+  assert.equal(selected[0].freshness, "current")
+  assert.equal(omitted, 1)
+})
+
+test("relevance: an unverifiable fact ranks after a current one and is never excluded for being unverifiable", async () => {
+  const files: Record<string, string> = { "src/a.ts": "current a" }
+  const current = await relevanceFact("current", "alpha", "src/a.ts", "current a", { acceptedAt: "2024-01-01T00:00:00.000Z" })
+  const unverifiable = await relevanceFact("unverifiable", "beta", "src/gone.ts", "gone", { acceptedAt: "2024-05-01T00:00:00.000Z" })
+  const both = await selectAcceptedFacts({ text: "Summarize", planItemIds: [] }, [unverifiable, current], [], async (file) => files[file], 2)
+  assert.deepEqual(both.selected.map(({ fact }) => fact.id), ["current", "unverifiable"])
+  assert.equal(both.selected[1].freshness, "unverifiable")
+  assert.equal(both.omitted, 0)
+})
+
+test("relevance: a fact from the active plan ranks first without excluding other facts", async () => {
+  const files: Record<string, string> = { "src/planned.ts": "changed planned", "src/other.ts": "other body" }
+  const planned = await relevanceFact("planned", "gamma", "src/planned.ts", "original planned", { itemId: "planned-task" })
+  const other = await relevanceFact("other", "delta", "src/other.ts", "other body", { acceptedAt: "2024-06-01T00:00:00.000Z" })
+  const reader: CurrentSourceReader = async (file) => files[file]
+  const one = await selectAcceptedFacts({ text: "Continue the work", planItemIds: ["planned-task"] }, [other, planned], [], reader, 1)
+  assert.equal(one.selected[0].fact.id, "planned")
+  const two = await selectAcceptedFacts({ text: "Continue the work", planItemIds: ["planned-task"] }, [other, planned], [], reader, 2)
+  assert.deepEqual(two.selected.map(({ fact }) => fact.id).sort(), ["other", "planned"])
+})
+
+test("relevance: a superseded fact is never selected, even when it is an exact match", async () => {
+  const files: Record<string, string> = { "src/exact.ts": "current body" }
+  const superseded = await relevanceFact("superseded", "readFile", "src/exact.ts", "current body", { supersededBy: "replacement" })
+  const replacement = await relevanceFact("replacement", "readFileAgain", "src/exact.ts", "current body", { acceptedAt: "2024-02-01T00:00:00.000Z" })
+  const { selected, omitted } = await selectAcceptedFacts(
+    { text: "Fix readFile", planItemIds: [] },
+    [superseded, replacement],
+    [],
+    async (file) => files[file],
+    12
+  )
+  assert.deepEqual(selected.map(({ fact }) => fact.id), ["replacement"])
+  assert.equal(omitted, 0)
+})
+
+test("relevance: rendered context keeps the ranked order and reports how many facts were omitted", async () => {
+  const files: Record<string, string> = { "src/a.ts": "current a", "src/b.ts": "changed b" }
+  const current = await relevanceFact("current", "alpha", "src/a.ts", "current a")
+  const historical = await relevanceFact("historical", "readFile", "src/b.ts", "original b")
+  const outline = { planId: "relevance-plan", revision: 1, goal: "Continue", tasks: [], children: [] } as unknown as IntentPlanOutline
+  const selection = await selectAcceptedFacts({ text: "Fix readFile", planItemIds: [] }, [current, historical], [], async (file) => files[file], 1)
+  const rendered = renderPlanContext(outline, selection.selected, selection.omitted)
+  assert.match(rendered, /historical \[historical\] readFile \(read_file\)/, "the exact match is the one rendered")
+  assert.doesNotMatch(rendered, /alpha/, "the unrelated fact is omitted by the budget")
+  assert.match(rendered, /… 1 more accepted fact\(s\)/, "the omitted count is reported")
+})
+
+const REFERENCE_TASKS = [
+  { id: "investigate", acceptance: "`read_file` is defined in src/extension/tools/workspace.ts" },
+  { id: "modify", acceptance: "Change the `read_file` tool in src/extension/tools/workspace.ts to report its line count" },
+  { id: "unrelated", acceptance: "Document the changelog entry for the release" }
+]
+
+/** Conversation A: the investigation accepts the read_file location fact through the deterministic review. */
+const acceptLocationFact = async () => {
+  const state = await evidenceFixtureFor(REFERENCE_TASKS)
+  const [investigate] = state.itemIds
+  await startItemInReview(state.repository, state.scope, investigate)
+  await observeRead(state, investigate, "reference-read", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+  await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, investigate), countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+  const lookup = await lookupEvidence(state, { symbol: "read_file", path: EVIDENCE_FILE }, currentWorkspace)
+  assert.equal(lookup.body!.facts.length, 1, "the investigation accepted exactly one location fact")
+  return { state, factId: String(lookup.body!.facts[0].evidence_id) }
+}
+const referenceEvidence = (tools: ReturnType<typeof todoWorkspaceTools>, itemId: string, factId: string, requestId: string) =>
+  tools.run({
+    name: "twinny_todo_evidence",
+    args: { item_id: itemId, kind: "observation", summary: "cites the accepted location", result: "observed", request_id: requestId, accepted_fact_id: factId }
+  })
+
+test("a host-verified accepted fact referenced by a TODO that names it is recorded with its provenance, and the TODO is not completed", async () => {
+  const { state, factId } = await acceptLocationFact()
+  try {
+    const [, modify] = state.itemIds
+    await startItemInReview(state.repository, state.scope, modify)
+    const before = (await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }))[0]
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: currentWorkspace })
+
+    const response = await referenceEvidence(tools, modify, factId, "reference-modify")
+    assert.equal(response.failed, undefined, response.output)
+    const evidence = JSON.parse(response.output) as { kind: string; result: string; summary: string }
+    assert.equal(evidence.kind, "accepted_fact")
+    assert.equal(evidence.result, "observed", "a reference is never recorded as a pass")
+    assert.match(evidence.summary, new RegExp(`accepted fact ${factId}`))
+    assert.match(evidence.summary, new RegExp(before.observationId))
+    assert.match(evidence.summary, new RegExp(before.conversationId))
+    assert.match(evidence.summary, new RegExp(before.sourceHash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+
+    assert.equal((await state.repository.getItem(state.scope, modify)).item.status, "in_review", "supporting evidence does not complete the modification TODO")
+    const review = await reviewFor(state, modify)
+    assert.ok(review.evidence.some((row) => row.kind === "accepted_fact"), "the reviewer sees the host-recorded reference")
+
+    const after = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.deepEqual(after, [before], "the original accepted fact is neither changed nor superseded by the reference")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("an accepted fact reference is rejected when it is unknown, foreign, stale, unverifiable, or unrelated to the TODO's criteria", async () => {
+  const { state, factId } = await acceptLocationFact()
+  try {
+    const [, modify, unrelated] = state.itemIds
+    await startItemInReview(state.repository, state.scope, modify)
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: currentWorkspace })
+    const expectRejected = async (run: Promise<ToolResult>, reason: RegExp, label: string) => {
+      const response = await run
+      assert.equal(response.failed, true, `${label} is rejected`)
+      assert.match(response.output, reason, label)
+    }
+
+    await expectRejected(referenceEvidence(tools, modify, "no-such-fact", "reject-unknown"), /not found in this project/, "an unknown id")
+    await expectRejected(
+      referenceEvidence(tools, unrelated, factId, "reject-unrelated"),
+      /not named by a criterion of this TODO/,
+      "a fact no criterion names"
+    )
+    await expectRejected(
+      referenceEvidence(todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: changedWorkspace }), modify, factId, "reject-stale"),
+      /is historical/,
+      "a stale fact"
+    )
+    await expectRejected(
+      referenceEvidence(todoWorkspaceTools(state.repository, state.scope, () => undefined), modify, factId, "reject-unverifiable"),
+      /is unverifiable/,
+      "a fact the host cannot re-read"
+    )
+    const foreignScope = { projectFingerprint: workspaceProjectFingerprint(["file:///other-project"]), conversationId: "foreign-chat", writer: "foreign-chat" }
+    const foreign = new TodoRepository(state.databasePath, wasmPath)
+    await expectRejected(
+      referenceEvidence(todoWorkspaceTools(foreign, foreignScope, () => undefined, { readCurrentSource: currentWorkspace }), modify, factId, "reject-foreign"),
+      /not found in this project/,
+      "a fact from another project"
+    )
+
+    assert.equal((await reviewFor(state, modify)).evidence.length, 0, "no rejected reference is recorded")
+    assert.equal((await state.repository.getItem(state.scope, modify)).item.status, "in_review")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+const MODIFY_REQUEST = "Change read_file so it reports its line count, then verify the change."
+const MODIFY_CRITERION = "Change the `read_file` tool in src/extension/tools/workspace.ts to report its line count"
+const contentHashOf = (output: string) => /content_hash: (\S+?);/.exec(output)![1]
+const setStatus = async (repository: TodoRepository, scope: EvidenceFixture["scope"], itemId: string, status: "in_progress" | "in_review", requestId: string) => {
+  const item = (await repository.getItem(scope, itemId)).item
+  return repository.updateItem(scope, { itemId, expectedVersion: item.version, patch: { status }, actor: "model", requestId })
+}
+/** The production line editor applied to the real workspace file, so later reads see the change. */
+const diskEditSink = (): EditSink => ({
+  mode: "apply",
+  read: async (file) => fs.readFileSync(file, "utf8"),
+  edit: async () => ({ ok: true, message: "unused" }),
+  create: async () => ({ ok: true, message: "unused" }),
+  async editLines(file, request) {
+    const text = fs.readFileSync(file, "utf8")
+    const patches = await planLineEdits(text, request)
+    let next = text
+    for (const patch of [...patches].reverse()) next = next.slice(0, patch.start) + patch.text + next.slice(patch.end)
+    fs.writeFileSync(file, next)
+    return { ok: true, message: "applied", contentHash: await contentHash(next) }
+  }
+})
+
+test("Scenario C: a location fact accepted in one conversation guides a modification in another without completing it", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const conversationA = await fixture(overlappingPlan, false, EVIDENCE_REQUEST)
+  try {
+    const { observation: locateObservation, verdict } = await establishFact(conversationA, workspace, reads)
+    assert.equal(verdict.decision, "accept")
+    const acceptedInA = (await conversationA.repository.listAcceptedEvidence(conversationA.scope)).find((candidate) => candidate.path === READ_FILE_SOURCE)!
+    const originalFact = { ...acceptedInA }
+
+    const scopeB = { projectFingerprint: conversationA.scope.projectFingerprint, conversationId: "chat-b", writer: "chat-b" }
+    const repositoryB = new TodoRepository(conversationA.databasePath, wasmPath)
+    await repositoryB.synchronizeIntentPlan(scopeB, plan([{ id: "modify", acceptance: MODIFY_CRITERION }], MODIFY_REQUEST), { prompt: MODIFY_REQUEST })
+    const modify = (await repositoryB.getList(scopeB)).items.find((item) => item.title === "modify")!
+
+    const facts = await repositoryB.listAcceptedEvidence(scopeB)
+    assert.deepEqual(facts.map((fact) => fact.id), [acceptedInA.id], "conversation B sees the project's accepted fact")
+    const selection = await selectAcceptedFacts({ text: MODIFY_REQUEST, planItemIds: [modify.id] }, facts, await repositoryB.listSymbolAliases(scopeB), sourceReader(workspace), 12)
+    assert.equal(selection.selected.length, 1)
+    assert.equal(selection.selected[0].freshness, "current")
+    assert.equal(selection.selected[0].fact.observationId, locateObservation.id, "provenance points to conversation A's observation")
+    assert.equal(selection.selected[0].fact.conversationId, conversationA.scope.conversationId)
+    const context = renderPlanContext((await repositoryB.getPlanOutline(scopeB))!, selection.selected, selection.omitted)
+    assert.ok(context.includes(`observation ${locateObservation.id}`), "the implementer receives the accepted location as compact context")
+
+    assert.deepEqual(await completeProvenReviews(repositoryB, scopeB, sourceReader(workspace)), [], "knowing the location does not complete the modification")
+    assert.equal((await repositoryB.getItem(scopeB, modify.id)).item.status, "pending")
+
+    await setStatus(repositoryB, scopeB, modify.id, "in_progress", "modify-claim")
+    const implementer = workspaceTools(workspace, [], { edits: diskEditSink(), git: false, instructions: false })
+    const toolCalls: string[] = []
+    const run = (name: string, args: Record<string, string>) => {
+      toolCalls.push(name)
+      return implementer.run({ name, args })
+    }
+
+    const window = { path: READ_FILE_SOURCE, start_line: String(acceptedInA.startLine), end_line: String(acceptedInA.endLine) }
+    const readBefore = await run("read_file", window)
+    assert.notEqual(readBefore.failed, true, readBefore.output)
+    assert.ok(readBefore.output.includes("const readFile = (view"), "the current source is read from the accepted range")
+    const beforeHash = contentHashOf(readBefore.output)
+    await repositoryB.recordToolObservation(scopeB, { itemId: modify.id, toolName: "read_file", arguments: window, output: "read", failed: false, requestId: "modify-read-before", evidenceOutput: readBefore.output })
+
+    const reference = await todoWorkspaceTools(repositoryB, scopeB, () => undefined, { readCurrentSource: sourceReader(workspace) }).run({
+      name: "twinny_todo_evidence",
+      args: { item_id: modify.id, kind: "observation", summary: "cites the accepted location", result: "observed", request_id: "modify-reference", accepted_fact_id: acceptedInA.id }
+    })
+    assert.equal(reference.failed, undefined, reference.output)
+    assert.equal((await repositoryB.getItem(scopeB, modify.id)).item.status, "in_progress", "the reference supports the TODO without completing it")
+
+    const edit = await run("edit_lines", { path: READ_FILE_SOURCE, expected_hash: beforeHash, edits: JSON.stringify([{ operation: "insert_after", line: 169, content: ["  const reportedLineCount = 0"] }]) })
+    assert.notEqual(edit.failed, true, edit.output)
+    const editObservation = await repositoryB.recordToolObservation(scopeB, { itemId: modify.id, toolName: "edit_lines", arguments: { path: READ_FILE_SOURCE }, output: edit.output, failed: false, requestId: "modify-edit" })
+
+    const verify = await run("read_file", { path: READ_FILE_SOURCE, start_line: "169", end_line: "171" })
+    assert.ok(verify.output.includes("const reportedLineCount = 0"), "the change is present in the current source")
+    assert.notEqual(contentHashOf(verify.output), beforeHash)
+    const verifyObservation = await repositoryB.recordToolObservation(scopeB, { itemId: modify.id, toolName: "read_file", arguments: { path: READ_FILE_SOURCE, start_line: "169", end_line: "171" }, output: "read", failed: false, requestId: "modify-verify", evidenceOutput: verify.output })
+    assert.deepEqual(toolCalls, ["read_file", "edit_lines", "read_file"], "no workspace-wide discovery was needed")
+
+    await setStatus(repositoryB, scopeB, modify.id, "in_review", "modify-in-review")
+    const review = (await repositoryB.getReviewPackages(scopeB)).find((candidate) => candidate.task.id === modify.id)!
+    assert.ok(review.evidence.some((row) => row.kind === "accepted_fact"), "the reviewer sees the host-recorded reference")
+    const evaluation = await evaluateTodoReview(repositoryB, scopeB, review,
+      async () => responseFor(review, { refs: [editObservation.id, verifyObservation.id] }), "mock-reviewer",
+      { readCurrentSource: sourceReader(workspace), requireWorkspaceChanges: true, hasVerifiedFileChanges: true })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal((await repositoryB.getItem(scopeB, modify.id)).item.status, "completed", "completion follows the verified edit, not the known location")
+
+    const preserved = (await repositoryB.listAcceptedEvidence(scopeB)).find((candidate) => candidate.id === originalFact.id)
+    assert.deepEqual(preserved, originalFact, "conversation A's accepted fact is unchanged")
+    const assessed = await assessAcceptedFacts(await repositoryB.listAcceptedEvidence(scopeB), sourceReader(workspace))
+    assert.equal(assessed.find((candidate) => candidate.fact.id === originalFact.id)!.freshness, "historical", "the old location is not presented as current")
+  } finally {
+    removeAll(conversationA.directory, workspace)
   }
 })

@@ -162,6 +162,8 @@ export interface RetainedObservationEvidence {
   arguments: Record<string, string>
   failed: boolean
   exitCode?: number
+  /** When the host recorded the observation (ISO time), used to tell fresh observations from earlier ones. */
+  observedAt: string
   retained: boolean
   complete: boolean
   originalChars: number
