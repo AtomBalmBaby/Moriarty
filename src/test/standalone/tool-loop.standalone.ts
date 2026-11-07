@@ -812,6 +812,23 @@ test("three consecutive failed tools stop the tool loop and request a final answ
   assert.equal(requests[3].tools, undefined)
 })
 
+test("identical invalid calls end the tool loop after three failures instead of repeating", async () => {
+  const root = workspace({ "src/a.ts": "one\ntwo\nthree\n" })
+  const invalid = JSON.stringify({ path: "src/a.ts", start_line: "1", end_line: "3", full_line: "true" })
+  const { client, requests } = scripted([
+    { calls: [{ id: "1", name: "read_file", arguments: invalid }] },
+    { calls: [{ id: "2", name: "read_file", arguments: invalid }] },
+    { calls: [{ id: "3", name: "read_file", arguments: invalid }] },
+    "I could not read it with full_line."
+  ])
+  const steps: ToolStep[] = []
+  await collect(withTools(client, workspaceTools(root), { mode: "native", maxSteps: 100, onStep: (step) => steps.push(step) }).chat(ask("Read it.")))
+  assert.equal(steps.length, 3)
+  assert.ok(steps.every((step) => step.failed && /full_line/.test(step.summary)), steps.map((step) => step.summary).join("\n"))
+  assert.equal(requests.length, 4, "three identical failures end the loop with one final answer request")
+  assert.equal(requests[3].tools, undefined)
+})
+
 test("an already-stopped tool loop does not send another model request", async () => {
   const stop = new AbortController()
   stop.abort()

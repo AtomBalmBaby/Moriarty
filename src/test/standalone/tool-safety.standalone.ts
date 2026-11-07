@@ -440,3 +440,38 @@ test("JSON strings are changed one by one; text that is not JSON is changed whol
   assert.strictEqual(mapJsonStrings("{\"a\":\"x\",\"b\":[\"y\",1,{\"c\":\"z\"}],\"n\":null}", upper), "{\"a\":\"X\",\"b\":[\"Y\",1,{\"c\":\"Z\"}],\"n\":null}")
   assert.strictEqual(mapJsonStrings("not json {", upper), "NOT JSON {")
 })
+
+test("full_line with a range says how to ask for it instead of failing silently", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-retry-"))
+  write(root, "workspace.ts", "const a = 1\nconst b = 2\nconst c = 3\nconst d = 4\nconst e = 5\n")
+  const tools = workspaceTools(root)
+  const read = (args: Record<string, string>) => tools.run({ name: "read_file", args: { path: "workspace.ts", ...args } })
+
+  const range = await read({ start_line: "2", end_line: "4", full_line: "true" })
+  assert.strictEqual(range.failed, true)
+  assert.match(range.output, /For a range, drop full_line and pass start_line and end_line/)
+
+  const single = await read({ start_line: "2", full_line: "true" })
+  assert.notStrictEqual(single.failed, true, "full_line with one start_line is the valid form")
+  assert.match(single.output, /const b = 2/)
+})
+
+test("a bare TODO or internal identifier is refused by search and grep, while a longer query containing one still runs", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-uuid-"))
+  write(root, "src/a.ts", "const note = \"3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b\"\n")
+  const tools = workspaceTools(root, [], { workspaceSearch: { search: async () => ({ results: [], total: 0 }) } })
+  const id = "3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b"
+
+  const grep = await tools.run({ name: "grep", args: { pattern: id } })
+  assert.strictEqual(grep.failed, true)
+  assert.match(grep.output, /internal identifier, not workspace text/)
+  const search = await tools.run({ name: "search_workspace", args: { query: id } })
+  assert.strictEqual(search.failed, true)
+  assert.match(search.output, /internal identifier, not workspace text/)
+
+  const inText = await tools.run({ name: "grep", args: { pattern: `note = "${id}"` } })
+  assert.notStrictEqual(inText.failed, true, "an identifier inside workspace text is an ordinary pattern")
+  assert.match(inText.output, /src\/a\.ts/)
+  const longSearch = await tools.run({ name: "search_workspace", args: { query: `note ${id}` } })
+  assert.doesNotMatch(longSearch.output, /internal identifier/, "a query that only contains an identifier is not refused")
+})

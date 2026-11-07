@@ -178,7 +178,6 @@ Example *proposed* `agents` section (illustrative, not assumed current schema):
 ```json
 {
   "agents": {
-    "defaultSelection": "off",
     "autoDiscover": true,
     "startReferencedMcp": true,
     "searchPaths": [
@@ -203,7 +202,7 @@ Rules:
 - Scope-aware relative path resolution and validation. Support local and remote workspace files through VS Code filesystem APIs.
 - Configurable `searchPaths` and user storage directory; default uses the editor's storage APIs.
 - Manual disable takes precedence over autodiscovery for the same registered agent.
-- Store active selection per chat/session to restore an existing chat; **new chats default to Agent off** unless current Twinny defaults explicitly require otherwise. Preserve the old on/off setting during migration. The last enabled selection may be kept for the Shift+Tab shortcut without making it the default for new chats.
+- Store active selection per chat/session to restore an existing chat. **New chats start with the agent chosen by `twinny.agents.startupSelection`** (Default Agent by default; Off or the last-used agent are also available). The last enabled selection is kept for the Shift+Tab shortcut and for the `lastUsed` startup option.
 - When auto-discovery and manual registration find the same canonical path, show it once.
 
 ## 8. State model and backwards compatibility

@@ -1,3 +1,4 @@
+import { logger } from "../../common/logger"
 import { assessAcceptedFacts, type CurrentSourceReader, resolveAcceptedFacts } from "../todos/feedback"
 import { TodoRepository } from "../todos/repository"
 import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
@@ -156,6 +157,8 @@ export const todoTools = (
         const facts = (await repository.listAcceptedEvidence(scope, { symbol, path })).slice(0, EVIDENCE_LOOKUP_LIMIT)
         const statuses = await assessAcceptedFacts(facts, options.readCurrentSource)
         const resolution = resolveAcceptedFacts(statuses)
+        logger.debug(`[Evidence] lookup project=${scope.projectFingerprint.slice(0, 12)} symbol=${symbol ?? "-"} path=${path ?? "-"} matches=${statuses.length} resolution=${resolution}`)
+        if (!statuses.length) logger.trace("[Evidence] lookup found no accepted fact for this project; facts are recorded only after a deterministic proof, so a missing fact means none was proven yet")
         const found = statuses.map(({ fact, freshness, reason }) => ({
           symbol: fact.symbol,
           tool_name: fact.toolName,

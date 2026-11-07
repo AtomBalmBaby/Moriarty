@@ -196,6 +196,26 @@ const COMMAND_OR_MUTATION = /\b(tests?|assertions?|compil\w*|build|type.?check|c
 const BEHAVIOR = /\b(when|whenever|if|unless|before|after|only|never|always|must|should|returns?|throws?|rejects?|validates?|ensures?|fails?|succeeds?|propagates?|retries|persists?|prevents?|guarantees?|rolls?\s+back)\b/i
 /** A path-only criterion that asserts a location, existence, or presence fact, rather than a judgment about the file's content. */
 const LOCATION_CLAIM = /\b(exist\w*|present|identif\w*|locat\w*|find|found|contain\w*|defin\w*|declar\w*|registered|registration)\b/i
+/** Fallback wording about where the answer comes from. It states a procedure, not a claim about the code. */
+const PROCEDURAL_FALLBACK = /\bif\s+(?:already\s+|previously\s+)?(?:available|recorded|accepted)\b/gi
+/** A trailing deliverable that asks only for provenance fields of the evidence, such as its filename, lines, or fingerprint. */
+const REPORTED_PROVENANCE = /(?:,\s*)?(?:\band\s+|\bor\s+)?\b(?:return|report|cite|state|give|provide|list)\s+(?:the\s+|its\s+)?([^.;!?]*?)[.;!?\s]*$/i
+const PROVENANCE_FIELDS = new Set(["filename", "file", "path", "line", "lines", "range", "number", "numbers", "start", "end", "fingerprint", "fingerprints", "hash", "content_hash", "observation", "observations", "location", "id", "ids"])
+const PROVENANCE_FILLER = new Set(["the", "a", "an", "and", "or", "of", "its", "recorded", "observed", "source", "exact", "matching", "authoritative"])
+
+/**
+ * The part of a criterion that makes a claim about the code. Procedural fallback wording and a
+ * trailing report of provenance fields are removed, so asking for the recorded location and
+ * fingerprint of a definition is not mistaken for a behavioral claim. Any other trailing clause stays.
+ */
+const judgedProse = (prose: string): string => {
+  const withoutFallback = prose.replace(PROCEDURAL_FALLBACK, " ")
+  const report = REPORTED_PROVENANCE.exec(withoutFallback)
+  if (!report) return withoutFallback
+  const words = report[1].toLowerCase().split(/[\s,]+/).filter(Boolean)
+  const provenanceOnly = words.every((word) => PROVENANCE_FILLER.has(word) || PROVENANCE_FIELDS.has(word))
+  return provenanceOnly ? withoutFallback.slice(0, report.index) : withoutFallback
+}
 
 const reconciled = (
   outcome: TodoCriterionReconciliation["outcome"],
@@ -620,18 +640,19 @@ export const reconcileCriteria = async (
     }
     const anchors = evidenceAnchors(criterion)
     const prose = criterion.replace(BACKTICKED_TEXT, " ")
+    const judged = judgedProse(prose)
     const unanchoredJudgment = anchors.paths.length > 0 && !anchors.symbols.length && !LOCATION_CLAIM.test(prose)
     const discoverable = !anchors.paths.length && isDefinitionCriterion(criterion)
       ? [...new Set([...anchors.symbols, ...codeIdentifiers(criterion)])].slice(0, 12)
       : []
     const semantic = !anchors.paths.length && !anchors.symbols.length && !discoverable.length
-      || COMMAND_OR_MUTATION.test(prose)
-      || BEHAVIOR.test(prose)
+      || COMMAND_OR_MUTATION.test(judged)
+      || BEHAVIOR.test(judged)
       || unanchoredJudgment
     if (semantic) {
       outcomes.push(reconciled("semantic", [], []))
     } else if (!anchors.paths.length) {
-      const exposure = /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(prose)
+      const exposure = /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(judged)
       outcomes.push(exposure
         ? inventoryOutcome(anchors.symbols, records)
         : await acceptedSymbolOutcome(discoverable, accepted, current, criterion, aliases)
@@ -1087,6 +1108,10 @@ export const evaluateTodoReview = (
   const operation = (async () => {
     const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource, review.acceptedEvidence, review.symbolAliases)
     const deterministic = deterministicTodoEvaluation(review, reconciliations)
+    logger.debug("[Feedback] criteria task=" + review.task.id + " " + reconciliations.map((item, i) => `${i}=${item.outcome}${item.facts?.length ? `(facts=${item.facts.length})` : ""}${item.reuse ? "(reuse)" : ""}`).join(" ") + " path=" + (deterministic ? "deterministic" : "feedback"))
+    reconciliations.forEach((item, i) => {
+      if (item.missing.length) logger.trace("[Feedback] criterion " + i + " " + item.outcome + " missing: " + item.missing.join("; ").slice(0, 400))
+    })
     let result: TodoEvaluation
     if (deterministic) {
       result = deterministic
@@ -1115,6 +1140,15 @@ export const evaluateTodoReview = (
       result.correctiveInstructions.push("Implement the requested source changes and provide trusted verification evidence.")
     }
     const verdictSource = deterministic ? "deterministic" : "feedback evaluator=" + evaluatorName
+    if (!deterministic) {
+      const proven = reconciliations.filter((item) => item.outcome === "proven").length
+      const disproven = reconciliations.some((item) => item.outcome === "disproven")
+      if (result.decision !== "accept" && reconciliations.length && proven === reconciliations.length) {
+        logger.debug("[Feedback] conflict task=" + review.task.id + " decision=" + result.decision + " but every criterion is proven by trusted observations")
+      } else if (result.decision === "accept" && disproven) {
+        logger.debug("[Feedback] conflict task=" + review.task.id + " decision=accept but a criterion is disproven by trusted observations")
+      }
+    }
     logger.info("[Feedback] todo.verdict source=" + verdictSource + " decision=" + result.decision + " task=" + review.task.id)
     return repository.applyEvaluation(scope, review.task.id, review.task.version, result, evaluationRequestId(review))
   })().finally(() => reviewsInFlight.delete(key))

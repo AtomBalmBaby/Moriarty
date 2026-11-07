@@ -542,14 +542,18 @@ const recordAcceptedFacts = (
   observations: Map<string, { tool_name: string; failed: number }>,
   acceptedAt: string
 ): void => {
+  function refuse(index: number, reason: string): never {
+    logger.debug(`[Evidence] fact not promoted task=${itemId} criterion=${index} reason=${reason}`)
+    throw new Error(`criteria[${index}] ${reason}`)
+  }
   for (const [index, criterion] of evaluation.criteria.entries()) {
     if (criterion.status !== "passed") continue
     for (const fact of criterion.reconciliation?.facts ?? []) {
       const observation = observations.get(fact.observationId)
-      if (!observation || observation.failed !== 0) throw new Error(`criteria[${index}] fact references an unusable observation`)
-      if (!fact.symbol.trim() || !fact.path.trim() || !fact.sourceHash.trim()) throw new Error(`criteria[${index}] fact is missing its symbol, path, or fingerprint`)
+      if (!observation || observation.failed !== 0) refuse(index, "fact references an unusable observation")
+      if (!fact.symbol.trim() || !fact.path.trim() || !fact.sourceHash.trim()) refuse(index, "fact is missing its symbol, path, or fingerprint")
       if (!Number.isInteger(fact.startLine) || !Number.isInteger(fact.endLine) || fact.startLine < 1 || fact.endLine < fact.startLine) {
-        throw new Error(`criteria[${index}] fact has an invalid line range`)
+        refuse(index, "fact has an invalid line range")
       }
       const id = randomUUID()
       database.run(
@@ -560,8 +564,9 @@ const recordAcceptedFacts = (
         "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
         [id, listId, fact.symbol, fact.path, id]
       )
+      logger.debug(`[Evidence] promoted task=${itemId} criterion=${index} symbol=${fact.symbol} path=${fact.path} lines=${fact.startLine}-${fact.endLine} observation=${fact.observationId}`)
       if (fact.implementation !== undefined) {
-        if (!fact.implementation.trim()) throw new Error(`criteria[${index}] alias has no implementation name`)
+        if (!fact.implementation.trim()) refuse(index, "alias has no implementation name")
         database.run("DELETE FROM todo_symbol_aliases WHERE list_id = ? AND tool_name = ? AND path = ?", [listId, fact.symbol, fact.path])
         database.run(
           "INSERT INTO todo_symbol_aliases(id, list_id, tool_name, implementation, path, start_line, end_line, observation_id, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

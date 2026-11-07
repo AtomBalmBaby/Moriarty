@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Choose which agent a new chat starts with.** `twinny.agents.startupSelection` is `default` (Default Agent, the default), `off`, or `lastUsed`. `lastUsed` restores the agent last chosen from the dropdown or with Shift+Tab, and falls back to Default Agent when that custom profile is missing or disabled. Choosing Agent off yourself does not change the setting, and an open chat keeps its agent. The setting is also in the agent settings panel. It replaces `twinny.agents.defaultSelection`, which is deprecated and no longer read.
+
 ## 4.3.17 · 2026-10-28
 
 Extension release: dependable mouse access to custom agents and agent settings in VSCodium.

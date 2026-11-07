@@ -1,29 +1,34 @@
 export const AGENT_SELECTION_STORAGE_KEY = "agentSelection"
 export const LAST_AGENT_SELECTION_STORAGE_KEY = "lastAgentSelection"
+export const AGENT_STARTUP_SELECTION_SETTING = "agents.startupSelection"
 
 export type AgentSelection = "off" | "default" | (string & {})
 
 export const normalizeAgentSelection = (value: unknown): AgentSelection | undefined =>
   typeof value === "string" && value.trim() && value !== "off" ? value as AgentSelection : value === "off" ? "off" : undefined
 
-export const selectionFromLegacyAgentMode = (value: unknown): AgentSelection | undefined =>
-  typeof value === "boolean" ? (value ? "default" : "off") : undefined
+export type AgentStartupSelection = "off" | "default" | "lastUsed"
 
-export const resolveAgentSelection = (
-  requested: unknown,
-  stored: unknown,
-  legacy: AgentSelection | undefined,
-  chatToolsEnabled: boolean,
-  defaultSelection: "off" | "default" | undefined
+export const normalizeAgentStartupSelection = (value: unknown): AgentStartupSelection =>
+  value === "off" || value === "lastUsed" ? value : "default"
+
+export const resolveAgentSelection = (requested: unknown, stored: unknown, fallback: AgentSelection): AgentSelection =>
+  normalizeAgentSelection(requested) ?? normalizeAgentSelection(stored) ?? fallback
+
+/** Only choices the user makes are remembered for "last used"; startup and history restores are not. */
+export const isRememberedAgentSource = (source: string): boolean =>
+  source === "dropdown" || source === "shift-tab"
+
+/** The selection a new chat starts with. A "last used" profile that is missing or disabled falls back to Default Agent. */
+export const resolveStartupAgentSelection = (
+  startup: AgentStartupSelection,
+  lastUsed: unknown,
+  available: ReadonlySet<string>
 ): AgentSelection => {
-  const explicit = normalizeAgentSelection(requested)
-  const canonical = normalizeAgentSelection(stored)
-  if (explicit) {
-    if (explicit !== "off" || canonical !== undefined) return explicit
-    const migrated = legacy ?? (chatToolsEnabled ? "default" : defaultSelection ?? "off")
-    return migrated === "off" ? explicit : migrated
-  }
-  return canonical ?? legacy ?? (chatToolsEnabled ? "default" : defaultSelection ?? "off")
+  if (startup !== "lastUsed") return startup
+  const previous = normalizeAgentSelection(lastUsed)
+  if (previous === undefined || previous === "off") return "default"
+  return previous === "default" || available.has(previous) ? previous : "default"
 }
 
 export interface AgentProfileSummary {

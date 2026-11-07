@@ -9,11 +9,14 @@ export const useConversationHistory = () => {
     Record<string, Conversation>
   >({})
   const [conversation, setConversation] = useState<Conversation>()
+  /** False until the active conversation has been read, even when there is none. */
+  const [conversationLoaded, setConversationLoaded] = useState(false)
 
   useServerEvent(CONVERSATION_EVENT_NAME.getConversations, (all) => {
     if (all) setConversations(all)
   })
   useServerEvent(CONVERSATION_EVENT_NAME.setActiveConversation, (active) => {
+    setConversationLoaded(true)
     if (active) setConversation(active)
   })
 
@@ -31,6 +34,7 @@ export const useConversationHistory = () => {
 
   return {
     conversation,
+    conversationLoaded,
     conversations,
     getConversations,
     setActiveConversation,

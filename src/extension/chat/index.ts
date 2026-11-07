@@ -5,7 +5,7 @@ import path from "path"
 import { ExtensionContext, RelativePattern, Uri, workspace } from "vscode"
 
 import type { AgentSelection } from "../../common/agents"
-import { AGENT_SELECTION_STORAGE_KEY, isAgentSelectionEnabled, normalizeAgentSelection, resolveAgentSelection, selectionFromLegacyAgentMode } from "../../common/agents"
+import { AGENT_SELECTION_STORAGE_KEY, AGENT_STARTUP_SELECTION_SETTING, isAgentSelectionEnabled, LAST_AGENT_SELECTION_STORAGE_KEY, normalizeAgentSelection, normalizeAgentStartupSelection, resolveAgentSelection, resolveStartupAgentSelection } from "../../common/agents"
 import { cleanModelSuggestion, composerSuggestionMessages } from "../../common/composer-predict"
 import {
   ACTIVE_CONVERSATION_STORAGE_KEY,
@@ -1088,17 +1088,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const state = this.context?.globalState
     const key = `${EVENT_NAME.twinnyGlobalContext}-${AGENT_SELECTION_STORAGE_KEY}`
     const stored = state?.get<unknown>(key)
-    const legacy = selectionFromLegacyAgentMode(
-      state?.get<unknown>(`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`)
-    )
-    const defaultSelection = this.config.get<{ defaultSelection?: "off" | "default" }>("agents", {})?.defaultSelection
-    const selection = resolveAgentSelection(
-      requested,
-      stored,
-      legacy,
-      this.config.get<boolean>("chatTools", false),
-      defaultSelection
-    )
+    const startup = normalizeAgentStartupSelection(this.config.get<string>(AGENT_STARTUP_SELECTION_SETTING))
+    const lastUsed = state?.get<unknown>(`${EVENT_NAME.twinnyGlobalContext}-${LAST_AGENT_SELECTION_STORAGE_KEY}`)
+    const profiles = startup === "lastUsed" ? await this._agents.list().catch(() => []) : []
+    const available = new Set(profiles.filter((profile) => profile.valid && profile.enabled && profile.userInvocable).map((profile) => profile.id))
+    const selection = resolveAgentSelection(requested, stored, resolveStartupAgentSelection(startup, lastUsed, available))
     if (normalizeAgentSelection(stored) !== selection) {
       await state?.update(key, selection)
       this._bridge.emit(EVENT_NAME.twinnyGlobalContext, { key: AGENT_SELECTION_STORAGE_KEY, value: selection })
@@ -1170,6 +1164,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    */
   private toolsView(): WorkspaceView | undefined {
     if (!this.agentMode()) return undefined
+    return this.workspaceView()
+  }
+
+  /** The open workspace under the same ignore and blocked-path policy the tools use, whether or not tools are on. */
+  private workspaceView(): WorkspaceView | undefined {
     const root = this.workspaceRoot()
     if (!root) return undefined
     return new WorkspaceView(
@@ -1220,8 +1219,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       .catch((error: unknown) => logger.error("[Todo] could not record the runtime tool inventory: " + String(error)))
   }
 
+  /** The workspace for source reads, or none when its folder cannot be opened; its facts then read as unreadable, not as a failed reply. */
+  private readableWorkspaceView(): WorkspaceView | undefined {
+    try {
+      return this.workspaceView()
+    } catch (error) {
+      logger.debug(`[Evidence] source reader unavailable: ${String(error)}`)
+      return undefined
+    }
+  }
+
   private currentSourceReader(): CurrentSourceReader | undefined {
-    const view = this.toolsView()
+    const view = this.readableWorkspaceView()
     if (!view) return undefined
     return async (path) => {
       try {
@@ -1480,6 +1489,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const outcome = evaluation?.decision === "accept" || awaitingDependencies.length
       ? workflow.advanceAcceptedTask(progress)
       : workflow.reconcile(decision, progress, workflow.recordEvidence({ observations: next.observations ?? [], passedCriteria }))
+    logger.debug(`[Execution] continuation task=${next.planTaskId} decision=${evaluation?.decision ?? "none"} state=${outcome.state} continue=${outcome.continue}${outcome.reason ? ` reason=${outcome.reason}` : ""}`)
     if (!outcome.continue) {
       const open = evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => criterion.criterion) ?? []
       const reason = (outcome.reason ?? "The autonomous execution retry budget was exhausted.") + (open.length ? ` Unsatisfied: ${open.slice(0, 3).join("; ")}.` : "")
@@ -1708,6 +1718,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             exitCode: evidence.exitCode,
             requestId: invocationId
           })
+          logger.debug(`[Evidence] observation tool=${call.name} task=${itemId} failed=${evidence.failed} invocation=${invocationId}`)
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
           logger.error(`[Todo] todo.evidence.missing ${JSON.stringify({ tool_name: call.name, invocation_id: invocationId, reason })}`)

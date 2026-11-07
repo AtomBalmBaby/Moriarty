@@ -168,9 +168,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
   )
   const [isBottom, setIsBottom] = useState(false)
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([])
-  const { conversation, saveLastConversation, setActiveConversation } = useConversationHistory()
-  const { agentMode, teamAgentRules, agentSelection, storedAgentSelection, lastAgentSelection, setAgentSelection, resetAgentSelectionForNewChat, agentPreferenceError } = useAgentMode(
-    agentProfiles.filter((profile) => profile.enabled && profile.valid && profile.userInvocable).map((profile) => profile.id)
+  const { conversation, conversationLoaded, saveLastConversation, setActiveConversation } = useConversationHistory()
+  const [agentProfilesSettled, setAgentProfilesSettled] = useState(false)
+  const { agentMode, teamAgentRules, agentSelection, storedAgentSelection, lastAgentSelection, setAgentSelection, resetAgentSelectionForNewChat, agentPreferenceError, agentSessionReady } = useAgentMode(
+    agentProfiles.filter((profile) => profile.enabled && profile.valid && profile.userInvocable).map((profile) => profile.id),
+    { profilesSettled: agentProfilesSettled, conversationLoaded, restoredSelection: conversation?.agentSelection }
   )
   const [agentProfilesLoaded, setAgentProfilesLoaded] = useState(false)
   const lastSyncedConversationId = useRef<string | undefined>(undefined)
@@ -276,12 +278,14 @@ export const Chat = (props: ChatProps): JSX.Element => {
         if (cancelled) return
         setAgentProfiles(profiles)
         setAgentProfilesLoaded(true)
+        setAgentProfilesSettled(true)
         setAgentPickerError("")
       })
       .catch((error) => {
         if (cancelled) return
         setAgentPickerError(error instanceof Error ? error.message : String(error))
         setAgentProfilesLoaded(false)
+        setAgentProfilesSettled(true)
       })
     return () => { cancelled = true }
   }, [])
@@ -300,16 +304,17 @@ export const Chat = (props: ChatProps): JSX.Element => {
   useServerEvent(EVENT_NAME.twinnyAgentRegistry, (profiles) => {
     setAgentProfiles(profiles)
     setAgentProfilesLoaded(true)
+    setAgentProfilesSettled(true)
     setAgentPickerError("")
   })
 
   useEffect(() => {
-    if (!agentProfilesLoaded || storedAgentSelection === "off" || storedAgentSelection === "default") return
+    if (!agentSessionReady || !agentProfilesLoaded || storedAgentSelection === "off" || storedAgentSelection === "default") return
     const selected = agentProfiles.find((profile) => profile.id === storedAgentSelection)
     if (selected?.valid && selected.enabled && selected.userInvocable) return
     setAgentSelection("off")
     emit(EVENT_NAME.twinnyNotification, "The selected agent is unavailable or disabled. Agent selection was reset to Agent off.")
-  }, [agentProfiles, agentProfilesLoaded, setAgentSelection, storedAgentSelection])
+  }, [agentProfiles, agentProfilesLoaded, agentSessionReady, setAgentSelection, storedAgentSelection])
 
   // A compilation belongs to the conversation it started in.
   const conversationIdRef = useRef(conversation?.id)

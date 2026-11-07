@@ -3,7 +3,7 @@ import * as path from "path"
 import * as vscode from "vscode"
 
 import type { AgentProfileSummary } from "../../common/agents"
-import { discoverAgentFileNames } from "../../common/agents"
+import { AGENT_STARTUP_SELECTION_SETTING, discoverAgentFileNames } from "../../common/agents"
 import { logger } from "../../common/logger"
 
 import type { ParsedAgentProfile } from "./profile"
@@ -22,6 +22,22 @@ interface AgentSettings {
   searchPaths?: string[]
   definitions?: AgentDefinition[]
   excludedPaths?: string[]
+}
+
+/**
+ * Writes the whole `agents` object. VS Code drops a dotted sibling such as `agents.startupSelection` that is
+ * stored in the same settings file, so an explicit value at the same target is written back afterwards.
+ */
+export const writeAgentsSetting = async (value: unknown, target: vscode.ConfigurationTarget): Promise<void> => {
+  const configuration = vscode.workspace.getConfiguration("twinny")
+  const startup = configuration.inspect<string>(AGENT_STARTUP_SELECTION_SETTING)
+  const explicit = target === vscode.ConfigurationTarget.Global
+    ? startup?.globalValue
+    : target === vscode.ConfigurationTarget.Workspace
+      ? startup?.workspaceValue
+      : startup?.workspaceFolderValue
+  await configuration.update("agents", value, target)
+  if (explicit !== undefined) await configuration.update(AGENT_STARTUP_SELECTION_SETTING, explicit, target)
 }
 
 interface ResolvedAgent {
@@ -59,7 +75,7 @@ export class AgentRegistry {
       : scope?.workspaceValue !== undefined
         ? vscode.ConfigurationTarget.Workspace
         : vscode.ConfigurationTarget.Global
-    await configuration.update("agents", settings, target)
+    await writeAgentsSetting(settings, target)
   }
 
   private resolvePath(value: string): vscode.Uri {

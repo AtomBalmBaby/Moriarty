@@ -1,6 +1,6 @@
 # Custom agent profiles
 
-Twinny's chat composer has one agent dropdown: **Agent off**, **Default Agent**, enabled `.agent.md` profiles, and **+ Manage Agents…**. Agent off is the fresh-install default. Existing `agentMode` preferences are migrated once to Off or Default Agent. Shift+Tab toggles between Off and the last enabled selection. Auto-run remains a separate command-approval preference.
+Twinny's chat composer has one agent dropdown: **Agent off**, **Default Agent**, enabled `.agent.md` profiles, and **+ Manage Agents…**. New chats start with the agent chosen by `twinny.agents.startupSelection` (Default Agent by default). Shift+Tab toggles between Off and the last enabled selection. Auto-run remains a separate command-approval preference.
 
 ## Add a profile
 
@@ -32,9 +32,8 @@ Twinny parses the YAML frontmatter and adds the Markdown body once to the select
 
 ## Settings
 
-The chat dropdown’s **+ Manage Agents…** panel exposes the new-chat default, automatic discovery, additional search directories, and registration controls. The extension also contributes `twinny.agents` to VS Code Settings:
+The chat dropdown’s **+ Manage Agents…** panel exposes the startup selection, automatic discovery, additional search directories, and registration controls. The extension also contributes `twinny.agents` to VS Code Settings:
 
-- `defaultSelection`: `off` (default) or `default`; legacy agent-on preference migration takes precedence.
 - `autoDiscover`: whether automatic discovery is enabled (default `true`).
 - `searchPaths`: additional directory paths. Workspace-relative paths can use `${workspaceFolder}/`; user storage can use `${extensionGlobalStorage}/`.
 - `definitions`: explicit registrations with `path`, optional `id`/`name`, `enabled`, and `scope`.

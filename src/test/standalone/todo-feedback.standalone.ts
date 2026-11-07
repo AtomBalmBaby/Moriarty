@@ -1863,6 +1863,27 @@ test("a definition criterion that names no path is located by the one fresh read
   }
 })
 
+test("a live request that asks to return the recorded fingerprint is decided from one fresh read, with no Feedback call", async () => {
+  const state = await evidenceFixture("Locate the native read_file definition using previously accepted TODO evidence if available, and return the recorded filename, line range, and source fingerprint.")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-live-return", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal(calls.count, 0)
+    const facts = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(facts.length, 1)
+    assert.equal(facts[0].observationId, observation.id)
+    assert.equal(facts[0].implementation, "readFile")
+    assert.equal(facts[0].startLine, 169)
+    assert.equal(facts[0].endLine, 172)
+    assert.equal(facts[0].sourceHash, await fingerprintContent(workspaceText), "the read_file fingerprint is the source fingerprint")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("a path-free definition criterion goes to Feedback when two fresh reads each declare the symbol", async () => {
   const state = await evidenceFixture("Locate the read_file tool definition")
   try {

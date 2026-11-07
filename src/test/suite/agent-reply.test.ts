@@ -13,6 +13,7 @@ import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
 
+import { AGENT_SELECTION_STORAGE_KEY } from "../../common/agents"
 import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../../common/constants"
 import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
@@ -574,7 +575,7 @@ suite("Agent reply, end to end", function () {
     const stored: Record<string, unknown> = {
       [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: agentProvider,
       [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: evaluatorProvider,
-      [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
+      [`${EVENT_NAME.twinnyGlobalContext}-${AGENT_SELECTION_STORAGE_KEY}`]: "default"
     }
     const context = {
       extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
@@ -602,7 +603,7 @@ suite("Agent reply, end to end", function () {
     const chat = new ChatIn(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
     chat.root = root
     try {
-      await chat.completion([{ role: "user", content: goal }], [], "off", scope.conversationId)
+      await chat.completion([{ role: "user", content: goal }], [], "default", scope.conversationId)
       assert.equal(fs.readFileSync(file, "utf8"), "export const TodoPanel = () => <div />\n")
       assert.equal(evaluatorModel.requests.length, 3, "one Feedback plan request and two reviews")
       assert.match(JSON.stringify(evaluatorModel.requests[0].messages), /Existing TODO plan/)

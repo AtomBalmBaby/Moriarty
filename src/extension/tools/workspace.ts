@@ -189,8 +189,11 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
       if (!lines.length) return { output: `${rel} (lines 0–0 of 0)\n${metadata}`, summary: `read \`${rel}\` · empty` }
       if (full_line === "true") {
         const lineNumber = Number.parseInt(start_line ?? "", 10)
-        if (!Number.isInteger(lineNumber) || lineNumber < 1 || lineNumber > lines.length || (end_line && Number.parseInt(end_line, 10) !== lineNumber)) {
-          throw new ToolInputError(`${rel}: full_line needs one valid start_line and no different end_line.`)
+        if (!Number.isInteger(lineNumber) || lineNumber < 1 || lineNumber > lines.length) {
+          throw new ToolInputError(`${rel}: full_line needs start_line set to one line from 1 to ${lines.length}. Retry with that start_line and no end_line.`)
+        }
+        if (end_line && Number.parseInt(end_line, 10) !== lineNumber) {
+          throw new ToolInputError(`${rel}: full_line returns exactly one line, but end_line ${end_line} differs from start_line ${lineNumber}. For a range, drop full_line and pass start_line and end_line. For one line, drop end_line.`)
         }
         const line = lines[lineNumber - 1]
         return { output: `${rel} (full line ${lineNumber})\n${metadata}\n${lineNumber}: ${line}`, summary: `read \`${rel}:${lineNumber}\` · full line` }
@@ -216,6 +219,15 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
   }
 }
 
+const INTERNAL_IDENTIFIER = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** A bare UUID is a TODO or other internal identifier, which is never workspace text; the TODO list and evidence lookup hold it. */
+const rejectInternalIdentifier = (tool: string, query: string) => {
+  if (INTERNAL_IDENTIFIER.test(query)) {
+    throw new ToolInputError(`${tool} was given an internal identifier, not workspace text. Task and evidence records are not in the workspace; search for the source name, such as a function, tool, or file name, instead.`)
+  }
+}
+
 const grep = (view: WorkspaceView): Tool => ({
   name: "grep",
   readOnly: true,
@@ -227,6 +239,7 @@ const grep = (view: WorkspaceView): Tool => ({
   ],
   async run({ pattern, path: dir }, context) {
     if (!pattern) throw new ToolInputError("grep needs a pattern.")
+    rejectInternalIdentifier("grep", pattern.trim())
     const scope = dir ? view.relative(view.resolve(dir, "any")) : "."
     const started = Date.now()
     const search = async (regex: RegExp) => {
@@ -696,6 +709,7 @@ const searchWorkspace = (view: WorkspaceView, index: WorkspaceSearchProvider): T
   async run({ query, mode, path, limit, offset }, context) {
     const wanted = query?.trim()
     if (!wanted) throw new ToolInputError("search_workspace needs a nonempty query.")
+    rejectInternalIdentifier("search_workspace", wanted)
     const selectedMode = mode || "auto"
     if (selectedMode !== "auto" && selectedMode !== "path" && selectedMode !== "symbol" && selectedMode !== "literal" && selectedMode !== "regex") {
       throw new ToolInputError("search_workspace mode must be auto, path, symbol, literal, or regex.")
@@ -820,25 +834,29 @@ export const workspaceTools = (
           failed: true
         }
       }
-      try {
-        const run = () => {
-          if (!tool.readOnly && context?.signal?.aborted) throw new ToolInputError("The execution stopped before this tool could run.")
-          return tool.run(call.args, context)
-        }
-        return withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
-      } catch (error) {
-        // Whatever goes wrong inside a tool is the model's to read and work
-        // around; it never ends the reply. A refusal of the model's input is
-        // given whole (it may show the lines to use instead); anything else,
-        // and the step's summary, keeps to the first line.
-        if (error instanceof LineEditError) return lineEditErrorResult(error.detail)
-        if (call.name === "edit_lines") return lineEditErrorResult(lineEditFailure("application_failed", error instanceof Error ? error.message : String(error)))
-        const full = error instanceof Error ? error.message : String(error)
-        const message = full.split("\n")[0]
-        return error instanceof ToolInputError
-          ? { output: full, summary: `${call.name} failed · ${message}`, failed: true }
-          : { output: `${call.name} could not run: ${message}`, summary: `${call.name} failed · ${message}`, failed: true }
+      return runTool(tool, call, context)
+    }
+  }
+
+  async function runTool(tool: Tool, call: ToolCall, context?: ToolContext): Promise<ToolResult> {
+    try {
+      const run = () => {
+        if (!tool.readOnly && context?.signal?.aborted) throw new ToolInputError("The execution stopped before this tool could run.")
+        return tool.run(call.args, context)
       }
+      return withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
+    } catch (error) {
+      // Whatever goes wrong inside a tool is the model's to read and work
+      // around; it never ends the reply. A refusal of the model's input is
+      // given whole (it may show the lines to use instead); anything else,
+      // and the step's summary, keeps to the first line.
+      if (error instanceof LineEditError) return lineEditErrorResult(error.detail)
+      if (call.name === "edit_lines") return lineEditErrorResult(lineEditFailure("application_failed", error instanceof Error ? error.message : String(error)))
+      const full = error instanceof Error ? error.message : String(error)
+      const message = full.split("\n")[0]
+      return error instanceof ToolInputError
+        ? { output: full, summary: `${call.name} failed · ${message}`, failed: true }
+        : { output: `${call.name} could not run: ${message}`, summary: `${call.name} failed · ${message}`, failed: true }
     }
   }
 }

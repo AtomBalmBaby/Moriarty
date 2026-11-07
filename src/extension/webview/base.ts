@@ -2,6 +2,7 @@ import { models } from "fluency.js"
 import path from "node:path"
 import * as vscode from "vscode"
 
+import { AGENT_STARTUP_SELECTION_SETTING } from "../../common/agents"
 import {
   ACTIVE_CONVERSATION_STORAGE_KEY,
   ACTIVE_FIM_PROVIDER_STORAGE_KEY,
@@ -25,7 +26,7 @@ import {
   TodoListSnapshot,
   TwinnyProvider
 } from "../../common/types"
-import { AgentRegistry } from "../agents/registry"
+import { AgentRegistry, writeAgentsSetting } from "../agents/registry"
 import { Chat } from "../chat"
 import { ConversationHistory } from "../chat/conversation-history"
 import { deliverEntireChat, type EntireChatExportDeps } from "../chat/entire-chat-export"
@@ -394,14 +395,14 @@ export class BaseProvider {
       [EVENT_NAME.twinnySetConfigValue]: async ({ key, value }) => {
         const configuration = vscode.workspace.getConfiguration("twinny")
         // Written where the user already set it, so a workspace value is not left overriding the change.
-        const scopedSetting = key.startsWith("chatBaseInstructions") || key.startsWith("promptCompiler.") || key.startsWith("feedback.")
-        const scope = key === "agents" || scopedSetting ? configuration.inspect(key) : undefined
+        const scopedSetting = key === "agents" || key.startsWith("agents.") || key.startsWith("chatBaseInstructions") || key.startsWith("promptCompiler.") || key.startsWith("feedback.")
+        const scope = scopedSetting ? configuration.inspect(key) : undefined
         const target = scope?.workspaceFolderValue !== undefined
           ? vscode.ConfigurationTarget.WorkspaceFolder
           : scope?.workspaceValue !== undefined
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global
-        await configuration.update(key, value, target)
+        await (key === "agents" ? writeAgentsSetting(value, target) : configuration.update(key, value, target))
         this.bridge?.emit(EVENT_NAME.twinnyConfigValueChanged, { key, value })
       },
       [EVENT_NAME.twinnySidebarReady]: () => {
@@ -440,6 +441,18 @@ export class BaseProvider {
           const configuration = vscode.workspace.getConfiguration("twinny")
           const value = key === PROMPT_COMPILER_ENABLED_KEY ? isPromptCompilerEnabled(configuration) : isFeedbackEnabled(configuration)
           bridge.emit(EVENT_NAME.twinnyConfigValueChanged, { key, value })
+        }
+        if (event.affectsConfiguration("twinny.agents")) {
+          bridge.emit(EVENT_NAME.twinnyConfigValueChanged, {
+            key: "agents",
+            value: vscode.workspace.getConfiguration("twinny").get("agents")
+          })
+        }
+        if (event.affectsConfiguration("twinny." + AGENT_STARTUP_SELECTION_SETTING)) {
+          bridge.emit(EVENT_NAME.twinnyConfigValueChanged, {
+            key: AGENT_STARTUP_SELECTION_SETTING,
+            value: vscode.workspace.getConfiguration("twinny").get(AGENT_STARTUP_SELECTION_SETTING)
+          })
         }
         // A new locale remounts the whole webview, so only a change to it is sent.
         if (!event.affectsConfiguration("twinny.locale")) return

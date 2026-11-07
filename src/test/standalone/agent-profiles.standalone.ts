@@ -6,12 +6,15 @@ import { test } from "node:test"
 
 import {
   AGENT_GLYPHS,
+  AGENT_STARTUP_SELECTION_SETTING,
   agentGlyphState,
   discoverAgentFileNames,
+  isRememberedAgentSource,
   nextAgentSelection,
   normalizeAgentSelection,
+  normalizeAgentStartupSelection,
   resolveAgentSelection,
-  selectionFromLegacyAgentMode,
+  resolveStartupAgentSelection,
   withAgentSelection
 } from "../../common/agents"
 import { parseAgentProfile } from "../../extension/agents/profile"
@@ -65,20 +68,65 @@ test("discovers only .agent.md files and does not treat AGENTS.md as a selectabl
   ]), ["review.agent.md"])
 })
 
-test("migrates the old boolean and Shift+Tab selects only Off or an enabled profile", () => {
-  assert.strictEqual(selectionFromLegacyAgentMode(true), "default")
-  assert.strictEqual(selectionFromLegacyAgentMode(false), "off")
-  assert.strictEqual(selectionFromLegacyAgentMode(undefined), undefined)
-  assert.strictEqual(resolveAgentSelection("off", undefined, "default", false, "off"), "default")
-  assert.strictEqual(resolveAgentSelection("off", undefined, undefined, false, "off"), "off")
-  assert.strictEqual(resolveAgentSelection(undefined, undefined, undefined, false, "default"), "default")
+test("startup selection accepts off, default and lastUsed, and anything else means Default Agent", () => {
+  assert.strictEqual(normalizeAgentStartupSelection("off"), "off")
+  assert.strictEqual(normalizeAgentStartupSelection("default"), "default")
+  assert.strictEqual(normalizeAgentStartupSelection("lastUsed"), "lastUsed")
+  assert.strictEqual(normalizeAgentStartupSelection(undefined), "default")
+  assert.strictEqual(normalizeAgentStartupSelection(""), "default")
+  assert.strictEqual(normalizeAgentStartupSelection("custom-a"), "default")
+  assert.strictEqual(normalizeAgentStartupSelection(true), "default")
+})
+
+test("startup off and default start a new chat from the preference, ignoring the remembered profile", () => {
+  const available = new Set(["custom-a"])
+  assert.strictEqual(resolveStartupAgentSelection("off", "custom-a", available), "off")
+  assert.strictEqual(resolveStartupAgentSelection("default", "custom-a", available), "default")
+  assert.strictEqual(resolveStartupAgentSelection("default", undefined, available), "default")
+})
+
+test("last used restores an enabled custom profile", () => {
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", "custom-a", new Set(["custom-a"])), "custom-a")
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", "default", new Set()), "default")
+})
+
+test("last used falls back to Default Agent when the profile is missing or disabled, or nothing is remembered", () => {
+  const enabledProfiles = new Set(["custom-a"])
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", "removed-agent", enabledProfiles), "default")
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", "disabled-agent", new Set(["other"])), "default")
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", undefined, enabledProfiles), "default")
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", "", enabledProfiles), "default")
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", 42, enabledProfiles), "default")
+})
+
+test("last used never restores Off, since Off is not remembered as a last-used profile", () => {
+  assert.strictEqual(resolveStartupAgentSelection("lastUsed", "off", new Set(["custom-a"])), "default")
+})
+
+test("only explicit dropdown and Shift+Tab choices count as last used", () => {
+  assert.strictEqual(isRememberedAgentSource("dropdown"), true)
+  assert.strictEqual(isRememberedAgentSource("shift-tab"), true)
+  for (const source of ["startup", "new-conversation", "history-restore", "legacy-migration", "storage-sync"]) {
+    assert.strictEqual(isRememberedAgentSource(source), false, `${source} must not change the last-used profile`)
+  }
+})
+
+test("resolving an explicit request or stored selection never consults the startup preference", () => {
+  assert.strictEqual(resolveAgentSelection("off", "custom-a", "default"), "off")
+  assert.strictEqual(resolveAgentSelection(undefined, "custom-a", "default"), "custom-a")
+  assert.strictEqual(resolveAgentSelection(undefined, undefined, "default"), "default")
   assert.strictEqual(normalizeAgentSelection("custom-a"), "custom-a")
   assert.strictEqual(normalizeAgentSelection("invalid"), "invalid")
+})
+
+test("Shift+Tab toggles Off and back to the last-used profile, or Default when it is gone", () => {
   const available = new Set(["custom-a"])
   const turnedOff = nextAgentSelection("custom-a", "custom-a", available)
   assert.strictEqual(turnedOff, "off")
   assert.strictEqual(nextAgentSelection(turnedOff, "custom-a", available), "custom-a")
   assert.strictEqual(nextAgentSelection("off", "removed-agent", available), "default")
+  assert.strictEqual(nextAgentSelection("default", "default", available), "off")
+  assert.strictEqual(nextAgentSelection("off", "default", available), "default")
 })
 
 test("chat payloads carry the exact Off, Default or custom profile selection", () => {
@@ -200,10 +248,22 @@ test("agent glyph animations are disabled for reduced motion", () => {
 test("agents settings schema defaults new profiles to Off and provides registration fields", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../../../package.json"), "utf8")) as { contributes: { configuration: { properties: Record<string, { default?: unknown; properties?: Record<string, unknown> }> } } }
   const schema = packageJson.contributes.configuration.properties["twinny.agents"]
-  assert.deepStrictEqual(schema.default, { defaultSelection: "off", autoDiscover: true, searchPaths: [], definitions: [], excludedPaths: [] })
+  assert.deepStrictEqual(schema.default, { autoDiscover: true, searchPaths: [], definitions: [], excludedPaths: [] })
   assert.ok(schema.properties?.definitions)
   assert.ok(schema.properties?.searchPaths)
-  assert.ok(schema.properties?.defaultSelection)
   assert.ok(schema.properties?.autoDiscover)
   assert.ok(schema.properties?.excludedPaths)
+})
+
+test("startupSelection is a flat setting with off, default and lastUsed, defaulting to default", () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../../../package.json"), "utf8")) as { contributes: { configuration: { properties: Record<string, { type?: string; enum?: string[]; default?: unknown; scope?: string; deprecationMessage?: string }> } } }
+  const properties = packageJson.contributes.configuration.properties
+  const startup = properties[`twinny.${AGENT_STARTUP_SELECTION_SETTING}`]
+  assert.ok(startup, "twinny.agents.startupSelection must be registered as its own setting")
+  assert.strictEqual(startup.type, "string")
+  assert.deepStrictEqual(startup.enum, ["off", "default", "lastUsed"])
+  assert.strictEqual(startup.default, "default")
+  assert.strictEqual(startup.scope, "resource")
+  const legacy = properties["twinny.agents"] as unknown as { properties: Record<string, { deprecationMessage?: string }> }
+  assert.match(legacy.properties.defaultSelection.deprecationMessage ?? "", /startupSelection/)
 })

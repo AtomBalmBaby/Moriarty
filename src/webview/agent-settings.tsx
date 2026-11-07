@@ -3,7 +3,8 @@ import React, { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import cx from "classnames"
 
-import type { AgentProfileSummary, AgentSelection } from "../common/agents"
+import type { AgentProfileSummary, AgentSelection, AgentStartupSelection } from "../common/agents";
+import { AGENT_STARTUP_SELECTION_SETTING, normalizeAgentStartupSelection } from "../common/agents";
 import { AGENT_STEP_PRESETS, DEFAULT_AGENT_STEPS, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../common/constants"
 import {
   FEEDBACK_ENABLED_KEY,
@@ -138,7 +139,6 @@ const Choices = <T extends string | number>({
 )
 
 interface AgentSettingsConfig extends Record<string, unknown> {
-  defaultSelection: "off" | "default"
   autoDiscover: boolean
   searchPaths: string[]
   excludedPaths: string[]
@@ -148,7 +148,9 @@ const isSettingsRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value)
 
 const AgentRegistryPanel = () => {
-  const [options, setOptions] = useState<AgentSettingsConfig>({ defaultSelection: "off", autoDiscover: true, searchPaths: [], excludedPaths: [] })
+  const [options, setOptions] = useState<AgentSettingsConfig>({ autoDiscover: true, searchPaths: [], excludedPaths: [] })
+  const [startupSelection, setStartupSelection] = useState<AgentStartupSelection>("default")
+  const [startupBusy, setStartupBusy] = useState(false)
   const [searchPathsDraft, setSearchPathsDraft] = useState("")
   const [excludedPathsDraft, setExcludedPathsDraft] = useState("")
   const [settingsBusy, setSettingsBusy] = useState(false)
@@ -168,7 +170,6 @@ const AgentRegistryPanel = () => {
       ? settings.excludedPaths.filter((entry): entry is string => typeof entry === "string")
       : []
     setOptions({
-      defaultSelection: settings.defaultSelection === "default" ? "default" : "off",
       autoDiscover: settings.autoDiscover !== false,
       searchPaths,
       excludedPaths
@@ -178,6 +179,10 @@ const AgentRegistryPanel = () => {
   }, [])
 
   useServerEvent(EVENT_NAME.twinnyConfigValueChanged, ({ key, value }) => {
+    if (key === AGENT_STARTUP_SELECTION_SETTING) {
+      setStartupSelection(normalizeAgentStartupSelection(value))
+      return
+    }
     if (key !== "agents") return
     configUpdateObserved.current = true
     applyConfig(value)
@@ -210,6 +215,31 @@ const AgentRegistryPanel = () => {
     return () => { cancelled = true }
   }, [applyConfig])
 
+  useEffect(() => {
+    let cancelled = false
+    bridge.request(EVENT_NAME.twinnyGetConfigValue, { key: AGENT_STARTUP_SELECTION_SETTING })
+      .then(({ value }) => {
+        if (!cancelled) setStartupSelection(normalizeAgentStartupSelection(value))
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(`Could not load agent settings: ${reason instanceof Error ? reason.message : String(reason)}`)
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  const updateStartupSelection = useCallback(async (next: AgentStartupSelection) => {
+    setStartupBusy(true)
+    setError("")
+    try {
+      await bridge.request(EVENT_NAME.twinnySetConfigValue, { key: AGENT_STARTUP_SELECTION_SETTING, value: next })
+      setStartupSelection(next)
+    } catch (reason) {
+      setError(`Could not save agent settings: ${reason instanceof Error ? reason.message : String(reason)}`)
+    } finally {
+      setStartupBusy(false)
+    }
+  }, [])
+
   const updateOptions = useCallback(async (patch: Partial<AgentSettingsConfig>) => {
     setSettingsBusy(true)
     setError("")
@@ -239,14 +269,15 @@ const AgentRegistryPanel = () => {
         <button type="button" className={styles.choice} disabled={busy} onClick={() => void perform({ action: "refresh" })}>Refresh</button>
       </div>
       <label className={styles.agentSettingRow}>
-        <span>New chat default</span>
+        <span>Startup selection</span>
         <select
-          value={options.defaultSelection}
-          disabled={settingsBusy}
-          onChange={(event) => void updateOptions({ defaultSelection: event.target.value === "default" ? "default" : "off" })}
+          value={startupSelection}
+          disabled={startupBusy}
+          onChange={(event) => void updateStartupSelection(normalizeAgentStartupSelection(event.target.value))}
         >
           <option value="off">Agent off</option>
           <option value="default">Default Agent</option>
+          <option value="lastUsed">Last used agent</option>
         </select>
       </label>
       <label className={styles.agentSettingRow}>

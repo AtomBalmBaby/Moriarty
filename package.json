@@ -744,16 +744,21 @@
           "order": 20,
           "type": "object",
           "default": {
-            "defaultSelection": "off",
             "autoDiscover": true,
             "searchPaths": [],
             "definitions": [],
             "excludedPaths": []
           },
           "scope": "resource",
-          "markdownDescription": "Selectable Copilot-compatible .agent.md profiles. Twinny discovers .github/agents in each workspace and its extension global storage agents directory. MCP entries are references to servers already configured in twinny.chatToolsMcpServers; definitions in agent files are never executed.",
+          "markdownDescription": "Selectable Copilot-compatible .agent.md profiles. Twinny discovers .github/agents in each workspace and its extension global storage agents directory. MCP entries are references to servers already configured in twinny.chatToolsMcpServers; definitions in agent files are never executed. The agent a new chat starts with is set by `#twinny.agents.startupSelection#`.",
           "properties": {
-            "defaultSelection": { "type": "string", "enum": ["off", "default"], "default": "off", "description": "Selection to migrate into new chat sessions when no legacy preference exists." },
+            "defaultSelection": {
+              "type": "string",
+              "enum": ["off", "default"],
+              "default": "off",
+              "deprecationMessage": "Deprecated: use twinny.agents.startupSelection to choose the agent a new chat starts with.",
+              "description": "Deprecated and no longer read. Use twinny.agents.startupSelection."
+            },
             "autoDiscover": { "type": "boolean", "default": true, "description": "Discover .agent.md profiles in workspace .github/agents and extension global storage." },
             "searchPaths": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Additional directories containing .agent.md files. Supports ${workspaceFolder}/ and ${extensionGlobalStorage}/ prefixes." },
             "definitions": {
@@ -778,6 +783,19 @@
               "markdownDescription": "Ignore tools declared in .agent.md profiles and use Twinny's normally available tools instead."
             }
           }
+        },
+        "twinny.agents.startupSelection": {
+          "order": 20,
+          "type": "string",
+          "enum": ["off", "default", "lastUsed"],
+          "enumDescriptions": [
+            "Start a new chat with Agent off.",
+            "Start a new chat with Default Agent.",
+            "Start a new chat with the agent last chosen from the agent picker or with Shift+Tab. If that custom profile is missing or disabled, Default Agent is used."
+          ],
+          "default": "default",
+          "scope": "resource",
+          "markdownDescription": "Which agent a new chat starts with. Only new chats and the New chat command use this; a chat that is already open keeps its agent. Choosing Agent off yourself does not change this setting."
         },
         "twinny.chatTools": {
           "order": 20,

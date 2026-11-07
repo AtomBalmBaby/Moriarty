@@ -56,4 +56,28 @@ suite("custom agent registry", () => {
       fs.rmSync(tempRoot, { recursive: true, force: true })
     }
   })
+
+  test("startupSelection is registered beside the agents object and survives agent profile changes", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-startup-setting-"))
+    const configuration = vscode.workspace.getConfiguration("twinny")
+    const inspected = configuration.inspect<string>("agents.startupSelection")
+    assert.strictEqual(inspected?.defaultValue, "default")
+    const originalStartup = inspected?.globalValue
+    const registry = new AgentRegistry({ globalStorageUri: vscode.Uri.file(tempRoot) })
+    let createdId: string | undefined
+    try {
+      await configuration.update("agents.startupSelection", "lastUsed", vscode.ConfigurationTarget.Global)
+      const created = await registry.create("Startup Agent")
+      const profile = created.find((candidate) => candidate.name === "Startup Agent")
+      assert.ok(profile?.valid)
+      createdId = profile.id
+      assert.strictEqual(vscode.workspace.getConfiguration("twinny").get("agents.startupSelection"), "lastUsed")
+      await registry.setEnabled(profile.id, false)
+      assert.strictEqual(vscode.workspace.getConfiguration("twinny").get("agents.startupSelection"), "lastUsed")
+    } finally {
+      if (createdId) await registry.remove(createdId)
+      await configuration.update("agents.startupSelection", originalStartup, vscode.ConfigurationTarget.Global)
+      fs.rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
 })
