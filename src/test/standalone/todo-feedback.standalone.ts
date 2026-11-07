@@ -1284,6 +1284,128 @@ test("retained read evidence lets Feedback approve an investigation whose final 
   }
 })
 
+test("a prose criterion that names a code identifier still promotes its verified definition fact", async () => {
+  const state = await evidenceFixture("Locate the read_file tool definition in src/extension/tools/workspace.ts")
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-prose", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal(calls.count, 0)
+    const facts = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(facts.length, 1, "the verified declaration is promoted even though the criterion has no backticks")
+    assert.equal(facts[0].observationId, observation.id)
+    assert.equal(facts[0].startLine, 169)
+    assert.equal(facts[0].endLine, 169)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("accepted source facts are project knowledge: a second chat reads them after reopen and completes without new reads", async () => {
+  const acceptance = "`read_file` is defined in src/extension/tools/workspace.ts"
+  const state = await evidenceFixture(acceptance)
+  try {
+    const item = await startInvestigation(state)
+    const observation = await observeRead(state, item.id, "read-origin", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const originCalls = { count: 0 }
+    const origin = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item.id), countingEvaluator(originCalls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(origin.decision, "accept", JSON.stringify(origin.problems))
+
+    const secondScope = { ...state.scope, conversationId: "second-chat" }
+    const secondPlan = await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance }]), { prompt: "Where is read_file defined?" })
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const facts = await reopened.listAcceptedEvidence(secondScope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(facts.length, 1, "a fact accepted in another chat of the same project is visible after reopen")
+    assert.equal(facts[0].conversationId, state.scope.conversationId, "the fact keeps its originating conversation")
+    assert.equal(facts[0].observationId, observation.id)
+
+    const lookupItem = secondPlan.items[0]
+    await startItemInReview(reopened, secondScope, lookupItem.id)
+    const secondCalls = { count: 0 }
+    const second = await evaluateTodoReview(reopened, secondScope, await reviewFor({ ...state, repository: reopened, scope: secondScope }, lookupItem.id), countingEvaluator(secondCalls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(second.decision, "accept", JSON.stringify(second.problems))
+    assert.equal(secondCalls.count, 0)
+    assert.deepEqual(second.criteria[0].evidenceRefs, [observation.id], "the second chat cites the origin observation without reading the file itself")
+    assert.equal((await reopened.getList({ ...secondScope, includeCompleted: true })).items.find((candidate) => candidate.id === lookupItem.id)?.status, "completed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a fact accepted in another chat of the project supersedes this chat's fact for the same symbol and path, with provenance kept", async () => {
+  const acceptance = "`read_file` is defined in src/extension/tools/workspace.ts"
+  const state = await evidenceFixture(acceptance)
+  try {
+    const startItem = await startInvestigation(state)
+    const original = await observeRead(state, startItem.id, "read-original", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const first = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, startItem.id), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(first.decision, "accept", JSON.stringify(first.problems))
+
+    const secondScope = { ...state.scope, conversationId: "second-chat" }
+    const secondPlan = await state.repository.synchronizeIntentPlan(secondScope, plan([{ id: "lookup", acceptance }]), { prompt: "Where is read_file defined?" })
+    const secondItem = secondPlan.items[0]
+    await startItemInReview(state.repository, secondScope, secondItem.id)
+    const fresh = await state.repository.recordToolObservation(secondScope, {
+      itemId: secondItem.id,
+      toolName: "read_file",
+      arguments: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" },
+      output: `read \`${EVIDENCE_FILE}:150\` · 51 lines`,
+      failed: false,
+      requestId: "read-second",
+      evidenceOutput: await readCurrentOutput(CHANGED_TEXT, EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    })
+    const second = await evaluateTodoReview(state.repository, secondScope, await reviewFor({ ...state, scope: secondScope }, secondItem.id), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: changedWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(second.decision, "accept", JSON.stringify(second.problems))
+    assert.equal(calls.count, 0)
+
+    const history = await state.repository.listAcceptedEvidence(secondScope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(history.length, 2, "both chats' facts are kept")
+    const current = history.filter((fact) => !fact.supersededBy)
+    assert.equal(current.length, 1)
+    assert.equal(current[0].observationId, fresh.id)
+    assert.equal(current[0].conversationId, "second-chat")
+    const previous = history.find((fact) => fact.observationId === original.id)!
+    assert.equal(previous.supersededBy, current[0].id, "the earlier chat's fact is superseded in the project view")
+    assert.equal(previous.conversationId, state.scope.conversationId, "the earlier fact keeps its originating chat")
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })).filter((fact) => !fact.supersededBy)[0].observationId, fresh.id, "every chat sees the same current fact")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("another conversation's TODO list in the project is readable read-only, and reads never create or change it", async () => {
+  const state = await evidenceFixture("`read_file` is defined in src/extension/tools/workspace.ts")
+  try {
+    const other = { projectFingerprint: state.scope.projectFingerprint, conversationId: "other-chat" }
+    assert.equal(await state.repository.readList(other), undefined, "a conversation with no list reads as absent")
+    assert.equal(await state.repository.readList(other), undefined, "reading an absent list does not create it")
+    await state.repository.createItem(other, { title: "Survey the parser" }, "other-create", "user")
+    const snapshot = await state.repository.readList(other)
+    assert.equal(snapshot?.conversationId, "other-chat")
+    assert.equal(snapshot?.items.length, 1)
+    snapshot?.items.splice(0)
+    assert.equal((await state.repository.readList(other))?.items.length, 1, "a returned snapshot is a copy, not the stored list")
+    const foreignProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "other-chat" }
+    assert.equal(await state.repository.readList(foreignProject), undefined, "a conversation in another project is not readable")
+
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined)
+    const read = await tools.run({ name: "twinny_todo_list", args: { conversation_id: "other-chat" } })
+    assert.ok(!read.failed, read.output)
+    const body = JSON.parse(read.output) as { conversationId: string; items: { title: string }[]; read_only: boolean }
+    assert.equal(body.read_only, true)
+    assert.equal(body.conversationId, "other-chat")
+    assert.deepEqual(body.items.map((item) => item.title), ["Survey the parser"])
+    const missing = await tools.run({ name: "twinny_todo_list", args: { conversation_id: "never-seen" } })
+    assert.equal(missing.failed, true, "a missing conversation list is reported, not created")
+    assert.equal(await state.repository.readList({ ...state.scope, conversationId: "never-seen" }), undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 const CHANGED_TEXT = `${workspaceText}\nconst changedFixture = true`
 const changedWorkspace: CurrentSourceReader = async (file) => (file === WORKSPACE_FILE ? CHANGED_TEXT : undefined)
 const startItemInReview = async (repository: TodoRepository, scope: EvidenceFixture["scope"], itemId: string) => {
@@ -1329,6 +1451,29 @@ test("a deterministically accepted source fact is persisted and reused by a late
     assert.deepEqual(secondEvaluation.criteria[0].evidenceRefs, [observation.id])
     assert.equal(calls.count, 0)
     assert.equal((await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((candidate) => candidate.id === second)?.status, "completed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("repeating an accepted review adds no duplicate fact, and another project reads none", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first] = state.itemIds
+    await startItemInReview(state.repository, state.scope, first)
+    await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const review = await reviewFor(state, first)
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })).length, 1)
+
+    await evaluateTodoReview(state.repository, state.scope, review, countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false }).catch(() => undefined)
+    assert.equal((await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })).length, 1, "a repeated acceptance must not duplicate the fact")
+
+    const otherProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "other-chat" }
+    assert.deepEqual(await state.repository.listAcceptedEvidence(otherProject, { symbol: "read_file", path: EVIDENCE_FILE }), [], "a fact is never visible to another project")
+    assert.equal(calls.count, 0)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }

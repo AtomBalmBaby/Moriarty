@@ -162,9 +162,13 @@ export interface RetainedObservationEvidence {
   hits: EvidenceHit[]
 }
 
-/** A source location previously verified and accepted for a completed task; durable across turns and reopen. */
+/**
+ * A source location previously verified and accepted for a completed task; durable across turns and reopen.
+ * Facts are project knowledge. `conversationId` records the originating chat as provenance, and only that chat may write its own facts.
+ */
 export interface AcceptedFact extends TodoSourceFact {
   id: string
+  conversationId: string
   itemId: string
   criterionIndex: number
   criterion: string

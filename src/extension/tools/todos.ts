@@ -103,13 +103,23 @@ export const todoTools = (
 ): Tool[] => [
   {
     name: "twinny_todo_list",
-    description: "Read the canonical native TODO list for the current Twinny conversation.",
-    parameters: [{ name: "include_completed", description: "Include completed and cancelled tasks (true or false).", optional: true }],
+    description: "Read the canonical native TODO list for the current Twinny conversation, or read-only another conversation's list in this project.",
+    parameters: [
+      { name: "include_completed", description: "Include completed and cancelled tasks (true or false).", optional: true },
+      { name: "conversation_id", description: "Another conversation in this project whose list to read. Read-only; omit for the current conversation.", optional: true }
+    ],
     guidance: "Use this before creating or changing tasks. The conversation and project scope are supplied by Twinny and cannot be changed by the model. For every mutation, generate a non-empty unique request_id and reuse it only for an exact retry.",
     readOnly: true,
     async run(args) {
       try {
-        return result(await repository.getList({ ...scope, includeCompleted: args.include_completed === "true" }), "read the native TODO list")
+        const includeCompleted = args.include_completed === "true"
+        const other = args.conversation_id?.trim()
+        if (other && other !== scope.conversationId) {
+          const snapshot = await repository.readList({ ...scope, conversationId: other, includeCompleted })
+          if (!snapshot) throw new Error("No TODO list exists for that conversation in this project")
+          return result({ ...snapshot, read_only: true }, "read another conversation's TODO list read-only")
+        }
+        return result(await repository.getList({ ...scope, includeCompleted }), "read the native TODO list")
       } catch (error) {
         return errorResult(error)
       }
@@ -131,7 +141,7 @@ export const todoTools = (
   },
   {
     name: "twinny_evidence_lookup",
-    description: "Look up source facts the host already accepted from trusted observations in this conversation's TODO list, with their freshness.",
+    description: "Look up source facts the host already accepted from trusted observations in any conversation of this project, with their freshness and originating conversation. Facts are read-only project knowledge; a fact from another conversation can be cited but never changed from here.",
     parameters: [
       { name: "symbol", description: "Exact symbol name, such as readFile.", optional: true },
       { name: "path", description: "Workspace-relative source path, such as src/extension/tools/workspace.ts.", optional: true }
@@ -153,6 +163,7 @@ export const todoTools = (
           end_line: fact.endLine,
           source_hash: fact.sourceHash,
           observation_id: fact.observationId,
+          conversation_id: fact.conversationId,
           item_id: fact.itemId,
           plan_revision: fact.planRevision,
           accepted_at: fact.acceptedAt,
@@ -375,7 +386,7 @@ export const todoWorkspaceTools = (
   const tools = todoTools(repository, scope, onChanged, options)
   return {
     tools,
-    orientation: "Twinny's canonical TODO list for the current conversation is available through the native TODO tools, including in ordinary chats with Agent mode off. These tools cannot access another conversation's list. When an authoritative plan exists, twinny_todo_create proposes a child task under todo_parent_id and Feedback decides whether it is created; a rejected or existing_task result is a decision to follow, not an error. Omit todo_parent_id only when no plan exists and you are creating a top-level TODO. Model completion claims through twinny_todo_update remain in_review until evidence supports them or the user approves them in the TODO panel. Report every native TODO tool error; a later successful retry does not erase an earlier failure.",
+    orientation: "Twinny's canonical TODO list for the current conversation is available through the native TODO tools, including in ordinary chats with Agent mode off. These tools write only to the current conversation's list. Another conversation's list in this project is readable, read-only, through twinny_todo_list with conversation_id; no tool changes it. When an authoritative plan exists, twinny_todo_create proposes a child task under todo_parent_id and Feedback decides whether it is created; a rejected or existing_task result is a decision to follow, not an error. Omit todo_parent_id only when no plan exists and you are creating a top-level TODO. Model completion claims through twinny_todo_update remain in_review until evidence supports them or the user approves them in the TODO panel. Report every native TODO tool error; a later successful retry does not erase an earlier failure.",
     instructionFiles: () => [],
     async run(call, context) {
       const tool = tools.find((candidate) => candidate.name === call.name)

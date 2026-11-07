@@ -219,13 +219,24 @@ export interface EvidenceAnchors {
   symbols: string[]
 }
 
-/** Paths and backticked identifiers a criterion names; these decide what evidence must exist. */
+/**
+ * Paths and identifiers a criterion names; these decide what evidence must exist.
+ * Backticked identifiers always count. A criterion that names a file also anchors
+ * its code-like prose identifiers (see codeIdentifiers), so "Locate the read_file
+ * tool definition in <path>" is checked against that file the same as "`read_file`".
+ */
 export const evidenceAnchors = (criterion: string): EvidenceAnchors => {
   const paths = unique([...criterion.matchAll(CODE_PATH)].map((match) => match[0]), 12)
   const pathSet = new Set(paths.map((path) => path.toLowerCase()))
-  const symbols = unique([...criterion.matchAll(BACKTICKED)]
-    .map((match) => match[1].trim())
-    .filter((symbol) => symbol && !pathSet.has(symbol.toLowerCase())), 12)
+  const backticked = [...criterion.matchAll(BACKTICKED)].map((match) => match[1].trim())
+  const prose = paths.length > 0 ? codeIdentifiers(criterion) : []
+  const seen = new Set<string>()
+  const symbols = [...backticked, ...prose].filter((symbol) => {
+    const key = symbol.toLowerCase()
+    if (!symbol || pathSet.has(key) || seen.has(key)) return false
+    seen.add(key)
+    return true
+  }).slice(0, 12)
   return { paths, symbols }
 }
 
@@ -304,6 +315,12 @@ export const propositionNeedles = (criterion: string): string[] => {
   const identifiers = [...withoutPaths.matchAll(IDENTIFIER)].map((match) => match[0]).filter((word) => /[_A-Z0-9]/.test(word))
   return unique([...backticked, ...identifiers].map((word) => word.toLowerCase()).filter(Boolean), 12)
 }
+
+/** Identifiers that read as code: snake_case, camelCase, or containing a digit. Sentence capitals do not count. */
+const codeIdentifiers = (criterion: string): string[] =>
+  [...criterion.replace(CODE_PATH, " ").matchAll(IDENTIFIER)]
+    .map((match) => match[0])
+    .filter((word) => /_|[a-z][A-Z]|\d/.test(word))
 
 const numberedLine = (line: string): number | undefined => {
   const match = /^(\d+): /.exec(line)

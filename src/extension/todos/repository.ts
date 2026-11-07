@@ -421,6 +421,7 @@ export const DEFAULT_EVIDENCE_STORAGE_LIMITS: EvidenceStorageLimits = { listChar
  */
 interface AcceptedFactRow {
   id: string
+  conversation_id: string
   item_id: string
   criterion_index: number
   criterion: string
@@ -437,22 +438,30 @@ interface AcceptedFactRow {
   created_at: string
 }
 
-const ACCEPTED_FACT_COLUMNS = "id, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, plan_id, plan_revision, created_at"
+const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item_id, evidence.criterion_index, evidence.criterion, evidence.observation_id, evidence.tool_name, evidence.symbol, evidence.path, evidence.start_line, evidence.end_line, evidence.source_hash, evidence.superseded_by, evidence.plan_id, evidence.plan_revision, evidence.created_at"
 
-const acceptedFactsFor = (database: Database, listId: string, options: { symbol?: string; path?: string; includeSuperseded?: boolean } = {}): AcceptedFact[] => {
-  const clauses = ["list_id = ?"]
-  const params: string[] = [listId]
-  if (!options.includeSuperseded) clauses.push("superseded_by IS NULL")
+/**
+ * Accepted facts for a project, across all its conversations. "Current" is decided per
+ * symbol and path on read: the newest current fact wins, and older ones report it as
+ * `supersededBy`. Rows are never rewritten here, so another conversation's record stays intact.
+ */
+const acceptedFactsFor = (database: Database, projectId: string, options: { symbol?: string; path?: string; includeSuperseded?: boolean } = {}): AcceptedFact[] => {
+  const clauses = ["lists.project_id = ?"]
+  const params: string[] = [projectId]
   if (options.symbol !== undefined) {
-    clauses.push("symbol = ?")
+    clauses.push("evidence.symbol = ?")
     params.push(options.symbol)
   }
   if (options.path !== undefined) {
-    clauses.push("path = ?")
+    clauses.push("evidence.path = ?")
     params.push(options.path)
   }
-  return rows<AcceptedFactRow>(database, `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC, id`, params).map((row) => ({
+  const facts = rows<AcceptedFactRow>(database,
+    `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id WHERE ${clauses.join(" AND ")} ORDER BY evidence.created_at DESC, evidence.id`,
+    params
+  ).map((row) => ({
     id: row.id,
+    conversationId: row.conversation_id,
     itemId: row.item_id,
     criterionIndex: row.criterion_index,
     criterion: row.criterion,
@@ -468,11 +477,20 @@ const acceptedFactsFor = (database: Database, listId: string, options: { symbol?
     supersededBy: row.superseded_by ?? undefined,
     acceptedAt: row.created_at
   }))
+  const newest = new Map<string, string>()
+  for (const fact of facts) {
+    const key = JSON.stringify([fact.symbol, fact.path])
+    if (fact.supersededBy) continue
+    const current = newest.get(key)
+    if (current) fact.supersededBy = current
+    else newest.set(key, fact.id)
+  }
+  return options.includeSuperseded ? facts : facts.filter((fact) => !fact.supersededBy)
 }
 
 /**
- * Stores host-verified source facts from an accepted evaluation. A new fact supersedes
- * earlier current facts for the same symbol and path; those rows stay for audit.
+ * Stores host-verified source facts from an accepted evaluation, in the reviewed conversation's list only.
+ * A new fact supersedes earlier facts for the same symbol and path in that list. Project-wide currency is resolved on read.
  */
 const recordAcceptedFacts = (
   database: Database,
@@ -858,7 +876,7 @@ export class TodoRepository {
         [list.id]
       )
       const taskMap = new Map(tasks.map((task) => [task.task_id, task]))
-      const acceptedEvidence = acceptedFactsFor(database, list.id)
+      const acceptedEvidence = acceptedFactsFor(database, list.project_id)
       return tasks.filter((task) => task.status === "in_review").map((row) => {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
@@ -981,10 +999,11 @@ export class TodoRepository {
         "SELECT observations.id, observations.item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)", [list.id, list.id])
       const evidenceIds = new Set(rows<{ id: string }>(database, "SELECT id FROM todo_evidence WHERE item_id = ?", [itemId]).map((entry) => entry.id))
       const observationIds = new Set(observations.map((observation) => observation.id))
+      const acceptedObservationIds = new Set(acceptedFactsFor(database, list.project_id).map((fact) => fact.observationId))
       for (const [index, criterion] of evaluation.criteria.entries()) {
         if (!["passed", "failed", "unverified"].includes(criterion.status)) throw new Error(`Evaluation criteria[${index}].status is not supported`)
         for (const reference of criterion.evidenceRefs) {
-          if (!observationIds.has(reference) && !evidenceIds.has(reference)) {
+          if (!observationIds.has(reference) && !evidenceIds.has(reference) && !acceptedObservationIds.has(reference)) {
             throw new Error(`Evaluation criteria[${index}].evidenceRefs references unknown evidence ID ${reference}`)
           }
         }
@@ -993,11 +1012,9 @@ export class TodoRepository {
         const byId = new Map(observations.map((observation) => [observation.id, observation]))
         const records = retainedEvidenceFor(database, itemId, true, list.id)
         const coverageGaps = (criterion: string) => evidenceGaps(evidenceAnchors(criterion), records)
-        const acceptedObservationIds = new Set(rows<{ observation_id: string }>(database,
-          "SELECT observation_id FROM todo_accepted_evidence WHERE list_id = ? AND superseded_by IS NULL", [list.id]).map((entry) => entry.observation_id))
         const unsupported = evaluation.criteria.some((criterion) => {
           if (criterion.reconciliation?.reuse === "accepted") {
-            // Reused criteria rest on current accepted facts in this list, not on this task's reads.
+            // Reused criteria rest on current accepted facts in this project, not on this task's reads.
             return criterion.status !== "passed" || !criterion.evidenceRefs.length || criterion.evidenceRefs.some((id) => !acceptedObservationIds.has(id))
           }
           if (criterion.status !== "passed") return true
@@ -1042,9 +1059,7 @@ export class TodoRepository {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
       if (!project) return []
-      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
-      if (!list) return []
-      return acceptedFactsFor(database, list.id, { ...options, includeSuperseded: true })
+      return acceptedFactsFor(database, project.id, { ...options, includeSuperseded: true })
     })
   }
 
@@ -1065,6 +1080,17 @@ export class TodoRepository {
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
       return snapshotFor(database, list, request.includeCompleted)
+    })
+  }
+
+  /**
+   * Read-only view of a conversation's TODO list in the same project. It never creates a list
+   * or writes a row, and the snapshot is a fresh copy. Undefined means no list exists yet.
+   */
+  readList(request: TodoListRequest): Promise<TodoListSnapshot | undefined> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      return list ? snapshotFor(database, list, request.includeCompleted) : undefined
     })
   }
 

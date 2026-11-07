@@ -146,14 +146,23 @@ export class BaseProvider {
   }
 
   private todoScope(conversationId: string) {
-    const active = this.context.globalState.get<Conversation>(ACTIVE_CONVERSATION_STORAGE_KEY)
-    if (!conversationId || active?.id !== conversationId) {
+    if (!conversationId || this.activeConversationId() !== conversationId) {
       throw new Error("TODO operations are limited to the active conversation")
     }
+    return this.todoReadScope(conversationId)
+  }
+
+  /** Scope for read-only access: any conversation in this workspace's project. Writes must use todoScope. */
+  private todoReadScope(conversationId: string) {
+    if (!conversationId) throw new Error("A conversation is required")
     return {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
       conversationId
     }
+  }
+
+  private activeConversationId(): string | undefined {
+    return this.context.globalState.get<Conversation>(ACTIVE_CONVERSATION_STORAGE_KEY)?.id
   }
 
   private async emitTodoSnapshot(conversationId: string): Promise<TodoListSnapshot> {
@@ -288,8 +297,12 @@ export class BaseProvider {
       [EVENT_NAME.twinnyPromptInstructions]: (request) => this.promptInstructions(request),
       [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection, conversationId }) =>
         void this.chat?.completion(messages, mentions, agentSelection, conversationId),
-      [TODO_EVENT_NAME.getList]: ({ conversationId }) =>
-        this._todoRepository.getList(this.todoScope(conversationId)),
+      [TODO_EVENT_NAME.getList]: async ({ conversationId }) => {
+        if (this.activeConversationId() === conversationId) return this._todoRepository.getList(this.todoScope(conversationId))
+        const snapshot = await this._todoRepository.readList(this.todoReadScope(conversationId))
+        if (!snapshot) throw new Error("No TODO list exists for that conversation in this project")
+        return snapshot
+      },
       [TODO_EVENT_NAME.createItem]: async ({ conversationId, requestId, ...input }) => {
         await this._todoRepository.createItem(this.todoScope(conversationId), input as CreateTodoInput, requestId, "user")
         return this.emitTodoSnapshot(conversationId)
