@@ -452,6 +452,13 @@ export const toolInstructions = (tools: ToolSpec[], orientation = "", native = f
 export const toolResultMessage = (name: string, output: string) =>
   `<tool_result name="${name}">\n${output}\n</tool_result>`
 
+/** Where a text-mode tool result ends, before any words said after it; 0 when `text` is not one. */
+export const toolResultEnd = (text: string) => {
+  if (!text.startsWith("<tool_result name=")) return 0
+  const close = text.lastIndexOf("</tool_result>")
+  return close < 0 ? text.length : close + "</tool_result>".length
+}
+
 /**
  * Sent with the last request of a reply, which offers no tools. It asks
  * for an honest account: a model told only to "answer now" tends to

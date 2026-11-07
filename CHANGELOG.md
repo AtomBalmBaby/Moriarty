@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Choose which agent a new chat starts with.** `twinny.agents.startupSelection` is `default` (Default Agent, the default), `off`, or `lastUsed`. `lastUsed` restores the agent last chosen from the dropdown or with Shift+Tab, and falls back to Default Agent when that custom profile is missing or disabled. Choosing Agent off yourself does not change the setting, and an open chat keeps its agent. The setting is also in the agent settings panel. It replaces `twinny.agents.defaultSelection`, which is deprecated and no longer read.
+- **See what each chat tool request is made of.** The `trace` log shows a `[Context] tool-loop request N` breakdown: agent instructions, tool instructions, project instructions, tool schemas, TODO and evidence context, conversation history, the model's tool calls, tool results and the closing prompt, each in tokens and characters, then a total. Where the server counts prompt tokens, a line sets that count against the estimate. The `debug` log is unchanged.
 
 ## 4.3.17 · 2026-10-28
 

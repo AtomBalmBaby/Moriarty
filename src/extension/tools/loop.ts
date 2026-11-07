@@ -34,6 +34,7 @@ import { hostedTakesTools } from "../inference/adapters/fluency"
 import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
 import { ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
+import { buildBreakdown, RequestBreakdown, RowChars } from "./context-breakdown"
 import { instructionsSection } from "./instructions"
 import {
   displayableLength,
@@ -45,6 +46,7 @@ import {
   ToolCall,
   toolDefinition,
   toolInstructions,
+  toolResultEnd,
   toolResultMessage
 } from "./protocol"
 import { ToolResult, WorkspaceTools } from "./workspace"
@@ -240,8 +242,13 @@ export interface ToolLoopOptions {
   onToolResult?(call: ToolCall, result: ToolResult): void | Promise<void>
   /** Stop dispatching tools and inference after a controller has blocked mutations. */
   shouldStop?(): boolean
-  /** Called once per request with the characters it sends and what they are estimated to be in tokens. */
-  onRequest?(promptChars: number, step: number, mode: ToolMode, estimatedTokens: number): void
+  /**
+   * Called once per request with the characters it sends and what they are estimated to be in tokens,
+   * and what each part of it is made of.
+   */
+  onRequest?(promptChars: number, step: number, mode: ToolMode, estimatedTokens: number, breakdown: RequestBreakdown): void
+  /** Called after each request the server counted, with the breakdown it was sent with. */
+  onRequestCounted?(step: number, breakdown: RequestBreakdown, promptTokens: number): void
   /** Called after each request the server counted. */
   onUsage?(usage: ToolLoopUsage): void
   /** Called when native tool-calling, or the reasoning effort, was refused and the loop carried on without it. */
@@ -499,6 +506,8 @@ class ToolLoop {
   private _mode: ToolMode
   private _effort: ChatRequest["reasoningEffort"]
   private _messages: ChatMessage[] = []
+  /** The tool and project sections of the system prompt, as `prompt` added them. */
+  private _sections: string[] = []
   private _results: ResultSlot[] = []
   /** Everything yielded so far, for spacing the step lines. */
   private _shown = ""
@@ -545,10 +554,54 @@ class ToolLoop {
 
   private prompt(request: ChatRequest) {
     const { tools, orientation, instructions } = this._workspace
-    return withToolPrompt(
-      request.messages,
-      [toolInstructions(tools, orientation, this._mode === "native"), ...(instructions ? [instructionsSection(instructions)] : [])].join("\n\n")
-    )
+    this._sections = [toolInstructions(tools, orientation, this._mode === "native"), ...(instructions ? [instructionsSection(instructions)] : [])]
+    return withToolPrompt(request.messages, this._sections.join("\n\n"))
+  }
+
+  /**
+   * What the request is made of, in characters, from what is sent. The rows
+   * add up to the characters `charsOf` counts for `sent`, plus the schemas.
+   */
+  private measure(sent: ChatMessage[], context: string | undefined, closing: boolean, schemas: number) {
+    const contextApplied = !!context?.trim()
+    // The system prompt is trimmed at its end when context follows it.
+    const section = this._sections.join("\n\n")
+    const sectionChars = contextApplied ? section.trimEnd().length : section.length
+    const toolChars = Math.min(this._sections[0]?.length ?? 0, sectionChars)
+    const contextChars = contextApplied ? context!.length + 2 : 0
+    const systemChars = sent[0]?.role === SYSTEM ? textOf(sent[0].content).length : 0
+
+    const base = this._messages[0]?.role === SYSTEM ? this._messages.slice(1) : this._messages
+    let history = 0
+    let calls = 0
+    let results = 0
+    for (const message of base) {
+      const text = textOf(message.content)
+      calls += callsOf(message).reduce((n, c) => n + c.function.name.length + c.function.arguments.length, 0)
+      if (message.role === "tool") results += text.length
+      else if (message.role === USER) {
+        const end = toolResultEnd(text)
+        results += end
+        history += text.length - end
+      } else history += text.length
+    }
+    const final = this._messages[this._messages.length - 1]
+    const closingChars = !closing
+      ? 0
+      : FINAL_ANSWER_PROMPT.length + (final?.role === USER && typeof final.content === "string" ? 2 : 0)
+
+    const chars: RowChars = {
+      system: systemChars - sectionChars - contextChars,
+      toolInstructions: toolChars,
+      projectInstructions: sectionChars - toolChars,
+      schemas,
+      context: contextChars,
+      history,
+      calls,
+      results,
+      closing: closingChars
+    }
+    return buildBreakdown(chars, this._estimator.charsPerToken)
   }
 
   private async *steps(request: ChatRequest, options?: InferenceOptions): AsyncGenerator<ChatChunk> {
@@ -594,7 +647,8 @@ class ToolLoop {
       }
       const sent = withRequestContext(closing ? withClosingPrompt(this._messages) : this._messages, context)
       const promptChars = charsOf(sent) + (tools ? definitionChars : 0)
-      this._options.onRequest?.(promptChars, step, this._mode, this._estimator.tokens(promptChars))
+      const breakdown = this.measure(sent, context, closing, tools ? definitionChars : 0)
+      this._options.onRequest?.(promptChars, step, this._mode, this._estimator.tokens(promptChars), breakdown)
 
       // A step of our own to cut short when a text call closes, without it
       // looking like the user pressed stop.
@@ -735,6 +789,7 @@ class ToolLoop {
       }
 
       this.count(promptChars, promptTokens, completionTokens)
+      if (promptTokens) this._options.onRequestCounted?.(step, breakdown, promptTokens)
       // A reply the output cap cut short may hold half a call: nothing it
       // says is run, and it is not presented as finished.
       if (finishReason === "length") {

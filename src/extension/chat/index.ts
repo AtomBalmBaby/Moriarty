@@ -69,9 +69,10 @@ import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanCon
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
+import { formatCountedTokens, formatRequestBreakdown } from "../tools/context-breakdown"
 import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
-import type { ToolCall } from "../tools/protocol"
+import { type ToolCall, toolDefinition } from "../tools/protocol"
 import { type TodoToolOptions, todoTools, todoWorkspaceTools } from "../tools/todos"
 import { WorkspaceView } from "../tools/view"
 import type { ToolResult } from "../tools/workspace"
@@ -1913,7 +1914,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onOutOfSteps: hooks.onOutOfSteps,
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,
-      onRequest: (chars, step, mode, tokens) => logger.debug(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`),
+      onRequest: (chars, step, mode, tokens, breakdown) => {
+        logger.debug(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
+        logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
+      },
+      onRequestCounted: (step, breakdown, promptTokens) => logger.trace(formatCountedTokens(step + 1, breakdown, promptTokens)),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
       onStep: (step) => {
@@ -2051,7 +2056,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const adaptiveExposure = this.config.get<boolean>("chatToolsAdaptiveExposureEnabled", false)
     const projection = projectTaskRelevantTools(selection.native, selection.mcp, intentGoal ?? "", adaptiveExposure)
     const permittedNames = new Set([...selection.native, ...selection.mcp].map((tool) => tool.name))
-    const schemaChars = (tools: typeof available.tools) => JSON.stringify(tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))).length
+    const schemaChars = (tools: typeof available.tools) => JSON.stringify(tools.map(toolDefinition)).length
     const beforeSchemaChars = schemaChars(available.tools.filter((tool) => permittedNames.has(tool.name)))
 
     // Select by the actual model-facing names. Native and MCP metadata stay
@@ -2086,6 +2091,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const outgoingNames = available.tools.map((tool) => tool.name)
     const outgoingSchemaChars = schemaChars(available.tools)
     logger.debug(`[ToolTrace] outgoing=${outgoingNames.length} tools: ${outgoingNames.join(", ")}`)
+    for (const tool of available.tools) logger.trace(`[ToolTrace] schema ${tool.name}: ${JSON.stringify(toolDefinition(tool)).length} chars`)
     if (adaptiveExposure) logger.debug("[ToolTrace] adaptive projection retained " + projection.native.length + " native, " + projection.mcp.length + " MCP; excluded=" + (projection.excluded.map((entry) => entry.name + " (" + entry.reason + ")").join(", ") || "none") + "; schema chars " + beforeSchemaChars + " (~" + Math.ceil(beforeSchemaChars / 4) + " tokens) -> " + outgoingSchemaChars + " (~" + Math.ceil(outgoingSchemaChars / 4) + " tokens)")
     const missingFromOutgoing = [...selectedNames].filter((name) => !outgoingNames.includes(name))
     if (missingFromOutgoing.length) {
@@ -2119,10 +2125,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onOutOfSteps: hooks.onOutOfSteps,
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,
-      onRequest: (chars, step, mode, tokens) =>
-        logger.debug(
-          `Chat tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`
-        ),
+      onRequest: (chars, step, mode, tokens, breakdown) => {
+        logger.debug(`Chat tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
+        logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
+      },
+      onRequestCounted: (step, breakdown, promptTokens) => logger.trace(formatCountedTokens(step + 1, breakdown, promptTokens)),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
       shouldStop: () => !safety.canMutate(),
