@@ -17,6 +17,7 @@ import { hasTrustedEvidenceForCriterion, isAnalysisOnlyIntent } from "./feedback
 import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
 import {
+  type AcceptedFact,
   type AddTodoEvidenceInput,
   type ChildTodoContext,
   type ChildTodoDecision,
@@ -418,6 +419,92 @@ export const DEFAULT_EVIDENCE_STORAGE_LIMITS: EvidenceStorageLimits = { listChar
  * every active plan task in that list are included, so one retained read can
  * support several related criteria. Each keeps its own item provenance.
  */
+interface AcceptedFactRow {
+  id: string
+  item_id: string
+  criterion_index: number
+  criterion: string
+  observation_id: string
+  tool_name: string
+  symbol: string
+  path: string
+  start_line: number
+  end_line: number
+  source_hash: string
+  superseded_by: string | null
+  plan_id: string
+  plan_revision: number
+  created_at: string
+}
+
+const ACCEPTED_FACT_COLUMNS = "id, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, plan_id, plan_revision, created_at"
+
+const acceptedFactsFor = (database: Database, listId: string, options: { symbol?: string; path?: string; includeSuperseded?: boolean } = {}): AcceptedFact[] => {
+  const clauses = ["list_id = ?"]
+  const params: string[] = [listId]
+  if (!options.includeSuperseded) clauses.push("superseded_by IS NULL")
+  if (options.symbol !== undefined) {
+    clauses.push("symbol = ?")
+    params.push(options.symbol)
+  }
+  if (options.path !== undefined) {
+    clauses.push("path = ?")
+    params.push(options.path)
+  }
+  return rows<AcceptedFactRow>(database, `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC, id`, params).map((row) => ({
+    id: row.id,
+    itemId: row.item_id,
+    criterionIndex: row.criterion_index,
+    criterion: row.criterion,
+    toolName: row.tool_name,
+    planId: row.plan_id,
+    planRevision: row.plan_revision,
+    symbol: row.symbol,
+    path: row.path,
+    startLine: row.start_line,
+    endLine: row.end_line,
+    observationId: row.observation_id,
+    sourceHash: row.source_hash,
+    supersededBy: row.superseded_by ?? undefined,
+    acceptedAt: row.created_at
+  }))
+}
+
+/**
+ * Stores host-verified source facts from an accepted evaluation. A new fact supersedes
+ * earlier current facts for the same symbol and path; those rows stay for audit.
+ */
+const recordAcceptedFacts = (
+  database: Database,
+  listId: string,
+  plan: { plan_id: string; revision: number },
+  itemId: string,
+  evaluation: TodoEvaluation,
+  observations: Map<string, { tool_name: string; failed: number }>,
+  acceptedAt: string
+): void => {
+  for (const [index, criterion] of evaluation.criteria.entries()) {
+    if (criterion.status !== "passed") continue
+    for (const fact of criterion.reconciliation?.facts ?? []) {
+      const observation = observations.get(fact.observationId)
+      if (!observation || observation.failed !== 0) throw new Error(`criteria[${index}] fact references an unusable observation`)
+      if (!fact.symbol.trim() || !fact.path.trim() || !fact.sourceHash.trim()) throw new Error(`criteria[${index}] fact is missing its symbol, path, or fingerprint`)
+      if (!Number.isInteger(fact.startLine) || !Number.isInteger(fact.endLine) || fact.startLine < 1 || fact.endLine < fact.startLine) {
+        throw new Error(`criteria[${index}] fact has an invalid line range`)
+      }
+      const id = randomUUID()
+      database.run(
+        "INSERT INTO todo_accepted_evidence(id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        [id, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, acceptedAt]
+      )
+      database.run(
+        "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
+        [id, listId, fact.symbol, fact.path, id]
+      )
+    }
+  }
+}
+
 const retainedEvidenceFor = (database: Database, itemId: string, withContent: boolean, sharedListId?: string): RetainedObservationEvidence[] =>
   rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
     "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, evidence.retained, " +
@@ -771,6 +858,7 @@ export class TodoRepository {
         [list.id]
       )
       const taskMap = new Map(tasks.map((task) => [task.task_id, task]))
+      const acceptedEvidence = acceptedFactsFor(database, list.id)
       return tasks.filter((task) => task.status === "in_review").map((row) => {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
@@ -808,6 +896,7 @@ export class TodoRepository {
           evidence,
           observations,
           retainedEvidence,
+          acceptedEvidence,
           lastEvaluation: lastEvaluation ? JSON.parse(lastEvaluation.evaluation_json) as TodoEvaluation : undefined
         }
       })
@@ -878,7 +967,7 @@ export class TodoRepository {
       if (!row) throw new Error("Review task was not found in the active conversation")
       if (row.status !== "in_review") throw new TodoConflictError("Cannot review a TODO in " + row.status + " status")
       if (row.version !== expectedVersion) throw new TodoConflictError("TODO changed since review version " + expectedVersion + "; current version is " + row.version)
-      const currentPlan = rows<{ revision: number; goal: string }>(database, "SELECT revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
+      const currentPlan = rows<{ plan_id: string; revision: number; goal: string }>(database, "SELECT plan_id, revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
       if (!currentPlan || currentPlan.revision !== evaluation.metadata.planRevision) throw new TodoConflictError("Intent plan changed while its TODO was being evaluated")
       if (evaluation.schemaVersion !== 1) throw new Error("Evaluation schemaVersion must be 1")
       if (evaluation.taskId !== row.task_id) throw new Error("Evaluation task ID does not match the reviewed task")
@@ -904,7 +993,13 @@ export class TodoRepository {
         const byId = new Map(observations.map((observation) => [observation.id, observation]))
         const records = retainedEvidenceFor(database, itemId, true, list.id)
         const coverageGaps = (criterion: string) => evidenceGaps(evidenceAnchors(criterion), records)
+        const acceptedObservationIds = new Set(rows<{ observation_id: string }>(database,
+          "SELECT observation_id FROM todo_accepted_evidence WHERE list_id = ? AND superseded_by IS NULL", [list.id]).map((entry) => entry.observation_id))
         const unsupported = evaluation.criteria.some((criterion) => {
+          if (criterion.reconciliation?.reuse === "accepted") {
+            // Reused criteria rest on current accepted facts in this list, not on this task's reads.
+            return criterion.status !== "passed" || !criterion.evidenceRefs.length || criterion.evidenceRefs.some((id) => !acceptedObservationIds.has(id))
+          }
           if (criterion.status !== "passed") return true
           if (coverageGaps(criterion.criterion).length > 0) return true
           const refs = criterion.evidenceRefs.filter((id) => byId.has(id))
@@ -919,7 +1014,7 @@ export class TodoRepository {
         })
         if (unsupported) {
           const gapMessages = evaluation.criteria.flatMap((criterion, index) =>
-            criterion.status === "passed" ? coverageGaps(criterion.criterion).map((gap) => `criteria[${index}]: ${describeGap(gap)}`) : [])
+            criterion.status === "passed" && criterion.reconciliation?.reuse !== "accepted" ? coverageGaps(criterion.criterion).map((gap) => `criteria[${index}]: ${describeGap(gap)}`) : [])
           throw new Error(["Evaluation cannot accept criteria without adequate trusted tool observations", ...gapMessages].join("; "))
         }
         const unfinishedDependency = rows<{ id: string }>(database,
@@ -935,10 +1030,21 @@ export class TodoRepository {
       database.run("UPDATE todo_items SET status = ?, verification = ?, blocked_reason = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
         [status, verification, blockedReason, updatedAt, itemId, expectedVersion])
       if (database.getRowsModified() !== 1) throw new TodoConflictError("TODO changed while applying its evaluation")
+      if (evaluation.decision === "accept") recordAcceptedFacts(database, list.id, currentPlan, itemId, evaluation, new Map(observations.map((observation) => [observation.id, observation])), updatedAt)
       bumpList(database, list.id, itemId, "evaluation_recorded", "system", requestId, { decision: evaluation.decision, evaluation })
       logTodoEvent("feedback.reconciled", { operation_id: list.id, item_id: itemId, decision: evaluation.decision, status, verification, request_id: requestId })
       if (status === "completed") logTodoEvent("todo.completed", { operation_id: list.id, item_id: itemId, verification, request_id: requestId })
       return evaluation
+    })
+  }
+
+  listAcceptedEvidence(request: TodoListRequest, options: { symbol?: string; path?: string } = {}): Promise<AcceptedFact[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+      if (!list) return []
+      return acceptedFactsFor(database, list.id, { ...options, includeSuperseded: true })
     })
   }
 

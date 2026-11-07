@@ -139,7 +139,29 @@ CREATE TABLE IF NOT EXISTS todo_child_proposals (
   PRIMARY KEY(list_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS todo_child_proposals_fingerprint ON todo_child_proposals(list_id, fingerprint, created_at);
-PRAGMA user_version = 5;
+CREATE TABLE IF NOT EXISTS todo_accepted_evidence (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  plan_id TEXT NOT NULL,
+  plan_revision INTEGER NOT NULL,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  criterion_index INTEGER NOT NULL,
+  criterion TEXT NOT NULL,
+  observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  tool_name TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  path TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  source_hash TEXT NOT NULL,
+  superseded_by TEXT REFERENCES todo_accepted_evidence(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS todo_accepted_evidence_lookup ON todo_accepted_evidence(list_id, symbol, path, superseded_by);
+CREATE INDEX IF NOT EXISTS todo_accepted_evidence_item ON todo_accepted_evidence(item_id, criterion_index);
+CREATE INDEX IF NOT EXISTS todo_accepted_evidence_observation ON todo_accepted_evidence(observation_id);
+CREATE INDEX IF NOT EXISTS todo_accepted_evidence_revision ON todo_accepted_evidence(list_id, plan_id, plan_revision);
+PRAGMA user_version = 6;
 `
 
 export class SqliteFile {
@@ -171,7 +193,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 5) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 6) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -190,7 +212,11 @@ export class SqliteFile {
           await this.persist(database)
         }
         if (version > 0 && version < 5) {
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_child_proposals"), SCHEMA.indexOf("PRAGMA user_version = 5;") + "PRAGMA user_version = 5;".length))
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_child_proposals"), SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence")))
+          await this.persist(database)
+        }
+        if (version > 0 && version < 6) {
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence"), SCHEMA.indexOf("PRAGMA user_version = 6;") + "PRAGMA user_version = 6;".length))
           await this.persist(database)
         }
       } finally {

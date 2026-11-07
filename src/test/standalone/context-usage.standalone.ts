@@ -142,10 +142,11 @@ test("a server that refuses stream_options is asked again without, and not asked
   } as unknown as TokenJS
   const strict = provider("openai-compatible", { apiHostname: "strict.example", apiPort: 9 })
   const records: string[] = []
-  const info = logger.info
-  const warn = logger.warn
+  const { info, warn, debug, trace } = logger
   logger.info = (message) => records.push(message)
   logger.warn = (message) => records.push(message)
+  logger.debug = (message) => records.push(message)
+  logger.trace = (message) => records.push(message)
   const read = async () => {
     const chunks: ChatChunk[] = []
     for await (const chunk of fluencyChat(client, strict, { model: "m", messages: conversation })) chunks.push(chunk)
@@ -157,6 +158,8 @@ test("a server that refuses stream_options is asked again without, and not asked
   } finally {
     logger.info = info
     logger.warn = warn
+    logger.debug = debug
+    logger.trace = trace
   }
   const events = records
     .filter((record) => record.startsWith("[Inference]"))
@@ -193,10 +196,11 @@ test("SDK cancellation ends its trace and ignores a late response without retryi
   } as unknown as TokenJS
   const controller = new AbortController()
   const records: string[] = []
-  const info = logger.info
-  const warn = logger.warn
+  const { info, warn, debug, trace } = logger
   logger.info = (message) => records.push(message)
   logger.warn = (message) => records.push(message)
+  logger.debug = (message) => records.push(message)
+  logger.trace = (message) => records.push(message)
   const chunks: ChatChunk[] = []
   const consume = (async () => {
     for await (const chunk of fluencyChat(
@@ -219,6 +223,8 @@ test("SDK cancellation ends its trace and ignores a late response without retryi
   } finally {
     logger.info = info
     logger.warn = warn
+    logger.debug = debug
+    logger.trace = trace
   }
   const events = records
     .filter((record) => record.startsWith("[Inference]"))

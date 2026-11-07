@@ -7,9 +7,9 @@ import initSqlJs from "sql.js"
 
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
-import { parseFeedbackPlanResponse, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
+import { CHILD_TODO_PROTOCOL, FEEDBACK_PLAN_PROTOCOL, parseFeedbackPlanResponse, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
-import { type CurrentSourceReader, evaluateTodoReview, feedbackContext, parseTodoEvaluation, reconcileCriteria, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput } from "../../extension/todos/feedback"
+import { assessAcceptedFacts, type CurrentSourceReader, evaluateTodoReview, feedbackContext, parseTodoEvaluation, reconcileCriteria, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { ChildTodoDecision, ChildTodoReview, IntentPlanOutline, TodoEvaluation, TodoReviewPackage } from "../../extension/todos/types"
@@ -399,19 +399,20 @@ test("existing version-2 TODO databases migrate review tables without losing tas
   }
 })
 
-test("existing version-4 TODO databases gain child proposals without losing tasks", async () => {
+test("existing version-4 TODO databases gain child proposals and accepted evidence without losing tasks", async () => {
   const state = await fixture([{ id: "kept", acceptance: "Kept task is inspected" }])
   try {
     const sql = await initSqlJs({ locateFile: () => wasmPath })
     const database = new sql.Database(fs.readFileSync(state.databasePath))
-    database.run("DROP TABLE todo_child_proposals; PRAGMA user_version = 4")
+    database.run("DROP TABLE todo_child_proposals; DROP TABLE todo_accepted_evidence; PRAGMA user_version = 4")
     fs.writeFileSync(state.databasePath, Buffer.from(database.export()))
     database.close()
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
     const check = new sql.Database(fs.readFileSync(state.databasePath))
-    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 5)
+    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 6)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_child_proposals'")[0].values[0][0], 1)
+    assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0].values[0][0], 1)
     check.close()
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -513,7 +514,7 @@ test("a dependency-blocked claim keeps its evidence, skips Feedback, and is revi
       return responseFor(validationReview, { refs: [validationRead.id] })
     }, "mock-reviewer", { readCurrentSource: currentWorkspace })
     assert.equal(validationEvaluation.decision, "accept")
-    assert.equal(calls, 1, "exactly one Feedback call reviews the dependent task")
+    assert.equal(calls, 0, "a dependent task proven deterministically makes no Feedback call")
     assert.equal((await state.repository.getItem(state.scope, validation.id)).item.status, "completed")
     assert.equal(reviewCandidates(await state.repository.getReviewPackages(state.scope)).length, 0, "a verified task is not reviewed again")
   } finally {
@@ -1090,7 +1091,7 @@ test("the native TODO tools are offered to the agent by default and dispatch to 
   }
 })
 
-test("feedback plans omit TODO bookkeeping tasks but keep distinct user work", () => {
+test("feedback plans with TODO bookkeeping tasks are rejected, while distinct user work is accepted", () => {
   const plan = {
     planId: "plan-bookkeeping",
     version: 1,
@@ -1103,8 +1104,20 @@ test("feedback plans omit TODO bookkeeping tasks but keep distinct user work", (
       { id: "task-list-ui", title: "Add task list component", description: "Render the task list panel", acceptanceCriteria: ["Panel renders"], dependencies: ["locate"] }
     ]
   }
-  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan }))
-  assert.ok("plan" in parsed, "the plan must remain valid after removing bookkeeping")
+  const rejected = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan }))
+  assert.ok("error" in rejected, "a plan that creates TODO bookkeeping tasks is rejected")
+  assert.equal(rejected.failure, "administrative")
+  assert.match(rejected.error, /tasks\[0\]/)
+
+  const kept = {
+    ...plan,
+    tasks: [
+      { id: "locate", title: "Locate read_file definition", description: "Find the native tool", acceptanceCriteria: ["Path identified"], dependencies: [] },
+      { id: "task-list-ui", title: "Add task list component", description: "Render the task list panel", acceptanceCriteria: ["Panel renders"], dependencies: ["locate"] }
+    ]
+  }
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: kept }))
+  assert.ok("plan" in parsed, "distinct user work remains a valid plan")
   assert.deepEqual(parsed.plan.tasks.map((task) => task.id), ["locate", "task-list-ui"])
   assert.deepEqual(parsed.plan.tasks[0].dependencies, [])
 })
@@ -1112,17 +1125,18 @@ test("feedback plans omit TODO bookkeeping tasks but keep distinct user work", (
 const EVIDENCE_FILE = "src/extension/tools/workspace.ts"
 const sourceLines = Array.from({ length: 850 }, (_, index) => index === 168 ? "  name: \"read_file\"," : `const filler${index + 1} = ${index + 1}`)
 const numbered = (start: number, lines: string[]) => lines.map((text, index) => `${start + index}: ${text}`).join("\n")
-const readOutput = (file: string, start: number, lines: string[]) =>
-  `${file} (lines ${start}–${start + lines.length - 1} of 850)\ncontent_hash: sha256:${"a".repeat(64)}; total_lines: 850\n${numbered(start, lines)}`
+const readOutput = async (file: string, start: number, lines: string[]) =>
+  `${file} (lines ${start}–${start + lines.length - 1} of 850)\ncontent_hash: ${await fingerprintContent(workspaceText)}; total_lines: 850\n${numbered(start, lines)}`
 
-const evidenceFixture = async (acceptance: string, listChars?: number) => {
+const evidenceFixtureFor = async (tasks: { id: string; acceptance: string }[], listChars?: number) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-evidence-"))
   const databasePath = path.join(directory, "twinny-state.sqlite")
   const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///evidence-project"]), conversationId: "evidence-chat" }
   const repository = new TodoRepository(databasePath, wasmPath, { listChars: listChars ?? 2_000_000 })
-  await repository.synchronizeIntentPlan(scope, plan([{ id: "investigate", acceptance }]), { prompt: "Explain how read_file is registered" })
-  return { directory, databasePath, scope, repository }
+  const synchronized = await repository.synchronizeIntentPlan(scope, plan(tasks), { prompt: "Explain how read_file is registered" })
+  return { directory, databasePath, scope, repository, itemIds: synchronized.items.map((item) => item.id) }
 }
+const evidenceFixture = async (acceptance: string, listChars?: number) => evidenceFixtureFor([{ id: "investigate", acceptance }], listChars)
 type EvidenceFixture = Awaited<ReturnType<typeof evidenceFixture>>
 
 const startInvestigation = async (state: EvidenceFixture) => {
@@ -1136,7 +1150,7 @@ const startInvestigation = async (state: EvidenceFixture) => {
   })
 }
 
-const observeRead = (state: EvidenceFixture, itemId: string, requestId: string, file: string, start: number, lines: string[]) =>
+const observeRead = async (state: EvidenceFixture, itemId: string, requestId: string, file: string, start: number, lines: string[]) =>
   state.repository.recordToolObservation(state.scope, {
     itemId,
     toolName: "read_file",
@@ -1144,18 +1158,18 @@ const observeRead = (state: EvidenceFixture, itemId: string, requestId: string, 
     output: `read \`${file}:${start}\` · ${lines.length} lines`,
     failed: false,
     requestId,
-    evidenceOutput: readOutput(file, start, lines)
+    evidenceOutput: await readOutput(file, start, lines)
   })
 
 const reviewFor = async (state: EvidenceFixture, itemId: string) =>
   (await state.repository.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === itemId)!
 
-test("a numbered read keeps its path, line range, total, and every source line", () => {
-  const output = readOutput(EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+test("a numbered read keeps its path, line range, total, and every source line", async () => {
+  const output = await readOutput(EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
   const preserved = preserveEvidence(output)
   assert.equal(preserved.complete, true)
   assert.equal(preserved.content, output)
-  assert.deepEqual(preserved.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: `sha256:${"a".repeat(64)}` }])
+  assert.deepEqual(preserved.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText) }])
   assert.ok(preserved.content.split("\n").includes("169:   name: \"read_file\","))
 })
 
@@ -1171,8 +1185,8 @@ test("search output keeps each hit's path, line, and preview", () => {
   assert.match(hits[0].preview, /read_file/)
 })
 
-test("oversized source is cut at a whole line and reports that it is incomplete", () => {
-  const output = readOutput(EVIDENCE_FILE, 1, sourceLines.map((line) => line + " ".repeat(400)))
+test("oversized source is cut at a whole line and reports that it is incomplete", async () => {
+  const output = await readOutput(EVIDENCE_FILE, 1, sourceLines.map((line) => line + " ".repeat(400)))
   const preserved = preserveEvidence(output)
   assert.equal(preserved.complete, false)
   assert.equal(preserved.originalChars, output.length)
@@ -1262,9 +1276,452 @@ test("retained read evidence lets Feedback approve an investigation whose final 
     assert.ok(excerpt.text.includes("169:   name: \"read_file\","))
     assert.deepEqual(input.deterministicCoverage, [], "the stored evidence covers every anchor")
 
-    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer", { requireWorkspaceChanges: taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria), hasVerifiedFileChanges: false })
-    assert.equal(evaluation.decision, "accept")
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria), hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
     assert.equal((await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((candidate) => candidate.id === item.id)?.status, "completed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+const CHANGED_TEXT = `${workspaceText}\nconst changedFixture = true`
+const changedWorkspace: CurrentSourceReader = async (file) => (file === WORKSPACE_FILE ? CHANGED_TEXT : undefined)
+const startItemInReview = async (repository: TodoRepository, scope: EvidenceFixture["scope"], itemId: string) => {
+  const item = (await repository.getList({ ...scope, includeCompleted: true })).items.find((candidate) => candidate.id === itemId)!
+  return repository.updateItem(scope, { itemId, expectedVersion: item.version, patch: { status: "in_review" }, actor: "model", requestId: `${itemId}-in-review` })
+}
+const countingEvaluator = (calls: { count: number }) => async (): Promise<string> => {
+  calls.count += 1
+  throw new Error("Feedback must not be consulted for a deterministic decision")
+}
+const readCurrentOutput = async (text: string, file: string, start: number, lines: string[]) =>
+  `${file} (lines ${start}–${start + lines.length - 1} of ${text.split("\n").length})\ncontent_hash: ${await fingerprintContent(text)}; total_lines: ${text.split("\n").length}\n${numbered(start, lines)}`
+const TWO_TASKS = [
+  { id: "investigate", acceptance: "`read_file` is defined in src/extension/tools/workspace.ts" },
+  { id: "locate-again", acceptance: "`read_file` is defined in src/extension/tools/workspace.ts" }
+]
+
+test("a deterministically accepted source fact is persisted and reused by a later TODO without Feedback or new reads", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first, second] = state.itemIds
+    await startItemInReview(state.repository, state.scope, first)
+    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const firstEvaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(firstEvaluation.decision, "accept", JSON.stringify(firstEvaluation.problems))
+    assert.equal(calls.count, 0)
+
+    const facts = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(facts.length, 1)
+    assert.equal(facts[0].observationId, observation.id)
+    assert.equal(facts[0].startLine, 169)
+    assert.equal(facts[0].endLine, 169)
+    assert.equal(facts[0].sourceHash, await fingerprintContent(workspaceText))
+    assert.equal(facts[0].supersededBy, undefined)
+
+    await startItemInReview(state.repository, state.scope, second)
+    const secondReview = await reviewFor(state, second)
+    assert.equal(secondReview.acceptedEvidence.length, 1, "the accepted fact is offered to the later TODO")
+    assert.deepEqual(secondReview.retainedEvidence.map((entry) => entry.observationId), [observation.id], "the later TODO adds no read of its own; it sees only the shared observation")
+    const secondEvaluation = await evaluateTodoReview(state.repository, state.scope, secondReview, countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(secondEvaluation.decision, "accept", JSON.stringify(secondEvaluation.problems))
+    assert.deepEqual(secondEvaluation.criteria[0].evidenceRefs, [observation.id])
+    assert.equal(calls.count, 0)
+    assert.equal((await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((candidate) => candidate.id === second)?.status, "completed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a changed source makes the accepted fact historical, and only fresh trusted evidence re-accepts it", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first, second] = state.itemIds
+    await startItemInReview(state.repository, state.scope, first)
+    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    const original = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(original.length, 1)
+    assert.equal((await assessAcceptedFacts(original, currentWorkspace))[0].freshness, "current")
+    const [stale] = await assessAcceptedFacts(original, changedWorkspace)
+    assert.equal(stale.freshness, "historical")
+    assert.ok(stale.reason, "staleness is explained")
+
+    await startItemInReview(state.repository, state.scope, second)
+    const blocked = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, second), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: changedWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.notEqual(blocked.decision, "accept", "the stale fact does not prove the changed source")
+    assert.equal(blocked.criteria[0].reconciliation?.reuse, undefined)
+    assert.equal(calls.count, 0)
+
+    const fresh = await state.repository.recordToolObservation(state.scope, {
+      itemId: second,
+      toolName: "read_file",
+      arguments: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" },
+      output: `read \`${EVIDENCE_FILE}:150\` · 51 lines`,
+      failed: false,
+      requestId: "read-changed",
+      evidenceOutput: await readCurrentOutput(CHANGED_TEXT, EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    })
+    const accepted = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, second), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: changedWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(accepted.decision, "accept", JSON.stringify(accepted.problems))
+    assert.equal(calls.count, 0)
+
+    const history = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(history.length, 2, "the superseded fact is kept for audit")
+    const current = history.filter((fact) => !fact.supersededBy)
+    assert.equal(current.length, 1)
+    assert.equal(current[0].observationId, fresh.id)
+    const previous = history.find((fact) => fact.observationId === observation.id)!
+    assert.equal(previous.supersededBy, current[0].id)
+    assert.equal((await assessAcceptedFacts([previous], changedWorkspace))[0].freshness, "historical")
+    assert.equal((await assessAcceptedFacts(current, changedWorkspace))[0].freshness, "current")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("accepted facts survive repository reopen and are reused without the original conversation or evaluator", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first, second] = state.itemIds
+    await startItemInReview(state.repository, state.scope, first)
+    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const facts = await reopened.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(facts.length, 1)
+    assert.equal(facts[0].observationId, observation.id)
+    assert.equal((await assessAcceptedFacts(facts, currentWorkspace))[0].freshness, "current")
+
+    await startItemInReview(reopened, state.scope, second)
+    const review = (await reopened.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === second)!
+    assert.equal(review.acceptedEvidence.length, 1)
+    const evaluation = await evaluateTodoReview(reopened, state.scope, review, countingEvaluator(calls), "different-provider-model", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal(calls.count, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+
+const lookupEvidence = async (state: EvidenceFixture, args: Record<string, string>, readCurrent?: CurrentSourceReader) => {
+  const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: readCurrent })
+  const response = await tools.run({ name: "twinny_evidence_lookup", args })
+  return { failed: response.failed === true, body: response.failed ? undefined : JSON.parse(response.output) as { facts: Record<string, unknown>[] } }
+}
+
+test("twinny_evidence_lookup returns a current accepted fact with its observation and freshness, and is read-only", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first] = state.itemIds
+    await startItemInReview(state.repository, state.scope, first)
+    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: currentWorkspace })
+    assert.equal(tools.tools.find((tool) => tool.name === "twinny_evidence_lookup")?.readOnly, true)
+
+    const lookup = await lookupEvidence(state, { symbol: "read_file", path: EVIDENCE_FILE }, currentWorkspace)
+    assert.equal(lookup.failed, false)
+    assert.equal(lookup.body!.facts.length, 1)
+    const [fact] = lookup.body!.facts
+    assert.equal(fact.observation_id, observation.id)
+    assert.equal(fact.symbol, "read_file")
+    assert.equal(fact.path, EVIDENCE_FILE)
+    assert.equal(fact.start_line, 169)
+    assert.equal(fact.end_line, 169)
+    assert.equal(fact.source_hash, await fingerprintContent(workspaceText))
+    assert.equal(fact.freshness, "current")
+    assert.equal(fact.refresh, undefined, "a current fact needs no refresh")
+    assert.equal(calls.count, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("twinny_evidence_lookup reports a changed source as historical with a refresh hint, and a superseded fact without one", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first, second] = state.itemIds
+    await startItemInReview(state.repository, state.scope, first)
+    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+
+    const stale = await lookupEvidence(state, { path: EVIDENCE_FILE }, changedWorkspace)
+    assert.equal(stale.body!.facts.length, 1)
+    assert.equal(stale.body!.facts[0].freshness, "historical")
+    assert.ok(typeof stale.body!.facts[0].reason === "string", "staleness is explained")
+    assert.equal(stale.body!.facts[0].refresh, `read ${EVIDENCE_FILE} lines 169-169 again`)
+
+    await startItemInReview(state.repository, state.scope, second)
+    const fresh = await state.repository.recordToolObservation(state.scope, {
+      itemId: second,
+      toolName: "read_file",
+      arguments: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" },
+      output: `read \`${EVIDENCE_FILE}:150\` · 51 lines`,
+      failed: false,
+      requestId: "read-changed",
+      evidenceOutput: await readCurrentOutput(CHANGED_TEXT, EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    })
+    const accepted = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, second), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: changedWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(accepted.decision, "accept", JSON.stringify(accepted.problems))
+
+    const history = await lookupEvidence(state, { symbol: "read_file" }, changedWorkspace)
+    assert.equal(history.body!.facts.length, 2)
+    const superseded = history.body!.facts.find((fact) => fact.observation_id === observation.id)!
+    const current = history.body!.facts.find((fact) => fact.observation_id === fresh.id)!
+    assert.equal(superseded.freshness, "historical")
+    assert.equal(superseded.refresh, undefined, "a superseded fact points to its replacement, not a re-read")
+    assert.equal(current.freshness, "current")
+    assert.equal(current.refresh, undefined)
+    assert.equal(calls.count, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("planning, observation, deterministic verification, persistence, context reset, and a different model's lookup run as one sequence", async () => {
+  const OBJECTIVE = "Locate the native read_file tool definition."
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-integration-"))
+  const databasePath = path.join(directory, "twinny-state.sqlite")
+  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///integration-project"]), conversationId: "integration-chat" }
+  try {
+    const task = (id: string, title: string, dependencies: string[]) => ({ id, title, description: `Work for ${id}.`, acceptanceCriteria: ["`read_file` is defined in src/extension/tools/workspace.ts"], dependencies })
+    const reply = JSON.stringify({ track: true, plan: { planId: "feedback-plan", version: 1, revision: 1, goal: OBJECTIVE, constraints: [], tasks: [
+      task("locate", "Locate native read_file definition", []),
+      task("follow-up", "Answer the read_file location follow-up", ["locate"]),
+      task("recheck", "Recheck the read_file location", ["locate"])
+    ] } })
+    const parsed = parseFeedbackPlanResponse(reply, OBJECTIVE)
+    if (!("plan" in parsed)) assert.fail(JSON.stringify(parsed))
+
+    const repository = new TodoRepository(databasePath, wasmPath, { listChars: 2_000_000 })
+    const synchronized = await repository.synchronizeIntentPlan(scope, parsed.plan, { source: "feedback", goal: OBJECTIVE })
+    const [locate, followUp, recheck] = synchronized.items.map((item) => item.id)
+    const state = { directory, databasePath, scope, repository, itemIds: [locate, followUp, recheck] }
+
+    await startItemInReview(repository, scope, locate)
+    const observation = await observeRead(state, locate, "integration-read", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const first = await evaluateTodoReview(repository, scope, await reviewFor(state, locate), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(first.decision, "accept", JSON.stringify(first.problems))
+    assert.equal(calls.count, 0, "a deterministic fact never reaches Feedback")
+
+    const reopened = new TodoRepository(databasePath, wasmPath)
+    const reopenedState = { ...state, repository: reopened }
+    const retained = await reopened.listAcceptedEvidence(scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(retained.length, 1)
+    assert.equal(retained[0].observationId, observation.id)
+    const lookup = await lookupEvidence(reopenedState, { symbol: "read_file", path: EVIDENCE_FILE }, currentWorkspace)
+    assert.equal(lookup.failed, false)
+    assert.equal(lookup.body!.facts.length, 1)
+    assert.equal(lookup.body!.facts[0].freshness, "current")
+    assert.equal(lookup.body!.facts[0].observation_id, observation.id)
+
+    await startItemInReview(reopened, scope, followUp)
+    const second = await evaluateTodoReview(reopened, scope, await reviewFor(reopenedState, followUp), countingEvaluator(calls), "different-provider-model", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(second.decision, "accept", JSON.stringify(second.problems))
+    assert.equal(calls.count, 0, "the second task reuses the accepted fact without a search or read")
+
+    const stale = await lookupEvidence(reopenedState, { symbol: "read_file", path: EVIDENCE_FILE }, changedWorkspace)
+    assert.equal(stale.body!.facts[0].freshness, "historical")
+    assert.ok(stale.body!.facts[0].refresh, "the lookup names the fresh read that would re-establish the fact")
+
+    await startItemInReview(reopened, scope, recheck)
+    const blocked = await evaluateTodoReview(reopened, scope, await reviewFor(reopenedState, recheck), countingEvaluator(calls), "different-provider-model", { readCurrentSource: changedWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.notEqual(blocked.decision, "accept", "the historical fact does not prove the changed source")
+    assert.equal(calls.count, 0)
+
+    const fresh = await reopened.recordToolObservation(scope, {
+      itemId: recheck,
+      toolName: "read_file",
+      arguments: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" },
+      output: `read \`${EVIDENCE_FILE}:150\` · 51 lines`,
+      failed: false,
+      requestId: "integration-read-changed",
+      evidenceOutput: await readCurrentOutput(CHANGED_TEXT, EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    })
+    const accepted = await evaluateTodoReview(reopened, scope, await reviewFor(reopenedState, recheck), countingEvaluator(calls), "different-provider-model", { readCurrentSource: changedWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(accepted.decision, "accept", JSON.stringify(accepted.problems))
+    assert.equal(calls.count, 0)
+
+    const history = await reopened.listAcceptedEvidence(scope, { symbol: "read_file", path: EVIDENCE_FILE })
+    assert.equal(history.length, 2, "the superseded fact is kept for audit")
+    const current = history.filter((fact) => !fact.supersededBy)
+    assert.equal(current.length, 1)
+    assert.equal(current[0].observationId, fresh.id)
+    const previous = history.find((fact) => fact.observationId === observation.id)!
+    assert.equal((await assessAcceptedFacts([previous], changedWorkspace))[0].freshness, "historical")
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("twinny_evidence_lookup requires a symbol or a path and fails without one", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const lookup = await lookupEvidence(state, {}, currentWorkspace)
+    assert.equal(lookup.failed, true)
+    assert.equal(lookup.body, undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+const malformedPlan = (revision: number, edit: (tasks: ReturnType<typeof plan>["tasks"]) => void, goal = "Verify the requested work") => {
+  const candidate = { ...plan(TWO_TASKS), revision, goal }
+  edit(candidate.tasks)
+  return candidate
+}
+const ADMINISTRATIVE_CRITERION = "Create a TODO entry documenting this location."
+
+test("an active plan with an administrative criterion is repaired at the next revision, keeping identity, evidence, and verification", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first, second] = state.itemIds
+    await state.repository.synchronizeIntentPlan(state.scope, malformedPlan(2, (tasks) => tasks[0].acceptanceCriteria.push(ADMINISTRATIVE_CRITERION)), { source: "feedback", goal: "Verify the requested work" })
+    assert.equal((await state.repository.getIntentTaskPlan(state.scope))!.tasks[0].acceptanceCriteria.length, 2)
+
+    await startItemInReview(state.repository, state.scope, first)
+    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const before = (await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.id === first)!
+    const otherBefore = (await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.id === second)!
+
+    const repair = await reconcileAdministrativeCriteria(state.repository, state.scope)
+    assert.deepEqual(repair, { revision: 3, repaired: [TWO_TASKS[0].id], unrepaired: [] })
+    const repaired = await state.repository.getIntentTaskPlan(state.scope)
+    assert.equal(repaired!.revision, 3)
+    assert.equal(repaired!.planId, "feedback-plan")
+    assert.deepEqual(repaired!.tasks[0].acceptanceCriteria, [TWO_TASKS[0].acceptance])
+    assert.deepEqual(repaired!.tasks[1].acceptanceCriteria, [TWO_TASKS[1].acceptance], "the other task is untouched")
+
+    const after = (await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.id === first)!
+    assert.equal(after.id, before.id, "task identity is preserved")
+    assert.equal(after.status, "in_review")
+    assert.equal(after.version, before.version, "no version bump is needed for a criteria-only repair")
+    assert.equal((await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.id === second)!.version, otherBefore.version)
+    assert.deepEqual((await reviewFor(state, first)).retainedEvidence.map((entry) => entry.observationId), [observation.id], "the observation is kept")
+
+    assert.equal(await reconcileAdministrativeCriteria(state.repository, state.scope), undefined, "a repaired plan is not repaired again")
+    const calls = { count: 0 }
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+    assert.equal(calls.count, 0, "pending verification is decided on the repaired criteria without Feedback or a new read")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("administrative text that cannot be removed cleanly is reported for a Feedback replan and leaves the plan unchanged", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    await state.repository.synchronizeIntentPlan(state.scope, malformedPlan(2, (tasks) => {
+      tasks[0].acceptanceCriteria = [ADMINISTRATIVE_CRITERION]
+      tasks[1].title = "Create a TODO for the second finding"
+    }), { source: "feedback", goal: "Verify the requested work" })
+    const stored = await state.repository.getIntentTaskPlan(state.scope)
+
+    const repair = await reconcileAdministrativeCriteria(state.repository, state.scope)
+    assert.equal(repair?.revision, 2)
+    assert.deepEqual(repair?.repaired, [])
+    assert.deepEqual(repair?.unrepaired.map((item) => item.taskId), TWO_TASKS.map((task) => task.id))
+    assert.deepEqual(await state.repository.getIntentTaskPlan(state.scope), stored, "nothing is silently rewritten")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a TODO-system objective keeps its TODO criteria, so the repair never touches legitimate work on TODO code", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    await state.repository.synchronizeIntentPlan(state.scope, malformedPlan(2, (tasks) => tasks[0].acceptanceCriteria.push(ADMINISTRATIVE_CRITERION), "Implement a filter for the TODO panel."), { source: "feedback", goal: "Implement a filter for the TODO panel." })
+    const stored = await state.repository.getIntentTaskPlan(state.scope)
+    assert.equal(await reconcileAdministrativeCriteria(state.repository, state.scope), undefined)
+    assert.deepEqual(await state.repository.getIntentTaskPlan(state.scope), stored)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a read that misses the definition's line range or names a different symbol never proves it, and needs no Feedback call", async () => {
+  const criterion = "`read_file` is defined in src/extension/tools/workspace.ts"
+  const cases = [
+    { label: "lines 1-50 hold no definition", start: 1, lines: sourceLines.slice(0, 50) },
+    { label: "the definition line names write_file", start: 150, lines: sourceLines.slice(149, 200).map((line) => line.replace("\"read_file\"", "\"write_file\"")) }
+  ]
+  for (const { label, start, lines } of cases) {
+    const state = await evidenceFixture(criterion)
+    try {
+      const [item] = state.itemIds
+      await startItemInReview(state.repository, state.scope, item)
+      await observeRead(state, item, `read-${start}`, EVIDENCE_FILE, start, lines)
+      const calls = { count: 0 }
+      const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+      assert.notEqual(evaluation.decision, "accept", label)
+      assert.equal(calls.count, 0, label)
+    } finally {
+      fs.rmSync(state.directory, { recursive: true, force: true })
+    }
+  }
+})
+
+test("a semantic relationship that no fact can settle still reaches Feedback", async () => {
+  const state = await evidenceFixture("`read_file` returns an error when its path is outside the workspace")
+  try {
+    const [item] = state.itemIds
+    await startItemInReview(state.repository, state.scope, item)
+    await observeRead(state, item, "read-semantic", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    const calls = { count: 0 }
+    const evaluator = async () => {
+      calls.count += 1
+      throw new Error("semantic review requested")
+    }
+    await assert.rejects(evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item), evaluator, "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false }), /semantic review requested/)
+    assert.equal(calls.count, 1, "the behavioral claim is decided by Feedback, not by the host")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("Feedback, verifier, child-review, and Mycroft prompts agree on the TODO and evidence rules", () => {
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /Planning workflow is not a user deliverable/)
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /Criteria are fixed when the plan is made/)
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /locate or lookup task needs only the facts/)
+  assert.match(CHILD_TODO_PROTOCOL, /justified by genuinely new work rather than by an administrative step/)
+  assert.match(todoReviewSystemPrompt, /never add a new condition, deliverable, or requirement to record, document, or report on the TODO list/)
+  const mycroft = renderPlanContext({ planId: "feedback-plan", revision: 1, tasks: [], children: [] } as unknown as IntentPlanOutline)
+  assert.match(mycroft, /search for the exact symbol or registration signature first/)
+  assert.match(mycroft, /about 150-250 lines/)
+  assert.match(mycroft, /submit one completion claim that cites the observation IDs/)
+  assert.match(mycroft, /do not create TODO entries to document or report this work/)
+  assert.doesNotMatch(mycroft, /create a TODO that documents|record this location in a TODO/i)
+})
+
+test("the plan context Mycroft receives lists current accepted facts before the tasks and omits stale ones", async () => {
+  const state = await evidenceFixtureFor(TWO_TASKS)
+  try {
+    const [first] = state.itemIds
+    await startItemInReview(state.repository, state.scope, first)
+    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
+    await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: currentWorkspace, requireWorkspaceChanges: false, hasVerifiedFileChanges: false })
+
+    const outline = (await state.repository.getPlanOutline(state.scope))!
+    const facts = await state.repository.listAcceptedEvidence(state.scope)
+    const current = renderPlanContext(outline, await assessAcceptedFacts(facts, currentWorkspace))
+    assert.ok(current.includes(`observation ${observation.id}`), "the current fact is offered to the next request")
+    assert.ok(current.indexOf("Accepted host evidence") < current.indexOf(`- ${first}`), "accepted evidence precedes the task list")
+    assert.ok(current.includes("Do not search or read for these facts again"))
+
+    const stale = renderPlanContext(outline, await assessAcceptedFacts(facts, changedWorkspace))
+    assert.equal(stale.includes(observation.id), false, "a historical fact is not offered as current")
+    assert.equal(stale.includes("Accepted host evidence"), false)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -1414,7 +1871,7 @@ test("retained evidence survives reopening the store, as it does across an autom
     const review = await reviewFor({ ...state, repository: reopened }, item.id)
     const retained = review.retainedEvidence.find((entry) => entry.observationId === observation.id)
     assert.ok(retained?.content?.includes("169:   name: \"read_file\","))
-    assert.deepEqual(retained?.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: `sha256:${"a".repeat(64)}` }])
+    assert.deepEqual(retained?.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText) }])
     assert.equal(review.observations.find((entry) => entry.id === observation.id)?.evidence?.retained, true)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -1422,7 +1879,7 @@ test("retained evidence survives reopening the store, as it does across an autom
 })
 
 test("evidence evicted by the storage budget is reported as evicted, never as covered", async () => {
-  const size = preserveEvidence(readOutput(EVIDENCE_FILE, 150, sourceLines.slice(149, 200))).preservedChars
+  const size = preserveEvidence(await readOutput(EVIDENCE_FILE, 150, sourceLines.slice(149, 200))).preservedChars
   const state = await evidenceFixture("`read_file` is defined in src/extension/tools/workspace.ts", Math.ceil(size * 1.5))
   try {
     const item = await startInvestigation(state)

@@ -64,8 +64,8 @@ import { describeProviderError, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, feedbackContext, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
-import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
+import { assessAcceptedFacts, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, feedbackContext, reviewCandidates, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
@@ -81,7 +81,7 @@ import { getLanguage } from "../utils"
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
 import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, observationReference, requiresWorkspaceChanges } from "./execution-reconciliation"
-import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanOutcome, type FeedbackRetryOutcome, userRequestsTodoCreation } from "./feedback-planner"
+import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanOutcome, type FeedbackRetryOutcome, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "./feedback-planner"
 import { ChatGeneration } from "./generation"
 import { McpHost } from "./mcp-host"
 import { OperationLifecycle } from "./operation-lifecycle"
@@ -621,7 +621,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       review: isFeedbackEnabled(workspace.getConfiguration("twinny"))
         ? (proposal, context, signal) => this._childReviewer.review(proposal, context, signal)
         : undefined,
-      isUserAuthorized: () => this._userRequestsTodo
+      isUserAuthorized: () => this._userRequestsTodo,
+      readCurrentSource: this.currentSourceReader()
     }
   }
 
@@ -1234,6 +1235,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   ): Promise<TodoEvaluation[]> {
     if (!this._todoRepository) return []
     const attempted = options.attempted ?? new Set<string>()
+    await this.repairAdministrativePlan(scope)
     const reviews = await this._todoRepository.getReviewPackages(scope)
     const candidates = reviewCandidates(reviews, itemId).filter((review) => !attempted.has(review.task.id + "@" + review.task.version))
     if (!candidates.length) {
@@ -1559,13 +1561,30 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
+  /** Host reconciliation: an active plan that still holds administrative criteria is repaired before anything reads it. */
+  private async repairAdministrativePlan(scope: TodoListRequest): Promise<void> {
+    if (!this._todoRepository) return
+    try {
+      await reconcileAdministrativeCriteria(this._todoRepository, scope)
+    } catch (error) {
+      logger.warn(`[Feedback] Could not repair administrative criteria in the TODO plan: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   /** Host state for one request: the active task and the plan, read as of this request. */
   private async planRequestContext(): Promise<string | undefined> {
     const scope = this.activeTodoScope()
     if (!scope || !this._todoRepository) return undefined
     try {
+      await this.repairAdministrativePlan(scope)
       const outline = await this._todoRepository.getPlanOutline(scope)
-      const plan = outline && outline.tasks.length ? renderPlanContext(outline) : ""
+      const accepted = outline && outline.tasks.length
+        ? await assessAcceptedFacts(
+          (await this._todoRepository.listAcceptedEvidence(scope)).filter((fact) => !fact.supersededBy).slice(0, MAX_ACCEPTED_CONTEXT_FACTS),
+          this.currentSourceReader()
+        )
+        : []
+      const plan = outline && outline.tasks.length ? renderPlanContext(outline, accepted) : ""
       const task = await this.activeIntentTaskProjection()
       return [task, plan].filter(Boolean).join("\n\n") || undefined
     } catch (error) {

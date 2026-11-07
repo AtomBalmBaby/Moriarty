@@ -6,7 +6,7 @@ import { test } from "node:test"
 
 import { logger } from "../../common/logger"
 import type { TodoListSnapshot } from "../../common/types"
-import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository, parseChildTodoDecision, parseFeedbackPlanResponse, requestsTodoMachineryWork, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
+import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository, findAdministrativeClauses, parseChildTodoDecision, parseFeedbackPlanResponse, requestsTodoMachineryWork, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { replyText, type RoleInference, type RoleReply, type RoleResolution, structuredReply } from "../../extension/chat/role-inference"
 import { readReply } from "../../extension/inference/stream"
 import type { ChatChunk } from "../../extension/inference/types"
@@ -17,14 +17,18 @@ const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
 
 const quietly = async <T>(run: () => Promise<T>) => {
   const records: string[] = []
-  const { info, warn } = logger
+  const { info, warn, debug, trace } = logger
   logger.info = (message) => records.push(message)
   logger.warn = (message) => records.push(message)
+  logger.debug = (message) => records.push(message)
+  logger.trace = (message) => records.push(message)
   try {
     return { result: await run(), records }
   } finally {
     logger.info = info
     logger.warn = warn
+    logger.debug = debug
+    logger.trace = trace
   }
 }
 
@@ -64,6 +68,42 @@ test("the Feedback plan response is validated before it can write TODOs", () => 
   assert.ok("error" in parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: { ...plan(), tasks: [] } })))
   assert.ok("error" in parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: plan(), prompt: "x" })))
   assert.ok("error" in parseFeedbackPlanResponse("nope"))
+})
+
+test("an administrative plan gets one corrective retry that names the offending criterion, and is never synced if it stays invalid", async () => {
+  const administrative = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", acceptanceCriteria: ["Create a TODO entry documenting this location."], dependencies: [] }] })
+  const clean = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", acceptanceCriteria: ["The path and line numbers of readFile are cited."], dependencies: [] }] })
+  await withRepository(async (repository) => {
+    const sent: string[] = []
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      resolve: () => endpoint(async ({ user }) => {
+        sent.push(user)
+        return JSON.stringify({ track: true, plan: sent.length === 1 ? administrative : clean })
+      })
+    })
+    const { result } = await quietly(() => planner.start(scope, "Locate read_file."))
+    assert.equal(result.status, "planned")
+    assert.equal(sent.length, 2, "exactly one corrective retry")
+    assert.match(sent[1], /tasks\[0\]\.acceptanceCriteria\[0\]/, "the correction names the offending criterion")
+    assert.deepEqual((await repository.getList(scope)).items.map((item) => item.title), ["Locate read_file"])
+  })
+  await withRepository(async (repository) => {
+    let calls = 0
+    const planner = new FeedbackPlanner({
+      enabled: () => true,
+      repository: () => repository,
+      resolve: () => endpoint(async () => {
+        calls += 1
+        return JSON.stringify({ track: true, plan: administrative })
+      })
+    })
+    const { result } = await quietly(() => planner.start(scope, "Locate read_file."))
+    assert.equal(result.status, "failed")
+    assert.equal(calls, 2, "the first reply and one corrective retry, then no further attempts")
+    assert.equal(await repository.getIntentTaskPlan(scope), undefined, "an invalid plan is never written")
+  })
 })
 
 test("plans TODOs from an ordinary prompt with no compiler involved, and does not duplicate them", async () => {
@@ -161,6 +201,12 @@ test("cancelled, superseded and late answers never write or revive TODOs", async
   await withRepository(async (repository) => {
     const releases: Array<(value: string) => void> = []
     const failures: string[] = []
+    const untilCalled = async (count: number) => {
+      for (let turn = 0; releases.length < count && turn < 10_000; turn++) {
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      assert.ok(releases.length >= count, `expected ${count} endpoint calls`)
+    }
     // Ignores the abort signal, so its answers arrive late.
     const planner = new FeedbackPlanner({
       enabled: () => true,
@@ -170,7 +216,7 @@ test("cancelled, superseded and late answers never write or revive TODOs", async
     })
     const { result: cancelled, records } = await quietly(async () => {
       const running = planner.start(scope, "First request")
-      await new Promise((resolve) => setTimeout(resolve, 10))
+      await untilCalled(1)
       planner.cancel("user")
       releases[0](JSON.stringify({ track: true, plan: plan({ planId: "late" }) }))
       return running
@@ -182,9 +228,9 @@ test("cancelled, superseded and late answers never write or revive TODOs", async
 
     const { result: outcomes } = await quietly(async () => {
       const older = planner.start(scope, "Older request")
-      await new Promise((resolve) => setTimeout(resolve, 10))
+      await untilCalled(2)
       const newer = planner.start(scope, "Newer request")
-      await new Promise((resolve) => setTimeout(resolve, 10))
+      await untilCalled(3)
       releases[1](JSON.stringify({ track: true, plan: plan({ planId: "older", goal: "Older" }) }))
       releases[2](JSON.stringify({ track: true, plan: plan({ planId: "newer", goal: "Newer" }) }))
       return Promise.all([older, newer])
@@ -386,7 +432,7 @@ const tasksOf = (parsed: ReturnType<typeof parseFeedbackPlanResponse>) => {
   return (parsed as { plan: { tasks: { id: string; dependencies: string[] }[] } }).plan.tasks
 }
 
-test("a read-only investigation plan drops the TODO administration Feedback generated, not the investigation", () => {
+test("a read-only investigation plan with TODO administration is rejected and names each offending clause", () => {
   const objective = "Investigate how read_file resolves paths and report where it can fail. Read-only: do not change any files."
   const reply = {
     track: true,
@@ -394,16 +440,19 @@ test("a read-only investigation plan drops the TODO administration Feedback gene
       goal: objective,
       tasks: [
         { id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Record the investigation in the TODO list.", acceptanceCriteria: ["A TODO entry exists with a clear title and description.", "Its status is Open or equivalent."], dependencies: [] },
-        { id: "todo-status", title: "Update TODO statuses and record evidence", description: "Keep the TODO statuses current.", acceptanceCriteria: ["Statuses reflect progress."], dependencies: ["todo-init"] },
-        { id: "trace", title: "Trace read_file path resolution", description: "Read the read_file implementation and its path helpers.", acceptanceCriteria: ["Path resolution steps are cited from source."], dependencies: ["todo-init"] },
-        { id: "report", title: "Report failure modes", description: "Summarize where read_file can fail with cited lines.", acceptanceCriteria: ["Each failure mode cites a source line."], dependencies: ["trace", "todo-status"] }
+        { id: "trace", title: "Trace read_file path resolution", description: "Read the read_file implementation and its path helpers.", acceptanceCriteria: ["Path resolution steps are cited from source.", "Create a TODO entry documenting this location."], dependencies: ["todo-init"] },
+        { id: "report", title: "Report failure modes", description: "Summarize where read_file can fail with cited lines.", acceptanceCriteria: ["Each failure mode cites a source line."], dependencies: ["trace"] }
       ]
     })
   }
-  const tasks = tasksOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective))
-  assert.deepEqual(tasks.map((task) => task.id), ["trace", "report"])
-  assert.deepEqual(tasks.find((task) => task.id === "report")?.dependencies, ["trace"], "a dependency on a removed task is dropped with it")
-  assert.deepEqual(tasks.find((task) => task.id === "trace")?.dependencies, [])
+  const parsed = parseFeedbackPlanResponse(JSON.stringify(reply), objective)
+  assert.equal(failureOf(parsed), "administrative")
+  const message = "error" in parsed ? parsed.error : ""
+  assert.match(message, /tasks\[0\]\.title/)
+  assert.match(message, /tasks\[0\]\.description/)
+  assert.match(message, /tasks\[0\]\.acceptanceCriteria\[0\]/)
+  assert.match(message, /tasks\[1\]\.acceptanceCriteria\[1\]/)
+  assert.doesNotMatch(message, /tasks\[2\]/, "clean tasks are not named")
 })
 
 test("a plan made only of TODO administration is rejected, so Mycroft does not start", () => {
@@ -415,7 +464,46 @@ test("a plan made only of TODO administration is rejected, so Mycroft does not s
       tasks: [{ id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Set up tracking.", acceptanceCriteria: ["A TODO entry exists."], dependencies: [] }]
     })
   }
-  assert.equal(failureOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective)), "schema")
+  assert.equal(failureOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective)), "administrative")
+})
+
+const administrativeOf = (task: { title: string; description: string; acceptanceCriteria: string[] }, objective = "Locate the native read_file definition.") =>
+  findAdministrativeClauses(plan({ goal: objective, tasks: [{ id: "t", dependencies: [], ...task }] }), objective).map((clause) => clause.path)
+
+test("administrative TODO clauses are detected in titles, descriptions, and every criterion", () => {
+  assert.deepEqual(administrativeOf({ title: "Use TODOs to track this", description: "", acceptanceCriteria: [] }), ["tasks[0].title"])
+  assert.deepEqual(administrativeOf({ title: "Locate read_file", description: "Update the TODO list with progress.", acceptanceCriteria: [] }), ["tasks[0].description"])
+  assert.deepEqual(
+    administrativeOf({ title: "Locate read_file", description: "", acceptanceCriteria: ["Path and line range cited.", "Create a TODO entry documenting this location.", "A TODO entry exists for it."] }),
+    ["tasks[0].acceptanceCriteria[1]", "tasks[0].acceptanceCriteria[2]"]
+  )
+  assert.deepEqual(administrativeOf({ title: "Locate read_file", description: "", acceptanceCriteria: ["The TODO status is Done."] }), ["tasks[0].acceptanceCriteria[0]"])
+})
+
+test("a legitimate task that touches Twinny's code or a negated TODO mention is not administrative", () => {
+  assert.deepEqual(administrativeOf({
+    title: "Locate the TODO scanner",
+    description: "Record the TODO-related code path and the TODO filter panel handling.",
+    acceptanceCriteria: ["Report the file and line range of the TODO scanner.", "Use the TODO filter function to confirm the path.", "Do not create any TODO entries."]
+  }), [])
+})
+
+test("an objective about the TODO machinery exempts TODO implementation tasks", () => {
+  const objective = "Fix the TODO filter so that completed items stay hidden."
+  const tasks = { title: "Create TODO entry fixtures for the filter tests", description: "Update the TODO list used by the filter.", acceptanceCriteria: ["A TODO entry exists in the fixture."] }
+  assert.deepEqual(administrativeOf(tasks, objective), [])
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: plan({ goal: objective, tasks: [{ id: "fix", ...tasks, dependencies: [] }] }) }), objective)
+  assert.ok("plan" in parsed, "TODO implementation work is accepted")
+})
+
+test("a plan whose administrative clauses are all corrected is accepted on the resubmission", () => {
+  const objective = "Locate the native read_file definition and report its path and line range."
+  const clean = plan({
+    goal: objective,
+    tasks: [{ id: "locate", title: "Locate read_file", description: "Find the native definition.", acceptanceCriteria: ["The file path and line range of readFile are cited."], dependencies: [] }]
+  })
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: clean }), objective)
+  assert.deepEqual(tasksOf(parsed).map((task) => task.id), ["locate"])
 })
 
 test("a request to build or fix TODO functionality keeps its TODO tasks", () => {
@@ -491,7 +579,7 @@ test("a build word in a heading does not make a read-only investigation TODO wor
   assert.equal(requestsTodoMachineryWork("Feedback/TODO work: test the TODO filter and fix the panel."), true)
 })
 
-test("the administrative TODO tasks Feedback produced for the read_file acceptance prompt are dropped, and the investigation is kept", () => {
+test("the administrative TODO tasks Feedback produced for the read_file acceptance prompt are rejected, naming each offending clause", () => {
   const reply = {
     track: true,
     plan: plan({
@@ -500,15 +588,31 @@ test("the administrative TODO tasks Feedback produced for the read_file acceptan
         { id: "todo-create", title: "Create actionable TODOs before beginning the investigation", description: "Create the initial TODO entries.", acceptanceCriteria: ["A TODO entry exists."], dependencies: [] },
         { id: "todo-status", title: "Update TODO status as each step progresses", description: "Keep the TODO statuses current.", acceptanceCriteria: ["Statuses reflect progress."], dependencies: ["todo-create"] },
         { id: "register", title: "Locate read_file registration", description: "Find where the native read_file tool definition is registered and made available to the agent.", acceptanceCriteria: ["Registration sites are cited with line numbers."], dependencies: ["todo-create"] },
-        { id: "dispatch", title: "Trace read_file dispatch", description: "Trace an incoming read_file call to its implementation.", acceptanceCriteria: ["The dispatch path is cited."], dependencies: ["register", "todo-status"] },
-        { id: "validate", title: "Locate read_file argument validation and file read", description: "Identify where arguments are validated and where the file is read.", acceptanceCriteria: ["Both sites are cited."], dependencies: ["dispatch"] }
+        { id: "define", title: "Locate native read_file definition", description: "Find the definition of the native read_file tool.", acceptanceCriteria: ["Identify the file path and line numbers where read_file is defined.", "Create a TODO entry documenting this location."], dependencies: [] }
       ]
     })
   }
-  const tasks = tasksOf(parseFeedbackPlanResponse(JSON.stringify(reply), acceptanceObjective))
-  assert.deepEqual(tasks.map((task) => task.id), ["register", "dispatch", "validate"])
-  assert.deepEqual(tasks.find((task) => task.id === "register")?.dependencies, [], "a dependency on a removed task is dropped with it")
-  assert.deepEqual(tasks.find((task) => task.id === "dispatch")?.dependencies, ["register"])
+  const parsed = parseFeedbackPlanResponse(JSON.stringify(reply), acceptanceObjective)
+  assert.equal(failureOf(parsed), "administrative")
+  const message = "error" in parsed ? parsed.error : ""
+  assert.match(message, /tasks\[0\]\.title/)
+  assert.match(message, /tasks\[0\]\.description/)
+  assert.match(message, /tasks\[1\]\.title/)
+  assert.match(message, /tasks\[3\]\.acceptanceCriteria\[1\]/)
+  assert.doesNotMatch(message, /tasks\[2\]/, "the legitimate registration task is not named")
+  assert.doesNotMatch(message, /tasks\[3\]\.acceptanceCriteria\[0\]/, "the legitimate criterion is not named")
+
+  const repaired = {
+    track: true,
+    plan: plan({
+      goal: acceptanceObjective,
+      tasks: [
+        { id: "register", title: "Locate read_file registration", description: "Find where the native read_file tool definition is registered and made available to the agent.", acceptanceCriteria: ["Registration sites are cited with line numbers."], dependencies: [] },
+        { id: "define", title: "Locate native read_file definition", description: "Find the definition of the native read_file tool.", acceptanceCriteria: ["Identify the file path and line numbers where read_file is defined."], dependencies: ["register"] }
+      ]
+    })
+  }
+  assert.deepEqual(tasksOf(parseFeedbackPlanResponse(JSON.stringify(repaired), acceptanceObjective)).map((task) => task.id), ["register", "define"])
 })
 
 test("an unsupported structured-output parameter is retried once without it, and remembered", async () => {

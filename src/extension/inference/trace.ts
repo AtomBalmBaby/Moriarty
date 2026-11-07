@@ -69,13 +69,51 @@ const safeEndpoint = (endpoint: string) => {
   }
 }
 
+export type InferenceEventLevel = "trace" | "debug" | "info" | "warn" | "error"
+
+/** Operation summaries: the INFO narrative. */
+const INFO_EVENTS = new Set(["operation.terminal"])
+
+/** Request starts, terminal states, and retry decisions: useful at DEBUG. */
+const DEBUG_EVENTS = new Set([
+  "operation.started",
+  "request.metadata",
+  "request.started",
+  "request.terminal",
+  "request.stream_stopped",
+  "request.cancelled_before_dispatch",
+  "http_attempt.terminal",
+  "http_attempt.retry_decision",
+  "provider_attempt.dispatched",
+  "provider_attempt.terminal",
+  "provider_attempt.retry_decision",
+  "provider_attempt.cancellation_requested",
+  "tool_loop.retry_decision"
+])
+
+/**
+ * The level an event is written at unless a call site says otherwise.
+ * Transport internals (headers, first bytes, stream cleanup) default to TRACE,
+ * so they stay out of the INFO channel.
+ */
+export const defaultInferenceEventLevel = (event: string): InferenceEventLevel => {
+  if (INFO_EVENTS.has(event)) return "info"
+  if (DEBUG_EVENTS.has(event)) return "debug"
+  return "trace"
+}
+
 export const inferenceEvent = (
   event: string,
   fields: Record<string, unknown> = {},
-  level: "info" | "warn" | "error" = "info"
+  level?: InferenceEventLevel
 ): void => {
-  const record = { timestamp: new Date().toISOString(), event, ...fields }
-  logger[level](`[Inference] ${JSON.stringify(record)}`)
+  const resolved = level ?? defaultInferenceEventLevel(event)
+  // The log channel already timestamps each line; INFO summaries omit a second copy.
+  const record =
+    resolved === "debug" || resolved === "trace"
+      ? { timestamp: new Date().toISOString(), event, ...fields }
+      : { event, ...fields }
+  logger[resolved](`[Inference] ${JSON.stringify(record)}`)
 }
 
 export const activeInferenceRequestSnapshot = (operationId?: string) =>
@@ -147,7 +185,7 @@ export const startInferenceAttempt = (
             ...(headers["task-id"] ? { "task-id": headers["task-id"] } : {})
           }
         },
-        response.ok ? "info" : "warn"
+        response.ok ? "trace" : "warn"
       )
     },
     firstResponse: (eventType?: string) => {
@@ -177,7 +215,7 @@ export const startInferenceAttempt = (
           active_requests: activeInferenceRequestSnapshot().length,
           queued_requests: 0
         },
-        state === "failed" ? "warn" : "info"
+        state === "failed" ? "warn" : "debug"
       )
     }
   }
@@ -298,7 +336,7 @@ export const startInferenceRequest = (
         active_requests: activeRequests.size,
         queued_requests: 0
       },
-      terminalState === "failed" ? "error" : "info"
+      terminalState === "failed" ? "error" : "debug"
     )
   }
 }

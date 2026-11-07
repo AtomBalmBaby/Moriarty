@@ -28,12 +28,17 @@ export const FEEDBACK_PLAN_PROTOCOL =
   "Use {\"track\": false, \"plan\": null} when the message needs no tracked work (a question, greeting, or a follow-up that the existing plan already covers). " +
   "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, acceptanceCriteria: string[], dependencies: string[]}]}. " +
   "Include 1-100 ordered tasks with stable IDs and no unknown or cyclic dependencies. Ground every task in the user's request; do not invent requirements. " +
-  "Each task must be user work. Do not include tasks that create, initialize, or organize the TODO list itself; Twinny records the plan automatically. " +
+  "Keep the plan as small as the objective allows: one task per distinct piece of user work, with factual, specific, measurable acceptance criteria proportional to that task. " +
+  "Planning workflow is not a user deliverable. Twinny creates and updates the TODO list itself, so no title, description, or criterion may ask Mycroft to create, update, verify, or report on TODO entries, statuses, or the list, even when the user says to use TODOs. " +
+  "Do not add reporting, documentation, or administrative deliverables that the user did not request. " +
+  "A locate or lookup task needs only the facts that answer it, such as the file, symbol, and line range, not logging, documentation, or a record of the finding. " +
+  "Criteria are fixed when the plan is made, so do not plan conditions that only verification would add. " +
+  "Accepted host evidence and earlier verified facts are authoritative for narrow deterministic facts, so do not plan work that re-establishes them. " +
   "When an existing plan is supplied, preserve its planId and unchanged task IDs, and increase revision only when task definitions change."
 
 export const DEFAULT_FEEDBACK_PLAN_TIMEOUT_MS = 60_000
 
-export type FeedbackPlanFailure = JsonFailure | "output-limit" | "schema"
+export type FeedbackPlanFailure = JsonFailure | "output-limit" | "schema" | "administrative"
 
 export type FeedbackPlanParse =
   | { track: false }
@@ -45,12 +50,12 @@ const EXCERPT_CHARS = 240
 
 /** Twinny's own TODO machinery: the list, its items, and their statuses. */
 const TODO_MACHINERY = /\b(?:todos?|to-dos?|task\s+list|plan\s+items?|tracking\s+items?|task\s+(?:statuses?|entries))(?![-\w])/i
-/** A bookkeeping verb applied to that machinery, e.g. "create initial TODO entry" or "update TODO statuses". */
-const BOOKKEEPING_OF_MACHINERY = new RegExp(
-  "\\b(?:create|initiali[sz]e|set\\s+up|populate|record|track|maintain|update|mark|log|submit|claim|complete|close|move|set)\\s+(?:\\S+\\s+){0,5}?" +
-    TODO_MACHINERY.source,
-  "i"
-)
+/** A verb that would direct Mycroft to write, maintain, use, or report on a TODO record. */
+const ADMINISTRATIVE_VERB = /\b(?:create|add|make|open|initiali[sz]e|set\s+up|populate|record|log|track|maintain|update|mark|verify|confirm|report|submit|complete|close|move|set|keep|use|document|file|write)\b/gi
+/** Words right after a TODO noun that name Twinny's code rather than its records, e.g. "TODO filter" or "TODO scanner". */
+const CODE_REFERENT_AFTER = /^\s*(?:[\w.'"`/-]+\s+){0,2}(?:path|paths|code|scanner|panel|filter|view|handler|handling|function|implementation|module|source|logic|component|command|feature|webview|parser|schema|migration|tests?|files?|regex|tool)\b/i
+/** A criterion that requires a TODO record to exist or to have a status. */
+const RECORD_STATE_AFTER = /^\s*(?:[\w'-]+\s+){0,3}?(?:exists?|existing|present|recorded|marked|status(?:es)?|reflects?|updated|created|is\s+(?:open|done|closed|complete|completed|in\s+progress|pending|verified))\b/i
 /**
  * Verbs that build, change, or debug the work itself, when they direct it: at the start of a line or sentence, or after
  * a request word such as "please" or "to". A word like "Test" inside a heading does not direct anything.
@@ -84,28 +89,65 @@ const DIRECT_TODO_CREATE = /^[\s>*\-\d.)]*(?:please\s+|can\s+you\s+|could\s+you\
 export const userRequestsTodoCreation = (message: string): boolean => DIRECT_TODO_CREATE.test(message)
 
 /**
- * Removes plan-management tasks that Twinny already performs itself. Dependencies on a removed task are dropped with it.
- * A task is administrative when the objective is not about the TODO machinery and the task applies a bookkeeping verb to it.
+ * Whether a span of plan text directs Mycroft to create, maintain, use, or report on a TODO record. A TODO noun counts only
+ * when a directive verb governs it within a short clause, it is not negated, and no code referent follows it ("TODO scanner").
+ * A criterion also counts when it requires that a TODO record exist or have a status.
  */
-export const removeBookkeepingTasks = (plan: unknown, objective = ""): unknown => {
-  if (!plan || typeof plan !== "object" || !Array.isArray((plan as { tasks?: unknown }).tasks)) return plan
-  const candidate = plan as { goal?: unknown; tasks: { id?: unknown; title?: unknown; description?: unknown; dependencies?: unknown }[] }
-  const basis = objective || (typeof candidate.goal === "string" ? candidate.goal : "")
-  if (requestsTodoMachineryWork(basis)) return plan
-  const isBookkeeping = (task: { title?: unknown; description?: unknown }) => {
-    const text = [task.title, task.description].filter((part): part is string => typeof part === "string").join(" ")
-    return BOOKKEEPING_OF_MACHINERY.test(text)
+const isAdministrativeText = (text: string, criterion: boolean): boolean => {
+  for (const noun of text.matchAll(new RegExp(TODO_MACHINERY.source, "gi"))) {
+    const end = (noun.index ?? 0) + noun[0].length
+    const after = text.slice(end, end + 60)
+    if (CODE_REFERENT_AFTER.test(after)) continue
+    if (criterion && RECORD_STATE_AFTER.test(after)) return true
+    const before = text.slice(0, noun.index ?? 0).split(/[.!?;:\n]/).pop() ?? ""
+    const verb = [...before.matchAll(ADMINISTRATIVE_VERB)].pop()
+    if (!verb || verb.index === undefined) continue
+    const between = before.slice(verb.index + verb[0].length).trim()
+    if (between.split(/\s+/).filter(Boolean).length > 5) continue
+    if (NEGATED_BEFORE.test(before.slice(0, verb.index))) continue
+    return true
   }
-  const removed = new Set(candidate.tasks.filter(isBookkeeping).map((task) => String(task.id)))
-  if (!removed.size) return plan
-  logger.info(`[Feedback] Removed ${removed.size} TODO administration task(s) from the plan: ${[...removed].join(", ")}`)
-  const tasks = candidate.tasks
-    .filter((task) => !removed.has(String(task.id)))
-    .map((task) => ({
-      ...task,
-      dependencies: Array.isArray(task.dependencies) ? task.dependencies.filter((id) => !removed.has(String(id))) : task.dependencies
-    }))
-  return { ...candidate, tasks }
+  return false
+}
+
+export interface AdministrativeClause {
+  path: string
+  text: string
+}
+
+/**
+ * Finds every title, description, and acceptance criterion that makes Mycroft administer the TODO list. Plans for an
+ * objective about the TODO machinery itself are exempt. Nothing is removed: the plan must be corrected and resubmitted.
+ */
+export const findAdministrativeClauses = (plan: unknown, objective = ""): AdministrativeClause[] => {
+  if (!plan || typeof plan !== "object" || !Array.isArray((plan as { tasks?: unknown }).tasks)) return []
+  const candidate = plan as { goal?: unknown; tasks: unknown[] }
+  const basis = objective || (typeof candidate.goal === "string" ? candidate.goal : "")
+  if (requestsTodoMachineryWork(basis)) return []
+  const found: AdministrativeClause[] = []
+  candidate.tasks.forEach((task, index) => {
+    if (!task || typeof task !== "object") return
+    const record = task as { title?: unknown; description?: unknown; acceptanceCriteria?: unknown }
+    for (const field of ["title", "description"] as const) {
+      const value = record[field]
+      if (typeof value === "string" && isAdministrativeText(value, false)) found.push({ path: `tasks[${index}].${field}`, text: value })
+    }
+    if (!Array.isArray(record.acceptanceCriteria)) return
+    record.acceptanceCriteria.forEach((criterion, position) => {
+      if (typeof criterion === "string" && isAdministrativeText(criterion, true)) {
+        found.push({ path: `tasks[${index}].acceptanceCriteria[${position}]`, text: criterion })
+      }
+    })
+  })
+  return found
+}
+
+const administrativeMessage = (found: AdministrativeClause[]): string => {
+  const quoted = found.map(({ path, text }) => `${path} "${text.length > 160 ? text.slice(0, 157) + "..." : text}"`)
+  return (
+    "Administrative TODO instructions are not allowed: Twinny maintains the TODO list itself, so no task may ask Mycroft to create, update, verify, or report on it. " +
+    "Remove these clauses and keep only the user's work, with minimal, factual criteria: " + quoted.join("; ") + "."
+  )
 }
 
 /** Reasoning arrived but no visible answer: the model spent its reply on thinking. */
@@ -127,11 +169,59 @@ const parseFeedbackPlanBody = (reply: string | RoleReply | undefined, objective:
   if (unexpected.length) return { error: "Unexpected keys: " + unexpected.join(", ") + ".", failure: "schema" }
   if (typeof value.track !== "boolean") return { error: "track must be a boolean.", failure: "schema" }
   if (!value.track) return { track: false }
-  const validation = validateIntentTaskPlan(removeBookkeepingTasks(value.plan, objective))
+  const administrative = findAdministrativeClauses(value.plan, objective)
+  if (administrative.length) return { error: administrativeMessage(administrative), failure: "administrative" }
+  const validation = validateIntentTaskPlan(value.plan)
   if (!validation.plan) {
     return { error: "Invalid task plan: " + (validation.diagnostic ?? "validation failed"), failure: "schema" }
   }
   return { track: true, plan: validation.plan }
+}
+
+export interface AdministrativeRepair {
+  revision: number
+  repaired: string[]
+  unrepaired: { taskId: string; reason: string }[]
+}
+
+/**
+ * Repairs an active plan that already contains administrative criteria, without restarting the investigation. Only the
+ * offending criteria are removed, under the same plan ID and item IDs, at the next revision. Item status, versions,
+ * observations, and verification are not touched, because synchronization keeps them. A task whose title or description
+ * is administrative, or that would be left with no criteria, is reported for a Feedback replan and left unchanged.
+ */
+export const reconcileAdministrativeCriteria = async (repository: FeedbackPlanRepository, scope: TodoListRequest): Promise<AdministrativeRepair | undefined> => {
+  const stored = await repository.getIntentTaskPlan(scope)
+  if (!stored) return undefined
+  const offending = findAdministrativeClauses(stored)
+  if (!offending.length) return undefined
+  const paths = new Set(offending.map((clause) => clause.path))
+  const unrepaired: AdministrativeRepair["unrepaired"] = []
+  const repairedTasks = new Map<string, IntentTaskPlan["tasks"][number]>()
+  stored.tasks.forEach((task, index) => {
+    if (paths.has(`tasks[${index}].title`) || paths.has(`tasks[${index}].description`)) {
+      unrepaired.push({ taskId: task.id, reason: "its title or description directs administrative TODO work, so Feedback must replan it" })
+      return
+    }
+    const kept = task.acceptanceCriteria.filter((_, position) => !paths.has(`tasks[${index}].acceptanceCriteria[${position}]`))
+    if (kept.length === task.acceptanceCriteria.length) return
+    if (!kept.length) {
+      unrepaired.push({ taskId: task.id, reason: "removing its administrative criteria would leave none, so Feedback must replan it" })
+      return
+    }
+    repairedTasks.set(task.id, { ...task, acceptanceCriteria: kept })
+  })
+  if (!repairedTasks.size) {
+    for (const item of unrepaired) logger.warn(`[Feedback] TODO ${item.taskId} still has administrative instructions: ${item.reason}.`)
+    return { revision: stored.revision, repaired: [], unrepaired }
+  }
+  const revision = stored.revision + 1
+  const next: IntentTaskPlan = { ...stored, revision, tasks: stored.tasks.map((task) => repairedTasks.get(task.id) ?? task) }
+  await repository.synchronizeIntentPlan(scope, next, { source: "feedback", goal: stored.goal, repair: "administrative-criteria" })
+  const repaired = [...repairedTasks.keys()]
+  logger.info(`[Feedback] Repaired plan ${stored.planId} to revision ${revision}: removed administrative criteria from ${repaired.join(", ")}.`)
+  for (const item of unrepaired) logger.warn(`[Feedback] TODO ${item.taskId} still has administrative instructions: ${item.reason}.`)
+  return { revision, repaired, unrepaired }
 }
 
 /** Parses a planning reply. A reply that stopped at the output limit is reported as such, never repaired. */
@@ -149,7 +239,7 @@ export const CHILD_TODO_PROTOCOL =
   "decision is one of: accepted (add the child as proposed), existing_task (a TODO in plan_items or existing_children already covers the work; set item_id to it), " +
   "revised (add the child with a narrower or corrected title, details, or parent_id; parent_id must name a TODO in the plan), " +
   "rejected (the work is unnecessary, out of scope, or is planning-system administration), or needs_clarification (the proposal is too broad; the instruction says how to narrow it). " +
-  "Child TODOs must be concrete steps that serve the goal. Reject or revise any child that only manages, records, or updates TODOs. " +
+  "Child TODOs must be concrete steps that serve the goal, justified by genuinely new work rather than by an administrative step. Reject or revise any child that only manages, records, or updates TODOs. " +
   "instruction is one short sentence telling the executing agent what to do next. Use null for item_id, title, details, and parent_id when they do not apply."
 
 export type ChildTodoParse = { ok: true; decision: ChildTodoDecision } | { ok: false; error: string }
@@ -314,7 +404,7 @@ const diagnose = (
       reasoning_chars: object?.reasoningChars ?? 0,
       ...("error" in parsed ? { failure: parsed.failure, offset: parsed.offset } : {})
     },
-    failed ? "warn" : "info"
+    failed ? "warn" : "debug"
   )
   if (text) logger.debug(`[Feedback] ${attempt} response excerpt: ${JSON.stringify(text.slice(0, EXCERPT_CHARS))}`)
 }

@@ -128,6 +128,7 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
     assert.deepEqual(tools.tools.map((tool) => tool.name), [
       "twinny_todo_list",
       "twinny_todo_get",
+      "twinny_evidence_lookup",
       "twinny_todo_create",
       "twinny_todo_update",
       "twinny_todo_evidence"

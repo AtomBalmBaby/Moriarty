@@ -3,10 +3,11 @@
  *
  * Built on VS Code's log channel, so every line carries a timestamp and a
  * level, and the panel's own level picker (or "Developer: Set Log Level…")
- * chooses how much to see. Info is the narrative: one line when a request
- * goes out, one when it comes back, with timings and sizes. Debug adds the
- * prompts and replies themselves. Warnings and errors are always written;
- * the `twinny.enableLogging` setting turns everything else off.
+ * chooses how much to see. Info is the narrative: operation summaries and
+ * significant milestones. Debug adds request starts and outcomes, retries,
+ * and the prompts and replies themselves. Trace adds transport internals:
+ * headers, first bytes, stream cleanup. Warnings and errors are always
+ * written; the `twinny.enableLogging` setting turns everything else off.
  */
 import type * as VsCode from "vscode"
 
@@ -32,12 +33,14 @@ interface LogSink {
   warn(message: string): void
   error(message: string): void
   debug(message: string): void
+  trace(message: string): void
   show(preserveFocus?: boolean): void
 }
 
 const headlessSink = (): LogSink => ({
   info: () => undefined,
   debug: () => undefined,
+  trace: () => undefined,
   warn: (message) => process.stderr.write(`[twinny] warn ${message}\n`),
   error: (message) => process.stderr.write(`[twinny] error ${message}\n`),
   show: () => undefined
@@ -135,6 +138,11 @@ export class Logger {
   /** Detail worth having when something is wrong: prompts, replies, bodies. */
   public debug(message: string) {
     if (this.enabled) this.channel.debug(redact(message))
+  }
+
+  /** Transport internals: headers, first bytes, stream cleanup. Shown only at trace level. */
+  public trace(message: string) {
+    if (this.enabled) this.channel.trace(redact(message))
   }
 
   /** A titled block of text at debug level: a prompt, a reply, a request body. */

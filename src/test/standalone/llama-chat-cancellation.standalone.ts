@@ -43,15 +43,18 @@ const withFetch = async <T>(fetcher: typeof fetch, run: () => Promise<T>) => {
 
 const captureInferenceLogs = async <T>(run: () => Promise<T>) => {
   const records: string[] = []
-  const info = logger.info
-  const warn = logger.warn
+  const { info, warn, debug, trace } = logger
   logger.info = (message) => records.push(message)
   logger.warn = (message) => records.push(message)
+  logger.debug = (message) => records.push(message)
+  logger.trace = (message) => records.push(message)
   try {
     return { result: await run(), records }
   } finally {
     logger.info = info
     logger.warn = warn
+    logger.debug = debug
+    logger.trace = trace
   }
 }
 

@@ -1,4 +1,4 @@
-import type { TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoStatus, TodoToolObservation, TodoVerification } from "../../common/types"
+import type { TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 
 import type { EvidenceHit, EvidenceSource } from "./evidence"
 
@@ -162,6 +162,20 @@ export interface RetainedObservationEvidence {
   hits: EvidenceHit[]
 }
 
+/** A source location previously verified and accepted for a completed task; durable across turns and reopen. */
+export interface AcceptedFact extends TodoSourceFact {
+  id: string
+  itemId: string
+  criterionIndex: number
+  criterion: string
+  toolName: string
+  planId: string
+  planRevision: number
+  /** Set when a later accepted fact for the same path and symbol replaced this one. The row is kept for audit. */
+  supersededBy?: string
+  acceptedAt: string
+}
+
 export interface TodoReviewPackage {
   projectFingerprint: string
   conversationId: string
@@ -176,6 +190,8 @@ export interface TodoReviewPackage {
   evidence: TodoEvidence[]
   observations: TodoToolObservation[]
   retainedEvidence: RetainedObservationEvidence[]
+  /** Current accepted source facts for this conversation, so verification can reuse them across TODOs. */
+  acceptedEvidence: AcceptedFact[]
   lastEvaluation?: TodoEvaluation
 }
 

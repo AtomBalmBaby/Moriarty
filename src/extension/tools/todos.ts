@@ -1,3 +1,4 @@
+import { assessAcceptedFacts, type CurrentSourceReader } from "../todos/feedback"
 import { TodoRepository } from "../todos/repository"
 import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoListRequest, TodoPriority, TodoStatus } from "../todos/types"
 
@@ -8,6 +9,8 @@ export interface TodoToolOptions {
   review?: ChildTodoReview
   /** Whether the user's own message directly asked for TODO creation. Read from trusted conversation state. */
   isUserAuthorized?: () => boolean
+  /** Reads the authoritative workspace source, so accepted facts can be judged current or historical. */
+  readCurrentSource?: CurrentSourceReader
 }
 
 const result = (value: unknown, summary: string): ToolResult => ({
@@ -64,6 +67,7 @@ const feedbackUnavailable = (parentId: string, reason: string): ToolResult => ({
 
 const priorities = new Set<TodoPriority>(["low", "normal", "high", "urgent"])
 const statuses = new Set<TodoStatus>(["pending", "in_progress", "in_review", "blocked", "completed", "cancelled"])
+const EVIDENCE_LOOKUP_LIMIT = 20
 
 const requestId = (args: Record<string, string>) => {
   const value = args.request_id?.trim()
@@ -120,6 +124,43 @@ export const todoTools = (
       try {
         if (!args.item_id) throw new Error("item_id is required")
         return result(await repository.getItem(scope, args.item_id), "read a native TODO")
+      } catch (error) {
+        return errorResult(error)
+      }
+    }
+  },
+  {
+    name: "twinny_evidence_lookup",
+    description: "Look up source facts the host already accepted from trusted observations in this conversation's TODO list, with their freshness.",
+    parameters: [
+      { name: "symbol", description: "Exact symbol name, such as readFile.", optional: true },
+      { name: "path", description: "Workspace-relative source path, such as src/extension/tools/workspace.ts.", optional: true }
+    ],
+    guidance: "Call this before searching or reading source for a fact that a previous task may already have established. A current fact is proven: cite its observation_id in your completion claim instead of searching again. A historical fact no longer matches the source; read only the listed lines again. Provide at least one of symbol or path.",
+    readOnly: true,
+    async run(args) {
+      try {
+        const symbol = args.symbol?.trim() || undefined
+        const path = args.path?.trim() || undefined
+        if (!symbol && !path) throw new Error("symbol or path is required")
+        const facts = (await repository.listAcceptedEvidence(scope, { symbol, path })).slice(0, EVIDENCE_LOOKUP_LIMIT)
+        const statuses = await assessAcceptedFacts(facts, options.readCurrentSource)
+        const found = statuses.map(({ fact, freshness, reason }) => ({
+          symbol: fact.symbol,
+          tool_name: fact.toolName,
+          path: fact.path,
+          start_line: fact.startLine,
+          end_line: fact.endLine,
+          source_hash: fact.sourceHash,
+          observation_id: fact.observationId,
+          item_id: fact.itemId,
+          plan_revision: fact.planRevision,
+          accepted_at: fact.acceptedAt,
+          freshness,
+          ...(reason ? { reason } : {}),
+          ...(freshness === "historical" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again` } : {})
+        }))
+        return result({ ok: true, facts: found, total: found.length, limit: EVIDENCE_LOOKUP_LIMIT }, `found ${found.length} accepted evidence fact(s)`)
       } catch (error) {
         return errorResult(error)
       }

@@ -4,20 +4,31 @@ import { test } from "node:test"
 import { logger } from "../../common/logger"
 import { ChatChunk, ChatRequest, InferenceProvider } from "../../extension/inference"
 import { guard } from "../../extension/inference/registry"
+import {
+  createInferenceTrace,
+  defaultInferenceEventLevel,
+  finishInferenceOperation,
+  inferenceEvent,
+  startInferenceAttempt,
+  startInferenceRequest
+} from "../../extension/inference/trace"
 import { withTools } from "../../extension/tools/loop"
 import { ToolResult, WorkspaceTools } from "../../extension/tools/workspace"
 
 const captureInferenceLogs = async <T>(run: () => Promise<T>) => {
   const records: string[] = []
-  const info = logger.info
-  const warn = logger.warn
+  const { info, warn, debug, trace } = logger
   logger.info = (message) => records.push(message)
   logger.warn = (message) => records.push(message)
+  logger.debug = (message) => records.push(message)
+  logger.trace = (message) => records.push(message)
   try {
     return { result: await run(), records }
   } finally {
     logger.info = info
     logger.warn = warn
+    logger.debug = debug
+    logger.trace = trace
   }
 }
 
@@ -142,4 +153,135 @@ test("a host cancellation before dispatch records the reason and sends no provid
     event.event === "request.cancelled_before_dispatch" &&
     event.request_id === "request-not-sent"
   ))
+})
+
+type LogLevel = "trace" | "debug" | "info" | "warn" | "error"
+interface LevelRecord {
+  level: LogLevel
+  event: string
+  fields: Record<string, unknown>
+  raw: string
+}
+
+const LOG_RANK: Record<LogLevel, number> = { trace: 0, debug: 1, info: 2, warn: 3, error: 4 }
+
+const captureAllLevels = <T>(run: () => T): { result: T; records: LevelRecord[] } => {
+  const records: LevelRecord[] = []
+  const original = { trace: logger.trace, debug: logger.debug, info: logger.info, warn: logger.warn, error: logger.error }
+  const levels: LogLevel[] = ["trace", "debug", "info", "warn", "error"]
+  for (const level of levels) {
+    logger[level] = (message: string) => {
+      if (!message.startsWith("[Inference] ")) return
+      const raw = message
+      const fields = JSON.parse(message.slice("[Inference] ".length)) as Record<string, unknown>
+      records.push({ level, event: String(fields.event), fields, raw })
+    }
+  }
+  try {
+    return { result: run(), records }
+  } finally {
+    Object.assign(logger, original)
+  }
+}
+
+/** What a channel set to `threshold` shows: records at or above that level. */
+const visibleAt = (threshold: LogLevel, records: LevelRecord[]) =>
+  records.filter((record) => LOG_RANK[record.level] >= LOG_RANK[threshold])
+
+const runCompletedRequest = () => {
+  const trace = createInferenceTrace({ operationKind: "chat" })
+  const finishRequest = startInferenceRequest(trace, { provider: "test", model: "m" })
+  const attempt = startInferenceAttempt(trace, { provider: "test", endpoint: "http://localhost:8080/v1?token=secret", model: "m" })
+  attempt.response(new Response("{}", { status: 200, headers: { "x-llama-task-id": "7" } }))
+  attempt.firstResponse("content")
+  attempt.finish("completed")
+  finishRequest("completed")
+  finishInferenceOperation(trace, "completed", { requests: 1 })
+}
+
+test("transport events default to trace, lifecycle to debug, and operation summaries to info", () => {
+  for (const event of [
+    "http_attempt.dispatched",
+    "http_attempt.response_headers",
+    "http_attempt.first_byte",
+    "http_attempt.first_stream_event",
+    "http_attempt.first_response",
+    "http_attempt.stream_cleanup",
+    "http_attempt.server_task_id"
+  ]) {
+    assert.equal(defaultInferenceEventLevel(event), "trace", event)
+  }
+  for (const event of ["request.started", "request.terminal", "http_attempt.terminal", "http_attempt.retry_decision", "provider_attempt.retry_decision", "tool_loop.retry_decision"]) {
+    assert.equal(defaultInferenceEventLevel(event), "debug", event)
+  }
+  assert.equal(defaultInferenceEventLevel("operation.terminal"), "info")
+})
+
+test("INFO mode shows operation summaries and no request lifecycle or transport events", () => {
+  const { records } = captureAllLevels(runCompletedRequest)
+  const shown = visibleAt("info", records).map((record) => record.event)
+  assert.deepEqual(shown, ["operation.terminal"])
+  for (const event of ["http_attempt.dispatched", "http_attempt.response_headers", "http_attempt.first_response", "http_attempt.terminal", "request.started", "request.terminal"]) {
+    assert.ok(records.some((record) => record.event === event), `${event} is still emitted for diagnostics`)
+  }
+})
+
+test("INFO summaries omit the duplicated timestamp; DEBUG and TRACE keep it", () => {
+  const { records } = captureAllLevels(runCompletedRequest)
+  const summary = records.find((record) => record.event === "operation.terminal")
+  assert.equal(summary?.level, "info")
+  assert.equal("timestamp" in (summary?.fields ?? {}), false)
+  const lifecycle = records.find((record) => record.event === "request.started")
+  assert.equal(lifecycle?.level, "debug")
+  assert.equal(typeof lifecycle?.fields.timestamp, "string")
+  const transport = records.find((record) => record.event === "http_attempt.response_headers")
+  assert.equal(transport?.level, "trace")
+  assert.equal(typeof transport?.fields.timestamp, "string")
+})
+
+test("DEBUG mode shows request starts, terminal states, and outcomes, but not transport internals", () => {
+  const { records } = captureAllLevels(runCompletedRequest)
+  const shown = new Set(visibleAt("debug", records).map((record) => record.event))
+  for (const event of ["request.started", "request.terminal", "http_attempt.terminal", "operation.terminal"]) {
+    assert.ok(shown.has(event), event)
+  }
+  assert.equal(shown.has("http_attempt.response_headers"), false)
+  assert.equal(shown.has("http_attempt.first_response"), false)
+})
+
+test("TRACE mode keeps response headers, first-response timing, and correlation identifiers", () => {
+  const { records } = captureAllLevels(runCompletedRequest)
+  const traced = visibleAt("trace", records)
+  const headers = traced.find((record) => record.event === "http_attempt.response_headers")
+  assert.equal(headers?.fields.status, 200)
+  assert.equal((headers?.fields.response_headers as Record<string, string>)["x-llama-task-id"], "7")
+  assert.equal(typeof headers?.fields.operation_id, "string")
+  assert.equal(typeof headers?.fields.attempt_id, "string")
+  const first = traced.find((record) => record.event === "http_attempt.first_response")
+  assert.equal(typeof first?.fields.time_to_first_response_ms, "number")
+})
+
+test("endpoint credentials are never written at any level", () => {
+  const { records } = captureAllLevels(runCompletedRequest)
+  assert.equal(records.some((record) => record.raw.includes("token=secret")), false)
+})
+
+test("failed attempts and requests stay visible at WARN and ERROR when TRACE is off", () => {
+  const { records } = captureAllLevels(() => {
+    const trace = createInferenceTrace({ operationKind: "chat" })
+    const finishRequest = startInferenceRequest(trace, { provider: "test", model: "m" })
+    const attempt = startInferenceAttempt(trace, { provider: "test", endpoint: "http://localhost:8080", model: "m" })
+    attempt.finish("failed", new Error("connect ECONNREFUSED"))
+    finishRequest("failed", new Error("connect ECONNREFUSED"))
+  })
+  const attemptFailure = records.find((record) => record.event === "http_attempt.terminal")
+  assert.equal(attemptFailure?.level, "warn")
+  const requestFailure = records.find((record) => record.event === "request.terminal")
+  assert.equal(requestFailure?.level, "error")
+  assert.equal(visibleAt("info", records).some((record) => record.event === "request.terminal"), true)
+})
+
+test("an explicit level overrides the event default", () => {
+  const { records } = captureAllLevels(() => inferenceEvent("feedback.failed", { reason: "x" }, "warn"))
+  assert.equal(records[0]?.level, "warn")
 })

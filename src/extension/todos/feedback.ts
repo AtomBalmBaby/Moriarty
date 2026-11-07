@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto"
 
 import { logger, redact } from "../../common/logger"
-import type { ReplyChangesView, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion } from "../../common/types"
+import type { ReplyChangesView, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TodoSourceFact } from "../../common/types"
 import { verifyContentFingerprint } from "../tools/fingerprint"
 
 import { describeGap, evidenceAnchors, evidenceGaps, type EvidenceSource, evidenceWindows, propositionNeedles, redactEvidence, samePath } from "./evidence"
-import { type IntentPlanContext, type RetainedObservationEvidence, RUNTIME_INVENTORY_TOOL, type TodoReviewPackage } from "./types"
+import { type AcceptedFact, type IntentPlanContext, type RetainedObservationEvidence, RUNTIME_INVENTORY_TOOL, type TodoReviewPackage } from "./types"
 
 export const taskRequiresWorkspaceChanges = (task: Pick<TodoReviewPackage["task"], "title" | "details">, criteria: string[]): boolean => {
   const taskText = [task.title, task.details ?? "", ...criteria].join("\n")
@@ -188,9 +188,14 @@ export type CurrentSourceReader = (path: string) => Promise<string | undefined>
 /** Bumped when the deterministic rules change, so stored outcomes can be told apart. */
 export const RECONCILIATION_VERSION = 1
 
+/** Evaluator identity recorded when the host decides a review without Feedback. */
+export const DETERMINISTIC_EVALUATOR = "host:deterministic"
+
 const BACKTICKED_TEXT = /`[^`\n]*`/g
 const COMMAND_OR_MUTATION = /\b(tests?|assertions?|compil\w*|build|type.?check|commands?|execut\w*|run|creat\w*|edit\w*|modif\w*|replac\w*|updat\w*|delet\w*|remov\w*|renam\w*)\b/i
 const BEHAVIOR = /\b(when|whenever|if|unless|before|after|only|never|always|must|should|returns?|throws?|rejects?|validates?|ensures?|fails?|succeeds?|propagates?|retries|persists?|prevents?|guarantees?|rolls?\s+back)\b/i
+/** A path-only criterion that asserts a location, existence, or presence fact, rather than a judgment about the file's content. */
+const LOCATION_CLAIM = /\b(exist\w*|present|identif\w*|locat\w*|find|found|contain\w*|defin\w*|declar\w*|registered|registration)\b/i
 
 const reconciled = (
   outcome: TodoCriterionReconciliation["outcome"],
@@ -238,11 +243,50 @@ const inventoryOutcome = (symbols: string[], records: RetainedObservationEvidenc
  * checked against the fingerprint of the source it captured; a read whose source
  * changed, or whose source cannot be read now, is not proof about the current file.
  */
+const NUMBERED_SOURCE_LINE = /^(\d+): (.*)$/
+const DEFINITION_CRITERION = /\b(defin\w*|declar\w*|implement\w*|locat\w*|where)\b/i
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+/** Matches a line that declares the symbol rather than merely calling or mentioning it. */
+const declarationPattern = (symbol: string): RegExp => {
+  const name = escapeRegExp(symbol)
+  return new RegExp(
+    `\\b(?:function|class|interface|type|enum|const|let|var|def|fn|func)\\s+${name}\\b` +
+    `|\\b${name}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)\\s*(?::[^{=]*)?\\{` +
+    `|\\b${name}\\s*[:=]\\s*(?:async\\s*)?(?:function\\b|\\([^)]*\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>)` +
+    // A tool object declares its registered name as a `name` property.
+    `|\\bname\\s*:\\s*["'\`]${name}["'\`]`,
+    "i"
+  )
+}
+
+/**
+ * Line numbers at which a retained read shows the symbol inside its captured
+ * source range. A definition query requires a declaration line, so a call site
+ * or a mention in a comment does not establish where the symbol is defined.
+ */
+const symbolLocations = (record: RetainedObservationEvidence, symbol: string, definition: boolean): number[] => {
+  if (!record.content) return []
+  const pattern = definition ? declarationPattern(symbol) : new RegExp(`\\b${escapeRegExp(symbol)}\\b`, "i")
+  const ranges = record.sources
+    .filter((source) => source.startLine !== undefined && source.endLine !== undefined)
+    .map((source) => [source.startLine as number, source.endLine as number])
+  return record.content.split("\n").flatMap((line) => {
+    const match = NUMBERED_SOURCE_LINE.exec(line)
+    if (!match || !pattern.test(match[2])) return []
+    const lineNumber = Number(match[1])
+    return ranges.some(([start, end]) => lineNumber >= start && lineNumber <= end) ? [lineNumber] : []
+  })
+}
+
 const sourceOutcome = async (
   anchors: { paths: string[]; symbols: string[] },
   records: RetainedObservationEvidence[],
-  current: (path: string) => Promise<string | undefined>
+  current: (path: string) => Promise<string | undefined>,
+  criterion: string
 ): Promise<TodoCriterionReconciliation> => {
+  const definition = DEFINITION_CRITERION.test(criterion.replace(BACKTICKED_TEXT, " "))
   const supporting: string[] = []
   const missing: string[] = []
   const contradictions: string[] = []
@@ -254,40 +298,128 @@ const sourceOutcome = async (
       missing.push(`no retained successful read of ${path}`)
       continue
     }
+    const pathMissing: string[] = []
     for (const record of reads) {
       const hash = record.sources.find((source) => samePath(source.path, path))?.contentHash
       if (!hash) {
-        missing.push(`observation ${record.observationId} of ${path} records no source fingerprint, so its currency is unknown`)
+        pathMissing.push(`observation ${record.observationId} of ${path} records no source fingerprint, so its currency is unknown`)
         continue
       }
       const text = await current(path)
       if (text === undefined) {
-        missing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
+        pathMissing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
         continue
       }
       if (await verifyContentFingerprint(text, hash).catch(() => false)) usable.push(record)
-      else missing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
+      else pathMissing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
     }
+    if (!usable.some((record) => record.sources.some((source) => samePath(source.path, path)))) missing.push(...pathMissing)
   }
+  const facts: TodoSourceFact[] = []
   for (const symbol of anchors.symbols) {
-    const needle = symbol.toLowerCase()
-    const hit = usable.find((record) => record.content?.toLowerCase().includes(needle))
+    let hit: { record: RetainedObservationEvidence; lines: number[] } | undefined
+    for (const record of usable) {
+      const lines = symbolLocations(record, symbol, definition)
+      if (lines.length) {
+        hit = { record, lines }
+        break
+      }
+    }
     if (hit) {
-      supporting.push(hit.observationId)
+      const { record, lines } = hit
+      supporting.push(record.observationId)
+      const path = anchors.paths.find((candidate) => record.sources.some((source) => samePath(source.path, candidate)))
+      const sourceHash = path ? record.sources.find((source) => samePath(source.path, path))?.contentHash : undefined
+      if (definition && path && sourceHash) {
+        facts.push({
+          symbol,
+          path,
+          startLine: Math.min(...lines),
+          endLine: Math.max(...lines),
+          observationId: record.observationId,
+          sourceHash
+        })
+      }
       continue
     }
+    const needle = symbol.toLowerCase()
+    const mentioned = usable.some((record) => record.content?.toLowerCase().includes(needle))
     const whole = usable.find((record) => isWholeFileRead(record, anchors.paths))
-    if (whole) {
+    if (whole && !mentioned) {
       supporting.push(whole.observationId)
       contradictions.push(`\`${symbol}\` does not appear in the current full read of ${anchors.paths.join(", ")}`)
       continue
     }
-    missing.push(`\`${symbol}\` does not appear in any fresh retained read; read the relevant lines again`)
+    missing.push(mentioned && definition
+      ? `\`${symbol}\` appears in a fresh retained read but no declaration of it is shown; read the lines that define it`
+      : `\`${symbol}\` does not appear in any fresh retained read; read the relevant lines again`)
   }
   if (contradictions.length) return reconciled("disproven", supporting, [...contradictions, ...missing])
   if (missing.length) return reconciled("unknown", supporting, missing)
   if (!usable.length) return reconciled("unknown", [], ["no fresh retained read establishes the criterion"])
-  return reconciled("proven", [...supporting, ...usable.map((record) => record.observationId)], [])
+  return { ...reconciled("proven", [...supporting, ...usable.map((record) => record.observationId)], []), ...(facts.length ? { facts } : {}) }
+}
+
+/**
+ * Reuses accepted source facts for a definition criterion when every named symbol
+ * has a non-superseded fact in one of the criterion's paths and the file still matches
+ * the fact's fingerprint. Returns undefined otherwise, so the criterion falls back to
+ * this task's own retained reads.
+ */
+const acceptedOutcome = async (
+  anchors: { paths: string[]; symbols: string[] },
+  accepted: AcceptedFact[],
+  current: (path: string) => Promise<string | undefined>,
+  criterion: string
+): Promise<TodoCriterionReconciliation | undefined> => {
+  if (!anchors.symbols.length || !anchors.paths.length) return undefined
+  if (!DEFINITION_CRITERION.test(criterion.replace(BACKTICKED_TEXT, " "))) return undefined
+  const supporting: string[] = []
+  for (const symbol of anchors.symbols) {
+    const fact = accepted.find((candidate) => !candidate.supersededBy && candidate.symbol === symbol && anchors.paths.some((path) => samePath(candidate.path, path)))
+    if (!fact) return undefined
+    const text = await current(fact.path)
+    if (text === undefined || !(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) return undefined
+    supporting.push(fact.observationId)
+  }
+  return { ...reconciled("proven", supporting, []), reuse: "accepted" }
+}
+
+const cachedCurrentReader = (readCurrent?: CurrentSourceReader): ((path: string) => Promise<string | undefined>) => {
+  const cache = new Map<string, Promise<string | undefined>>()
+  return (path: string) => {
+    if (!readCurrent) return Promise.resolve(undefined)
+    let text = cache.get(path)
+    if (!text) {
+      text = readCurrent(path).catch(() => undefined)
+      cache.set(path, text)
+    }
+    return text
+  }
+}
+
+export interface AcceptedFactStatus {
+  fact: AcceptedFact
+  freshness: "current" | "historical"
+  /** Why the fact no longer proves the current source; absent when current. */
+  reason?: string
+}
+
+/**
+ * Classifies accepted facts without changing them. Superseded and source-changed facts
+ * stay in the repository as historical evidence with an explanation.
+ */
+export const assessAcceptedFacts = async (facts: AcceptedFact[], readCurrent?: CurrentSourceReader): Promise<AcceptedFactStatus[]> => {
+  const current = cachedCurrentReader(readCurrent)
+  return Promise.all(facts.map(async (fact): Promise<AcceptedFactStatus> => {
+    if (fact.supersededBy) return { fact, freshness: "historical", reason: `superseded by accepted fact ${fact.supersededBy}` }
+    const text = await current(fact.path)
+    if (text === undefined) return { fact, freshness: "historical", reason: `${fact.path} could not be read to confirm its fingerprint` }
+    if (!(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) {
+      return { fact, freshness: "historical", reason: `${fact.path} changed after this fact was accepted` }
+    }
+    return { fact, freshness: "current" }
+  }))
 }
 
 /**
@@ -299,35 +431,74 @@ const sourceOutcome = async (
 export const reconcileCriteria = async (
   criteria: string[],
   records: RetainedObservationEvidence[],
-  readCurrent?: CurrentSourceReader
+  readCurrent?: CurrentSourceReader,
+  accepted: AcceptedFact[] = []
 ): Promise<TodoCriterionReconciliation[]> => {
-  const cache = new Map<string, Promise<string | undefined>>()
-  const current = (path: string) => {
-    if (!readCurrent) return Promise.resolve(undefined)
-    let text = cache.get(path)
-    if (!text) {
-      text = readCurrent(path).catch(() => undefined)
-      cache.set(path, text)
-    }
-    return text
-  }
+  const current = cachedCurrentReader(readCurrent)
   const outcomes: TodoCriterionReconciliation[] = []
   for (const criterion of criteria) {
     const anchors = evidenceAnchors(criterion)
     const prose = criterion.replace(BACKTICKED_TEXT, " ")
+    const unanchoredJudgment = anchors.paths.length > 0 && !anchors.symbols.length && !LOCATION_CLAIM.test(prose)
     const semantic = !anchors.paths.length && !anchors.symbols.length
       || COMMAND_OR_MUTATION.test(prose)
       || BEHAVIOR.test(prose)
+      || unanchoredJudgment
     if (semantic) {
       outcomes.push(reconciled("semantic", [], []))
     } else if (!anchors.paths.length) {
       const exposure = /\b(availab\w*|expos\w*|offered|outgoing|inventory)\b/i.test(prose)
       outcomes.push(exposure ? inventoryOutcome(anchors.symbols, records) : reconciled("semantic", [], []))
     } else {
-      outcomes.push(await sourceOutcome(anchors, records, current))
+      outcomes.push(await acceptedOutcome(anchors, accepted, current, criterion) ?? await sourceOutcome(anchors, records, current, criterion))
     }
   }
   return outcomes
+}
+
+/**
+ * Decides a review from host-verified reconciliations alone. Returns undefined
+ * when any criterion is semantic, so only genuinely interpretive questions
+ * reach Feedback. Ordinary workspace-change and approval gates still apply
+ * to the result the caller receives.
+ */
+export const deterministicTodoEvaluation = (
+  review: TodoReviewPackage,
+  reconciliations: TodoCriterionReconciliation[],
+  evaluatedAt = new Date().toISOString()
+): TodoEvaluation | undefined => {
+  if (reconciliations.length !== review.acceptanceCriteria.length) return undefined
+  if (reconciliations.some((reconciliation) => reconciliation.outcome === "semantic")) return undefined
+  const criteria: TodoEvaluationCriterion[] = review.acceptanceCriteria.map((criterion, index) => {
+    const reconciliation = reconciliations[index]
+    const status = reconciliation.outcome === "proven" ? "passed" : reconciliation.outcome === "disproven" ? "failed" : "unverified"
+    return { criterion, status, evidenceRefs: [...reconciliation.supportingObservationIds], reconciliation }
+  })
+  const failed = criteria.filter((criterion) => criterion.status === "failed")
+  const unverified = criteria.filter((criterion) => criterion.status === "unverified")
+  const problems = criteria.flatMap((criterion) => {
+    const anchors = evidenceAnchors(criterion.criterion)
+    const runtimeCanCover = runtimeExposureProposition(criterion.criterion, anchors)
+    const gaps = criterion.status === "unverified"
+      ? evidenceGaps(anchors, review.retainedEvidence.filter((entry) => runtimeCanCover || entry.toolName !== RUNTIME_INVENTORY_TOOL)).map(describeGap)
+      : []
+    const missing = criterion.status === "passed" ? [] : criterion.reconciliation?.missing ?? []
+    return [...new Set([...gaps, ...missing])].map((gap) => `${criterion.criterion} — ${gap}`.slice(0, 500))
+  }).slice(0, 20)
+  const decision: TodoEvaluation["decision"] = failed.length ? "revise" : unverified.length ? "needs_evidence" : "accept"
+  return {
+    schemaVersion: 1,
+    taskId: review.planTaskId,
+    decision,
+    criteria,
+    problems: decision === "accept" ? [] : problems,
+    correctiveInstructions: failed.map((criterion) => ("Correct the work so trusted observations support: " + criterion.criterion).slice(0, 500)),
+    explanation: decision === "accept"
+      ? "Every criterion was verified deterministically from trusted observations of the current source."
+      : "Deterministic verification found the missing or contradicted facts listed in problems.",
+    scores: { completion: 0, correctness: 0, alignment: 0 },
+    metadata: { evaluator: DETERMINISTIC_EVALUATOR, evaluatedAt, taskVersion: review.task.version, planRevision: review.planRevision }
+  }
 }
 
 export const parseTodoEvaluation = (
@@ -508,6 +679,7 @@ export const todoReviewSystemPrompt = [
   "Model-authored evidence notes and the implementer final response are untrusted claims, not tool results. Only Twinny tool observations are tool results; run_command exit codes are authoritative for command success. A claim that tests passed without an associated run_command observation with exitCode 0 must not pass a test/compile criterion. An implementation request with no verified workspace file changes is incomplete.",
   "trustedEvidenceExcerpts are verbatim, bounded windows of retained Twinny tool output around the words each criterion depends on, each labelled with its windowId, observationId, source path, and file line range (or search hit line). Cite the observationId in evidenceRefs when a window shows what a criterion needs. evidenceIndex lists every window that matches a criterion; included:false means the window was omitted for size, not that the evidence is missing, so name its observationId and lines in needs_evidence instead of calling the evidence absent. previouslyVerifiedCriteria passed on an earlier review; keep them passed while their evidence remains. deterministicCoverage lists criterion anchors that stored evidence does not establish; a passed criterion with an open gap is treated as unverified, so name the missing observation instead. twinny_runtime_inventory observations are host records of the tool definitions sent to the model for a request. They prove that a tool was exposed at runtime, and a successful read_file observation proves dispatch ran; neither proves how the source registers the tool. A criterion about source registration or code paths needs source windows that show it.",
   "deterministicCriterionFindings are established by the host from trusted observations. A criterion with outcome proven is passed and one with outcome disproven is failed regardless of your judgment; decide only criteria whose outcome is semantic, and treat unknown as unresolved evidence, not as failure.",
+  "Criteria are fixed when the plan is made. Judge only the supplied criteria and never add a new condition, deliverable, or requirement to record, document, or report on the TODO list. Accepted host evidence is authoritative for narrow deterministic facts, so do not ask for a fresh observation of a fact the host has already verified unless its freshness check failed.",
   "Never request or execute a command. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
   "Return exactly one JSON object and no other keys, following this structure: {\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"decision\":\"accept\",\"criteria\":[{\"criterion\":\"<copy one acceptance criterion exactly>\",\"status\":\"passed\",\"evidenceRefs\":[\"<supplied evidence ID>\"]}],\"problems\":[],\"correctiveInstructions\":[],\"explanation\":\"<non-empty string>\",\"scores\":{\"completion\":0,\"correctness\":0,\"alignment\":0}}. Every listed key is required. decision must be exactly one of accept, revise, needs_evidence, blocked. Each criteria entry has exactly criterion (string), status (passed, failed, or unverified), and evidenceRefs (array of supplied IDs). criteria must contain exactly one entry per supplied acceptance criterion in the same order and with identical text. Each evidenceRefs entry must be an ID explicitly supplied in the input; never invent or infer IDs. problems and correctiveInstructions are arrays of strings and may be empty; explanation is a non-empty string; scores has exactly completion, correctness, and alignment, each an integer from -7 to +8. Do not use 'text' instead of 'criterion', do not return correctiveInstructions as a string, and do not add fields."
 ].join("\n")
@@ -725,22 +897,28 @@ export const evaluateTodoReview = (
   const inFlight = reviewsInFlight.get(key)
   if (inFlight) return inFlight
   const operation = (async () => {
-    const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource)
-    let raw = await evaluator(undefined, reconciliations)
+    const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, requirements.readCurrentSource, review.acceptedEvidence)
+    const deterministic = deterministicTodoEvaluation(review, reconciliations)
     let result: TodoEvaluation
-    try {
-      result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis, reconciliations)
-    } catch (error) {
-      if (!(error instanceof TodoEvaluationValidationError)) throw error
-      logger.warn("[FeedbackEvaluator] Invalid response (code=" + error.code + ", field=" + (error.field ?? "root") + "): " + error.message + "; expected=" + JSON.stringify(error.expected) + "; received=" + JSON.stringify(error.received) + "; raw=" + redact(raw).slice(0, 4000))
-      raw = await evaluator("Your prior response failed validation (" + error.code + ": " + error.message + "). Return a corrected JSON object only. The canonical taskId must be exactly " + JSON.stringify(review.planTaskId) + ". Do not change the supplied task criteria or invent evidence.", reconciliations)
+    if (deterministic) {
+      logger.info("[Feedback] todo.verified deterministic decision=" + deterministic.decision + " task=" + review.task.id)
+      result = deterministic
+    } else {
+      let raw = await evaluator(undefined, reconciliations)
       try {
         result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis, reconciliations)
-      } catch (retryError) {
-        if (retryError instanceof TodoEvaluationValidationError) {
-          logger.warn("[FeedbackEvaluator] Correction response still invalid (code=" + retryError.code + ", field=" + (retryError.field ?? "root") + "): " + retryError.message + "; expected=" + JSON.stringify(retryError.expected) + "; received=" + JSON.stringify(retryError.received) + "; raw=" + redact(raw).slice(0, 4000))
+      } catch (error) {
+        if (!(error instanceof TodoEvaluationValidationError)) throw error
+        logger.warn("[FeedbackEvaluator] Invalid response (code=" + error.code + ", field=" + (error.field ?? "root") + "): " + error.message + "; expected=" + JSON.stringify(error.expected) + "; received=" + JSON.stringify(error.received) + "; raw=" + redact(raw).slice(0, 4000))
+        raw = await evaluator("Your prior response failed validation (" + error.code + ": " + error.message + "). Return a corrected JSON object only. The canonical taskId must be exactly " + JSON.stringify(review.planTaskId) + ". Do not change the supplied task criteria or invent evidence.", reconciliations)
+        try {
+          result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), requirements.allowEvidenceFreeAnalysis, reconciliations)
+        } catch (retryError) {
+          if (retryError instanceof TodoEvaluationValidationError) {
+            logger.warn("[FeedbackEvaluator] Correction response still invalid (code=" + retryError.code + ", field=" + (retryError.field ?? "root") + "): " + retryError.message + "; expected=" + JSON.stringify(retryError.expected) + "; received=" + JSON.stringify(retryError.received) + "; raw=" + redact(raw).slice(0, 4000))
+          }
+          throw retryError
         }
-        throw retryError
       }
     }
     if (result.decision === "accept" && requirements.requireWorkspaceChanges && !requirements.hasVerifiedFileChanges) {

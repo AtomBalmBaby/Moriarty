@@ -7,14 +7,18 @@ import type { RoleInference, RoleResolution } from "../../extension/chat/role-in
 
 const captureLogs = async <T>(run: () => Promise<T>) => {
   const records: string[] = []
-  const { info, warn } = logger
+  const { info, warn, debug, trace } = logger
   logger.info = (message) => records.push(message)
   logger.warn = (message) => records.push(message)
+  logger.debug = (message) => records.push(message)
+  logger.trace = (message) => records.push(message)
   try {
     return { result: await run(), records }
   } finally {
     logger.info = info
     logger.warn = warn
+    logger.debug = debug
+    logger.trace = trace
   }
 }
 

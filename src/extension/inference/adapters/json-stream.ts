@@ -62,13 +62,11 @@ export const responseError = async (response: Response) => {
  */
 export const logRequest = (url: string, body: unknown) => {
   const payload = body && typeof body === "object" ? (body as Record<string, unknown>) : {}
-  logger.debug(
-    `[Inference] request.metadata ${JSON.stringify({
-      endpoint: endpointOf(url),
-      model: payload.model,
-      fields: Object.keys(payload).filter((key) => key !== "prompt" && key !== "messages")
-    })}`
-  )
+  inferenceEvent("request.metadata", {
+    endpoint: endpointOf(url),
+    model: payload.model,
+    fields: Object.keys(payload).filter((key) => key !== "prompt" && key !== "messages")
+  })
 }
 
 export interface JsonStreamRequest {
@@ -363,6 +361,6 @@ export async function* streamJsonLines(
       duration_ms: Math.round(performance.now() - startedClock),
       active_requests: activeHttpAttempts,
       queued_requests: 0
-    }, terminalState === "failed" || terminalState === "timeout" ? "warn" : "info")
+    }, terminalState === "failed" || terminalState === "timeout" ? "warn" : "debug")
   }
 }

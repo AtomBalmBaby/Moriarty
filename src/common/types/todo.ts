@@ -37,11 +37,25 @@ export type TodoEvaluationDecision = "accept" | "revise" | "needs_evidence" | "b
  * Deterministic result for one criterion. `semantic` marks criteria that name
  * no checkable source path or runtime fact; those remain with the Feedback AI.
  */
+/** A checked source location: where a symbol is declared, and the fingerprint it was read under. */
+export interface TodoSourceFact {
+  symbol: string
+  path: string
+  startLine: number
+  endLine: number
+  observationId: string
+  sourceHash: string
+}
+
 export interface TodoCriterionReconciliation {
   outcome: "proven" | "disproven" | "unknown" | "semantic"
   supportingObservationIds: string[]
   missing: string[]
   version: number
+  /** Source locations this outcome proves; recorded as accepted evidence when the task is accepted. */
+  facts?: TodoSourceFact[]
+  /** `accepted` when previously accepted, still-fresh facts satisfied the criterion without this task's reads. */
+  reuse?: "accepted"
 }
 
 export interface TodoEvaluationCriterion {

@@ -143,10 +143,11 @@ test("streams text, then the calls and usage when the response completes", async
   }))
   try {
     const records: string[] = []
-    const info = logger.info
-    const warn = logger.warn
+    const { info, warn, debug, trace } = logger
     logger.info = (message) => records.push(message)
     logger.warn = (message) => records.push(message)
+    logger.debug = (message) => records.push(message)
+    logger.trace = (message) => records.push(message)
     let chunks: ChatChunk[]
     try {
       chunks = await collect(
@@ -178,6 +179,8 @@ test("streams text, then the calls and usage when the response completes", async
     } finally {
       logger.info = info
       logger.warn = warn
+      logger.debug = debug
+      logger.trace = trace
     }
     const lifecycle = records
       .filter((record) => record.startsWith("[Inference]"))
@@ -188,6 +191,7 @@ test("streams text, then the calls and usage when the response completes", async
             unknown
           >
       )
+      .filter((event) => String(event.event).startsWith("http_attempt."))
     assert.deepStrictEqual(
       lifecycle.map((event) => event.event),
       [

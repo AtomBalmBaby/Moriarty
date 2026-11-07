@@ -310,7 +310,7 @@ export class CompletionProvider
     ])
     if (!prepared || this.isStale(request)) return
     const { prompt, context } = prepared
-    logger.info(
+    logger.debug(
       `FIM #${request.id} → ${provider.modelName} · ${where} · ` +
         `prompt ${formatCount(prompt.length)} chars`
     )
@@ -405,7 +405,7 @@ export class CompletionProvider
       return
     }
     if (!completion) {
-      logger.info(outcome("nothing usable"))
+      logger.debug(outcome("nothing usable"))
       return
     }
 
@@ -420,7 +420,7 @@ export class CompletionProvider
     )
 
     const lines = formatted.split("\n").length
-    logger.info(
+    logger.debug(
       outcome(
         formatted
           ? `${formatted.length} chars, ${lines} line${lines === 1 ? "" : "s"}${multiline ? "" : " (single-line mode)"}`

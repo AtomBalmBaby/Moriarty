@@ -516,7 +516,7 @@ const startSdkAttempt = (
         queued_requests: 0,
         response_headers: "not-exposed-by-provider-sdk"
       },
-      state === "failed" ? "warn" : "info"
+      state === "failed" ? "warn" : "debug"
     )
   }
   onAbort = () => {
