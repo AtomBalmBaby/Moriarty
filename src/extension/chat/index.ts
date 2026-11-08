@@ -64,7 +64,7 @@ import { describeProviderError, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest } from "../todos/types"
@@ -1661,11 +1661,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       const active = await this._todoRepository.getActiveIntentContext(scope)
       if (!active) return
       const live = (await this._todoRepository.listAcceptedEvidence(scope)).filter((fact) => !fact.supersededBy)
+      const lookup = evidenceCheckRecord(live)
       await this._todoRepository.recordToolObservation(scope, {
         itemId: active.task.id,
         toolName: EVIDENCE_CHECK_TOOL,
-        arguments: { scope: "project", factCount: String(live.length), factIds: live.slice(0, 20).map((fact) => fact.id).join(",") },
-        output: `Accepted-evidence check: ${live.length} live accepted fact(s) in this project.`,
+        arguments: lookup.arguments,
+        output: lookup.output,
         failed: false,
         requestId
       })

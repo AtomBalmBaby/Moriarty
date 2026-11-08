@@ -11,7 +11,7 @@ import { resolveAgentToolSelection } from "../../extension/agents/tool-selection
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
 import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, parseFeedbackPlanResponse, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
-import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidencePreflight, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, reconcileCriteria, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
+import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, reconcileCriteria, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { AcceptedFact, ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, SymbolAlias, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
@@ -3402,6 +3402,108 @@ test("accepted-evidence check: a subset-only, failed, or non-behavioral check do
   const behavior = await reconcileCriteria(["Verified that the accepted evidence handles missing files correctly"], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" })], undefined, [])
   assert.equal(behavior[0].outcome, "semantic", "a behavioral criterion about accepted evidence is still judged, not decided by a count")
 })
+
+const CHECK_TASK = "Check for existing accepted evidence of native read_file implementation"
+const INQUIRY_CRITERION = "Confirm whether accepted evidence exists."
+const dependentLivePlan = [
+  { id: "check", title: CHECK_TASK, acceptance: INQUIRY_CRITERION },
+  { id: "locate-native-read-file", title: LIVE_TASK, acceptance: LIVE_CRITERIA, dependencies: ["check"] }
+]
+/** Records the host's lookup through the production record builder; overrides model a failed, filtered, or mis-scoped lookup. */
+const recordLookup = (state: FeedbackFixture, title: string, live: AcceptedFact[], requestId: string, overrides: { failed?: boolean; toolName?: string; arguments?: Record<string, string> } = {}) => {
+  const lookup = evidenceCheckRecord(live)
+  return state.repository.recordToolObservation(state.scope, {
+    itemId: itemTitled(state, title).id,
+    toolName: overrides.toolName ?? EVIDENCE_CHECK_TOOL,
+    arguments: overrides.arguments ?? lookup.arguments,
+    output: lookup.output,
+    failed: overrides.failed ?? false,
+    requestId
+  })
+}
+
+test("inquiry: a completed project-wide lookup proves the requirement whether it found facts or none, and claims are still decided by count", async () => {
+  const found = await reconcileCriteria([INQUIRY_CRITERION], [evidenceCheck({ scope: "project", factCount: "1", factIds: "fact-live", resolution: "found" })], undefined, [acceptedFact("fact-live")])
+  assert.equal(found[0].outcome, "proven")
+  const none = await reconcileCriteria([INQUIRY_CRITERION], [evidenceCheck({ scope: "project", factCount: "0", factIds: "", resolution: "none" })], undefined, [])
+  assert.equal(none[0].outcome, "proven", "a successful none answers the question; it is not a failed requirement")
+  const laterFact = await reconcileCriteria([INQUIRY_CRITERION], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" })], undefined, [acceptedFact("later", { acceptedAt: "2026-06-01T00:00:00.000Z" })])
+  assert.equal(laterFact[0].outcome, "proven", "a lookup that was performed stays proof that it occurred")
+  const claim = await reconcileCriteria(["Accepted evidence exists for this project"], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" })], undefined, [])
+  assert.equal(claim[0].outcome, "disproven", "a presence claim still needs a live matching fact")
+  const failed = await reconcileCriteria([INQUIRY_CRITERION], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" }, true)], undefined, [])
+  assert.equal(failed[0].outcome, "semantic", "a failed lookup did not answer the question")
+  const filtered = await reconcileCriteria([INQUIRY_CRITERION], [evidenceCheck({ scope: "subject", factCount: "0", factIds: "" })], undefined, [])
+  assert.equal(filtered[0].outcome, "semantic", "a subject-filtered lookup is not comprehensive for a project-wide inquiry")
+})
+
+const lookupOutcomes: [string, AcceptedFact[]][] = [["found", [acceptedFact("fact-live")]], ["none", []]]
+for (const [label, live] of lookupOutcomes) {
+  test(`live regression (${label}): the two-TODO dependent plan proves the lookup, releases the dependent TODO, and reuses the existing read`, async () => {
+    const workspace = sourceWorkspace()
+    const reads = { count: 0 }
+    const state = await fixture(dependentLivePlan, false, EVIDENCE_REQUEST)
+    try {
+      let feedbackCalls = 0
+      const feedback = async (): Promise<string> => {
+        feedbackCalls += 1
+        throw new Error("Feedback must not judge a host-proven lookup or a criterion the host decided")
+      }
+      await claimTask(state, CHECK_TASK, "check-claim")
+      const read = await runReadFile(workspace, reads, "169", "220")
+      await recordRead(state, itemTitled(state, CHECK_TASK).id, "existing-read", read)
+      await recordLookup(state, CHECK_TASK, live, "check-observation")
+      const first = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, CHECK_TASK).id), feedback, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+      assert.equal(first.criteria[0].reconciliation!.outcome, "proven")
+      assert.equal(first.decision, "accept")
+      assert.equal(await statusOf(state, CHECK_TASK), "completed")
+      const dependent = (await state.repository.getReviewPackages(state.scope, { includeOpen: true })).find((candidate) => candidate.task.id === itemTitled(state, LIVE_TASK).id)!
+      assert.equal(dependent.dependencies[0]?.status, "completed")
+      assert.ok(dependenciesComplete(dependent), "a completed negative prerequisite does not block its dependent TODO")
+      await claimTask(state, LIVE_TASK, "locate-claim")
+      const verdict = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), feedback, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+      assert.equal(verdict.decision, "accept")
+      assert.equal(await statusOf(state, LIVE_TASK), "completed")
+      assert.equal(reads.count, 1, "the dependent TODO reuses the existing read instead of repeating it")
+      assert.equal(feedbackCalls, 0, "no contradictory rejection and no continuation occurs")
+    } finally {
+      removeAll(state.directory, workspace)
+    }
+  })
+}
+
+test("live regression: a failed lookup, a filtered or subject-scoped lookup, an absent record, or another project's lookup does not prove the inquiry", async () => {
+  const cases: { name: string; record?: (state: FeedbackFixture) => Promise<unknown> }[] = [
+    { name: "failed lookup", record: (state) => recordLookup(state, CHECK_TASK, [], "check-failed", { failed: true }) },
+    { name: "filtered native lookup", record: (state) => recordLookup(state, CHECK_TASK, [], "check-filtered", { toolName: "twinny_evidence_lookup", arguments: { symbol: "read_file", path: READ_FILE_SOURCE } }) },
+    { name: "subject-scoped check", record: (state) => recordLookup(state, CHECK_TASK, [], "check-subject", { arguments: { scope: "subject", factCount: "0", factIds: "" } }) },
+    { name: "absent lookup record" },
+    { name: "another project's lookup", record: async () => undefined }
+  ]
+  for (const testCase of cases) {
+    const state = await fixture([dependentLivePlan[0]], false, EVIDENCE_REQUEST)
+    const other = await fixture([dependentLivePlan[0]], false, EVIDENCE_REQUEST)
+    try {
+      await claimTask(state, CHECK_TASK, "check-claim")
+      if (testCase.name === "another project's lookup") {
+        await claimTask(other, CHECK_TASK, "other-claim")
+        await recordLookup(other, CHECK_TASK, [], "other-check")
+      } else {
+        await testCase.record?.(state)
+      }
+      let feedbackCalls = 0
+      await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, CHECK_TASK).id), async () => {
+        feedbackCalls += 1
+        throw new Error("Feedback decides a criterion the host could not prove")
+      }, "mock-reviewer").catch(() => undefined)
+      assert.equal(feedbackCalls, 1, `${testCase.name}: the criterion is not host-proven`)
+      assert.notEqual(await statusOf(state, CHECK_TASK), "completed", `${testCase.name}: the TODO does not complete`)
+    } finally {
+      removeAll(state.directory, other.directory)
+    }
+  }
+})
+
 
 test("live regression: the host's accepted-evidence check proves absence for the TODO with no Feedback call and completes it", async () => {
   const state = await fixture([{ id: "locate-native-read-file", title: LIVE_TASK, acceptance: [EVIDENCE_CHECK_CRITERION] }], false, EVIDENCE_REQUEST)

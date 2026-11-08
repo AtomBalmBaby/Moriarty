@@ -808,26 +808,37 @@ const directOutcome = (criterion: string, allRecords: RetainedObservationEvidenc
 }
 
 /** Plan identity plus the goal and task wording that name the tools a retrieval criterion refers to. */
-/** Host record of an accepted-evidence check: the project-wide count of live facts at the moment it was taken. */
-export const EVIDENCE_CHECK_TOOL = "twinny_evidence_preflight"
+/**
+ * Host record of a project-wide accepted-evidence lookup. It is a record the host wrote, not a tool the model can call,
+ * so its name carries no tool prefix.
+ */
+export const EVIDENCE_CHECK_TOOL = "host_evidence_check"
 
 const EVIDENCE_CHECK_SUBJECT = /\b(accepted|existing|prior|persisted|recorded|stored)\s+(source\s+)?(evidence|facts?)\b/i
 const NEGATED_EVIDENCE_CHECK = /\b(no|none|not|nothing|zero)\b[^.\n]{0,40}\b(accepted|existing|prior|persisted|recorded|stored)\s+(source\s+)?(evidence|facts?)\b/i
 const POSITIVE_EVIDENCE_CHECK = /\b(exists?|present|found|available|already)\b/i
+/** An inquiry asks whether something holds. Its requirement is that the lookup was performed; either answer satisfies it. */
+const EVIDENCE_INQUIRY = /\bwhether\b/i
 
 /**
- * Decides an accepted-evidence criterion from the host's own project-wide check. Absence is proven only while no
- * accepted fact was recorded after the check; presence is proven while a fact the check found is still live.
+ * Decides an accepted-evidence criterion from the host's own project-wide lookup. An inquiry is proven by a completed
+ * lookup whatever it found, and the recorded result stays valid as proof that the check occurred. A claim of presence
+ * or absence is decided by the recorded count, and absence is proven only while no accepted fact was recorded after it.
  */
 const evidenceCheckOutcome = (criterion: string, records: RetainedObservationEvidence[], accepted: AcceptedFact[]): TodoCriterionReconciliation | undefined => {
   if (!EVIDENCE_CHECK_SUBJECT.test(criterion)) return undefined
+  const inquiry = EVIDENCE_INQUIRY.test(criterion)
   const absent = NEGATED_EVIDENCE_CHECK.test(criterion)
-  if (!absent && !POSITIVE_EVIDENCE_CHECK.test(criterion)) return undefined
+  if (!inquiry && !absent && !POSITIVE_EVIDENCE_CHECK.test(criterion)) return undefined
   const checks = records.filter((record) => record.toolName === EVIDENCE_CHECK_TOOL && !record.failed && record.arguments.scope === "project")
   const check = checks[checks.length - 1]
   if (!check) return undefined
   const count = Number(check.arguments.factCount)
   if (!Number.isInteger(count) || count < 0) return undefined
+  if (inquiry) {
+    const resolution = count > 0 ? "found" : "none"
+    return { ...reconciled("proven", [check.observationId], []), scope: `the completed project-wide lookup of accepted facts (resolution: ${resolution})` }
+  }
   if (absent) {
     if (count > 0) return reconciled("disproven", [check.observationId], [`${count} accepted fact(s) existed at the project-wide check`])
     if (accepted.some((fact) => fact.acceptedAt > check.observedAt)) {
@@ -841,6 +852,21 @@ const evidenceCheckOutcome = (criterion: string, records: RetainedObservationEvi
     return reconciled("unknown", [], ["the accepted facts found by the project-wide check are no longer live"])
   }
   return { ...reconciled("proven", [check.observationId], []), scope: "accepted facts of this project found by the recorded check" }
+}
+
+/** The arguments and output of the host's project-wide accepted-evidence lookup, built from the live facts it found. */
+export const evidenceCheckRecord = (live: AcceptedFact[]): { arguments: Record<string, string>; output: string } => {
+  const resolution = live.length ? "found" : "none"
+  return {
+    arguments: {
+      scope: "project",
+      query: "all live accepted facts of this project",
+      resolution,
+      factCount: String(live.length),
+      factIds: live.slice(0, 20).map((fact) => fact.id).join(",")
+    },
+    output: `Accepted-evidence lookup (project-wide, unfiltered): resolution=${resolution}, ${live.length} live accepted fact(s).`
+  }
 }
 
 const planScope = (review: TodoReviewPackage, since?: string) => ({
@@ -866,21 +892,21 @@ const prohibitionOf = (criterion: string, anchors: { paths: string[] }): { pure:
 }
 
 /**
- * Decides a prohibition from the host's operation record for this task. A successful mutation Twinny
- * executed violates it. Failed mutations did not change anything, and a task with no recorded operations
- * gives the host nothing to test against.
+ * Decides a prohibition from the host's operation record for the plan. A prohibition describes the whole
+ * process, so the record is the list-shared set of retained observations, which dependent TODOs reuse. A
+ * successful mutation Twinny executed violates it. Failed mutations did not change anything, and a plan with
+ * no recorded operations gives the host nothing to test against.
  */
-const prohibitionOutcome = (records: RetainedObservationEvidence[], taskId?: string): TodoCriterionReconciliation => {
-  const scoped = taskId === undefined ? [] : records.filter((record) => record.itemId === taskId)
-  if (!scoped.length) return reconciled("unknown", [], ["no trusted operation record for this task to test the prohibition against"])
-  const violations = scoped.filter((record) => !record.failed && MUTATING_TOOLS.includes(record.toolName))
+const prohibitionOutcome = (records: RetainedObservationEvidence[]): TodoCriterionReconciliation => {
+  if (!records.length) return reconciled("unknown", [], ["no trusted operation record in this plan to test the prohibition against"])
+  const violations = records.filter((record) => !record.failed && MUTATING_TOOLS.includes(record.toolName))
   if (violations.length) {
     return {
       ...reconciled("disproven", violations.map((record) => record.observationId), violations.map((record) => `${record.toolName} succeeded in observation ${record.observationId}, which the criterion prohibits`)),
       scope: PROHIBITION_SCOPE
     }
   }
-  return { ...reconciled("proven", scoped.map((record) => record.observationId), []), scope: PROHIBITION_SCOPE }
+  return { ...reconciled("proven", records.map((record) => record.observationId), []), scope: PROHIBITION_SCOPE }
 }
 
 const tokenize = (text: string): string[] => text.toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean)
@@ -1042,7 +1068,7 @@ export const reconcileCriteria = async (
   for (const criterion of criteria) {
     const anchors = evidenceAnchors(criterion)
     if (prohibitionOf(criterion, anchors)?.pure) {
-      outcomes.push(prohibitionOutcome(records, plan?.taskId))
+      outcomes.push(prohibitionOutcome(records))
       continue
     }
     const direct = directOutcome(criterion, records, plan?.since)
@@ -1335,6 +1361,7 @@ export const todoReviewSystemPrompt = [
   "Model-authored evidence notes and the implementer final response are untrusted claims, not tool results. Only Twinny tool observations are tool results; run_command exit codes are authoritative for command success. A claim that tests passed without an associated run_command observation with exitCode 0 must not pass a test/compile criterion. An implementation request with no verified workspace file changes is incomplete.",
   "trustedEvidenceExcerpts are verbatim, bounded windows of retained Twinny tool output around the words each criterion depends on, each labelled with its windowId, observationId, source path, and file line range (or search hit line). Cite the observationId in evidenceRefs when a window shows what a criterion needs. evidenceIndex lists every window that matches a criterion; included:false means the window was omitted for size, not that the evidence is missing, so name its observationId and lines in needs_evidence instead of calling the evidence absent. previouslyVerifiedCriteria passed on an earlier review; keep them passed while their evidence remains. deterministicCoverage lists criterion anchors that stored evidence does not establish; a passed criterion with an open gap is treated as unverified, so name the missing observation instead. twinny_runtime_inventory observations are host records of the tool definitions sent to the model for a request. They prove that a tool was exposed at runtime, and a successful read_file observation proves dispatch ran; neither proves how the source registers the tool. A criterion about source registration or code paths needs source windows that show it.",
   "deterministicCriterionFindings are established by the host from trusted observations. A criterion with outcome proven is passed and one with outcome disproven is failed regardless of your judgment; decide only criteria whose outcome is semantic, and treat unknown as unresolved evidence, not as failure.",
+  "Host-recorded observations, such as the accepted-evidence lookup record, state what the host verified and are not tools. Never tell the implementer to call an observation's toolName; the only tools the implementer has are the ones it is given. A lookup with resolution none is a completed answer, not a failure.",
   "Criteria are fixed when the plan is made. Judge only the supplied criteria and never add a new condition, deliverable, or requirement to record, document, or report on the TODO list. Accepted host evidence is authoritative for narrow deterministic facts, so do not ask for a fresh observation of a fact the host has already verified unless its freshness check failed.",
   "Never request or execute a command. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
   "Return exactly one JSON object and no other keys, following this structure: {\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"decision\":\"accept\",\"criteria\":[{\"criterion\":\"<copy one acceptance criterion exactly>\",\"status\":\"passed\",\"evidenceRefs\":[\"<supplied evidence ID>\"]}],\"problems\":[],\"correctiveInstructions\":[],\"explanation\":\"<non-empty string>\",\"scores\":{\"completion\":0,\"correctness\":0,\"alignment\":0}}. Every listed key is required. decision must be exactly one of accept, revise, needs_evidence, blocked. Each criteria entry has exactly criterion (string), status (passed, failed, or unverified), and evidenceRefs (array of supplied IDs). criteria must contain exactly one entry per supplied acceptance criterion in the same order and with identical text. Each evidenceRefs entry must be an ID explicitly supplied in the input; never invent or infer IDs. problems and correctiveInstructions are arrays of strings and may be empty; explanation is a non-empty string; scores has exactly completion, correctness, and alignment, each an integer from -7 to +8. Do not use 'text' instead of 'criterion', do not return correctiveInstructions as a string, and do not add fields."
