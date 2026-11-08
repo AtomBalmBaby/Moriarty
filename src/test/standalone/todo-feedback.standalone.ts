@@ -6,11 +6,12 @@ import { test } from "node:test"
 import initSqlJs from "sql.js"
 
 import { logger } from "../../common/logger"
+import type { TodoCriterionReconciliation } from "../../common/types/todo"
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
 import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, parseFeedbackPlanResponse, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
-import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, DETERMINISTIC_EVALUATOR, evaluateTodoReview, evidencePreflight, feedbackContext, parseTodoEvaluation, provenTodoEvaluation, reconcileCriteria, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
+import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidencePreflight, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, reconcileCriteria, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { AcceptedFact, ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, SymbolAlias, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
@@ -21,7 +22,7 @@ import { todoWorkspaceTools } from "../../extension/tools/todos"
 import { type EditSink, type ToolResult,workspaceTools } from "../../extension/tools/workspace"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
-const plan = (tasks: { id: string; acceptance: string | string[]; dependencies?: string[] }[], goal = "Verify the requested work") => ({
+const plan = (tasks: { id: string; title?: string; acceptance: string | string[]; dependencies?: string[] }[], goal = "Verify the requested work") => ({
   planId: "feedback-plan",
   version: 1 as const,
   revision: 1,
@@ -29,14 +30,14 @@ const plan = (tasks: { id: string; acceptance: string | string[]; dependencies?:
   constraints: ["Preserve existing behavior"],
   tasks: tasks.map((task) => ({
     id: task.id,
-    title: task.id,
+    title: task.title ?? task.id,
     description: `Work for ${task.id}`,
     acceptanceCriteria: Array.isArray(task.acceptance) ? task.acceptance : [task.acceptance],
     dependencies: task.dependencies ?? []
   }))
 })
 
-const fixture = async (tasks: { id: string; acceptance: string | string[]; dependencies?: string[] }[], complete = true, goal = "Verify the requested work") => {
+const fixture = async (tasks: { id: string; title?: string; acceptance: string | string[]; dependencies?: string[] }[], complete = true, goal = "Verify the requested work") => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-feedback-"))
   const databasePath = path.join(directory, "twinny-state.sqlite")
   const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///feedback-project"]), conversationId: "feedback-chat", writer: "feedback-chat" }
@@ -3204,6 +3205,440 @@ test("Scenario B: a reopened repository in a new conversation resolves the persi
     assert.equal(reads.count, 1, "the new conversation issues no read")
   } finally {
     removeAll(first.directory, workspace)
+  }
+})
+
+const FILENAME_CRITERION = "The filename of the implementation is identified"
+const RANGE_CRITERION = "The implementation line range (start and end line numbers) is specified"
+const FINGERPRINT_CRITERION = "The authoritative source fingerprint is obtained via read_file"
+const NO_MODIFICATION_CRITERION = "No files are modified during the process"
+const SEMANTIC_CRITERION = "The implementation handles malformed input gracefully"
+const LIVE_TASK = "Locate the native read_file implementation"
+const LIVE_CRITERIA = [FILENAME_CRITERION, RANGE_CRITERION, FINGERPRINT_CRITERION, NO_MODIFICATION_CRITERION]
+const livePlan = [{ id: "locate-native-read-file", title: LIVE_TASK, acceptance: LIVE_CRITERIA }]
+
+test("live regression: planner criteria are resolved by the host from one authoritative read, and the TODO completes without Feedback or continuation", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(livePlan, false, EVIDENCE_REQUEST)
+  try {
+    const preflight = await evidencePreflight(EVIDENCE_REQUEST, await state.repository.listAcceptedEvidence(state.scope), await state.repository.listSymbolAliases(state.scope), sourceReader(workspace))
+    assert.equal(preflight.status, "missing")
+
+    await claimTask(state, LIVE_TASK, "live-claim")
+    const read = await runReadFile(workspace, reads, "169", "220")
+    const observation = await recordRead(state, itemTitled(state, LIVE_TASK).id, "live-read", read)
+    let evaluatorCalls = 0
+    const verdict = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), async () => {
+      evaluatorCalls += 1
+      throw new Error("Feedback must not judge criteria the host has proven")
+    }, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    assert.equal(evaluatorCalls, 0)
+    assert.equal(verdict.decision, "accept")
+    assert.deepEqual(verdict.criteria.map((criterion) => criterion.status), ["passed", "passed", "passed", "passed"])
+
+    const [filename, range, fingerprint, prohibition] = verdict.criteria.map((criterion) => criterion.reconciliation!)
+    assert.equal(filename.outcome, "proven")
+    assert.deepEqual(filename.supportingObservationIds, [observation.id])
+    assert.equal(range.outcome, "proven")
+    assert.equal(fingerprint.outcome, "proven")
+    assert.equal(prohibition.outcome, "proven", "a read modifies nothing, so the prohibition holds")
+    assert.match(prohibition.scope ?? "", /shell/, "the claim is bounded to operations Twinny controls")
+
+    const fact = (await state.repository.listAcceptedEvidence(state.scope)).find((candidate) => candidate.path === READ_FILE_SOURCE)!
+    assert.equal(fact.startLine, 169)
+    assert.equal(fact.endLine, 220)
+    assert.equal(fact.sourceHash, await fingerprintContent(realWorkspaceSource))
+    assert.equal(await statusOf(state, LIVE_TASK), "completed")
+
+    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [], "nothing remains to complete, so no continuation is needed")
+    assert.equal(evaluatorCalls, 0)
+    assert.equal(reads.count, 1, "one authoritative read establishes every source fact")
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const later = { projectFingerprint: state.scope.projectFingerprint, conversationId: "later-chat", writer: "later-chat" }
+    await reopened.synchronizeIntentPlan(later, plan(livePlan, EVIDENCE_REQUEST), { prompt: EVIDENCE_REQUEST })
+    const laterPreflight = await evidencePreflight(EVIDENCE_REQUEST, await reopened.listAcceptedEvidence(later), await reopened.listSymbolAliases(later), sourceReader(workspace))
+    assert.equal(laterPreflight.status, "fresh")
+    assert.ok(renderEvidencePreflight(laterPreflight).includes(fact.sourceHash), "the next conversation receives the fingerprint")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("live regression: a reviewer rejection that claims every criterion is satisfied cannot overturn host-proven facts, and its explanation stays distinct from its decision", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture([{ id: "locate-native-read-file", title: LIVE_TASK, acceptance: [...LIVE_CRITERIA, SEMANTIC_CRITERION] }], false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, LIVE_TASK, "contradiction-claim")
+    const read = await runReadFile(workspace, reads, "169", "220")
+    const observation = await recordRead(state, itemTitled(state, LIVE_TASK).id, "contradiction-read", read)
+    const review = await reviewOf(state, itemTitled(state, LIVE_TASK).id)
+    const explanation = "Rejected, although every mandatory criterion is satisfied by the observations."
+    const contradictory = JSON.stringify({
+      schemaVersion: 1,
+      taskId: review.planTaskId,
+      decision: "revise",
+      criteria: review.acceptanceCriteria.map((criterion) => ({ criterion, status: "failed", evidenceRefs: [observation.id] })),
+      problems: [],
+      correctiveInstructions: ["Explain how the semantic criterion is satisfied by the read."],
+      explanation,
+      scores: { completion: 6, correctness: 6, alignment: 6 }
+    })
+    let evaluatorCalls = 0
+    const verdict = await evaluateTodoReview(state.repository, state.scope, review, async () => {
+      evaluatorCalls += 1
+      return contradictory
+    }, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+
+    assert.equal(evaluatorCalls, 1, "only the semantic criterion is left for Feedback")
+    const objective = verdict.criteria.filter((criterion) => LIVE_CRITERIA.includes(criterion.criterion))
+    assert.deepEqual(objective.map((criterion) => criterion.status), ["passed", "passed", "passed", "passed"], "host-proven criteria are not demoted by the reviewer")
+    assert.equal(verdict.criteria.find((criterion) => criterion.criterion === SEMANTIC_CRITERION)!.status, "failed")
+    assert.equal(verdict.decision, "revise", "a genuinely failed semantic criterion keeps the decision open")
+    assert.equal(verdict.explanation, explanation, "the reviewer's explanation is preserved as prose, not as proof")
+    assert.equal(await statusOf(state, LIVE_TASK), "in_progress", "the TODO is sent back for work, not completed, from the contradictory verdict")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("live regression: passive provenance wording and a 'do not modify' prohibition are proven from the same read, with no Feedback call", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const criteria = ["Verified: the filename of the implementation is identified", RANGE_CRITERION, "Do not modify any files"]
+  const state = await fixture([{ id: "locate-native-read-file", title: LIVE_TASK, acceptance: criteria }], false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, LIVE_TASK, "passive-claim")
+    const read = await runReadFile(workspace, reads, "169", "220")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "passive-read", read)
+    let evaluatorCalls = 0
+    const verdict = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), async () => {
+      evaluatorCalls += 1
+      throw new Error("Feedback must not judge criteria the host has proven")
+    }, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    assert.equal(evaluatorCalls, 0)
+    assert.deepEqual(verdict.criteria.map((criterion) => criterion.reconciliation!.outcome), ["proven", "proven", "proven"])
+    assert.equal(verdict.decision, "accept")
+    assert.equal(await statusOf(state, LIVE_TASK), "completed")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("a provenance criterion about a subject the task never names is not resolved by the host and goes to Feedback", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture([{ id: "locate-native-read-file", title: LIVE_TASK, acceptance: ["The filename of the cache is identified"] }], false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, LIVE_TASK, "cache-claim")
+    const read = await runReadFile(workspace, reads, "169", "220")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "cache-read", read)
+    let evaluatorCalls = 0
+    await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), async () => {
+      evaluatorCalls += 1
+      throw new Error("Feedback review requested")
+    }, "mock-reviewer", { readCurrentSource: sourceReader(workspace) }).catch(() => undefined)
+    assert.equal(evaluatorCalls, 1, "an unanchored subject is a judgment, not a host fact")
+    assert.notEqual(await statusOf(state, LIVE_TASK), "completed")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+const EVIDENCE_CHECK_CRITERION = "Verified that no existing accepted evidence is present project-wide"
+const evidenceCheck = (args: Record<string, string>, failed = false): RetainedObservationEvidence => ({
+  ...commandRecord("", 0, "obs-evidence-check", failed),
+  toolName: EVIDENCE_CHECK_TOOL,
+  itemId: "locate",
+  arguments: args
+})
+const acceptedFact = (id: string, overrides: Partial<AcceptedFact> = {}): AcceptedFact => ({
+  id,
+  symbol: "readFile",
+  path: READ_FILE_SOURCE,
+  startLine: 169,
+  endLine: 220,
+  observationId: `obs-${id}`,
+  sourceHash: "hash",
+  conversationId: "chat",
+  itemId: "locate",
+  criterionIndex: 0,
+  criterion: "criterion",
+  toolName: "read_file",
+  planId: "plan",
+  planRevision: 1,
+  acceptedAt: "2024-01-01T00:00:00.000Z",
+  ...overrides
+})
+
+test("accepted-evidence check: the host's project-wide check proves absence, and a later accepted fact makes it unknown", async () => {
+  const none = await reconcileCriteria([EVIDENCE_CHECK_CRITERION], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" })], undefined, [])
+  assert.equal(none[0].outcome, "proven")
+  assert.deepEqual(none[0].supportingObservationIds, ["obs-evidence-check"])
+  const stale = await reconcileCriteria([EVIDENCE_CHECK_CRITERION], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" })], undefined, [acceptedFact("late", { acceptedAt: "2026-06-01T00:00:00.000Z" })])
+  assert.equal(stale[0].outcome, "unknown", "a fact accepted after the check invalidates the absence it proved")
+  const present = await reconcileCriteria([EVIDENCE_CHECK_CRITERION], [evidenceCheck({ scope: "project", factCount: "2", factIds: "" })], undefined, [])
+  assert.equal(present[0].outcome, "disproven", "the check found accepted facts, so absence is contradicted")
+})
+
+test("accepted-evidence check: presence is proven only by a fact the check found that is still live", async () => {
+  const criterion = "Verified that accepted facts for this project are present"
+  const check = evidenceCheck({ scope: "project", factCount: "1", factIds: "fact-live" })
+  const [live] = await reconcileCriteria([criterion], [check], undefined, [acceptedFact("fact-live")])
+  assert.equal(live.outcome, "proven")
+  const [superseded] = await reconcileCriteria([criterion], [check], undefined, [acceptedFact("fact-live", { supersededBy: "fact-new" })])
+  assert.equal(superseded.outcome, "unknown", "a found fact that has since been superseded no longer proves presence")
+  const [empty] = await reconcileCriteria([criterion], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" })], undefined, [])
+  assert.equal(empty.outcome, "disproven")
+})
+
+test("accepted-evidence check: a subset-only, failed, or non-behavioral check does not decide the criterion", async () => {
+  const subset = await reconcileCriteria([EVIDENCE_CHECK_CRITERION], [evidenceCheck({ scope: "subject", factCount: "0", factIds: "" })], undefined, [])
+  assert.equal(subset[0].outcome, "semantic", "a check of one subject does not prove project-wide absence")
+  const failed = await reconcileCriteria([EVIDENCE_CHECK_CRITERION], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" }, true)], undefined, [])
+  assert.equal(failed[0].outcome, "semantic")
+  const behavior = await reconcileCriteria(["Verified that the accepted evidence handles missing files correctly"], [evidenceCheck({ scope: "project", factCount: "0", factIds: "" })], undefined, [])
+  assert.equal(behavior[0].outcome, "semantic", "a behavioral criterion about accepted evidence is still judged, not decided by a count")
+})
+
+test("live regression: the host's accepted-evidence check proves absence for the TODO with no Feedback call and completes it", async () => {
+  const state = await fixture([{ id: "locate-native-read-file", title: LIVE_TASK, acceptance: [EVIDENCE_CHECK_CRITERION] }], false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, LIVE_TASK, "check-claim")
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: itemTitled(state, LIVE_TASK).id,
+      toolName: EVIDENCE_CHECK_TOOL,
+      arguments: { scope: "project", factCount: "0", factIds: "" },
+      output: "Accepted-evidence check: 0 live accepted fact(s) in this project.",
+      failed: false,
+      requestId: "check-observation"
+    })
+    let evaluatorCalls = 0
+    const verdict = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), async () => {
+      evaluatorCalls += 1
+      throw new Error("Feedback must not judge a check the host has recorded")
+    }, "mock-reviewer")
+    assert.equal(evaluatorCalls, 0)
+    assert.equal(verdict.criteria[0].reconciliation!.outcome, "proven")
+    assert.equal(verdict.decision, "accept")
+    assert.equal(await statusOf(state, LIVE_TASK), "completed")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("live regression: a reviewer decision that rejects with no failed criterion is reconciled to its criteria, not its prose", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture([{ id: "locate-native-read-file", title: LIVE_TASK, acceptance: [...LIVE_CRITERIA, SEMANTIC_CRITERION] }], false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, LIVE_TASK, "reconcile-claim")
+    const read = await runReadFile(workspace, reads, "169", "220")
+    const observation = await recordRead(state, itemTitled(state, LIVE_TASK).id, "reconcile-read", read)
+    const review = await reviewOf(state, itemTitled(state, LIVE_TASK).id)
+    let reconciliations: TodoCriterionReconciliation[] = []
+    await evaluateTodoReview(state.repository, state.scope, review, async (_correction, seen) => {
+      reconciliations = seen ?? []
+      return JSON.stringify({
+        schemaVersion: 1,
+        taskId: review.planTaskId,
+        decision: "revise",
+        criteria: review.acceptanceCriteria.map((criterion) => ({ criterion, status: "failed", evidenceRefs: [observation.id] })),
+        problems: [],
+        correctiveInstructions: ["Explain how the semantic criterion is satisfied by the read."],
+        explanation: "Every criterion is satisfied.",
+        scores: { completion: 6, correctness: 6, alignment: 6 }
+      })
+    }, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    assert.equal(reconciliations.length, review.acceptanceCriteria.length)
+
+    const decided = parseTodoEvaluation(JSON.stringify({
+      schemaVersion: 1,
+      taskId: review.planTaskId,
+      decision: "revise",
+      criteria: review.acceptanceCriteria.map((criterion) => ({
+        criterion,
+        status: criterion === SEMANTIC_CRITERION ? "passed" : "failed",
+        evidenceRefs: []
+      })),
+      problems: [],
+      correctiveInstructions: ["Explain how the semantic criterion is satisfied by the read."],
+      explanation: "Every criterion is satisfied.",
+      scores: { completion: 8, correctness: 8, alignment: 8 }
+    }), review, "mock-reviewer", new Date().toISOString(), true, reconciliations)
+    assert.equal(decided.decision, "accept", "no criterion remains failed once the host's proven outcomes are applied")
+    assert.ok(decided.criteria.slice(0, 4).every((criterion) => criterion.status === "passed"))
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("negative: a read that stops before the closing line leaves the range criterion unproven, even when the reviewer says it passed", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(livePlan, false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, LIVE_TASK, "short-claim")
+    const read = await runReadFile(workspace, reads, "169", "219")
+    const observation = await recordRead(state, itemTitled(state, LIVE_TASK).id, "short-read", read)
+    const review = await reviewOf(state, itemTitled(state, LIVE_TASK).id)
+    const verdict = await evaluateTodoReview(state.repository, state.scope, review, async () => JSON.stringify({
+      schemaVersion: 1,
+      taskId: review.planTaskId,
+      decision: "accept",
+      criteria: review.acceptanceCriteria.map((criterion) => ({ criterion, status: "passed", evidenceRefs: [observation.id] })),
+      problems: [],
+      correctiveInstructions: [],
+      explanation: "All criteria are satisfied.",
+      scores: { completion: 8, correctness: 8, alignment: 8 }
+    }), "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+
+    const range = verdict.criteria.find((criterion) => criterion.criterion === RANGE_CRITERION)!
+    assert.notEqual(range.status, "passed", "a positive reviewer claim without trusted evidence does not prove the range")
+    assert.notEqual(range.reconciliation?.outcome, "proven")
+    assert.ok(range.reconciliation?.missing.some((gap) => gap.includes("220")), "the unresolved gap names the closing line")
+    assert.notEqual(verdict.decision, "accept")
+    assert.notEqual(await statusOf(state, LIVE_TASK), "completed")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+/** A later model claim: re-reads the item's current version, so it works after an earlier evaluation changed the version. */
+const reclaim = async (state: FeedbackFixture, title: string, requestId: string) => {
+  const id = itemTitled(state, title).id
+  const current = (await state.repository.getItem(state.scope, id)).item
+  return state.repository.updateItem(state.scope, { itemId: id, expectedVersion: current.version, patch: { status: "in_review" }, actor: "model", requestId })
+}
+
+test("separate evidence: a read stopping at 219 proves the other criteria and leaves only the range open; a later read closes it without Feedback", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(livePlan, false, EVIDENCE_REQUEST)
+  const noFeedback = async () => {
+    throw new Error("Feedback must not judge objective source criteria")
+  }
+  try {
+    await claimTask(state, LIVE_TASK, "split-claim")
+    const first = await runReadFile(workspace, reads, "169", "219")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "split-first", first)
+    const partial = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), noFeedback, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    assert.equal(partial.decision, "needs_evidence")
+    const [filename, range, fingerprint, prohibition] = partial.criteria.map((criterion) => criterion.reconciliation!)
+    assert.equal(filename.outcome, "proven")
+    assert.equal(fingerprint.outcome, "proven")
+    assert.equal(prohibition.outcome, "proven")
+    assert.notEqual(range.outcome, "proven")
+    assert.ok(range.missing.some((gap) => gap.includes("220")), "the outstanding gap names the closing line")
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    const persisted = (await reopened.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === itemTitled(state, LIVE_TASK).id)!.lastEvaluation
+    assert.deepEqual(persisted?.criteria.map((criterion) => criterion.status), ["passed", "unverified", "passed", "passed"], "each criterion's outcome survives a restart")
+    assert.notEqual(await statusOf(state, LIVE_TASK), "completed")
+
+    await reclaim(state, LIVE_TASK, "split-reclaim")
+    const second = await runReadFile(workspace, reads, "200", "230")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "split-second", second)
+    const verdict = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), noFeedback, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    assert.equal(verdict.decision, "accept")
+    assert.deepEqual(verdict.criteria.map((criterion) => criterion.status), ["passed", "passed", "passed", "passed"])
+    assert.equal(await statusOf(state, LIVE_TASK), "completed")
+    assert.equal(reads.count, 2, "each criterion needed only the read that carried its missing fact")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("negative: a boundary read taken after the source changed does not close a range whose registration read is stale", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(livePlan, false, EVIDENCE_REQUEST)
+  const noFeedback = async () => {
+    throw new Error("Feedback must not judge objective source criteria")
+  }
+  try {
+    await claimTask(state, LIVE_TASK, "stale-claim")
+    const first = await runReadFile(workspace, reads, "169", "219")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "stale-first", first)
+    fs.writeFileSync(path.join(workspace, READ_FILE_SOURCE), realWorkspaceSource + "\n")
+    const boundary = await runReadFile(workspace, reads, "200", "230")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "stale-boundary", boundary)
+    const verdict = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), noFeedback, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    const range = verdict.criteria.find((criterion) => criterion.criterion === RANGE_CRITERION)!
+    assert.notEqual(range.reconciliation?.outcome, "proven")
+    assert.ok(range.reconciliation?.missing.some((gap) => gap.includes("changed after observation")), "the stale registration read is named")
+    assert.notEqual(verdict.decision, "accept")
+    assert.notEqual(await statusOf(state, LIVE_TASK), "completed")
+
+    await reclaim(state, LIVE_TASK, "stale-reclaim")
+    const fresh = await runReadFile(workspace, reads, "169", "230")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "stale-fresh", fresh)
+    const accepted = await evaluateTodoReview(state.repository, state.scope, await reviewOf(state, itemTitled(state, LIVE_TASK).id), noFeedback, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    assert.equal(accepted.decision, "accept")
+    assert.equal(await statusOf(state, LIVE_TASK), "completed")
+  } finally {
+    removeAll(state.directory, workspace)
+  }
+})
+
+test("host decision: a review whose criteria are all objective needs no Feedback, even while its range is open; a semantic criterion still does", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const state = await fixture(livePlan, false, EVIDENCE_REQUEST)
+  const semantic = await fixture([{ id: "semantic-task", title: "Semantic task", acceptance: [SEMANTIC_CRITERION] }], false, EVIDENCE_REQUEST)
+  try {
+    await claimTask(state, LIVE_TASK, "decide-claim")
+    const partial = await runReadFile(workspace, reads, "169", "219")
+    await recordRead(state, itemTitled(state, LIVE_TASK).id, "decide-read", partial)
+    assert.equal(await hostDecidesReview(await reviewOf(state, itemTitled(state, LIVE_TASK).id), sourceReader(workspace)), true)
+
+    const claim = await claimTask(semantic, "Semantic task", "semantic-claim")
+    assert.equal(claim.status, "in_review")
+    assert.equal(await hostDecidesReview(await reviewOf(semantic, itemTitled(semantic, "Semantic task").id), sourceReader(workspace)), false)
+  } finally {
+    removeAll(state.directory, semantic.directory, workspace)
+  }
+})
+
+test("negative: a failed write never violates the no-modification criterion, while a successful write disproves it", async () => {
+  const workspace = sourceWorkspace()
+  const reads = { count: 0 }
+  const failedState = await fixture(livePlan, false, EVIDENCE_REQUEST)
+  const successState = await fixture(livePlan, false, EVIDENCE_REQUEST)
+  try {
+    for (const [state, failed] of [[failedState, true], [successState, false]] as const) {
+      await claimTask(state, LIVE_TASK, `write-claim-${failed}`)
+      const read = await runReadFile(workspace, reads, "169", "220")
+      await recordRead(state, itemTitled(state, LIVE_TASK).id, `write-read-${failed}`, read)
+      await state.repository.recordToolObservation(state.scope, {
+        itemId: itemTitled(state, LIVE_TASK).id,
+        toolName: "edit_lines",
+        arguments: { path: READ_FILE_SOURCE },
+        output: failed ? "edit failed" : "edited",
+        failed,
+        requestId: `write-${failed}`
+      })
+    }
+
+    let evaluatorCalls = 0
+    const failedVerdict = await evaluateTodoReview(failedState.repository, failedState.scope, await reviewOf(failedState, itemTitled(failedState, LIVE_TASK).id), async () => {
+      evaluatorCalls += 1
+      throw new Error("Feedback must not judge criteria the host has proven")
+    }, "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    assert.equal(failedVerdict.decision, "accept")
+    assert.equal(failedVerdict.criteria.find((criterion) => criterion.criterion === NO_MODIFICATION_CRITERION)!.reconciliation?.outcome, "proven")
+    assert.equal(evaluatorCalls, 0)
+
+    const successReview = await reviewOf(successState, itemTitled(successState, LIVE_TASK).id)
+    const successVerdict = await evaluateTodoReview(successState.repository, successState.scope, successReview, async () =>
+      responseFor(successReview, { decision: "revise", status: "failed" }), "mock-reviewer", { readCurrentSource: sourceReader(workspace) })
+    const prohibition = successVerdict.criteria.find((criterion) => criterion.criterion === NO_MODIFICATION_CRITERION)!
+    assert.equal(prohibition.reconciliation?.outcome, "disproven")
+    assert.equal(prohibition.status, "failed")
+    assert.notEqual(successVerdict.decision, "accept")
+  } finally {
+    removeAll(failedState.directory, successState.directory, workspace)
   }
 })
 

@@ -58,6 +58,8 @@ export interface TodoCriterionReconciliation {
   facts?: TodoSourceFact[]
   /** `accepted` when previously accepted, still-fresh facts satisfied the criterion without this task's reads. */
   reuse?: "accepted"
+  /** What a proven outcome does not cover, when the host's record of operations is not a complete audit. */
+  scope?: string
 }
 
 export interface TodoEvaluationCriterion {

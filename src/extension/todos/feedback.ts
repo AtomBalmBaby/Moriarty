@@ -13,9 +13,20 @@ const DELETE_VERB = /\b(delet(?:e|es|ed|ing))\b/i
 const EDIT_VERB = /\b(add(?:s|ed|ing)?|chang(?:e|es|ed|ing)|edit(?:s|ed|ing)?|fix(?:es|ed|ing)?|implement(?:s|ed|ing)?|improv(?:e|es|ed|ing)|insert(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|refactor(?:s|ed|ing)?|remov(?:e|es|ed|ing)|renam(?:e|es|ed|ing)|replac(?:e|es|ed|ing)|rewrit(?:e|es|ed|ing)|updat(?:e|es|ed|ing))\b/i
 const WRITE_VERB = /\bwrit(?:e|es|ing|ten)\b/i
 const MUTATION_VERB = new RegExp([CREATE_VERB, DELETE_VERB, EDIT_VERB, WRITE_VERB].map((verb) => verb.source).join("|"), "i")
+/** A negation whose object is a file mutation: "No files are modified", "must not edit", "without changing". Global, so use only with replace. */
+const PROHIBITION_SPAN = /\b(?:no|not|never|without|nor)\b(?:\s+[\w'-]+){0,3}?\s+(?:creat|modif|edit|chang|delet|remov|writ|updat|alter|mutat|renam|replac|touch|sav|insert|refactor|rewrit|add)\w*/gi
+/** Words that may surround a prohibition without adding a claim of their own. Any other word makes the criterion a mixed claim. */
+const PROHIBITION_CONTEXT = new Set([
+  "the", "a", "an", "of", "in", "to", "by", "for", "any", "all", "other", "than", "this", "that", "its", "their", "during", "while", "and", "or",
+  "are", "is", "be", "was", "were", "been", "files", "file", "source", "sources", "workspace", "project", "task", "process", "run", "session",
+  "conversation", "changes", "change", "modifications", "edits", "writes", "outside", "within", "nothing", "none", "anything", "further", "implementation", "tool", "tools",
+  "do", "does", "did", "done", "being", "made"
+])
+
+const affirmativeProse = (text: string): string => text.replace(PROHIBITION_SPAN, " ")
 
 export const taskRequiresWorkspaceChanges = (task: Pick<TodoReviewPackage["task"], "title" | "details">, criteria: string[]): boolean => {
-  const taskText = [task.title, task.details ?? "", ...criteria].join("\n")
+  const taskText = affirmativeProse([task.title, task.details ?? "", ...criteria].join("\n"))
   if (/\b(inspect|identify|list|locate|map|note|document|report|review|summari[sz]e|understand)\b/i.test(taskText) && !MUTATION_VERB.test(taskText)) return false
   return MUTATION_VERB.test(taskText)
 }
@@ -143,12 +154,14 @@ const FILE_EDIT_TOOLS = ["edit_lines", "edit_file"]
 const FILE_DELETE_TOOLS = ["delete_file"]
 const MUTATING_TOOLS = [...FILE_CREATE_TOOLS, ...FILE_EDIT_TOOLS, ...FILE_DELETE_TOOLS]
 
+/** Mutation groups a criterion requires. A negated mutation ("No files are modified") requires nothing, so it is excluded first. */
 export const requiredFileMutations = (criterion: string): string[][] => {
+  const affirmative = affirmativeProse(criterion)
   const groups: string[][] = []
-  if (CREATE_VERB.test(criterion)) groups.push(FILE_CREATE_TOOLS)
-  if (EDIT_VERB.test(criterion)) groups.push(FILE_EDIT_TOOLS)
-  if (DELETE_VERB.test(criterion)) groups.push(FILE_DELETE_TOOLS)
-  if (!groups.length && WRITE_VERB.test(criterion)) groups.push(FILE_EDIT_TOOLS)
+  if (CREATE_VERB.test(affirmative)) groups.push(FILE_CREATE_TOOLS)
+  if (EDIT_VERB.test(affirmative)) groups.push(FILE_EDIT_TOOLS)
+  if (DELETE_VERB.test(affirmative)) groups.push(FILE_DELETE_TOOLS)
+  if (!groups.length && WRITE_VERB.test(affirmative)) groups.push(FILE_EDIT_TOOLS)
   return groups
 }
 
@@ -795,12 +808,213 @@ const directOutcome = (criterion: string, allRecords: RetainedObservationEvidenc
 }
 
 /** Plan identity plus the goal and task wording that name the tools a retrieval criterion refers to. */
+/** Host record of an accepted-evidence check: the project-wide count of live facts at the moment it was taken. */
+export const EVIDENCE_CHECK_TOOL = "twinny_evidence_preflight"
+
+const EVIDENCE_CHECK_SUBJECT = /\b(accepted|existing|prior|persisted|recorded|stored)\s+(source\s+)?(evidence|facts?)\b/i
+const NEGATED_EVIDENCE_CHECK = /\b(no|none|not|nothing|zero)\b[^.\n]{0,40}\b(accepted|existing|prior|persisted|recorded|stored)\s+(source\s+)?(evidence|facts?)\b/i
+const POSITIVE_EVIDENCE_CHECK = /\b(exists?|present|found|available|already)\b/i
+
+/**
+ * Decides an accepted-evidence criterion from the host's own project-wide check. Absence is proven only while no
+ * accepted fact was recorded after the check; presence is proven while a fact the check found is still live.
+ */
+const evidenceCheckOutcome = (criterion: string, records: RetainedObservationEvidence[], accepted: AcceptedFact[]): TodoCriterionReconciliation | undefined => {
+  if (!EVIDENCE_CHECK_SUBJECT.test(criterion)) return undefined
+  const absent = NEGATED_EVIDENCE_CHECK.test(criterion)
+  if (!absent && !POSITIVE_EVIDENCE_CHECK.test(criterion)) return undefined
+  const checks = records.filter((record) => record.toolName === EVIDENCE_CHECK_TOOL && !record.failed && record.arguments.scope === "project")
+  const check = checks[checks.length - 1]
+  if (!check) return undefined
+  const count = Number(check.arguments.factCount)
+  if (!Number.isInteger(count) || count < 0) return undefined
+  if (absent) {
+    if (count > 0) return reconciled("disproven", [check.observationId], [`${count} accepted fact(s) existed at the project-wide check`])
+    if (accepted.some((fact) => fact.acceptedAt > check.observedAt)) {
+      return reconciled("unknown", [], ["an accepted fact was recorded after the project-wide check; repeat the check"])
+    }
+    return { ...reconciled("proven", [check.observationId], []), scope: "accepted facts of this project at the recorded check; a fact accepted later invalidates it" }
+  }
+  if (count === 0) return reconciled("disproven", [check.observationId], ["no accepted fact was present at the project-wide check"])
+  const live = new Set(accepted.filter((fact) => !fact.supersededBy).map((fact) => fact.id))
+  if (!(check.arguments.factIds ?? "").split(",").some((id) => live.has(id))) {
+    return reconciled("unknown", [], ["the accepted facts found by the project-wide check are no longer live"])
+  }
+  return { ...reconciled("proven", [check.observationId], []), scope: "accepted facts of this project found by the recorded check" }
+}
+
 const planScope = (review: TodoReviewPackage, since?: string) => ({
   planId: review.planId,
   conversationId: review.conversationId,
+  taskId: review.task.id,
   context: [review.goal, review.task.title, ...review.acceptanceCriteria].join("\n"),
   since
 })
+
+/** Scope of the prohibition outcome. The host records only operations Twinny itself executes, so the claim stops there. */
+const PROHIBITION_SCOPE = "Covers file operations Twinny controls (create_file, edit_lines, edit_file, delete_file). Writes made by other mechanisms, including shell commands, are not audited."
+
+/**
+ * A criterion whose negated mutation is its only claim. Returns undefined when the criterion has no negated
+ * mutation. A negated mutation mixed with any other claim is not decided by the host.
+ */
+const prohibitionOf = (criterion: string, anchors: { paths: string[] }): { pure: boolean } | undefined => {
+  if (!new RegExp(PROHIBITION_SPAN.source, "i").test(criterion)) return undefined
+  const remainder = criterion.replace(PROHIBITION_SPAN, " ")
+  const pathWords = new Set(anchors.paths.flatMap(tokenize))
+  return { pure: tokenize(remainder).every((word) => PROHIBITION_CONTEXT.has(word) || pathWords.has(word)) }
+}
+
+/**
+ * Decides a prohibition from the host's operation record for this task. A successful mutation Twinny
+ * executed violates it. Failed mutations did not change anything, and a task with no recorded operations
+ * gives the host nothing to test against.
+ */
+const prohibitionOutcome = (records: RetainedObservationEvidence[], taskId?: string): TodoCriterionReconciliation => {
+  const scoped = taskId === undefined ? [] : records.filter((record) => record.itemId === taskId)
+  if (!scoped.length) return reconciled("unknown", [], ["no trusted operation record for this task to test the prohibition against"])
+  const violations = scoped.filter((record) => !record.failed && MUTATING_TOOLS.includes(record.toolName))
+  if (violations.length) {
+    return {
+      ...reconciled("disproven", violations.map((record) => record.observationId), violations.map((record) => `${record.toolName} succeeded in observation ${record.observationId}, which the criterion prohibits`)),
+      scope: PROHIBITION_SCOPE
+    }
+  }
+  return { ...reconciled("proven", scoped.map((record) => record.observationId), []), scope: PROHIBITION_SCOPE }
+}
+
+const tokenize = (text: string): string[] => text.toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean)
+
+/** Words that state an outcome about the evidence ("is identified", "is obtained via"), not a claim about the code. */
+const PROVENANCE_OUTCOME_VOCABULARY = new Set([
+  "identified", "identify", "specified", "specify", "obtained", "obtain", "via", "start", "end", "closing", "closes", "located", "locate",
+  "is", "are", "be", "been", "were", "was", "all", "each", "known", "given", "stated", "implementation", "implementations",
+  "verified", "verify", "confirmed", "confirm", "established", "establish", "determined", "determine", "supplied", "supply", "provided",
+  "provide", "recorded", "record", "reported", "report", "shown", "show", "present", "by", "through", "using", "from", "with", "that",
+  "which", "where", "in", "on", "at", "to", "for", "it", "this", "has", "have", "had"
+])
+const FILENAME_FIELDS = ["filename", "file", "path", "location"]
+const RANGE_FIELDS = ["line", "lines", "range", "start", "end", "number", "numbers"]
+const FINGERPRINT_FIELDS = ["fingerprint", "fingerprints", "hash", "content_hash"]
+
+/** A registration (name: "read_file") paired with the declaration that implements it, and the fingerprinted read that shows it. */
+interface RegistrationRead {
+  record: RetainedObservationEvidence
+  alias: { tool: string; implementation: string; startLine: number; endLine: number }
+  path: string
+  sourceHash: string
+}
+
+const registrationReads = (records: RetainedObservationEvidence[]): RegistrationRead[] =>
+  records.filter((record) => !record.failed && record.retained && record.content !== undefined).flatMap((record) =>
+    implementationAliases(record).flatMap((alias) => {
+      const source = record.sources.find((candidate) =>
+        candidate.startLine !== undefined && candidate.endLine !== undefined
+        && candidate.startLine <= alias.startLine && alias.endLine <= candidate.endLine && candidate.contentHash)
+      return source?.contentHash ? [{ record, alias, path: source.path, sourceHash: source.contentHash }] : []
+    }))
+
+/**
+ * The line that closes a declaration: the first later line at the declaration's indentation that starts with a closing brace.
+ * Measured on the current source, so the range is independent of how much a read happened to capture.
+ */
+const declarationEnd = (text: string, startLine: number): number | undefined => {
+  const lines = text.split("\n")
+  const opening = lines[startLine - 1]
+  if (opening === undefined) return undefined
+  const indent = indentOf(opening)
+  for (let index = startLine; index < lines.length; index++) {
+    const line = lines[index]
+    if (line.trim() && indentOf(line) === indent && line.trimStart().startsWith("}")) return index + 1
+  }
+  return undefined
+}
+
+/** Whether a retained read captured the given line of the path, so its content is actually shown and not merely in an unread range. */
+const showsLine = (record: RetainedObservationEvidence, path: string, line: number): boolean =>
+  record.sources.some((source) => samePath(source.path, path) && source.startLine !== undefined && source.endLine !== undefined
+    && source.startLine <= line && line <= source.endLine)
+  && !!record.content?.split("\n").some((text) => NUMBERED_SOURCE_LINE.exec(text)?.[1] === String(line))
+
+/**
+ * Fresh retained reads, from any observation, that show a line of the path. Each must match the current
+ * source, so a boundary read taken before an edit cannot close a range at the current revision.
+ */
+const boundaryObservations = async (records: RetainedObservationEvidence[], path: string, line: number, text: string): Promise<string[]> => {
+  const ids: string[] = []
+  for (const record of records) {
+    if (record.failed || !record.retained || record.content === undefined || !showsLine(record, path, line)) continue
+    const hash = record.sources.find((source) => samePath(source.path, path))?.contentHash
+    if (hash && await verifyContentFingerprint(text, hash).catch(() => false)) ids.push(record.observationId)
+  }
+  return ids
+}
+
+/**
+ * Decides a criterion that asks for provenance of a source: the filename, line range, or fingerprint of the implementation
+ * a tool is registered to. The subject is the one tool or symbol that both the task's context and the host's records name,
+ * so the criterion needs no backticked anchor. Only field and outcome words may appear, so a behavioral claim never qualifies.
+ */
+const provenanceOutcome = async (
+  prose: string,
+  records: RetainedObservationEvidence[],
+  accepted: AcceptedFact[],
+  current: (path: string) => Promise<string | undefined>,
+  context: string
+): Promise<TodoCriterionReconciliation | undefined> => {
+  const words = tokenize(prose)
+  const needsFilename = words.some((word) => FILENAME_FIELDS.includes(word))
+  const needsRange = words.some((word) => RANGE_FIELDS.includes(word))
+  const needsFingerprint = words.some((word) => FINGERPRINT_FIELDS.includes(word))
+  if (!needsFilename && !needsRange && !needsFingerprint) return undefined
+  if (BEHAVIOR.test(prose) || COMMAND_OR_MUTATION.test(prose)) return undefined
+  const live = accepted.filter((fact) => !fact.supersededBy)
+  const registrations = registrationReads(records)
+  const contextWords = new Set(tokenize(context))
+  const executedTools = new Set(records.map((record) => record.toolName))
+  const subjects = [...new Set([...registrations.map((read) => read.alias.tool), ...live.map((fact) => fact.symbol)])]
+    .filter((subject) => contextWords.has(subject.toLowerCase()) && (executedTools.has(subject) || live.some((fact) => fact.symbol === subject)))
+  if (subjects.length !== 1) return undefined
+  const [subject] = subjects
+  if (!words.every((word) => word === subject.toLowerCase() || PROVENANCE_FIELDS.has(word) || PROVENANCE_FILLER.has(word)
+    || RETRIEVAL_VOCABULARY.has(word) || PROVENANCE_OUTCOME_VOCABULARY.has(word) || /^\d+$/.test(word))) return undefined
+
+  for (const fact of live.filter((candidate) => candidate.symbol === subject)) {
+    const text = await current(fact.path)
+    if (text === undefined || !(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) continue
+    if (!needsRange || declarationEnd(text, fact.startLine) === fact.endLine) return { ...reconciled("proven", [fact.observationId], []), reuse: "accepted" }
+  }
+
+  const missing: string[] = []
+  for (const { record, alias, path, sourceHash } of registrations.filter((read) => read.alias.tool === subject)) {
+    const text = await current(path)
+    if (text === undefined) {
+      missing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
+      continue
+    }
+    if (!(await verifyContentFingerprint(text, sourceHash).catch(() => false))) {
+      missing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
+      continue
+    }
+    const end = declarationEnd(text, alias.startLine)
+    if (end === undefined) {
+      missing.push(`the closing line of ${alias.implementation} in ${path} cannot be found`)
+      continue
+    }
+    const boundary = await boundaryObservations(records, path, end, text)
+    if (needsRange && !boundary.length) {
+      missing.push(`${alias.implementation} in ${path} closes at line ${end}, which no fresh retained read shows; read through line ${end}`)
+      continue
+    }
+    return {
+      ...reconciled("proven", [...new Set([record.observationId, ...boundary])], []),
+      ...(boundary.length ? {
+        facts: [{ symbol: subject, implementation: alias.implementation, path, startLine: alias.startLine, endLine: end, observationId: record.observationId, sourceHash }]
+      } : {})
+    }
+  }
+  return reconciled("unknown", [], missing.length ? missing : [`no retained successful ${subject} read shows the implementation`])
+}
 
 /**
  * Deterministic pass over acceptance criteria. Only narrow, anchored presence
@@ -815,7 +1029,7 @@ export const reconcileCriteria = async (
   readCurrent?: CurrentSourceReader,
   accepted: AcceptedFact[] = [],
   aliases: SymbolAlias[] = [],
-  plan?: { planId: string; conversationId: string; context?: string; since?: string }
+  plan?: { planId: string; conversationId: string; taskId?: string; context?: string; since?: string }
 ): Promise<TodoCriterionReconciliation[]> => {
   const current = cachedCurrentReader(readCurrent)
   const contextWords = new Set((plan?.context ?? "").toLowerCase().split(/[^a-z0-9_]+/))
@@ -824,13 +1038,35 @@ export const reconcileCriteria = async (
     || contextWords.has(fact.toolName.toLowerCase())
     || contextWords.has(fact.symbol.toLowerCase())))
   const outcomes: TodoCriterionReconciliation[] = []
+  let factsEmitted = false
   for (const criterion of criteria) {
+    const anchors = evidenceAnchors(criterion)
+    if (prohibitionOf(criterion, anchors)?.pure) {
+      outcomes.push(prohibitionOutcome(records, plan?.taskId))
+      continue
+    }
     const direct = directOutcome(criterion, records, plan?.since)
     if (direct) {
       outcomes.push(direct)
       continue
     }
-    const anchors = evidenceAnchors(criterion)
+    if (!anchors.paths.length && !anchors.symbols.length) {
+      const check = evidenceCheckOutcome(criterion.replace(BACKTICKED_TEXT, " "), records, accepted)
+      if (check) {
+        outcomes.push(check)
+        continue
+      }
+    }
+    let provenanceGap: TodoCriterionReconciliation | undefined
+    if (plan && !anchors.paths.length && !anchors.symbols.length) {
+      const provenance = await provenanceOutcome(criterion.replace(BACKTICKED_TEXT, " "), records, accepted, current, plan.context ?? "")
+      if (provenance?.outcome === "proven") {
+        outcomes.push(provenance.facts && factsEmitted ? { ...provenance, facts: undefined } : provenance)
+        factsEmitted ||= !!provenance.facts
+        continue
+      }
+      provenanceGap = provenance
+    }
     const prose = criterion.replace(BACKTICKED_TEXT, " ")
     const judged = judgedProse(prose)
     const unanchoredJudgment = anchors.paths.length > 0 && !anchors.symbols.length && !LOCATION_CLAIM.test(prose)
@@ -860,6 +1096,8 @@ export const reconcileCriteria = async (
     } else {
       outcomes.push(await acceptedOutcome(anchors, accepted, current, criterion, aliases) ?? await sourceOutcome(anchors, records, current, criterion))
     }
+    const settled = outcomes[outcomes.length - 1]
+    if (provenanceGap && (settled.outcome === "semantic" || settled.outcome === "unknown")) outcomes[outcomes.length - 1] = provenanceGap
   }
   return outcomes
 }
@@ -902,7 +1140,7 @@ export const deterministicTodoEvaluation = (
     problems: decision === "accept" ? [] : problems,
     correctiveInstructions: failed.map((criterion) => ("Correct the work so trusted observations support: " + criterion.criterion).slice(0, 500)),
     explanation: decision === "accept"
-      ? "Every criterion was verified deterministically from trusted observations of the current source."
+      ? ["Every criterion was verified deterministically from trusted observations of the current source.", ...new Set(reconciliations.map((reconciliation) => reconciliation.scope).filter((scope): scope is string => !!scope))].join(" ")
       : "Deterministic verification found the missing or contradicted facts listed in problems.",
     scores: { completion: 0, correctness: 0, alignment: 0 },
     metadata: { evaluator: DETERMINISTIC_EVALUATOR, evaluatedAt, taskVersion: review.task.version, planRevision: review.planRevision }
@@ -988,12 +1226,20 @@ export const parseTodoEvaluation = (
       const contradiction = (criterion.reconciliation?.missing ?? []).join("; ") || "trusted observations contradict this criterion"
       if (problems.length < 20) problems.push((criterion.criterion + " — " + contradiction).slice(0, 500))
       if (correctiveInstructions.length < 20) correctiveInstructions.push(("Correct the work so trusted observations support: " + criterion.criterion).slice(0, 500))
-    } else if (outcome === "proven" && criterion.status !== "failed") {
+    } else if (outcome === "proven") {
+      if (criterion.status !== "passed") logger.warn("[Feedback] reviewer.criterion_overridden task=" + value.taskId + " reviewer_status=" + criterion.status + " host_outcome=proven")
       criterion.status = "passed"
     }
   }
+  const reviewerDecision = decision
   if (disproven) decision = "revise"
-  else if (decision === "needs_evidence" && criteria.every((criterion) => criterion.status === "passed") && criteria.some((criterion) => criterion.reconciliation?.outcome === "proven")) decision = "accept"
+  else if (decision === "revise" && !criteria.some((criterion) => criterion.status === "failed")) {
+    decision = criteria.every((criterion) => criterion.status === "passed") ? "accept" : "needs_evidence"
+  } else if (decision === "needs_evidence" && criteria.every((criterion) => criterion.status === "passed") && criteria.some((criterion) => criterion.reconciliation?.outcome === "proven")) decision = "accept"
+  if (decision !== reviewerDecision) logger.warn("[Feedback] reviewer.decision_reconciled task=" + value.taskId + " reviewer=" + reviewerDecision + " host=" + decision)
+  if (decision !== "accept" && /\b(all|every)\b[^.]{0,80}\b(satisf\w*|met|verified|passed)\b/i.test(explanation)) {
+    logger.warn("[Feedback] reviewer.explanation_contradicts_decision task=" + value.taskId + " decision=" + decision)
+  }
   for (const criterion of criteria) {
     if (criterion.status !== "passed" || criterion.reconciliation?.outcome === "proven") continue
     const anchors = evidenceAnchors(criterion.criterion)
@@ -1067,6 +1313,8 @@ export const feedbackContext = (review: Pick<IntentPlanContext, "lastEvaluation"
     taskId: result.taskId,
     acceptanceCriteria: review.acceptanceCriteria,
     failedCriteria: result.criteria.filter((criterion) => criterion.status !== "passed"),
+    establishedCriteria: result.criteria.filter((criterion) => criterion.status === "passed" && criterion.reconciliation?.outcome === "proven").map((criterion) => criterion.criterion),
+    continuationRule: "Do not repeat searches, reads, or git commands for establishedCriteria; they are proven by trusted observations. Request only what failedCriteria still lacks.",
     problems: result.problems.slice(0, 8).map((problem) => clip(problem, 400)),
     supportingEvidence: result.criteria.flatMap((criterion) => criterion.evidenceRefs).map((id) => {
       const observation = review.observations?.find((entry) => entry.id === id)
@@ -1353,6 +1601,15 @@ export const provenTodoEvaluation = async (
   const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, readCurrentSource, review.acceptedEvidence, review.symbolAliases, planScope(review, since))
   const evaluation = deterministicTodoEvaluation(review, reconciliations)
   return evaluation?.decision === "accept" ? evaluation : undefined
+}
+
+/**
+ * Whether the host can decide a review from its own trusted observations alone, so no Feedback model is needed.
+ * True when no criterion is semantic, even when some remain unproven and the decision is needs_evidence.
+ */
+export const hostDecidesReview = async (review: TodoReviewPackage, readCurrentSource?: CurrentSourceReader, since?: string): Promise<boolean> => {
+  const reconciliations = await reconcileCriteria(review.acceptanceCriteria, review.retainedEvidence, readCurrentSource, review.acceptedEvidence, review.symbolAliases, planScope(review, since))
+  return deterministicTodoEvaluation(review, reconciliations) !== undefined
 }
 
 export const evaluateTodoReview = (

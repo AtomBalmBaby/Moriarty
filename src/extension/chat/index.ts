@@ -64,7 +64,7 @@ import { describeProviderError, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, evidencePreflight, feedbackContext, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanContext } from "../todos/plan-context"
 import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest } from "../todos/types"
@@ -318,6 +318,8 @@ export class Chat extends Base {
   private _userRequestsTodo = false
   /** The host evidence preflight for this turn's explicit evidence-first request, injected into every request of the turn. */
   private _evidencePreflight: string | undefined
+  /** Request ID of this turn's accepted-evidence preflight, recorded as a host observation once a task is active. */
+  private _evidencePreflightCheck: string | undefined
   /** Open operations (planning, replies, reviews, continuations); Stop stays available while any is open. */
   private readonly _lifecycle: OperationLifecycle
   /**
@@ -761,6 +763,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   ): Promise<string | undefined> {
     this._activeConversationId = conversationId
     this._evidencePreflight = undefined
+    this._evidencePreflightCheck = undefined
     const provider = this.start()
     if (!provider) return undefined
     return this.operate(() => this.completionReply(provider, messages, mentions, requestedSelection, conversationId))
@@ -1273,8 +1276,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (itemId) throw new Error("This TODO is not awaiting evaluation")
       return []
     }
-    const { provider, error: providerError } = await this.roleProvider("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny")))
-    if (!provider) {
+    const readCurrentSource = this.currentSourceReader()
+    const hostDecided = new Set<string>()
+    for (const review of candidates) {
+      if (await hostDecidesReview(review, readCurrentSource, options.since)) hostDecided.add(review.task.id)
+    }
+    const { provider, error: providerError } = hostDecided.size === candidates.length
+      ? { provider: undefined, error: undefined }
+      : await this.roleProvider("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny")))
+    if (!provider && hostDecided.size < candidates.length) {
       const message = "Feedback evaluation is unavailable: " + (providerError ?? "no Feedback provider is configured.")
       logger.warn(message)
       if (itemId || options.strict) throw new Error(message)
@@ -1282,11 +1292,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return []
     }
     let providerFailure: string | undefined
-    const readCurrentSource = this.currentSourceReader()
     const evaluations = await Promise.all(candidates.map(async (review) => {
       attempted.add(review.task.id + "@" + review.task.version)
       try {
         const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async (correction, reconciliations) => {
+          if (!provider) throw new Error("Host-decidable criteria must not be sent to Feedback")
           const controller = new AbortController()
           let timeout: ReturnType<typeof setTimeout>
           const abortFromExecution = () => controller.abort(options.signal?.reason)
@@ -1319,7 +1329,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             clearTimeout(timeout!)
             options.signal?.removeEventListener("abort", abortFromExecution)
           }
-        }, provider.modelName, {
+        }, provider?.modelName ?? "host", {
           requireWorkspaceChanges: options.requireWorkspaceChanges && taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria),
           hasVerifiedFileChanges: !!changes?.files.length,
           allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal),
@@ -1337,7 +1347,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         return undefined
       }
     }))
-    if (providerFailure) this._bridge.emit(EVENT_NAME.twinnyNotification, "Feedback evaluation failed (" + provider.label + "): " + providerFailure)
+    if (providerFailure) this._bridge.emit(EVENT_NAME.twinnyNotification, "Feedback evaluation failed (" + provider?.label + "): " + providerFailure)
     const results = evaluations.filter((evaluation): evaluation is TodoEvaluation => !!evaluation)
     if (!itemId && !options.signal?.aborted && results.some((evaluation) => evaluation.decision === "accept")) {
       // A verified task can unblock dependents; review them once, without repeating tasks already attempted in this call.
@@ -1540,7 +1550,14 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         return `${task.itemId} (version ${task.version}, ${task.status}): ${task.title}${needs}${problem}`
       })
     const nextOutline = outline?.tasks.find((task) => task.itemId === next.planTaskId)
-    const unmetCriteria = nextOutline?.unmetCriteria.length ? nextOutline.unmetCriteria : next.acceptanceCriteria
+    const nextEvaluation = next.planTaskId === intent.planTaskId ? evaluation : undefined
+    const unmetCriteria = nextEvaluation
+      ? nextEvaluation.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => criterion.criterion)
+      : nextOutline?.unmetCriteria.length ? nextOutline.unmetCriteria : next.acceptanceCriteria
+    const hostProven = (nextEvaluation?.criteria ?? []).flatMap((criterion) => {
+      const ids = criterion.reconciliation?.outcome === "proven" ? criterion.reconciliation.supportingObservationIds : []
+      return ids.length ? [`${criterion.criterion} — proven by the host from [${[...new Set(ids)].join("], [")}]; do not search or re-read for it`] : []
+    })
     const unresolvedEvidence = next.planTaskId === intent.planTaskId
       ? (evaluation?.criteria ?? []).flatMap((criterion) => {
           if (criterion.status === "passed" || !criterion.reconciliation) return []
@@ -1559,6 +1576,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       unresolvedEvidence,
       feedback,
       verifiedObservations: [
+        ...hostProven,
         ...(intent.observations ?? []).filter((observation) => !observation.failed).slice(0, 5).map((observation) => {
           return observationReference(observation)
         }),
@@ -1612,6 +1630,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     if (!scope || !this._todoRepository) return preflight
     try {
       await this.repairAdministrativePlan(scope)
+      await this.recordEvidenceCheck(scope)
       const outline = await this._todoRepository.getPlanOutline(scope)
       const selection = outline && outline.tasks.length
         ? await selectAcceptedFacts(
@@ -1628,6 +1647,30 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     } catch (error) {
       logger.warn(`[Intent] Could not load the TODO plan for this request: ${error instanceof Error ? error.message : String(error)}`)
       return preflight
+    }
+  }
+
+  /**
+   * Records this turn's accepted-evidence preflight as a host observation on the active task. The live project fact
+   * count is read at record time, so it describes the store as the observation was made.
+   */
+  private async recordEvidenceCheck(scope: TodoWriteRequest): Promise<void> {
+    const requestId = this._evidencePreflightCheck
+    if (!requestId || !this._todoRepository) return
+    try {
+      const active = await this._todoRepository.getActiveIntentContext(scope)
+      if (!active) return
+      const live = (await this._todoRepository.listAcceptedEvidence(scope)).filter((fact) => !fact.supersededBy)
+      await this._todoRepository.recordToolObservation(scope, {
+        itemId: active.task.id,
+        toolName: EVIDENCE_CHECK_TOOL,
+        arguments: { scope: "project", factCount: String(live.length), factIds: live.slice(0, 20).map((fact) => fact.id).join(",") },
+        output: `Accepted-evidence check: ${live.length} live accepted fact(s) in this project.`,
+        failed: false,
+        requestId
+      })
+    } catch (error) {
+      logger.warn(`[Preflight] could not record the accepted-evidence check: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
@@ -1658,6 +1701,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         this._todoRepository.listSymbolAliases(request)
       ])
       const preflight = await evidencePreflight(text, facts, aliases, this.currentSourceReader())
+      this._evidencePreflightCheck = `evidence-check-${randomUUID()}`
       logger.debug(`[Preflight] project=${request.projectFingerprint.slice(0, 12)} status=${preflight.status} subjects=${preflight.subjects.join(",") || "-"} facts=${preflight.facts.map((fact) => `${fact.path}:${fact.startLine}-${fact.endLine}/${fact.verification}`).join(" ") || "-"} reason=${preflight.reason}`)
       return renderEvidencePreflight(preflight)
     } catch (error) {
