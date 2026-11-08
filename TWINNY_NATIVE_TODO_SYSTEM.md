@@ -1,7 +1,23 @@
 # Twinny Native TODO System
 
-**Status:** Proposed implementation specification  
-**Version:** 0.1, 2026-11-02  
+
+## Reconciled governing decisions (2026-11-08)
+
+This is **one system**, described by three complementary documents. The [intent/feedback overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW_RECONCILED.md) owns architectural boundaries and internal message protocol; the [native TODO specification](TWINNY_NATIVE_TODO_SYSTEM_RECONCILED.md) owns task identity, dependencies, state and persistence; the [evidence manifesto](TWINNY_EVIDENCE_MANIFESTO_RECONCILED.md) owns observation/fact trust, criterion proofs, freshness and live acceptance. When an older example in any document differs, this reconciled contract governs. **Design target is not evidence of implementation.**
+
+- **Structured internal control:** Planner, host, implementer, verifier, and reviewer exchange versioned JSON objects conforming to validated schemas. Human-readable descriptions are labels/explanations and never the executable acceptance condition. Model-facing tool calls already have structured arguments; internal prompt transport may still serialize JSON as text, but must validate the parsed object before acting.
+- **Stable responsibilities:** Models propose plans, investigations, claims and semantic judgments. Twinny owns identity, permissions, execution outcomes, evidence capture, objective verification, transitions and retries. The user owns requirements and explicit authorization. No prose explanation or model-proposed `passed` flag overrides a contradictory trusted host observation.
+- **Typed criteria:** Each criterion has a stable ID, explicit `verification.kind`, expected predicate, evidence requirements, subject/scope, a proof owner and freshness policy. Implemented known types are a **target**, not an assertion of currently shipped behavior. Unsupported semantics go to `semantic_review`; they do not quietly become `proven` or `disproven`.
+- **Independent reconciliation:** A task's mandatory criteria resolve individually as `proven`, `disproven`, `unknown` or `requires_semantic_review`. One observation may support several criteria; a criterion may require several observations accumulated over turns. Proof has immutable references, verified scope and an invalidation rule. A task is not one monolithic reviewer verdict.
+- **Lookup semantics:** A successful `evidence_lookup` with `resolution=none` proves **a lookup was completed**, when the query and scope cover the requirement. It does **not** prove that a matching accepted fact exists. A historical negative lookup remains proof that the lookup occurred at that time, while any claim of present absence must be revalidated.
+- **Host-owned invariants:** Prohibitions such as “do not modify files” are audited within the host's demonstrable operation scope, over the entire relevant task interval. A host cannot assert that arbitrary shell/MCP/external filesystem side effects did not occur unless they were monitored. Pending approvals or unknown side effects keep an invariant unresolved rather than falsely satisfied.
+- **Evidence is not a shortcut for doing unrelated work:** Accepted knowledge is projected to inform new tasks. Evidence can complete an objective criterion only when it directly establishes that criterion; it never auto-completes a broader mutation, test or user-deliverable obligation.
+- **Liveness:** Before automatic continuation, reconcile new and retained observations. Advance satisfied dependencies atomically, and ask only for genuinely missing information. Repeating the same failing state with no new evidence or changed conditions is a controller defect; stop with a bounded actionable blocker instead.
+- **Truth in reporting:** Distinguish *observed live*, *reported by Copilot/tests*, *designed*, and *unverified*. A zero-failure helper suite does not prove the actual VSCodium extension-host orchestration works.
+
+
+**Status:** Reconciled implementation contract; legacy proposed migration examples are historical sketches, not a description of shipped storage  
+**Baseline:** 2026-11-02; reconciled 2026-11-08 (design and observed implementation distinguished)  
 **Parent architecture:** [TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md)
 
 ## 1. Objective
@@ -16,7 +32,7 @@ This is the first vertical slice of the larger intent, execution, feedback, and 
 
 ### 2.1 Recommended default
 
-**One SQLite database per Twinny extension-host storage location**, placed under VS Code's `ExtensionContext.globalStorageUri`:
+**One SQLite database per Twinny extension-host storage location**, placed under VS Code's `ExtensionContext.globalStorageUri`. The following WAL filenames describe an earlier native-SQLite proposal, **not** the implemented `sql.js` persistence strategy:
 
 ```text
 ExtensionContext.globalStorageUri/
@@ -44,7 +60,7 @@ Do **not** put the full TODO database in `globalState` or `workspaceState` key/v
 
 The store exists **where the extension host executes**. A local VSCodium instance and an SSH/remote extension host may have different physical `globalStorageUri` directories. The UI must not imply automatic synchronization. The first release is local-to-host only, with explicit portable export/import planned.
 
-For WAL, require a local filesystem on the same host for all database connections. SQLite's WAL mode is not suitable for direct multi-machine access over NFS/SMB. If a future configurable path is on a network filesystem, reject or switch to a separately designed supported strategy; do not silently use WAL there.
+The implemented adapter is `sql.js` (SQLite WASM) with serialized writes, transactions, and atomic file replacement. It does **not** use WAL. The WAL discussion above is retained only as a caution for any future native-SQLite adapter; never silently switch persistence engines or put a native WAL database on NFS/SMB.
 
 ### 2.3 Storage abstraction
 
@@ -120,7 +136,7 @@ A project can contain many chats; each chat has its own canonical list. Project-
 
 Later, introduce separate `intents`, `intent_revisions`, evaluator judgments, playbook invocations, and richer handoff records. Do not prematurely embed those semantics in TODO title fields.
 
-### 4.2 Example schema (conceptual migration)
+### 4.2 Legacy example schema (historical, **not** the active migration)
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -205,7 +221,7 @@ CREATE TABLE IF NOT EXISTS todo_evidence (
 
 This is a representative core, **not** a complete drop-in migration: add the remaining entity tables, foreign-key consistency enforcement, full migration metadata, and dependency-cycle validation before shipping. Use monotonically increasing list revisions and item versions. A task's `parent_id`, dependencies, project and conversation relationship must be validated within the repository, not trusted from raw model input.
 
-### 4.3 Write transactions and event journal
+### 4.3 Write transactions and event journal (adapter-neutral intent)
 
 Each accepted mutation executes in **one SQLite transaction**:
 
@@ -405,7 +421,41 @@ Persistence, tool, protocol, and checklist code are in place. llama.cpp receives
 
 Administrative-TODO control: when Feedback manages a plan, every title, description, and acceptance criterion is validated structurally before synchronization. Text that instructs Mycroft to create, update, verify, or report on the TODO system is rejected unless the user's objective concerns TODO functionality. A violating plan gets one corrective Feedback retry that names the offending paths, and an invalid plan is never stored. An already active plan can be repaired by removing only the offending criteria, which increments the plan revision, preserves task identity, observations, and verification, and leaves unrelated tasks unchanged. This detector is heuristic. Its objective basis is the stored intent goal, which can differ from the user's original prompt.
 
-Deterministic verification runs before Feedback. A plan whose criteria are all source-location or other objective facts is decided by the host from trusted observations: the fact must have a successful read, a workspace-relative path, a matching symbol and line span, and a current fingerprint. Outcomes are `proven`, `disproven`, `unknown`, and `semantic`. An accepted-evidence criterion with no path or symbol anchor is decided from the host's `host_evidence_check` observation, which records the project-wide accepted-fact lookup (`resolution: found` or `none`, the query, the scope, and the fact IDs) when the turn's preflight runs. That observation is host-recorded, not a tool the model can call. An inquiry ("Confirm whether accepted evidence exists") is proven by any completed, successful, project-scoped lookup, including `none`. A claim ("Accepted evidence exists") is decided by count: absence is proven only while no accepted fact was recorded after that check, and presence needs a listed fact that is still live. A failed or subject-scoped lookup proves neither. The no-modification criterion is a prohibition: it is proven when the plan's operation record exists and holds no successful mutation Twinny executed, unknown when no operation was recorded at all, and it is scoped to operations Twinny controls. Only `semantic` criteria reach Feedback. Facts are recorded in `todo_accepted_evidence` (schema version 6), keyed by list, symbol, and path. Replacing a fact marks the older row historical rather than deleting it. The read-only `twinny_evidence_lookup` tool returns accepted facts with freshness, and the Mycroft context lists current facts before the tasks. Limits: a fact covers the declaration's line span rather than the whole function body, and "fresh" means the host re-fingerprints the file on verification. It does not mean the agent performed a new read. The typed criterion descriptors from the design are only partly implemented, through symbol and path anchors plus the `semantic` fallback.
+Deterministic verification runs before Feedback. A plan whose criteria are all source-location or other objective facts is decided by the host from trusted observations: the fact must have a successful read, a workspace-relative path, a matching symbol and line span, and a current fingerprint. Outcomes are `proven`, `disproven`, `unknown`, and `semantic`. The currently documented English-criterion classifier attempts to decide an accepted-evidence criterion with no path or symbol anchor from the host's `host_evidence_check` observation, which records the project-wide accepted-fact lookup (`resolution: found` or `none`, the query, the scope, and the fact IDs) when the turn's preflight runs. That observation is host-recorded, not a tool the model can call. An inquiry ("Confirm whether accepted evidence exists") **should** be proven by any completed, successful, sufficiently scoped lookup, including `none`; November 8 live traces show this behavior failed and it is not verified as fixed. A claim ("Accepted evidence exists") is decided by count: absence is proven only while no accepted fact was recorded after that check, and presence needs a listed fact that is still live. A failed or subject-scoped lookup proves neither. The no-modification criterion is a prohibition: it is proven when the plan's operation record exists and holds no successful mutation Twinny executed, unknown when no operation was recorded at all, and it is scoped to operations Twinny controls. Only `semantic` criteria reach Feedback. Facts are recorded in `todo_accepted_evidence` (schema version 6), keyed by list, symbol, and path. Replacing a fact marks the older row historical rather than deleting it. The read-only `twinny_evidence_lookup` tool returns accepted facts with freshness, and the Mycroft context lists current facts before the tasks. Limits: a fact covers the declaration's line span rather than the whole function body, and "fresh" means the host re-fingerprints the file on verification. It does not mean the agent performed a new read. As of the uploaded implementation notes, typed criterion descriptors are **not** established end-to-end; symbol/path anchors and English-language classifiers remain in use. The reconciled contract below replaces these with a versioned, typed JSON control protocol as the target, not a claim of current completion.
+
+
+## Reconciled TODO and persistence implementation contract
+
+### Task/criterion ownership
+
+A TODO is a durable **unit of user-relevant work**, not an administrative instruction to manage Twinny. Preflight, repository lookup, criterion verification and feedback dispatch are host/controller activities; add them as task criteria or linked events when useful, not as synthetic dependent tasks whose completion obstructs the user's actual deliverable. Genuine multi-step dependencies are supported and can be satisfied by host-owned events without Mycroft repeating a tool call.
+
+A task's `status` (`pending`, `in_progress`, `in_review`, `blocked`, `completed`, `cancelled`) is different from overall `verification` (`not_checked`, `passed`, `failed`, `waived`), and both differ from the **per-criterion** results (`proven`, `disproven`, `unknown`, `requires_semantic_review`). The canonical repository must retain the criterion ID, original typed contract, supporting observation/accepted-fact IDs, check time, verifier, reason code, source/plan version and invalidation rule. These can use existing normalized tables or versioned JSON payloads if atomic and indexed enough; do not assume a new table is necessary. A TODO is complete only after all mandatory criteria and execution constraints have been reconciled. An implementer's `twinny_todo_update(status=completed)` is a *claim* and never directly overrides verification.
+
+### Persistence reality and migration policy
+
+Existing implementation documentation identifies `sql.js` WASM plus serialized SQLite transactions and atomic file replacement under extension-host global storage. This is the **current documented adapter**. Native SQLite WAL files and `node:sqlite` are historical proposals, not shipping assumptions. Preserve the repository adapter boundary and per-project/per-conversation scoping; do not introduce another DB, shadow memory index, or WAL mode merely to implement criterion contracts. Any storage migration must be reversible or safely backable up, idempotent, preserve existing TODO/evidence/plan IDs and history, and be tested through close/reopen. Use the actual source migrations to establish live schema version rather than relying on a document's version number.
+
+### Identity, authorization and durable facts
+
+The host assigns project, chat, plan, task, criterion and observation identities. A project is the knowledge/read boundary; a conversation is the default TODO-write boundary. Same-project, other-conversation evidence and TODOs can be read when authorized but not modified. Other-project records are private. Retrieval and source validity do not depend on chat transcript length or an LLM's memory. A fact from another conversation may be cited by reference in the active task without copying or mutating its origin record.
+
+`todo_evidence`/observation and accepted-fact rows have separate trust states. Acceptance must atomically promote demonstrable source facts (when the actual criterion calls for source knowledge) or record an idempotent recovery obligation. Completion by itself cannot fabricate or promote a fact. Preflight's `none` result is a valid completed lookup but **not** an accepted source-location fact. A file's authoritative fingerprint must be derived from the same current buffer/disk representation the `read_file` tool used. When source changes, preserve the older fact as history and require fresh proof for current criteria.
+
+### State transitions and liveness
+
+A host-proven task may move directly to completed through the validated controller transition; it need not manufacture `in_review` and a Feedback call first. When unresolved semantic checks exist, `in_review` is appropriate. `blocked` requires a reason, precise missing criterion and recovery possibility; `completed` requires a persisted result and provenance. After task completion, dependent tasks become eligible immediately under the same transaction/reconciliation cycle, even if the satisfying lookup returned zero matches. Automatically continue only for a new actionable step. Stop unchanged rejection loops with a structured no-progress outcome, rather than claiming successful execution.
+
+For “no files modified,” maintain a task-interval invariant based on **observed** mutations plus their outcomes and tool categories. Native edit tools can be monitored; `run_command`, unknown MCP side effects, other applications, and external writes require explicit tracking or an honestly bounded claim. A failed edit is not a successful mutation. Revalidate the invariant at final commit, not only at the beginning.
+
+### User-facing status and API
+
+Keep the above-chat TODO panel a projection of repository state. Its eventual criterion detail should show each typed criterion's proof state, evidence reference(s) and specific missing/failed reason, without exposing private internal prompts. Existing native tools stay namespaced and operate through the host's validated API. The model receives structured `task.dispatch` data and returns structured claims/references; the host does not infer task completion from a conversational “done.”
+
+### Required task lifecycle regression
+
+A single read-only implementation task asks to (i) check existing knowledge, (ii) find source location, (iii) establish declaration-body end boundary, (iv) obtain current authoritative fingerprint and (v) avoid modifications. Start with a successful subject-scoped `none` lookup. Assert lookup criterion `proven`, not `disproven`; then carry out reads with a real native `read_file`. Persist per-criterion proof IDs and complete the task without semantic review or repeated investigation. If the planner legitimately splits the work, assert the lookup prerequisite completes and releases its dependent task immediately. Close/reopen the repository, then use the accepted fact from another chat in the same project without a redundant source read. Exercise both 169–219 incomplete and 169–220 complete source observations against the **specific test snapshot** rather than pinning those line numbers globally.
+
 
 ## 14. References
 

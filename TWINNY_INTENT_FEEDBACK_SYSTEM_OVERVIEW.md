@@ -1,7 +1,23 @@
 # Twinny: Intent, Execution, Feedback, and Recovery System
 
-**Status:** Proposed architecture  
-**Version:** 0.1, 2026-11-02  
+
+## Reconciled governing decisions (2026-11-08)
+
+This is **one system**, described by three complementary documents. The [intent/feedback overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW_RECONCILED.md) owns architectural boundaries and internal message protocol; the [native TODO specification](TWINNY_NATIVE_TODO_SYSTEM_RECONCILED.md) owns task identity, dependencies, state and persistence; the [evidence manifesto](TWINNY_EVIDENCE_MANIFESTO_RECONCILED.md) owns observation/fact trust, criterion proofs, freshness and live acceptance. When an older example in any document differs, this reconciled contract governs. **Design target is not evidence of implementation.**
+
+- **Structured internal control:** Planner, host, implementer, verifier, and reviewer exchange versioned JSON objects conforming to validated schemas. Human-readable descriptions are labels/explanations and never the executable acceptance condition. Model-facing tool calls already have structured arguments; internal prompt transport may still serialize JSON as text, but must validate the parsed object before acting.
+- **Stable responsibilities:** Models propose plans, investigations, claims and semantic judgments. Twinny owns identity, permissions, execution outcomes, evidence capture, objective verification, transitions and retries. The user owns requirements and explicit authorization. No prose explanation or model-proposed `passed` flag overrides a contradictory trusted host observation.
+- **Typed criteria:** Each criterion has a stable ID, explicit `verification.kind`, expected predicate, evidence requirements, subject/scope, a proof owner and freshness policy. Implemented known types are a **target**, not an assertion of currently shipped behavior. Unsupported semantics go to `semantic_review`; they do not quietly become `proven` or `disproven`.
+- **Independent reconciliation:** A task's mandatory criteria resolve individually as `proven`, `disproven`, `unknown` or `requires_semantic_review`. One observation may support several criteria; a criterion may require several observations accumulated over turns. Proof has immutable references, verified scope and an invalidation rule. A task is not one monolithic reviewer verdict.
+- **Lookup semantics:** A successful `evidence_lookup` with `resolution=none` proves **a lookup was completed**, when the query and scope cover the requirement. It does **not** prove that a matching accepted fact exists. A historical negative lookup remains proof that the lookup occurred at that time, while any claim of present absence must be revalidated.
+- **Host-owned invariants:** Prohibitions such as “do not modify files” are audited within the host's demonstrable operation scope, over the entire relevant task interval. A host cannot assert that arbitrary shell/MCP/external filesystem side effects did not occur unless they were monitored. Pending approvals or unknown side effects keep an invariant unresolved rather than falsely satisfied.
+- **Evidence is not a shortcut for doing unrelated work:** Accepted knowledge is projected to inform new tasks. Evidence can complete an objective criterion only when it directly establishes that criterion; it never auto-completes a broader mutation, test or user-deliverable obligation.
+- **Liveness:** Before automatic continuation, reconcile new and retained observations. Advance satisfied dependencies atomically, and ask only for genuinely missing information. Repeating the same failing state with no new evidence or changed conditions is a controller defect; stop with a bounded actionable blocker instead.
+- **Truth in reporting:** Distinguish *observed live*, *reported by Copilot/tests*, *designed*, and *unverified*. A zero-failure helper suite does not prove the actual VSCodium extension-host orchestration works.
+
+
+**Status:** Reconciled architecture and integration contract; implementation claims require live/code verification  
+**Baseline:** 2026-11-02; reconciled 2026-11-08 (design and observed implementation distinguished)  
 **Companion specification:** [TWINNY_NATIVE_TODO_SYSTEM.md](TWINNY_NATIVE_TODO_SYSTEM.md)
 
 ## 1. Purpose
@@ -183,7 +199,7 @@ The storage module exposes an internal repository interface so a future backend 
 
 Because the database lives with the extension host, different local or remote extension hosts may have separate stores. Never silently imply shared cross-machine state. Provide user-visible export/import, backup, and eventual explicit synchronization semantics.
 
-Use SQLite transactions, migrations, foreign keys, indexes, and an event journal. Local WAL mode can be considered with proper checkpoint and backup handling; **do not place a WAL database on a network filesystem**.
+Use the implemented `sql.js` SQLite WASM adapter, serialized transactions, migrations, indexed queries, and atomic database-file replacement. It has no WAL files. Native SQLite/WAL is only a hypothetical future adapter and must not silently replace the current one.
 
 ## 5. Component boundaries
 
@@ -235,7 +251,7 @@ Do not combine every stage in one large change. A working stage 1 is useful inde
 - One active task per chat and no cross-host automatic sync in the first release.
 - No generated Markdown files as the default persistence scheme.
 
-### To settle during implementation
+### Historical implementation questions (several were subsequently resolved; see the reconciled contract below)
 
 1. Actual existing Twinny chat/conversation identifiers and their stability across reloads.
 2. How project identity should map renamed folders, worktrees, and multi-root workspaces.
@@ -243,6 +259,110 @@ Do not combine every stage in one large change. A working stage 1 is useful inde
 4. Whether the first UI supports shared project boards or only chat-scoped lists (schema supports both).
 5. Maximum retained event history and how large diagnostics are archived or pruned.
 6. Exact planner/evaluator protocol and scoring rubric after native TODO state is stable.
+
+
+## Structured internal protocol and boundaries (normative target)
+
+### 1. One typed protocol, different owners
+
+The protocol is **control-plane JSON** with a `schema_version`, `message_id`, `kind`, `project_id`, `conversation_id`, `intent_id`/`revision`, `task_id`/`task_version` where applicable, an originating `actor`, and a `correlation_id` or `operation_id`. IDs and authorization are assigned or checked by the host, not trusted merely because a model included them. Version and schema validation happen before persistence or execution. Unknown major versions and invalid payloads are refused with a structured error; never fall back to assuming a positive result.
+
+| Direction | JSON message kind | Authority |
+|---|---|---|
+| Planner → host | `plan.proposal` / `plan.revision` | Proposed work and typed criteria, subject to host/user validation |
+| Host → implementer | `task.dispatch` | Active task, known facts, missing checks, allowed tools, stop condition |
+| Implementer → host | `evidence.reference`, `task.completion_claim`, `work.discovery` | Claims/requests only; tool records remain host-owned |
+| Dispatcher → repository | `observation.recorded` | Actual execution/result/provenance and error state |
+| Host → verifier | `criterion.evaluate` | Trusted source observations and typed predicate |
+| Verifier → controller | `criterion.result` | Host-owned criterion result and evidence IDs |
+| Host → semantic reviewer | `semantic.review_request` | Only unresolved semantic requirements and relevant facts |
+| Reviewer → host | `semantic.review_result` | Structured criterion-scoped judgment; not direct DB mutation |
+| Controller → runtime | `task.transition` / `task.blocked` | Atomic, authorized workflow changes |
+| Controller → models/UI | `execution.feedback` | Structured outstanding work and reasons; text only for display |
+
+A textual description **may** accompany each object for humans. It is not an alternative authorization, predicate or transition protocol. Use strict typed parsing and bounded schema-validation repair for malformed model JSON; do not create a second chat-prose decision pathway.
+
+### 2. Example plan criterion
+
+```json
+{
+  "schema_version": 1,
+  "kind": "plan.proposal",
+  "goal": "Locate the native read_file implementation and report its current fingerprint",
+  "tasks": [{
+    "local_id": "locate-implementation",
+    "depends_on": [],
+    "description": "Find the implementation and report its source details",
+    "criteria": [
+      {"id":"lookup", "description":"Check existing accepted knowledge", "verification":{"kind":"evidence_lookup_completed", "subject":"read_file", "scope":"project", "allowed_resolutions":["found","none"]}},
+      {"id":"location", "description":"Identify authoritative source file", "verification":{"kind":"source_location", "subject":"read_file", "freshness":"current"}},
+      {"id":"range", "description":"Identify the entire implementation range", "verification":{"kind":"implementation_range", "subject":"read_file", "boundary":"declaration_body", "freshness":"current"}},
+      {"id":"hash", "description":"Obtain authoritative read_file fingerprint", "verification":{"kind":"source_fingerprint", "subject":"read_file", "origin_tool":"read_file", "freshness":"current"}},
+      {"id":"unchanged", "description":"Do not modify source", "verification":{"kind":"execution_invariant", "predicate":"no_host_observed_file_mutation", "interval":"task"}}
+    ]
+  }]
+}
+```
+
+This is an **illustrative contract**; the host must assign durable IDs and validate that criteria preserve the original user's desired outcomes. In particular, a planner may not replace a user-required result with a weaker `lookup_completed` criterion. Do not require a separate TODO merely to check evidence; preflight is a host-owned step, unless there is meaningful user work to track.
+
+### 3. Structured observation and criterion result
+
+```json
+{
+  "schema_version": 1,
+  "kind": "observation.recorded",
+  "observation_id": "host-assigned-id",
+  "tool": "host_evidence_check",
+  "status": "success",
+  "scope": {"project_id":"host-project-id", "query_subject":"read_file", "query_completeness":"subject-scoped"},
+  "result": {"resolution":"none", "matched_fact_ids":[]},
+  "observed_at": "2026-11-08T05:05:43Z"
+}
+```
+
+```json
+{
+  "schema_version": 1,
+  "kind": "criterion.result",
+  "task_id": "host-task-id",
+  "criterion_id": "lookup",
+  "outcome": "proven",
+  "evidence_ids": ["host-assigned-id"],
+  "reason_code": "lookup_completed_with_no_match",
+  "reviewer": "host",
+  "checked_against_plan_revision": 1
+}
+```
+
+A subject-scoped lookup **must not** be represented as an exhaustive assertion of project-wide nonexistence. Its completion may satisfy a subject-scoped lookup requirement. Scope matching is part of verification, not just an annotation.
+
+### 4. Typed verification registry (bounded and explicit)
+
+Initial target kinds: `evidence_lookup_completed`, `accepted_fact_exists`, `source_location`, `implementation_range`, `source_fingerprint`, `source_contains`, `tool_registered`, `tool_execution_succeeded`, `command_exit_status`, `execution_invariant`, `response_delivered`, and `semantic_review`. Each has schema-defined inputs, matching observation kinds, freshness rules, truth conditions and an owner. Avoid creating a general-purpose arbitrary condition language. Semantic questions remain with the reviewer; objective verification remains in TypeScript.
+
+The outcomes are **four-valued**, not boolean. `unknown` means missing/inconclusive proof and calls for a targeted action; `disproven` means an authoritative counterexample within the declared scope; `requires_semantic_review` is intentional delegation, not failure. Historical proof may remain on file while the *current* result becomes unknown after source changes.
+
+### 5. One reconciliation and transition authority
+
+On every relevant new tool observation, completion claim, review result, restart/reopen, or changed source:
+
+1. Validate identity, active plan revision and authorized scope; append idempotent observation/event.
+2. Re-evaluate affected criteria from **all relevant retained evidence**; do not throw away already valid proofs.
+3. Persist per-criterion results and provenance, with optimistic task/plan version checks.
+4. If all mandatory results are proven (or explicitly user-waived where permitted), recheck live execution invariants, pending approvals, dependencies, and deliverable obligations.
+5. Atomically complete eligible tasks and release their dependents; if a `response_delivered` criterion is used, settle it only after delivery completes.
+6. If a genuine semantic criterion remains, ask Feedback only about that criterion with its evidence IDs; independently validate returned JSON and its trusted references.
+7. If work remains, dispatch **only actionable missing work**. Never automatically retry the same unchanged state without a new fact, changed condition or bounded recovery strategy.
+
+The **same reconciler** must drive manual review, automatic review, on-turn completion, retry, and reopening. No separate reviewer verdict or UI checkbox may bypass it. Keep a distinct explicit user-authorized waiver mechanism; waivers are not ordinary evidence.
+
+### 6. Known observed failure and nonclaims
+
+The November 8 live runs showed `host_evidence_check` successfully recorded, a correct `read_file` fingerprint observed, and then the criterion “Confirm whether accepted evidence exists” incorrectly marked `disproven` on a successful negative lookup. Twinny repeatedly continued a dependent plan even after Mycroft reported the source. This is a **demonstrated live failure**, not resolved by the green standalone suites. In one run Mycroft reported an implementation end of line 219 though the source declaration's closing brace was line 220. The exact hash and line numbers are revision-specific test observations.
+
+Do not mark typed control communication, complete per-criterion persistence, dependency advancement, no-repeat continuation, or cross-conversation evidence reuse **implemented** merely because source notes or Copilot reported them. Verify the production path with the actual extension host and restarted repository.
+
 
 ## 9. References
 

@@ -1,6 +1,22 @@
 # Twinny Evidence-First Execution Manifesto
 
-**Status:** Engineering contract for the next integration and hardening iteration  
+
+## Reconciled governing decisions (2026-11-08)
+
+This is **one system**, described by three complementary documents. The [intent/feedback overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW_RECONCILED.md) owns architectural boundaries and internal message protocol; the [native TODO specification](TWINNY_NATIVE_TODO_SYSTEM_RECONCILED.md) owns task identity, dependencies, state and persistence; the [evidence manifesto](TWINNY_EVIDENCE_MANIFESTO_RECONCILED.md) owns observation/fact trust, criterion proofs, freshness and live acceptance. When an older example in any document differs, this reconciled contract governs. **Design target is not evidence of implementation.**
+
+- **Structured internal control:** Planner, host, implementer, verifier, and reviewer exchange versioned JSON objects conforming to validated schemas. Human-readable descriptions are labels/explanations and never the executable acceptance condition. Model-facing tool calls already have structured arguments; internal prompt transport may still serialize JSON as text, but must validate the parsed object before acting.
+- **Stable responsibilities:** Models propose plans, investigations, claims and semantic judgments. Twinny owns identity, permissions, execution outcomes, evidence capture, objective verification, transitions and retries. The user owns requirements and explicit authorization. No prose explanation or model-proposed `passed` flag overrides a contradictory trusted host observation.
+- **Typed criteria:** Each criterion has a stable ID, explicit `verification.kind`, expected predicate, evidence requirements, subject/scope, a proof owner and freshness policy. Implemented known types are a **target**, not an assertion of currently shipped behavior. Unsupported semantics go to `semantic_review`; they do not quietly become `proven` or `disproven`.
+- **Independent reconciliation:** A task's mandatory criteria resolve individually as `proven`, `disproven`, `unknown` or `requires_semantic_review`. One observation may support several criteria; a criterion may require several observations accumulated over turns. Proof has immutable references, verified scope and an invalidation rule. A task is not one monolithic reviewer verdict.
+- **Lookup semantics:** A successful `evidence_lookup` with `resolution=none` proves **a lookup was completed**, when the query and scope cover the requirement. It does **not** prove that a matching accepted fact exists. A historical negative lookup remains proof that the lookup occurred at that time, while any claim of present absence must be revalidated.
+- **Host-owned invariants:** Prohibitions such as “do not modify files” are audited within the host's demonstrable operation scope, over the entire relevant task interval. A host cannot assert that arbitrary shell/MCP/external filesystem side effects did not occur unless they were monitored. Pending approvals or unknown side effects keep an invariant unresolved rather than falsely satisfied.
+- **Evidence is not a shortcut for doing unrelated work:** Accepted knowledge is projected to inform new tasks. Evidence can complete an objective criterion only when it directly establishes that criterion; it never auto-completes a broader mutation, test or user-deliverable obligation.
+- **Liveness:** Before automatic continuation, reconcile new and retained observations. Advance satisfied dependencies atomically, and ask only for genuinely missing information. Repeating the same failing state with no new evidence or changed conditions is a controller defect; stop with a bounded actionable blocker instead.
+- **Truth in reporting:** Distinguish *observed live*, *reported by Copilot/tests*, *designed*, and *unverified*. A zero-failure helper suite does not prove the actual VSCodium extension-host orchestration works.
+
+
+**Status:** Reconciled evidence and verification contract; live failures remain unresolved until end-to-end reproduction passes  
 **Scope:** Native TODOs, Feedback planning and verification, source evidence, SQLite persistence, cross-conversation authorization, prompt construction, and logging  
 **Priority:** Correctness and demonstrable end-to-end behavior before expanding features
 
@@ -130,7 +146,7 @@ Expected behavior: conversation A verifies `read_file`; repository closes and re
 
 ## 7. LAW: objective proof should not need an LLM judge
 
-For straightforward source facts, use existing TypeScript evidence reconciliation **before** requesting Cerebras review.
+For straightforward source facts, use TypeScript evidence reconciliation **before** requesting Cerebras review. The target contract is typed JSON emitted by the planner and validated by the host; existing English heuristics are a compatibility bridge only, not the canonical contract.
 
 The task `Locate native read_file tool definition` needs: workspace-relative filename, precise definition location/range, trusted successful source read containing the real symbol/tool declaration, and a fresh authoritative source fingerprint if claiming current state.
 
@@ -260,6 +276,52 @@ Also run complete standalone and VS Code extension-host suites with a Node runti
 For each stage: inspect current code, reproduce a failing case, implement through actual production boundaries, add tests that fail before the fix, and validate. Preserve functioning code; keep scope constrained. **No placeholders, no parallel orchestration systems, no new report files, no automatic commit.**
 
 If the entire scope cannot be completed, do not claim it is done: finish the highest-priority vertical slice, run its tests, and report exact remaining gaps. Avoid endless implementation narration; give concise factual results.
+
+
+## Reconciled evidence and verification laws
+
+### Structured fact contract, never prose-driven verdicts
+
+The planner emits versioned, **typed JSON criteria**, the tool dispatcher emits host-owned structured observations, the implementer submits structured evidence references and completion claims, and Feedback emits structured criterion-scoped semantic judgments. Human English summaries are optional and cannot substitute for criterion predicates or evidence IDs. The full envelope, sample JSON and reconciliation algorithm are specified in the [system overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW_RECONCILED.md). Typed contracts are a **target architecture**; the uploaded implementation status still admits English heuristic classification.
+
+A verifier must not infer the desired result from a word such as “exists,” “verified” or “modified.” Its decision comes from the typed predicate and scope. `lookup_completed` may accept either `found` or `none`; `accepted_fact_exists` requires a real current matching fact; `source_fingerprint` needs a trusted current `read_file` fingerprint; `execution_invariant` needs a host audit over the task interval. Store the observation's *result* separately from whether it *satisfies a criterion*.
+
+### Observation, fact, claim and proof are different entities
+
+- **Observation:** immutable host-recorded operation result with status, inputs, output references, project/task/operation identity, request ID, time, source version/scope, and error classification. An unsuccessful operation is still a valid observation of failure.
+- **Claim:** model request or statement, including `task.completion_claim`; never evidence by itself.
+- **Criterion proof:** individually evaluated, durable association of a validated typed predicate with trusted observation/fact IDs, result, reason, verifier, scope and freshness.
+- **Accepted fact:** reusable, verified source knowledge promoted only from actual proof. Its scope and provenance outlive the producing chat.
+- **Current vs historical:** source-linked facts are current only after authoritative freshness checks; stale facts remain accessible as history; unknown freshness remains unknown.
+
+One observation can establish more than one criterion, and multiple compatible observations can satisfy one criterion. Evidence may arrive with the first tool call, later submissions, or subsequent turns. Never require four different evidence IDs just because a task has four requirements. When a check is negated (e.g. no successful file mutation), observe the **whole interval**, not merely one `git status` result.
+
+### Negative lookup and lookup completeness
+
+The November 8 live failure is a canonical regression: the host records a successful preflight `none`, but then labels a criterion “Confirm whether accepted evidence exists” **disproven**. This is invalid if the criterion's actual predicate is “perform a lookup and report whether a match exists.” A `none` result only contradicts a **positive existence requirement**. Preserve both the query scope and the timestamp. A subject-only query cannot establish universal project-wide absence; if the requirement is a comprehensive search, perform the appropriate broader query. Historical evidence that a lookup occurred does not expire when a later source fact gets accepted; a claim that no fact exists *now* may expire.
+
+### Reviewer scope and authority
+
+A source-location result proven by current authoritative evidence stays proven unless later trusted information invalidates it. Feedback only reviews criteria marked `requires_semantic_review`; it cannot force a repeat lookup because its prose contradicts a host-computed criterion. Its JSON decision is advisory on semantics and is validated at the controller boundary. Likewise a reviewer `passed` citing an unrelated trusted read does **not** prove a missing source boundary. Track facts against exact typed predicates and validated evidence IDs.
+
+### Evidence as useful work context
+
+The primary value of accepted evidence is that the next implementer can use verified project knowledge in a **different, broader task** without researching it again. Auto-completion of an objective criterion is permitted where proof is genuinely sufficient, but a fact about a source filename cannot satisfy a requirement to edit code, run tests, or deliver a user artifact. Context projection should rank current, directly relevant facts before limiting count or tokens, and distinguish accepted facts from raw observations.
+
+### Required integrated acceptance scenario
+
+Run the actual extension-host controller with scripted planner/reviewer outputs and real native tools, not only isolated `feedback.ts` helpers:
+
+1. Plan a source-lookup task with typed criteria and a host-run preflight. Include both `none` and `found` fixtures. Validate the planner contract against the original request.
+2. Confirm host preflight is persisted on the right task and **correct** project and scope. For `none`, `evidence_lookup_completed=proven` while `accepted_fact_exists` (if required) is not proven.
+3. Read the actual native source, verify the true implementation closing boundary, and capture the authoritative `content_hash` from `read_file`. Verify no out-of-scope mutation occurred.
+4. Model submits criterion-scoped references incrementally or in one batch. Host reconciles all mandatory criteria, persists proofs, completes the task and releases dependencies with zero unnecessary Feedback calls and zero no-progress continuations.
+5. Reopen SQLite, start fresh conversation B and verify the same current accepted source fact is discoverable across chat boundaries with **zero** source rereads; ensure B cannot mutate A's tasks. Different project C cannot read it.
+6. Change the source or buffer, prove stale/historical classification, and require new current evidence. Exercise approval pending, tool failure, unknown shell side effects, cancellation, and malicious/incorrect reviewer output.
+7. Run `npm run build-tests`, the full standalone suite, `npm run lint`, `npm run build`, the VS Code extension-host integration tests when available, and `git diff --check`; record actual counts and skipped coverage. Verify a real UI trace before stating fixed.
+
+**Green unit tests are not substitute evidence for the execution controller path.** These tests must fail for the old `none → disproven` bug and pass for the repaired typed contract. Preserve original live logs as regression fixtures, without embedding private secrets in the repo.
+
 
 ## 13. Definition of done
 
