@@ -39,8 +39,8 @@ const plan = (overrides: Record<string, unknown> = {}) => ({
   goal: "Fix the parser",
   constraints: [],
   tasks: [
-    { id: "inspect", title: "Inspect parser", description: "Find the bug", acceptanceCriteria: ["Bug located"], dependencies: [] },
-    { id: "fix", title: "Fix parser", description: "Fix the bug", acceptanceCriteria: ["Test passes"], dependencies: ["inspect"] }
+    { id: "inspect", title: "Inspect parser", description: "Find the bug", criteria: [{ id: "criterion-1", description: "Bug located", verification: { kind: "semantic_review" } }], dependencies: [] },
+    { id: "fix", title: "Fix parser", description: "Fix the bug", criteria: [{ id: "criterion-1", description: "Test passes", verification: { kind: "semantic_review" } }], dependencies: ["inspect"] }
   ],
   ...overrides
 })
@@ -71,8 +71,8 @@ test("the Feedback plan response is validated before it can write TODOs", () => 
 })
 
 test("an administrative plan gets one corrective retry that names the offending criterion, and is never synced if it stays invalid", async () => {
-  const administrative = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", acceptanceCriteria: ["Create a TODO entry documenting this location."], dependencies: [] }] })
-  const clean = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", acceptanceCriteria: ["The path and line numbers of readFile are cited."], dependencies: [] }] })
+  const administrative = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", criteria: [{ id: "criterion-1", description: "Create a TODO entry documenting this location.", verification: { kind: "semantic_review" } }], dependencies: [] }] })
+  const clean = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", criteria: [{ id: "criterion-1", description: "The path and line numbers of readFile are cited.", verification: { kind: "semantic_review" } }], dependencies: [] }] })
   await withRepository(async (repository) => {
     const sent: string[] = []
     const planner = new FeedbackPlanner({
@@ -86,7 +86,7 @@ test("an administrative plan gets one corrective retry that names the offending 
     const { result } = await quietly(() => planner.start(scope, "Locate read_file."))
     assert.equal(result.status, "planned")
     assert.equal(sent.length, 2, "exactly one corrective retry")
-    assert.match(sent[1], /tasks\[0\]\.acceptanceCriteria\[0\]/, "the correction names the offending criterion")
+    assert.match(sent[1], /tasks\[0\]\.criteria\[0\]\.description/, "the correction names the offending criterion")
     assert.deepEqual((await repository.getList(scope)).items.map((item) => item.title), ["Locate read_file"])
   })
   await withRepository(async (repository) => {
@@ -110,7 +110,7 @@ const followUpPlan = (overrides: Record<string, unknown> = {}) => plan({
   planId: "plan-b",
   revision: 1,
   goal: "Write the release notes",
-  tasks: [{ id: "notes", title: "Write release notes", description: "Draft the notes", acceptanceCriteria: ["The notes name each change."], dependencies: [] }],
+  tasks: [{ id: "notes", title: "Write release notes", description: "Draft the notes", criteria: [{ id: "criterion-1", description: "The notes name each change.", verification: { kind: "semantic_review" } }], dependencies: [] }],
   ...overrides
 })
 
@@ -241,7 +241,7 @@ test("plans TODOs from an ordinary prompt with no compiler involved, and does no
       // A model that renames the plan and forgets to bump its revision.
       resolve: () => endpoint(async ({ user }) => {
         users.push(user)
-        return JSON.stringify({ track: true, plan: users.length === 1 ? plan() : plan({ planId: "renamed", tasks: [...plan().tasks, { id: "verify", title: "Verify", description: "Run tests", acceptanceCriteria: ["Green"], dependencies: ["fix"] }] }) })
+        return JSON.stringify({ track: true, plan: users.length === 1 ? plan() : plan({ planId: "renamed", tasks: [...plan().tasks, { id: "verify", title: "Verify", description: "Run tests", criteria: [{ id: "criterion-1", description: "Green", verification: { kind: "semantic_review" } }], dependencies: ["fix"] }] }) })
       })
     })
     const { result: first } = await quietly(() => planner.start(scope, "Fix the parser."))
@@ -564,9 +564,9 @@ test("a read-only investigation plan with TODO administration is rejected and na
     plan: plan({
       goal: objective,
       tasks: [
-        { id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Record the investigation in the TODO list.", acceptanceCriteria: ["A TODO entry exists with a clear title and description.", "Its status is Open or equivalent."], dependencies: [] },
-        { id: "trace", title: "Trace read_file path resolution", description: "Read the read_file implementation and its path helpers.", acceptanceCriteria: ["Path resolution steps are cited from source.", "Create a TODO entry documenting this location."], dependencies: ["todo-init"] },
-        { id: "report", title: "Report failure modes", description: "Summarize where read_file can fail with cited lines.", acceptanceCriteria: ["Each failure mode cites a source line."], dependencies: ["trace"] }
+        { id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Record the investigation in the TODO list.", criteria: [{ id: "criterion-1", description: "A TODO entry exists with a clear title and description.", verification: { kind: "semantic_review" } }, { id: "criterion-2", description: "Its status is Open or equivalent.", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "trace", title: "Trace read_file path resolution", description: "Read the read_file implementation and its path helpers.", criteria: [{ id: "criterion-1", description: "Path resolution steps are cited from source.", verification: { kind: "semantic_review" } }, { id: "criterion-2", description: "Create a TODO entry documenting this location.", verification: { kind: "semantic_review" } }], dependencies: ["todo-init"] },
+        { id: "report", title: "Report failure modes", description: "Summarize where read_file can fail with cited lines.", criteria: [{ id: "criterion-1", description: "Each failure mode cites a source line.", verification: { kind: "semantic_review" } }], dependencies: ["trace"] }
       ]
     })
   }
@@ -575,8 +575,8 @@ test("a read-only investigation plan with TODO administration is rejected and na
   const message = "error" in parsed ? parsed.error : ""
   assert.match(message, /tasks\[0\]\.title/)
   assert.match(message, /tasks\[0\]\.description/)
-  assert.match(message, /tasks\[0\]\.acceptanceCriteria\[0\]/)
-  assert.match(message, /tasks\[1\]\.acceptanceCriteria\[1\]/)
+  assert.match(message, /tasks\[0\]\.criteria\[0\]\.description/)
+  assert.match(message, /tasks\[1\]\.criteria\[1\]\.description/)
   assert.doesNotMatch(message, /tasks\[2\]/, "clean tasks are not named")
 })
 
@@ -586,36 +586,36 @@ test("a plan made only of TODO administration is rejected, so Mycroft does not s
     track: true,
     plan: plan({
       goal: objective,
-      tasks: [{ id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Set up tracking.", acceptanceCriteria: ["A TODO entry exists."], dependencies: [] }]
+      tasks: [{ id: "todo-init", title: "Create initial TODO entry for the investigation", description: "Set up tracking.", criteria: [{ id: "criterion-1", description: "A TODO entry exists.", verification: { kind: "semantic_review" } }], dependencies: [] }]
     })
   }
   assert.equal(failureOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective)), "administrative")
 })
 
-const administrativeOf = (task: { title: string; description: string; acceptanceCriteria: string[] }, objective = "Locate the native read_file definition.") =>
+const administrativeOf = (task: { title: string; description: string; criteria: { id: string; description: string; verification: { kind: string } }[] }, objective = "Locate the native read_file definition.") =>
   findAdministrativeClauses(plan({ goal: objective, tasks: [{ id: "t", dependencies: [], ...task }] }), objective).map((clause) => clause.path)
 
 test("administrative TODO clauses are detected in titles, descriptions, and every criterion", () => {
-  assert.deepEqual(administrativeOf({ title: "Use TODOs to track this", description: "", acceptanceCriteria: [] }), ["tasks[0].title"])
-  assert.deepEqual(administrativeOf({ title: "Locate read_file", description: "Update the TODO list with progress.", acceptanceCriteria: [] }), ["tasks[0].description"])
+  assert.deepEqual(administrativeOf({ title: "Use TODOs to track this", description: "", criteria: [] }), ["tasks[0].title"])
+  assert.deepEqual(administrativeOf({ title: "Locate read_file", description: "Update the TODO list with progress.", criteria: [] }), ["tasks[0].description"])
   assert.deepEqual(
-    administrativeOf({ title: "Locate read_file", description: "", acceptanceCriteria: ["Path and line range cited.", "Create a TODO entry documenting this location.", "A TODO entry exists for it."] }),
-    ["tasks[0].acceptanceCriteria[1]", "tasks[0].acceptanceCriteria[2]"]
+    administrativeOf({ title: "Locate read_file", description: "", criteria: [{ id: "criterion-1", description: "Path and line range cited.", verification: { kind: "semantic_review" } }, { id: "criterion-2", description: "Create a TODO entry documenting this location.", verification: { kind: "semantic_review" } }, { id: "criterion-3", description: "A TODO entry exists for it.", verification: { kind: "semantic_review" } }] }),
+    ["tasks[0].criteria[1].description", "tasks[0].criteria[2].description"]
   )
-  assert.deepEqual(administrativeOf({ title: "Locate read_file", description: "", acceptanceCriteria: ["The TODO status is Done."] }), ["tasks[0].acceptanceCriteria[0]"])
+  assert.deepEqual(administrativeOf({ title: "Locate read_file", description: "", criteria: [{ id: "criterion-1", description: "The TODO status is Done.", verification: { kind: "semantic_review" } }] }), ["tasks[0].criteria[0].description"])
 })
 
 test("a legitimate task that touches Twinny's code or a negated TODO mention is not administrative", () => {
   assert.deepEqual(administrativeOf({
     title: "Locate the TODO scanner",
     description: "Record the TODO-related code path and the TODO filter panel handling.",
-    acceptanceCriteria: ["Report the file and line range of the TODO scanner.", "Use the TODO filter function to confirm the path.", "Do not create any TODO entries."]
+    criteria: [{ id: "criterion-1", description: "Report the file and line range of the TODO scanner.", verification: { kind: "semantic_review" } }, { id: "criterion-2", description: "Use the TODO filter function to confirm the path.", verification: { kind: "semantic_review" } }, { id: "criterion-3", description: "Do not create any TODO entries.", verification: { kind: "semantic_review" } }]
   }), [])
 })
 
 test("an objective about the TODO machinery exempts TODO implementation tasks", () => {
   const objective = "Fix the TODO filter so that completed items stay hidden."
-  const tasks = { title: "Create TODO entry fixtures for the filter tests", description: "Update the TODO list used by the filter.", acceptanceCriteria: ["A TODO entry exists in the fixture."] }
+  const tasks = { title: "Create TODO entry fixtures for the filter tests", description: "Update the TODO list used by the filter.", criteria: [{ id: "criterion-1", description: "A TODO entry exists in the fixture.", verification: { kind: "semantic_review" } }] }
   assert.deepEqual(administrativeOf(tasks, objective), [])
   const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: plan({ goal: objective, tasks: [{ id: "fix", ...tasks, dependencies: [] }] }) }), objective)
   assert.ok("plan" in parsed, "TODO implementation work is accepted")
@@ -625,7 +625,7 @@ test("a plan whose administrative clauses are all corrected is accepted on the r
   const objective = "Locate the native read_file definition and report its path and line range."
   const clean = plan({
     goal: objective,
-    tasks: [{ id: "locate", title: "Locate read_file", description: "Find the native definition.", acceptanceCriteria: ["The file path and line range of readFile are cited."], dependencies: [] }]
+    tasks: [{ id: "locate", title: "Locate read_file", description: "Find the native definition.", criteria: [{ id: "criterion-1", description: "The file path and line range of readFile are cited.", verification: { kind: "semantic_review" } }], dependencies: [] }]
   })
   const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: clean }), objective)
   assert.deepEqual(tasksOf(parsed).map((task) => task.id), ["locate"])
@@ -638,8 +638,8 @@ test("a request to build or fix TODO functionality keeps its TODO tasks", () => 
     plan: plan({
       goal: objective,
       tasks: [
-        { id: "filter", title: "Create the TODO filter control", description: "Add a checkbox that hides completed TODO items.", acceptanceCriteria: ["The checkbox hides completed items."], dependencies: [] },
-        { id: "verify", title: "Test the TODO filter", description: "Check that hidden items stay hidden after reload.", acceptanceCriteria: ["Hidden items stay hidden."], dependencies: ["filter"] }
+        { id: "filter", title: "Create the TODO filter control", description: "Add a checkbox that hides completed TODO items.", criteria: [{ id: "criterion-1", description: "The checkbox hides completed items.", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "verify", title: "Test the TODO filter", description: "Check that hidden items stay hidden after reload.", criteria: [{ id: "criterion-1", description: "Hidden items stay hidden.", verification: { kind: "semantic_review" } }], dependencies: ["filter"] }
       ]
     })
   }
@@ -652,7 +652,7 @@ test("a read-only request that mentions TODO code is not treated as TODO adminis
     track: true,
     plan: plan({
       goal: objective,
-      tasks: [{ id: "scan", title: "Record the TODO-related code path", description: "Trace how scanner tokens are read.", acceptanceCriteria: ["The token path is cited."], dependencies: [] }]
+      tasks: [{ id: "scan", title: "Record the TODO-related code path", description: "Trace how scanner tokens are read.", criteria: [{ id: "criterion-1", description: "The token path is cited.", verification: { kind: "semantic_review" } }], dependencies: [] }]
     })
   }
   assert.deepEqual(tasksOf(parseFeedbackPlanResponse(JSON.stringify(reply), objective)).map((task) => task.id), ["scan"])
@@ -710,10 +710,10 @@ test("the administrative TODO tasks Feedback produced for the read_file acceptan
     plan: plan({
       goal: acceptanceObjective,
       tasks: [
-        { id: "todo-create", title: "Create actionable TODOs before beginning the investigation", description: "Create the initial TODO entries.", acceptanceCriteria: ["A TODO entry exists."], dependencies: [] },
-        { id: "todo-status", title: "Update TODO status as each step progresses", description: "Keep the TODO statuses current.", acceptanceCriteria: ["Statuses reflect progress."], dependencies: ["todo-create"] },
-        { id: "register", title: "Locate read_file registration", description: "Find where the native read_file tool definition is registered and made available to the agent.", acceptanceCriteria: ["Registration sites are cited with line numbers."], dependencies: ["todo-create"] },
-        { id: "define", title: "Locate native read_file definition", description: "Find the definition of the native read_file tool.", acceptanceCriteria: ["Identify the file path and line numbers where read_file is defined.", "Create a TODO entry documenting this location."], dependencies: [] }
+        { id: "todo-create", title: "Create actionable TODOs before beginning the investigation", description: "Create the initial TODO entries.", criteria: [{ id: "criterion-1", description: "A TODO entry exists.", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "todo-status", title: "Update TODO status as each step progresses", description: "Keep the TODO statuses current.", criteria: [{ id: "criterion-1", description: "Statuses reflect progress.", verification: { kind: "semantic_review" } }], dependencies: ["todo-create"] },
+        { id: "register", title: "Locate read_file registration", description: "Find where the native read_file tool definition is registered and made available to the agent.", criteria: [{ id: "criterion-1", description: "Registration sites are cited with line numbers.", verification: { kind: "semantic_review" } }], dependencies: ["todo-create"] },
+        { id: "define", title: "Locate native read_file definition", description: "Find the definition of the native read_file tool.", criteria: [{ id: "criterion-1", description: "Identify the file path and line numbers where read_file is defined.", verification: { kind: "semantic_review" } }, { id: "criterion-2", description: "Create a TODO entry documenting this location.", verification: { kind: "semantic_review" } }], dependencies: [] }
       ]
     })
   }
@@ -723,17 +723,17 @@ test("the administrative TODO tasks Feedback produced for the read_file acceptan
   assert.match(message, /tasks\[0\]\.title/)
   assert.match(message, /tasks\[0\]\.description/)
   assert.match(message, /tasks\[1\]\.title/)
-  assert.match(message, /tasks\[3\]\.acceptanceCriteria\[1\]/)
+  assert.match(message, /tasks\[3\]\.criteria\[1\]\.description/)
   assert.doesNotMatch(message, /tasks\[2\]/, "the legitimate registration task is not named")
-  assert.doesNotMatch(message, /tasks\[3\]\.acceptanceCriteria\[0\]/, "the legitimate criterion is not named")
+  assert.doesNotMatch(message, /tasks\[3\]\.criteria\[0\]\.description/, "the legitimate criterion is not named")
 
   const repaired = {
     track: true,
     plan: plan({
       goal: acceptanceObjective,
       tasks: [
-        { id: "register", title: "Locate read_file registration", description: "Find where the native read_file tool definition is registered and made available to the agent.", acceptanceCriteria: ["Registration sites are cited with line numbers."], dependencies: [] },
-        { id: "define", title: "Locate native read_file definition", description: "Find the definition of the native read_file tool.", acceptanceCriteria: ["Identify the file path and line numbers where read_file is defined."], dependencies: ["register"] }
+        { id: "register", title: "Locate read_file registration", description: "Find where the native read_file tool definition is registered and made available to the agent.", criteria: [{ id: "criterion-1", description: "Registration sites are cited with line numbers.", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "define", title: "Locate native read_file definition", description: "Find the definition of the native read_file tool.", criteria: [{ id: "criterion-1", description: "Identify the file path and line numbers where read_file is defined.", verification: { kind: "semantic_review" } }], dependencies: ["register"] }
       ]
     })
   }
@@ -912,7 +912,7 @@ test("existing user-created TODOs are preserved when a plan is synchronized", as
 test("a plan with one invalid task writes no TODOs at all", async () => {
   await withRepository(async (repository) => {
     const order: string[] = []
-    const broken = { ...plan(), tasks: [plan().tasks[0], { ...plan().tasks[1], acceptanceCriteria: "not a list" }] }
+    const broken = { ...plan(), tasks: [plan().tasks[0], { ...plan().tasks[1], criteria: "not a list" }] }
     const reply = JSON.stringify({ track: true, plan: broken })
     const planner = plannerWith(spied(repository, order), scripted([reply, reply]))
     const { result } = await quietly(() => planner.start(scope, "Fix the parser."))
@@ -1000,9 +1000,9 @@ test("administrative child TODO titles and details are refused deterministically
 })
 
 test("past-tense TODO record wording is detected as administrative", () => {
-  const plan = { tasks: [{ id: "locate", title: "Locate the read_file definition", description: "", acceptanceCriteria: ["The location is logged as a TODO entry"], dependencies: [] }] }
+  const plan = { tasks: [{ id: "locate", title: "Locate the read_file definition", description: "", criteria: [{ id: "criterion-1", description: "The location is logged as a TODO entry", verification: { kind: "semantic_review" } }], dependencies: [] }] }
   assert.equal(findAdministrativeClauses(plan, "Where is read_file implemented?").length, 1)
-  const concrete = { tasks: [{ id: "locate", title: "Locate the read_file definition", description: "", acceptanceCriteria: ["The definition is located at a line range"], dependencies: [] }] }
+  const concrete = { tasks: [{ id: "locate", title: "Locate the read_file definition", description: "", criteria: [{ id: "criterion-1", description: "The definition is located at a line range", verification: { kind: "semantic_review" } }], dependencies: [] }] }
   assert.equal(findAdministrativeClauses(concrete, "Where is read_file implemented?").length, 0)
 })
 
@@ -1074,4 +1074,12 @@ test("a stop during child TODO review returns at once, and a late decision is di
   await new Promise((resolve) => setTimeout(resolve, 10))
   assert.equal(outcome.ok, false, "a decision that arrives after Stop never authorizes a mutation")
   assert.equal(requests.length, 1, "no correction request starts after Stop")
+})
+
+test("the abandoned string acceptanceCriteria contract is rejected with an actionable typed-criteria message", () => {
+  const legacy = plan({ tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", acceptanceCriteria: ["Path and line range cited."], dependencies: [] }] })
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: legacy }), "Locate read_file.")
+  assert.ok("error" in parsed, "a legacy string criterion never becomes an accepted plan")
+  assert.match(parsed.error, /acceptanceCriteria is no longer accepted/)
+  assert.match(parsed.error, /criteria\[\]/)
 })

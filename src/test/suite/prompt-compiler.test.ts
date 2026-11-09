@@ -49,9 +49,9 @@ const PLAN = {
   goal: "Make parser behavior reliable",
   constraints: ["Preserve public API"],
   tasks: [
-    { id: "inspect-parser", title: "Inspect parser", description: "Inspect parser behavior", acceptanceCriteria: ["Identify faulty branch"], dependencies: [] },
-    { id: "fix-parser", title: "Fix parser", description: "Correct faulty branch", acceptanceCriteria: ["Regression test passes"], dependencies: ["inspect-parser"] },
-    { id: "verify-parser", title: "Verify parser", description: "Run focused tests", acceptanceCriteria: ["Focused tests pass"], dependencies: ["fix-parser"] }
+    { id: "inspect-parser", title: "Inspect parser", description: "Inspect parser behavior", criteria: [{ id: "criterion-1", description: "Identify faulty branch", verification: { kind: "semantic_review" } }], dependencies: [] },
+    { id: "fix-parser", title: "Fix parser", description: "Correct faulty branch", criteria: [{ id: "criterion-1", description: "Regression test passes", verification: { kind: "semantic_review" } }], dependencies: ["inspect-parser"] },
+    { id: "verify-parser", title: "Verify parser", description: "Run focused tests", criteria: [{ id: "criterion-1", description: "Focused tests pass", verification: { kind: "semantic_review" } }], dependencies: ["fix-parser"] }
   ]
 }
 

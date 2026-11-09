@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 export interface ToolEvidenceInput {
   name: string
   args: Record<string, unknown>
@@ -11,6 +13,8 @@ export interface CompactToolEvidence {
   toolName: string
   invocationId: string
   targetPath?: string
+  command?: string
+  commandSha256?: string
   failed: boolean
   exitCode?: number
   lineRange?: { start: number; end: number }
@@ -23,18 +27,35 @@ export const MAX_EVIDENCE_TEXT = 1000
 const MAX_FAILURE_SUMMARY = 240
 const MAX_RESULT_IDS = 8
 const PATH_KEYS = ["path", "file_path", "filePath", "file", "target"]
+const COMMAND_KEYS = ["command"]
+const DISPLAY_CHARS = 500
 const START_KEYS = ["start_line", "startLine"]
 const END_KEYS = ["end_line", "endLine"]
 const FINGERPRINT = /\b(?:xxh64:[0-9a-f]{16}|xxh3_128:[0-9a-f]{32}|sha256:[0-9a-f]{64})\b/g
 const RESULT_ID = /\b(?:observation_id|item_id|itemId|id)"?\s*[:=]\s*"?([A-Za-z0-9._:-]{4,80})/g
 
-const firstString = (args: Record<string, unknown>, keys: string[]): string | undefined => {
+const firstValue = (args: Record<string, unknown>, keys: string[]): string | undefined => {
   for (const key of keys) {
     const value = args[key]
-    if (typeof value === "string" && value.trim()) return value.trim().slice(0, 500)
+    if (typeof value === "string" && value.trim()) return value.trim()
   }
   return undefined
 }
+
+const firstString = (args: Record<string, unknown>, keys: string[]): string | undefined =>
+  firstValue(args, keys)?.slice(0, DISPLAY_CHARS)
+
+/**
+ * Verification identity of a run_command invocation. It covers the whole trimmed command, so a bounded display
+ * prefix can never stand in for a longer command. Commands always run at the workspace root, so the enclosing
+ * record's project scope is the only working-directory context needed.
+ */
+export const commandDigest = (command: string): string =>
+  `sha256:${createHash("sha256").update(JSON.stringify(["run_command", command.trim()])).digest("hex")}`
+
+/** Arguments as shown to the model and the user: identity-only fields such as `command_sha256` are left out. */
+export const displayArguments = (args: Record<string, unknown>): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(args).filter(([key]) => key !== "command_sha256"))
 
 const positiveInteger = (args: Record<string, unknown>, keys: string[]): number | undefined => {
   for (const key of keys) {
@@ -77,10 +98,13 @@ export const compactToolEvidence = (input: ToolEvidenceInput): CompactToolEviden
     ? `failed: ${firstLine || "no output"}`
     : `${lines} line${lines === 1 ? "" : "s"} of output`
   const resultIds = [...text.matchAll(RESULT_ID)].map((match) => match[1])
+  const command = input.name === "run_command" ? firstValue(input.args, COMMAND_KEYS) : undefined
   return {
     toolName: input.name.slice(0, 120),
     invocationId: input.invocationId,
     targetPath: firstString(input.args, PATH_KEYS),
+    command: command?.slice(0, DISPLAY_CHARS),
+    commandSha256: command === undefined ? undefined : commandDigest(command),
     failed: input.failed,
     exitCode: input.exitCode,
     lineRange: start && end && end >= start ? { start, end } : start ? { start, end: start } : undefined,
@@ -93,6 +117,8 @@ export const compactToolEvidence = (input: ToolEvidenceInput): CompactToolEviden
 export const compactArguments = (evidence: CompactToolEvidence): Record<string, string> => {
   const pairs: [string, string | number | undefined][] = [
     ["path", evidence.targetPath],
+    ["command", evidence.command],
+    ["command_sha256", evidence.commandSha256],
     ["start_line", evidence.lineRange?.start],
     ["end_line", evidence.lineRange?.end]
   ]

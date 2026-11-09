@@ -1,5 +1,5 @@
 import type { TodoToolObservation } from "../../common/types/todo"
-import { isAnalysisOnlyIntent } from "../todos/feedback"
+import { displayArguments } from "../todos/evidence"
 
 export type ExecutionState = "executing" | "reconciling" | "accepted" | "continue" | "repairing" | "blocked" | "cancelled"
 export type EvaluatorDecision = "accept" | "revise" | "needs_evidence" | "blocked"
@@ -155,19 +155,9 @@ export class ExecutionReconciliationController {
   }
 }
 
-const changeVerbs = /\b(add|change|create|delete|edit|enhance|fix|implement|improve|make|modify|refactor|remove|rewrite|update|write)\b/i
-
-export const requiresWorkspaceChanges = (goal: string): boolean => {
-  const leading = /^\s*(explain|analy[sz]e|review|describe|compare|summari[sz]e|why|how)\b/i.test(goal)
-  return leading ? !isAnalysisOnlyIntent(goal) : changeVerbs.test(goal)
-}
-
-export const isAnalysisOnlyGoal = isAnalysisOnlyIntent
-
 export const allIntentTasksComplete = (statuses: string[]): boolean => statuses.length > 0 && statuses.every((status) => status === "completed")
 
 export const forbiddenDeleteReason = (goal: string, relativePath: string): string | undefined => {
-  if (!requiresWorkspaceChanges(goal)) return undefined
   const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()
   const named = goal.replace(/\\/g, "/").toLowerCase()
   const basename = normalized.split("/").at(-1) ?? normalized
@@ -185,7 +175,7 @@ export const forbiddenDeleteReason = (goal: string, relativePath: string): strin
 
 export const observationReference = (observation: TodoToolObservation): string => {
   const path = observation.arguments.path ?? observation.arguments.file
-  const label = path ? `${observation.toolName} ${path}` : `${observation.toolName} ${JSON.stringify(observation.arguments)}`
+  const label = path ? `${observation.toolName} ${path}` : `${observation.toolName} ${JSON.stringify(displayArguments(observation.arguments))}`
   const evidence = observation.evidence
   const storage = !evidence
     ? "storage status unknown"

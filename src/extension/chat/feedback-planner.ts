@@ -27,7 +27,18 @@ export const FEEDBACK_PLAN_PROTOCOL =
   "You maintain the task plan Twinny uses to track progress on the user's request. " +
   "Return exactly one valid JSON object, with no prose or Markdown fences, with keys track (boolean) and plan. " +
   "Use {\"track\": false, \"plan\": null} when the message needs no tracked work (a question, greeting, or a follow-up that the existing plan already covers). " +
-  "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, acceptanceCriteria: string[], dependencies: string[]}]}. " +
+  "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, criteria: [{id: stable string, description: string, verification: object}], dependencies: string[]}]}. " +
+  "Each criterion's verification is a typed descriptor chosen by what must be proven, never by its wording. Allowed verification objects: " +
+  "{kind: \"evidence_lookup_completed\"} proves only that a project-scoped evidence lookup succeeded, whether or not facts matched; " +
+  "{kind: \"accepted_fact_exists\", symbol: string, path?: string} requires a current accepted fact about the symbol; " +
+  "{kind: \"source_location\", symbol: string, path: string} requires the declaration's start line; " +
+  "{kind: \"source_range\", symbol: string, path: string} requires the declaration's complete start-to-closing range; " +
+  "{kind: \"source_fingerprint\", symbol: string, path: string} requires the authoritative content fingerprint of the declaration; " +
+  "{kind: \"execution_invariant\", invariant: \"no_mutating_tool_calls\"} requires that no mutating tool ran in this conversation; " +
+  "{kind: \"workspace_mutation\", operation?: \"create\"|\"edit\"|\"delete\"} requires that a successful file create, edit, or delete ran during this task (narrowed to one operation when given), and is the only way to require a workspace change; " +
+  "{kind: \"command_exit_status\", command: string, exitCode: number, execution?: \"recorded\"|\"after_activation\"} requires the latest Twinny run of that exact command to exit with exitCode; execution \"after_activation\" also requires that run to come after the task's requirement activation, which is how a criterion demands a run made now (for example, \"is run again\"); " +
+  "{kind: \"semantic_review\"} is only for a criterion that genuinely needs judgment. " +
+  "symbol is a bare identifier and path is repository-relative. Each criterion description must match its descriptor exactly and must not weaken the user's requirement. " +
   "Include 1-100 ordered tasks with stable IDs and no unknown or cyclic dependencies. Ground every task in the user's request; do not invent requirements. " +
   "Keep the plan as small as the objective allows: one task per distinct piece of user work, with factual, specific, measurable acceptance criteria proportional to that task. " +
   "Planning workflow is not a user deliverable. Twinny creates and updates the TODO list itself, so no title, description, or criterion may ask Mycroft to create, update, verify, or report on TODO entries, statuses, or the list, even when the user says to use TODOs. " +
@@ -131,15 +142,16 @@ export const findAdministrativeClauses = (plan: unknown, objective = ""): Admini
   const found: AdministrativeClause[] = []
   candidate.tasks.forEach((task, index) => {
     if (!task || typeof task !== "object") return
-    const record = task as { title?: unknown; description?: unknown; acceptanceCriteria?: unknown }
+    const record = task as { title?: unknown; description?: unknown; criteria?: unknown }
     for (const field of ["title", "description"] as const) {
       const value = record[field]
       if (typeof value === "string" && isAdministrativeText(value, false)) found.push({ path: `tasks[${index}].${field}`, text: value })
     }
-    if (!Array.isArray(record.acceptanceCriteria)) return
-    record.acceptanceCriteria.forEach((criterion, position) => {
-      if (typeof criterion === "string" && isAdministrativeText(criterion, true)) {
-        found.push({ path: `tasks[${index}].acceptanceCriteria[${position}]`, text: criterion })
+    if (!Array.isArray(record.criteria)) return
+    record.criteria.forEach((criterion, position) => {
+      const description = criterion && typeof criterion === "object" ? (criterion as { description?: unknown }).description : undefined
+      if (typeof description === "string" && isAdministrativeText(description, true)) {
+        found.push({ path: `tasks[${index}].criteria[${position}].description`, text: description })
       }
     })
   })
@@ -207,13 +219,15 @@ export const reconcileAdministrativeCriteria = async (repository: FeedbackPlanRe
       unrepaired.push({ taskId: task.id, reason: "its title or description directs administrative TODO work, so Feedback must replan it" })
       return
     }
-    const kept = task.acceptanceCriteria.filter((_, position) => !paths.has(`tasks[${index}].acceptanceCriteria[${position}]`))
-    if (kept.length === task.acceptanceCriteria.length) return
+    const dropped = new Set(task.criteria.flatMap((_, position) =>
+      paths.has(`tasks[${index}].criteria[${position}].description`) ? [position] : []))
+    if (!dropped.size) return
+    const kept = task.criteria.filter((_, position) => !dropped.has(position))
     if (!kept.length) {
       unrepaired.push({ taskId: task.id, reason: "removing its administrative criteria would leave none, so Feedback must replan it" })
       return
     }
-    repairedTasks.set(task.id, { ...task, acceptanceCriteria: kept })
+    repairedTasks.set(task.id, { ...task, criteria: kept })
   })
   if (!repairedTasks.size) {
     for (const item of unrepaired) logger.warn(`[Feedback] TODO ${item.taskId} still has administrative instructions: ${item.reason}.`)

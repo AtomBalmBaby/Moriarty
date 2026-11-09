@@ -1,9 +1,22 @@
 # Twinny Native TODO System
 
 
+## Development-phase contract policy (2026-11-08)
+
+**Twinny is an unreleased development fork with no external users who depend on old state or APIs. Backward compatibility with obsolete development formats is explicitly NOT a requirement.** This decision supersedes any earlier instruction in these three documents to retain old acceptance-criterion strings, run dual interpreters, maintain legacy model protocols, or migrate abandoned test-state schemas. It does **not** relax authorization, evidence provenance, durability of the *new* system, stop/cancellation semantics, or correctness tests.
+
+- **One canonical criterion representation:** a versioned, schema-validated typed JSON criterion with a stable criterion ID, `description` for display only, `verification.kind`, typed operands, subject/scope, and evidence requirements. Do not persist a separate `acceptanceCriteria: string[]` authority or require its text to mirror the typed objects. Derive any display labels from the typed record.
+- **One live decision path:** new planner output MUST use typed contracts. Remove the old English/regex criterion classifier, automatic legacy-plan fallback, dual interpretation, and old reviewer gates once the typed path is wired through production. Unknown or malformed contracts are rejected with bounded structured correction, never silently reinterpreted as prose.
+- **Development data reset is permitted, not automatic:** inventory the current extension-host `sql.js` database, identify anything worth keeping, and offer/export a backup before any destructive reset. After an intentional reset, use the single current schema; obsolete compatibility migrations and shadow columns need not survive. Do not wipe databases implicitly on extension startup or upgrade.
+- **Preserve capabilities, not legacy representations:** project/conversation isolation, stable IDs for newly created work, accepted-evidence persistence, cross-chat read permissions, atomic task transitions, concurrency guards, current-source freshness, cancellation, approvals, and provenance remain essential. Refactor or delete only after identifying the current call sites and replacing all uses.
+- **Tests and documentation follow the new contract:** replace tests asserting obsolete string-based verification with tests of the same user-visible behavior under typed contracts. Keep historical failure fixtures as evidence of what went wrong, but never interpret them as compatibility requirements. A green helper suite alone cannot establish production integration.
+- **No architecture fork:** reuse the existing planner, `TodoRepository`, `sql.js` adapter, native tools, verifier and execution controller. Consolidate conflicting behavior rather than introducing a second state machine, database, parser or API layer.
+
+**Current verification status:** Gate 1 has been *reported* as implemented with typed criteria and passing automated suites, but the full live Mycroft/controller/evidence path is not independently proven here. The subsequent gate must remove remaining dual-format machinery and validate production behavior; do not mistake this policy for a claim that cleanup is already complete.
+
 ## Reconciled governing decisions (2026-11-08)
 
-This is **one system**, described by three complementary documents. The [intent/feedback overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW_RECONCILED.md) owns architectural boundaries and internal message protocol; the [native TODO specification](TWINNY_NATIVE_TODO_SYSTEM_RECONCILED.md) owns task identity, dependencies, state and persistence; the [evidence manifesto](TWINNY_EVIDENCE_MANIFESTO_RECONCILED.md) owns observation/fact trust, criterion proofs, freshness and live acceptance. When an older example in any document differs, this reconciled contract governs. **Design target is not evidence of implementation.**
+This is **one system**, described by three complementary documents. The [intent/feedback overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md) owns architectural boundaries and internal message protocol; the [native TODO specification](TWINNY_NATIVE_TODO_SYSTEM.md) owns task identity, dependencies, state and persistence; the [evidence manifesto](TWINNY_EVIDENCE_MANIFESTO.md) owns observation/fact trust, criterion proofs, freshness and live acceptance. When an older example in any document differs, this reconciled contract governs. **Design target is not evidence of implementation.**
 
 - **Structured internal control:** Planner, host, implementer, verifier, and reviewer exchange versioned JSON objects conforming to validated schemas. Human-readable descriptions are labels/explanations and never the executable acceptance condition. Model-facing tool calls already have structured arguments; internal prompt transport may still serialize JSON as text, but must validate the parsed object before acting.
 - **Stable responsibilities:** Models propose plans, investigations, claims and semantic judgments. Twinny owns identity, permissions, execution outcomes, evidence capture, objective verification, transitions and retries. The user owns requirements and explicit authorization. No prose explanation or model-proposed `passed` flag overrides a contradictory trusted host observation.
@@ -16,7 +29,7 @@ This is **one system**, described by three complementary documents. The [intent/
 - **Truth in reporting:** Distinguish *observed live*, *reported by Copilot/tests*, *designed*, and *unverified*. A zero-failure helper suite does not prove the actual VSCodium extension-host orchestration works.
 
 
-**Status:** Reconciled implementation contract; legacy proposed migration examples are historical sketches, not a description of shipped storage  
+**Status:** Reconciled development contract; the typed JSON schema is canonical and obsolete formats carry no compatibility obligation
 **Baseline:** 2026-11-02; reconciled 2026-11-08 (design and observed implementation distinguished)  
 **Parent architecture:** [TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md)
 
@@ -32,13 +45,11 @@ This is the first vertical slice of the larger intent, execution, feedback, and 
 
 ### 2.1 Recommended default
 
-**One SQLite database per Twinny extension-host storage location**, placed under VS Code's `ExtensionContext.globalStorageUri`. The following WAL filenames describe an earlier native-SQLite proposal, **not** the implemented `sql.js` persistence strategy:
+**One `sql.js` SQLite WASM database per Twinny extension-host storage location**, placed under VS Code's `ExtensionContext.globalStorageUri`:
 
 ```text
 ExtensionContext.globalStorageUri/
   twinny-state.sqlite
-  twinny-state.sqlite-wal   (present when WAL is active)
-  twinny-state.sqlite-shm   (present when WAL is active)
 ```
 
 These names are illustrative; resolve the actual location from the ExtensionContext at runtime. The directory may need to be created. Do not hardcode `~/.vscode-oss`, `.vscode`, or repository paths.
@@ -60,7 +71,7 @@ Do **not** put the full TODO database in `globalState` or `workspaceState` key/v
 
 The store exists **where the extension host executes**. A local VSCodium instance and an SSH/remote extension host may have different physical `globalStorageUri` directories. The UI must not imply automatic synchronization. The first release is local-to-host only, with explicit portable export/import planned.
 
-The implemented adapter is `sql.js` (SQLite WASM) with serialized writes, transactions, and atomic file replacement. It does **not** use WAL. The WAL discussion above is retained only as a caution for any future native-SQLite adapter; never silently switch persistence engines or put a native WAL database on NFS/SMB.
+The implemented adapter is `sql.js` (SQLite WASM), with serialized writes, transactions and atomic database-file replacement. It does **not** use WAL. Do not add a second storage engine to satisfy obsolete compatibility needs.
 
 ### 2.3 Storage abstraction
 
@@ -131,95 +142,41 @@ A project can contain many chats; each chat has its own canonical list. Project-
 | `todo_items` | `id`, `list_id`, `parent_id?`, `title`, `details?`, `status`, `verification`, `priority`, `sort_order`, `version`, `assigned_run_id?`, `blocked_reason?`, timestamps | Current task state |
 | `todo_dependencies` | `item_id`, `depends_on_item_id` | Explicit dependency graph |
 | `todo_events` | `id`, `list_id`, `item_id?`, `list_revision`, `event_type`, `actor`, `request_id`, `payload_json`, `created_at` | Append-only record of changes |
+| `todo_requirement_activations` | `id`, `list_id`, `item_id`, `request_id`, `kind`, `list_revision`, `activated_at` | Host-owned requirement activation and renewal records (Unix ms); eligibility for `after_activation` command results |
 | `todo_evidence` | `id`, `item_id`, `run_id?`, `kind`, `summary`, `result`, `reference?`, `created_at` | Verification and observations |
 | `agent_runs` | `id`, `conversation_id`, `item_id?`, `provider`, `model`, `status`, `started_at`, `finished_at` | Trace task attempts and interruptions |
 
 Later, introduce separate `intents`, `intent_revisions`, evaluator judgments, playbook invocations, and richer handoff records. Do not prematurely embed those semantics in TODO title fields.
 
-### 4.2 Legacy example schema (historical, **not** the active migration)
+### 4.2 Current schema contract (typed-only development target)
 
-```sql
-PRAGMA foreign_keys = ON;
+The actual `sql.js` repository schema and source migrations are the implementation baseline; the old untyped SQL sketch is deliberately retired. Model the accepted current contract without a parallel `acceptanceCriteria: string[]` authority or a legacy parser.
 
-CREATE TABLE IF NOT EXISTS projects (
-  id TEXT PRIMARY KEY,
-  display_name TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
+- Store typed criteria with stable IDs, versioned verification descriptors, and human-readable descriptions derived from the same canonical record.
+- Store each criterion's latest result, proof references, reason code, freshness/scope, task and plan revision. Preserve the immutable observation/event trail even when the current outcome changes.
+- Keep trusted observations distinct from model-authored claims; accepted facts link to actual verified criteria and source fingerprints.
+- Keep project, conversation, dependency, authorization, idempotent request, and revision relationships enforceable by the repository.
+- For the development fork, an **explicit, backed-up reset** may replace incompatible old development tables and columns. Do not ship multiple schema variants or migration shims merely to read old test data.
 
-CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id),
-  title TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+Do not interpret this section as a ready-to-run SQL migration. Inspect the current repository implementation and apply one consistent canonical schema through its normal initialization path.
 
-CREATE TABLE IF NOT EXISTS todo_lists (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id),
-  conversation_id TEXT REFERENCES conversations(id),
-  scope TEXT NOT NULL CHECK (scope IN ('chat', 'project')),
-  revision INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  CHECK ((scope = 'chat' AND conversation_id IS NOT NULL)
-      OR (scope = 'project' AND conversation_id IS NULL))
-);
+### 4.4 Timestamp, revision, and freshness policy
 
-CREATE UNIQUE INDEX IF NOT EXISTS one_chat_todo_list
-  ON todo_lists(conversation_id) WHERE scope = 'chat';
-CREATE UNIQUE INDEX IF NOT EXISTS one_project_todo_list
-  ON todo_lists(project_id) WHERE scope = 'project';
+Identity, ordering, and freshness are separate concerns. Each one uses its own mechanism.
 
-CREATE TABLE IF NOT EXISTS todo_items (
-  id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  parent_id TEXT REFERENCES todo_items(id),
-  title TEXT NOT NULL,
-  details TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',
-  verification TEXT NOT NULL DEFAULT 'not_checked',
-  priority INTEGER NOT NULL DEFAULT 0,
-  sort_order INTEGER NOT NULL DEFAULT 0,
-  version INTEGER NOT NULL DEFAULT 1,
-  assigned_run_id TEXT,
-  blocked_reason TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  CHECK (status IN ('pending','in_progress','in_review',
-                   'blocked','completed','cancelled')),
-  CHECK (verification IN ('not_checked','passed','failed','waived'))
-);
+- **Stable identity.** Entity IDs (items, lists, observations, requirement activations) are stable unique IDs. Ordinal positions and SQLite `rowid` values are never identity.
+- **Event time.** Unix epoch milliseconds are the canonical event timestamp. `todo_requirement_activations.activated_at` already uses this form. Other tables still store ISO text from earlier development. Converting them is a repository-wide follow-on migration, not part of the current change.
+- **TODO revision tokens.** `todo_lists.revision` and `todo_items.version` are integer compare-and-set tokens checked by `expected_version`. They are not timestamps. Replacing them with timestamp tokens requires equivalent atomic compare-and-update guarantees and tests first.
+- **Causal order.** Per-list `list_revision` values on `todo_events` and `todo_tool_observations` are taken in the same transaction as the write they describe. They prove ordering without the system clock. Wall-clock time never proves ordering. `rowid` is only a final tie-break.
+- **Requirement activation.** `todo_requirement_activations` (schema v11) records an `activation` (first issue for an item, idempotent) or a `renewal` (explicit), each with a `list_revision` and `activated_at`. A `command_exit_status` with `execution: "after_activation"` counts only runs whose `list_revision` is greater than the latest activation's. Feedback reviews and completion claims never create or renew an activation.
+- **Source freshness.** Source revisions are decided by the current authoritative fingerprint, including unsaved editor buffers. Timestamps are never used for this.
 
-CREATE INDEX IF NOT EXISTS todo_items_by_list_status
-  ON todo_items(list_id, status, sort_order);
-
-CREATE TABLE IF NOT EXISTS todo_events (
-  id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  item_id TEXT REFERENCES todo_items(id),
-  list_revision INTEGER NOT NULL,
-  event_type TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  request_id TEXT NOT NULL UNIQUE,
-  payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(list_id, list_revision)
-);
-
-CREATE TABLE IF NOT EXISTS todo_evidence (
-  id TEXT PRIMARY KEY,
-  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
-  run_id TEXT,
-  kind TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  result TEXT NOT NULL,
-  reference TEXT,
-  created_at TEXT NOT NULL
-);
-```
-
-This is a representative core, **not** a complete drop-in migration: add the remaining entity tables, foreign-key consistency enforcement, full migration metadata, and dependency-cycle validation before shipping. Use monotonically increasing list revisions and item versions. A task's `parent_id`, dependencies, project and conversation relationship must be validated within the repository, not trusted from raw model input.
+| Table | Column | Form | Role |
+|---|---|---|---|
+| `todo_lists` / `todo_items` | `revision` / `version` | integer | CAS token (`expected_version`) |
+| `todo_events`, `todo_tool_observations` | `list_revision` | integer | Causal order within a list |
+| `todo_requirement_activations` | `list_revision`, `activated_at` | integer, Unix ms | Requirement activation and renewal |
+| all other tables | `created_at`, `updated_at` | ISO text (current) | Follow-on migration to Unix ms |
 
 ### 4.3 Write transactions and event journal (adapter-neutral intent)
 
@@ -234,7 +191,7 @@ Each accepted mutation executes in **one SQLite transaction**:
 
 An event is provenance, not an enormous copy of source code or an entire chat transcript. Store compact metadata and bounded result summaries. Link to external trace logs or artifacts when needed.
 
-Concurrency: SQLite has a single writer at a time. Keep write transactions short, use a busy timeout, use connection coordination for multiple extension windows, and test concurrent revision conflicts. Use an appropriate SQLite online backup method rather than blindly copying a live WAL database file.
+Concurrency: serialize `sql.js` writes, keep transactions short, coordinate multiple extension windows, and test conflicting revisions. Back up a quiescent database snapshot using the adapter-supported mechanism; never assume native SQLite WAL semantics.
 
 ## 5. Task state machine
 
@@ -358,7 +315,7 @@ The models are replaceable. The store, state machine, and tool contracts do not 
 - Prune or archive old verbose run diagnostics by policy while retaining task/event provenance needed for audit and deduplication.
 - Offer export of a task list as Markdown or JSON on demand. Markdown is a presentation/export format, **not** the system of record.
 - Support deliberate JSON export/import for portability. Include schema version and stable IDs; detect collisions and avoid duplicate imports.
-- Use SQLite's backup facility or a safe checkpoint/closed-database process. Include WAL considerations and backup restoration tests.
+- Back up a quiescent `sql.js` database snapshot and test restoration; no WAL checkpoint behavior applies.
 
 ## 10. Delivery: one complete vertical slice
 
@@ -366,7 +323,7 @@ The models are replaceable. The store, state machine, and tool contracts do not 
 
 1. Inspect existing Twinny chat IDs, workspace identity, and extension lifecycle; do not assume conventions.
 2. Add a `TodoRepository` interface and SQLite implementation in extension-host code.
-3. Implement migrations and project/chat resolution, including no-workspace fallback.
+3. Establish one current schema (resetting backed-up obsolete development data if explicitly authorized) and project/chat resolution, including no-workspace fallback.
 4. Implement canonical list CRUD, item versions, request idempotency, and event logging.
 5. Add initial native TODO tools to the existing model-facing tool registry, subject to normal permission checks.
 6. Add the above-chat collapsible checklist and bridge events for snapshots/changes.
@@ -421,7 +378,7 @@ Persistence, tool, protocol, and checklist code are in place. llama.cpp receives
 
 Administrative-TODO control: when Feedback manages a plan, every title, description, and acceptance criterion is validated structurally before synchronization. Text that instructs Mycroft to create, update, verify, or report on the TODO system is rejected unless the user's objective concerns TODO functionality. A violating plan gets one corrective Feedback retry that names the offending paths, and an invalid plan is never stored. An already active plan can be repaired by removing only the offending criteria, which increments the plan revision, preserves task identity, observations, and verification, and leaves unrelated tasks unchanged. This detector is heuristic. Its objective basis is the stored intent goal, which can differ from the user's original prompt.
 
-Deterministic verification runs before Feedback. A plan whose criteria are all source-location or other objective facts is decided by the host from trusted observations: the fact must have a successful read, a workspace-relative path, a matching symbol and line span, and a current fingerprint. Outcomes are `proven`, `disproven`, `unknown`, and `semantic`. The currently documented English-criterion classifier attempts to decide an accepted-evidence criterion with no path or symbol anchor from the host's `host_evidence_check` observation, which records the project-wide accepted-fact lookup (`resolution: found` or `none`, the query, the scope, and the fact IDs) when the turn's preflight runs. That observation is host-recorded, not a tool the model can call. An inquiry ("Confirm whether accepted evidence exists") **should** be proven by any completed, successful, sufficiently scoped lookup, including `none`; November 8 live traces show this behavior failed and it is not verified as fixed. A claim ("Accepted evidence exists") is decided by count: absence is proven only while no accepted fact was recorded after that check, and presence needs a listed fact that is still live. A failed or subject-scoped lookup proves neither. The no-modification criterion is a prohibition: it is proven when the plan's operation record exists and holds no successful mutation Twinny executed, unknown when no operation was recorded at all, and it is scoped to operations Twinny controls. Only `semantic` criteria reach Feedback. Facts are recorded in `todo_accepted_evidence` (schema version 6), keyed by list, symbol, and path. Replacing a fact marks the older row historical rather than deleting it. The read-only `twinny_evidence_lookup` tool returns accepted facts with freshness, and the Mycroft context lists current facts before the tasks. Limits: a fact covers the declaration's line span rather than the whole function body, and "fresh" means the host re-fingerprints the file on verification. It does not mean the agent performed a new read. As of the uploaded implementation notes, typed criterion descriptors are **not** established end-to-end; symbol/path anchors and English-language classifiers remain in use. The reconciled contract below replaces these with a versioned, typed JSON control protocol as the target, not a claim of current completion.
+Deterministic verification runs before Feedback. A plan whose criteria are all source-location or other objective facts is decided by the host from trusted observations: the fact must have a successful read, a workspace-relative path, a matching symbol and line span, and a current fingerprint. Outcomes are `proven`, `disproven`, `unknown`, and `semantic`. The currently documented English-criterion classifier attempts to decide an accepted-evidence criterion with no path or symbol anchor from the host's `host_evidence_check` observation, which records the project-wide accepted-fact lookup (`resolution: found` or `none`, the query, the scope, and the fact IDs) when the turn's preflight runs. That observation is host-recorded, not a tool the model can call. An inquiry ("Confirm whether accepted evidence exists") **should** be proven by any completed, successful, sufficiently scoped lookup, including `none`; November 8 live traces show this behavior failed and it is not verified as fixed. A claim ("Accepted evidence exists") is decided by count: absence is proven only while no accepted fact was recorded after that check, and presence needs a listed fact that is still live. A failed or subject-scoped lookup proves neither. The no-modification criterion is a prohibition: it is proven when the plan's operation record exists and holds no successful mutation Twinny executed, unknown when no operation was recorded at all, and it is scoped to operations Twinny controls. Only `semantic` criteria reach Feedback. Facts are recorded in `todo_accepted_evidence` (schema version 6), keyed by list, symbol, and path. Replacing a fact marks the older row historical rather than deleting it. The read-only `twinny_evidence_lookup` tool returns accepted facts with freshness, and the Mycroft context lists current facts before the tasks. Limits: a fact covers the declaration's line span rather than the whole function body, and "fresh" means the host re-fingerprints the file on verification. It does not mean the agent performed a new read. The earlier uploaded implementation still used English-language classifiers, while Gate 1 reportedly added typed criteria. The intended end state is **typed-only**; eliminate the old classifiers and verify the full production path rather than maintaining both representations.
 
 
 ## Reconciled TODO and persistence implementation contract
@@ -434,7 +391,7 @@ A task's `status` (`pending`, `in_progress`, `in_review`, `blocked`, `completed`
 
 ### Persistence reality and migration policy
 
-Existing implementation documentation identifies `sql.js` WASM plus serialized SQLite transactions and atomic file replacement under extension-host global storage. This is the **current documented adapter**. Native SQLite WAL files and `node:sqlite` are historical proposals, not shipping assumptions. Preserve the repository adapter boundary and per-project/per-conversation scoping; do not introduce another DB, shadow memory index, or WAL mode merely to implement criterion contracts. Any storage migration must be reversible or safely backable up, idempotent, preserve existing TODO/evidence/plan IDs and history, and be tested through close/reopen. Use the actual source migrations to establish live schema version rather than relying on a document's version number.
+Existing implementation documentation identifies `sql.js` WASM plus serialized SQLite transactions and atomic file replacement under extension-host global storage. This is the **current documented adapter**. Native SQLite WAL files and `node:sqlite` are historical proposals, not shipping assumptions. Preserve the repository adapter boundary and per-project/per-conversation scoping; do not introduce another DB, shadow memory index, or WAL mode merely to implement criterion contracts. During this unreleased development phase, obsolete schema/data compatibility is not required. Inventory and explicitly back up any valuable local development data before an authorized reset; then prefer one canonical current schema. New-system transactions, backups, close/reopen and crash recovery must remain correct. Use the actual source migrations to establish live schema version rather than relying on a document's version number.
 
 ### Identity, authorization and durable facts
 

@@ -4,16 +4,13 @@ import { Database, SqlValue } from "sql.js"
 import { logger } from "../../common/logger"
 
 import {
-  describeGap,
-  evidenceAnchors,
-  evidenceGaps,
+  displayArguments,
   type EvidenceHit,
   type EvidenceSource,
   MAX_EVIDENCE_TEXT,
   preserveEvidence,
   redactEvidence
 } from "./evidence"
-import { hasTrustedEvidenceForCriterion, isAnalysisOnlyIntent } from "./feedback"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
 import {
@@ -29,6 +26,7 @@ import {
   type IntentPlanOutline,
   type IntentPlanOutlineChild,
   type IntentTaskPlan,
+  type RequirementActivation,
   type RetainedObservationEvidence,
   type SymbolAlias,
   type TodoCompletionClaim,
@@ -49,6 +47,7 @@ import {
   type TodoToolObservationInput,
   type TodoVerification,
   type TodoWriteRequest,
+  type TypedCriterion,
   type UpdateTodoInput} from "./types"
 
 interface ProjectRow {
@@ -74,7 +73,7 @@ interface ItemRow {
   priority: TodoPriority
   created_by: "user" | "model"
   source: TodoSource
-  acceptance_criteria?: string | null
+  criteria_json?: string | null
   sort_order: number
   blocked_reason: string | null
   version: number
@@ -83,6 +82,17 @@ interface ItemRow {
 }
 
 const now = () => new Date().toISOString()
+/** Canonical JSON of a task's typed criteria, the only stored acceptance representation. */
+const criteriaJson = (criteria: TypedCriterion[]): string => JSON.stringify(criteria)
+const storedCriteria = (json: string | null | undefined): TypedCriterion[] | undefined => json ? JSON.parse(json) as TypedCriterion[] : undefined
+/** Typed criteria of an active plan task. Active tasks always carry them, so a missing value is corrupt storage. */
+const requiredCriteria = (json: string | null | undefined): TypedCriterion[] => {
+  const criteria = storedCriteria(json)
+  if (!criteria) throw new Error("Active TODO plan task has no typed criteria")
+  return criteria
+}
+/** Display text of typed criteria, derived for projections that need strings. */
+const displayOf = (criteria: TypedCriterion[]): string[] => criteria.map((criterion) => criterion.description)
 type TodoLogField = string | number | boolean | null
 const logTodoEvent = (event: string, fields: Record<string, TodoLogField>, level: "info" | "debug" = "info") => {
   const line = "[Todo] " + event + " " + JSON.stringify(fields)
@@ -123,7 +133,7 @@ const itemOf = (row: ItemRow): TodoItem => ({
   priority: row.priority,
   createdBy: row.created_by,
   source: row.source,
-  acceptanceCriteria: row.acceptance_criteria ? JSON.parse(row.acceptance_criteria) as string[] : undefined,
+  criteria: storedCriteria(row.criteria_json),
   sortOrder: row.sort_order,
   blockedReason: row.blocked_reason ?? undefined,
   version: row.version,
@@ -169,7 +179,7 @@ const findList = (database: Database, request: TodoListRequest): ListRow | undef
 
 interface PlanTaskLink {
   taskId: string
-  acceptance: string[]
+  criteria: TypedCriterion[]
   dependencies: string[]
 }
 
@@ -188,15 +198,15 @@ const planMembership = (database: Database, listId: string): PlanMembership => {
       .map((row): [string, ItemRow] => [row.id, row])
   )
   const tasks = new Map<string, PlanTaskLink>(
-    rows<{ item_id: string; task_id: string; acceptance_json: string; dependencies_json: string }>(
+    rows<{ item_id: string; task_id: string; criteria_json: string | null; dependencies_json: string }>(
       database,
-      "SELECT item_id, task_id, acceptance_json, dependencies_json FROM todo_intent_tasks WHERE list_id = ? AND active = 1",
+      "SELECT item_id, task_id, criteria_json, dependencies_json FROM todo_intent_tasks WHERE list_id = ? AND active = 1",
       [listId]
     )
       .filter((task) => items.has(task.item_id))
       .map((task): [string, PlanTaskLink] => [task.item_id, {
         taskId: task.task_id,
-        acceptance: JSON.parse(task.acceptance_json) as string[],
+        criteria: requiredCriteria(task.criteria_json),
         dependencies: JSON.parse(task.dependencies_json) as string[]
       }])
   )
@@ -275,7 +285,7 @@ const childContext = (membership: PlanMembership, plan: { plan_id: string; revis
       title: parent.title,
       details: parent.details ?? undefined,
       status: parent.status,
-      acceptance: ownLink?.acceptance ?? [],
+      acceptance: displayOf(ownLink?.criteria ?? []),
       dependsOn: (ownLink?.dependencies ?? []).flatMap((taskId) => titleByTaskId.get(taskId) ?? [])
     },
     children: [...membership.items.values()]
@@ -318,7 +328,7 @@ const snapshotFor = (database: Database, list: ListRow, includeCompleted = true)
   const itemRows = rows<ItemRow>(
     database,
     `SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority,
-            items.created_by, items.source, tasks.acceptance_json AS acceptance_criteria, items.sort_order, items.blocked_reason,
+            items.created_by, items.source, tasks.criteria_json, items.sort_order, items.blocked_reason,
             items.version, items.created_at, items.updated_at
      FROM todo_items AS items LEFT JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id
      WHERE items.list_id = ? ${includeCompleted ? "" : "AND items.status NOT IN ('completed','cancelled')"}
@@ -453,11 +463,11 @@ interface AcceptedFactRow {
   superseded_by: string | null
   plan_id: string
   plan_revision: number
-  implementation: string | null
+  registered_tool: string | null
   created_at: string
 }
 
-const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item_id, evidence.criterion_index, evidence.criterion, evidence.observation_id, evidence.tool_name, evidence.symbol, evidence.path, evidence.start_line, evidence.end_line, evidence.source_hash, evidence.superseded_by, evidence.plan_id, evidence.plan_revision, aliases.implementation, evidence.created_at"
+const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item_id, evidence.criterion_index, evidence.criterion, evidence.observation_id, evidence.tool_name, evidence.symbol, evidence.path, evidence.start_line, evidence.end_line, evidence.source_hash, evidence.superseded_by, evidence.plan_id, evidence.plan_revision, aliases.tool_name AS registered_tool, evidence.created_at"
 
 /**
  * Accepted facts for a project, across all its conversations. "Current" is decided per
@@ -472,7 +482,7 @@ const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item
 const acceptedFactsFor = (database: Database, projectId: string, options: { symbol?: string; path?: string; includeSuperseded?: boolean } = {}): AcceptedFact[] => {
   const facts = rows<AcceptedFactRow>(database,
     `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id ` +
-    "LEFT JOIN todo_symbol_aliases AS aliases ON aliases.list_id = evidence.list_id AND aliases.observation_id = evidence.observation_id AND aliases.tool_name = evidence.symbol AND aliases.path = evidence.path " +
+    "LEFT JOIN todo_symbol_aliases AS aliases ON aliases.list_id = evidence.list_id AND aliases.observation_id = evidence.observation_id AND aliases.implementation = evidence.symbol AND aliases.path = evidence.path " +
     "WHERE lists.project_id = ? ORDER BY evidence.created_at DESC, evidence.id",
     [projectId]
   ).map((row) => ({
@@ -485,7 +495,7 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
     planId: row.plan_id,
     planRevision: row.plan_revision,
     symbol: row.symbol,
-    implementation: row.implementation ?? undefined,
+    registeredTool: row.registered_tool ?? undefined,
     path: row.path,
     startLine: row.start_line,
     endLine: row.end_line,
@@ -503,7 +513,7 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
     else newest.set(key, fact.id)
   }
   const matches = facts.filter((fact) =>
-    (options.symbol === undefined || fact.symbol === options.symbol || fact.implementation === options.symbol)
+    (options.symbol === undefined || fact.symbol === options.symbol || fact.registeredTool === options.symbol)
     && (options.path === undefined || fact.path === options.path))
   return options.includeSuperseded ? matches : matches.filter((fact) => !fact.supersededBy)
 }
@@ -534,47 +544,47 @@ const symbolAliasesFor = (database: Database, projectId: string): SymbolAlias[] 
  * A new fact supersedes earlier facts for the same symbol and path in that list. Project-wide currency is resolved on read.
  */
 const recordAcceptedFacts = (
-  database: Database,
-  listId: string,
-  plan: { plan_id: string; revision: number },
-  itemId: string,
-  evaluation: TodoEvaluation,
-  observations: Map<string, { tool_name: string; failed: number }>,
-  acceptedAt: string
+    database: Database,
+    listId: string,
+    plan: { plan_id: string; revision: number },
+    itemId: string,
+    evaluation: TodoEvaluation,
+    observations: Map<string, { tool_name: string; failed: number }>,
+    acceptedAt: string
 ): void => {
-  function refuse(index: number, reason: string): never {
-    logger.debug(`[Evidence] fact not promoted task=${itemId} criterion=${index} reason=${reason}`)
-    throw new Error(`criteria[${index}] ${reason}`)
-  }
-  for (const [index, criterion] of evaluation.criteria.entries()) {
-    if (criterion.status !== "passed") continue
-    for (const fact of criterion.reconciliation?.facts ?? []) {
-      const observation = observations.get(fact.observationId)
-      if (!observation || observation.failed !== 0) refuse(index, "fact references an unusable observation")
-      if (!fact.symbol.trim() || !fact.path.trim() || !fact.sourceHash.trim()) refuse(index, "fact is missing its symbol, path, or fingerprint")
-      if (!Number.isInteger(fact.startLine) || !Number.isInteger(fact.endLine) || fact.startLine < 1 || fact.endLine < fact.startLine) {
-        refuse(index, "fact has an invalid line range")
-      }
-      const id = randomUUID()
+    function refuse(index: number, reason: string): never {
+      logger.debug(`[Evidence] fact not promoted task=${itemId} criterion=${index} reason=${reason}`)
+      throw new Error(`criteria[${index}] ${reason}`)
+    }
+    const candidates = evaluation.criteria.flatMap((criterion, index) =>
+      criterion.status === "passed" ? (criterion.reconciliation?.facts ?? []).map((fact) => ({ index, criterion, fact })) : [])
+    for (const { index, criterion, fact } of candidates) {
+    const observation = observations.get(fact.observationId)
+    if (!observation || observation.failed !== 0) refuse(index, "fact references an unusable observation")
+    if (!fact.symbol.trim() || !fact.path.trim() || !fact.sourceHash.trim()) refuse(index, "fact is missing its symbol, path, or fingerprint")
+    if (!Number.isInteger(fact.startLine) || !Number.isInteger(fact.endLine) || fact.startLine < 1 || fact.endLine < fact.startLine) {
+      refuse(index, "fact has an invalid line range")
+    }
+    const id = randomUUID()
+    database.run(
+      "INSERT INTO todo_accepted_evidence(id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+      [id, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, acceptedAt]
+    )
+    database.run(
+      "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
+      [id, listId, fact.symbol, fact.path, id]
+    )
+    logger.debug(`[Evidence] promoted task=${itemId} criterion=${index} symbol=${fact.symbol} path=${fact.path} lines=${fact.startLine}-${fact.endLine} observation=${fact.observationId}`)
+    if (fact.registeredTool !== undefined) {
+      if (!fact.registeredTool.trim()) refuse(index, "alias has no registered tool name")
+      database.run("DELETE FROM todo_symbol_aliases WHERE list_id = ? AND observation_id = ? AND tool_name = ? AND implementation = ? AND path = ?", [listId, fact.observationId, fact.registeredTool, fact.symbol, fact.path])
       database.run(
-        "INSERT INTO todo_accepted_evidence(id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
-        [id, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, acceptedAt]
+        "INSERT INTO todo_symbol_aliases(id, list_id, tool_name, implementation, path, start_line, end_line, observation_id, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [randomUUID(), listId, fact.registeredTool, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.observationId, fact.sourceHash, acceptedAt]
       )
-      database.run(
-        "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
-        [id, listId, fact.symbol, fact.path, id]
-      )
-      logger.debug(`[Evidence] promoted task=${itemId} criterion=${index} symbol=${fact.symbol} path=${fact.path} lines=${fact.startLine}-${fact.endLine} observation=${fact.observationId}`)
-      if (fact.implementation !== undefined) {
-        if (!fact.implementation.trim()) refuse(index, "alias has no implementation name")
-        database.run("DELETE FROM todo_symbol_aliases WHERE list_id = ? AND tool_name = ? AND path = ?", [listId, fact.symbol, fact.path])
-        database.run(
-          "INSERT INTO todo_symbol_aliases(id, list_id, tool_name, implementation, path, start_line, end_line, observation_id, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          [randomUUID(), listId, fact.symbol, fact.implementation, fact.path, fact.startLine, fact.endLine, fact.observationId, fact.sourceHash, acceptedAt]
-        )
-      }
     }
   }
+
 }
 
 /** A stored plan is closed when every task it still has is finished; its history stays, and new work may replace it. */
@@ -583,16 +593,22 @@ const intentPlanClosed = (database: Database, listId: string): boolean =>
     `SELECT COUNT(*) AS open_tasks FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
      WHERE tasks.list_id = ? AND tasks.active = 1 AND items.status NOT IN ('completed', 'cancelled')`, [listId])[0].open_tasks === 0
 
+const latestActivation = (database: Database, listId: string, itemId: string): RequirementActivation | undefined => {
+  const row = rows<{ id: string; item_id: string; kind: RequirementActivation["kind"]; list_revision: number; activated_at: number }>(database,
+    "SELECT id, item_id, kind, list_revision, activated_at FROM todo_requirement_activations WHERE list_id = ? AND item_id = ? ORDER BY list_revision DESC LIMIT 1", [listId, itemId])[0]
+  return row ? { id: row.id, itemId: row.item_id, kind: row.kind, listRevision: row.list_revision, activatedAt: row.activated_at } : undefined
+}
+
 const retainedEvidenceFor = (database: Database, itemId: string, withContent: boolean, sharedListId?: string): RetainedObservationEvidence[] =>
-  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; observed_at: string; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
-    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, observations.created_at AS observed_at, evidence.retained, " +
+  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; observed_at: string; list_revision: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
+    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, observations.created_at AS observed_at, observations.list_revision, evidence.retained, " +
     (withContent ? "evidence.content" : "NULL AS content") +
     ", evidence.complete, evidence.original_chars, evidence.preserved_chars, evidence.metadata_json " +
     "FROM todo_tool_observations AS observations LEFT JOIN todo_tool_evidence AS evidence ON evidence.observation_id = observations.id " +
     (sharedListId
       ? "WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) "
       : "WHERE observations.item_id = ? ") +
-    "ORDER BY observations.created_at, observations.rowid", sharedListId ? [sharedListId, sharedListId] : [itemId]).map((row) => {
+    "ORDER BY observations.list_revision, observations.created_at, observations.rowid", sharedListId ? [sharedListId, sharedListId] : [itemId]).map((row) => {
       const metadata = row.metadata_json
         ? JSON.parse(row.metadata_json) as { sources: EvidenceSource[]; hits: EvidenceHit[] }
         : { sources: [], hits: [] }
@@ -608,6 +624,7 @@ const retainedEvidenceFor = (database: Database, itemId: string, withContent: bo
         complete: row.complete === 1,
         originalChars: row.original_chars ?? 0,
         preservedChars: row.preserved_chars ?? 0,
+        ...(row.list_revision === null ? {} : { listRevision: row.list_revision }),
         content: withContent && row.retained === 1 ? row.content ?? undefined : undefined,
         sources: metadata.sources,
         hits: metadata.hits
@@ -657,9 +674,9 @@ export class TodoRepository {
         database, "SELECT plan_id, revision, goal, constraints_json FROM todo_intent_plans WHERE list_id = ?", [list.id]
       )[0]
       if (!stored) return undefined
-      const tasks = rows<{ task_id: string; title: string; details: string; acceptance_json: string; dependencies_json: string }>(
+      const tasks = rows<{ task_id: string; title: string; details: string; dependencies_json: string; criteria_json: string }>(
         database,
-        `SELECT tasks.task_id, items.title, items.details, tasks.acceptance_json, tasks.dependencies_json
+        `SELECT tasks.task_id, items.title, items.details, tasks.dependencies_json, tasks.criteria_json
          FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
          WHERE tasks.list_id = ? AND tasks.active = 1 ORDER BY items.sort_order, items.created_at`, [list.id]
       )
@@ -673,7 +690,7 @@ export class TodoRepository {
           id: task.task_id,
           title: task.title,
           description: task.details,
-          acceptanceCriteria: JSON.parse(task.acceptance_json) as string[],
+          criteria: requiredCriteria(task.criteria_json),
           dependencies: JSON.parse(task.dependencies_json) as string[]
         }))
       }
@@ -722,10 +739,10 @@ export class TodoRepository {
       }
 
       const priorTasks = rows<{
-        task_id: string; item_id: string; acceptance_json: string; dependencies_json: string; active: number
+        task_id: string; item_id: string; dependencies_json: string; criteria_json: string | null; active: number
         title: string; details: string | null; sort_order: number
       }>(database,
-        `SELECT tasks.task_id, tasks.item_id, tasks.acceptance_json, tasks.dependencies_json, tasks.active,
+        `SELECT tasks.task_id, tasks.item_id, tasks.dependencies_json, tasks.criteria_json, tasks.active,
                 items.title, items.details, items.sort_order
          FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
          WHERE tasks.list_id = ?`, [list.id])
@@ -739,7 +756,7 @@ export class TodoRepository {
         if (priorTasks.filter((task) => task.active).length !== plan.tasks.length || plan.tasks.some((task) => {
           const prior = priorById.get(task.id)
           return !prior || !prior.active || prior.title !== task.title || prior.details !== task.description ||
-            prior.acceptance_json !== JSON.stringify(task.acceptanceCriteria) || prior.dependencies_json !== JSON.stringify(task.dependencies)
+            prior.dependencies_json !== JSON.stringify(task.dependencies) || prior.criteria_json !== criteriaJson(task.criteria)
         })) throw new TodoConflictError("Intent tasks changed without increasing plan.revision")
         database.run("UPDATE todo_intent_plans SET intent_result_json = ?, updated_at = ? WHERE list_id = ?", [resultJson, now(), list.id])
         return snapshotFor(database, list, request.includeCompleted)
@@ -777,11 +794,11 @@ export class TodoRepository {
           }
         }
         database.run(
-          `INSERT INTO todo_intent_tasks(list_id, task_id, item_id, acceptance_json, dependencies_json, active)
+          `INSERT INTO todo_intent_tasks(list_id, task_id, item_id, dependencies_json, criteria_json, active)
            VALUES (?, ?, ?, ?, ?, 1)
-           ON CONFLICT(list_id, task_id) DO UPDATE SET item_id = excluded.item_id, acceptance_json = excluded.acceptance_json,
-             dependencies_json = excluded.dependencies_json, active = 1`,
-          [list.id, task.id, itemId, JSON.stringify(task.acceptanceCriteria), JSON.stringify(task.dependencies)]
+           ON CONFLICT(list_id, task_id) DO UPDATE SET item_id = excluded.item_id,
+             dependencies_json = excluded.dependencies_json, criteria_json = excluded.criteria_json, active = 1`,
+          [list.id, task.id, itemId, JSON.stringify(task.dependencies), criteriaJson(task.criteria)]
         )
         database.run("DELETE FROM todo_dependencies WHERE item_id = ?", [itemId])
       }
@@ -819,11 +836,11 @@ export class TodoRepository {
         database, "SELECT plan_id, revision, goal, constraints_json FROM todo_intent_plans WHERE list_id = ?", [list.id]
       )[0]
       if (!plan) return undefined
-      const tasks = rows<ItemRow & { task_id: string; acceptance_json: string; dependencies_json: string }>(
+      const tasks = rows<ItemRow & { task_id: string; dependencies_json: string; criteria_json: string | null }>(
         database,
         `SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification,
                 items.priority, items.created_by, items.source, items.sort_order, items.blocked_reason, items.version,
-                items.created_at, items.updated_at, tasks.task_id, tasks.acceptance_json, tasks.acceptance_json AS acceptance_criteria, tasks.dependencies_json
+                items.created_at, items.updated_at, tasks.task_id, tasks.dependencies_json, tasks.criteria_json
          FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id
          WHERE tasks.list_id = ? AND tasks.active = 1 ORDER BY items.sort_order, items.created_at`, [list.id]
       )
@@ -855,7 +872,7 @@ export class TodoRepository {
         constraints: JSON.parse(plan.constraints_json) as string[],
         task: itemOf(current),
         planTaskId: current.task_id,
-        acceptanceCriteria: JSON.parse(current.acceptance_json as string) as string[],
+        criteria: requiredCriteria(current.criteria_json),
         dependencies: dependencyIds.flatMap((id) => {
           const dependency = byId.get(id)
           return dependency ? [{ id, title: dependency.title, status: dependency.status }] : []
@@ -927,7 +944,7 @@ export class TodoRepository {
       return rows<{ tool_name: string; arguments_json: string; exit_code: number | null; output: string }>(database,
         "SELECT tool_name, arguments_json, exit_code, output FROM todo_tool_observations WHERE list_id = ? AND failed = 1 ORDER BY created_at ASC", [list.id]
       ).map((row) => {
-        const args = JSON.parse(row.arguments_json) as Record<string, unknown>
+        const args = displayArguments(JSON.parse(row.arguments_json) as Record<string, unknown>)
         const target = typeof args.path === "string" ? args.path : JSON.stringify(args).slice(0, 160)
         const exit = row.exit_code === null ? "" : ` (exit ${row.exit_code})`
         return `${row.tool_name} ${target}${exit}: ${row.output.replace(/\s+/g, " ").slice(0, 160)}`
@@ -943,9 +960,9 @@ export class TodoRepository {
       if (!list) return []
       const plan = rows<{ plan_id: string; revision: number; goal: string; constraints_json: string }>(database, "SELECT plan_id, revision, goal, constraints_json FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
       if (!plan) return []
-      const tasks = rows<ItemRow & { task_id: string; acceptance_json: string; dependencies_json: string }>(
+      const tasks = rows<ItemRow & { task_id: string; dependencies_json: string; criteria_json: string | null }>(
         database,
-        "SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority, items.created_by, items.source, items.sort_order, items.blocked_reason, items.version, items.created_at, items.updated_at, tasks.task_id, tasks.acceptance_json, tasks.dependencies_json " +
+        "SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority, items.created_by, items.source, items.sort_order, items.blocked_reason, items.version, items.created_at, items.updated_at, tasks.task_id, tasks.dependencies_json, tasks.criteria_json " +
           "FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id " +
           "WHERE tasks.list_id = ? AND tasks.active = 1 ORDER BY items.sort_order, items.created_at",
         [list.id]
@@ -959,7 +976,7 @@ export class TodoRepository {
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
         const retainedEvidence = retainedEvidenceFor(database, row.id, true, list.id)
         const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed_number: number; exitCode: number | null; createdAt: string }>(database,
-          "SELECT observations.id, observations.item_id AS itemId, observations.tool_name AS toolName, observations.arguments_json, observations.output, observations.failed AS failed_number, observations.exit_code AS exitCode, observations.created_at AS createdAt FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) ORDER BY observations.created_at DESC", [list.id, list.id]
+          "SELECT observations.id, observations.item_id AS itemId, observations.tool_name AS toolName, observations.arguments_json, observations.output, observations.failed AS failed_number, observations.exit_code AS exitCode, observations.created_at AS createdAt FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) ORDER BY observations.created_at DESC, observations.rowid DESC", [list.id, list.id]
         ).map((observation) => ({
           id: observation.id,
           itemId: observation.itemId,
@@ -983,7 +1000,7 @@ export class TodoRepository {
           constraints: JSON.parse(plan.constraints_json) as string[],
           planTaskId: row.task_id,
           task: itemOf(row),
-          acceptanceCriteria: JSON.parse(row.acceptance_json) as string[],
+          criteria: requiredCriteria(row.criteria_json),
           dependencies: dependencyIds.flatMap((id) => {
             const dependency = taskMap.get(id)
             return dependency ? [{ id, title: dependency.title, status: dependency.status }] : []
@@ -993,6 +1010,7 @@ export class TodoRepository {
           retainedEvidence,
           acceptedEvidence,
           symbolAliases,
+          requirementActivation: latestActivation(database, list.id, row.id),
           lastEvaluation: lastEvaluation ? JSON.parse(lastEvaluation.evaluation_json) as TodoEvaluation : undefined
         }
       })
@@ -1039,17 +1057,52 @@ export class TodoRepository {
         preservedChars: preserved.preservedChars
       }
       const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence }
-      database.run("INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt])
+      const listRevision = bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
+      database.run("INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision])
       if (preserved) {
         database.run("INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
         enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
       }
       if (row.status === "in_review") database.run("UPDATE todo_items SET version = version + 1, updated_at = ? WHERE id = ?", [observation.createdAt, row.id])
-      bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
       logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
       return observation
+    })
+  }
+
+  /**
+   * Starts a task's execution requirements at the current causal revision. The first activation is idempotent, so a
+   * task keeps its activation across replies. Only an explicit renewal records a new one, which makes earlier runs ineligible.
+   */
+  activateRequirement(request: TodoWriteRequest, itemId: string, requestId: string): Promise<RequirementActivation> {
+    return this.recordActivation(request, itemId, requestId, "activation")
+  }
+
+  renewRequirement(request: TodoWriteRequest, itemId: string, requestId: string): Promise<RequirementActivation> {
+    return this.recordActivation(request, itemId, requestId, "renewal")
+  }
+
+  private recordActivation(request: TodoWriteRequest, itemId: string, requestId: string, kind: RequirementActivation["kind"]): Promise<RequirementActivation> {
+    assertWriter(request)
+    validateRequestId(requestId)
+    return this.sqlite.write((database) => {
+      const list = ensureList(database, request)
+      const prior = latestActivation(database, list.id, itemId)
+      const replay = rows<{ id: string; item_id: string; kind: RequirementActivation["kind"]; list_revision: number; activated_at: number }>(database,
+        "SELECT id, item_id, kind, list_revision, activated_at FROM todo_requirement_activations WHERE list_id = ? AND request_id = ?", [list.id, requestId])[0]
+      if (replay) return { id: replay.id, itemId: replay.item_id, kind: replay.kind, listRevision: replay.list_revision, activatedAt: replay.activated_at }
+      if (kind === "activation" && prior) return prior
+      const item = rows<{ status: TodoStatus }>(database, "SELECT status FROM todo_items WHERE id = ? AND list_id = ?", [itemId, list.id])[0]
+      if (!item) throw new Error("Requirement activation task was not found")
+      if (item.status === "completed" || item.status === "cancelled") throw new Error("Requirement activation task is no longer actionable")
+      const intentTask = rows<{ task_id: string }>(database, "SELECT task_id FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [itemId, list.id])[0]
+      if (!intentTask) throw new Error("Requirement activations are limited to active Intent tasks")
+      const listRevision = bumpList(database, list.id, itemId, kind === "activation" ? "requirement_activated" : "requirement_renewed", "system", requestId, { kind })
+      const activation: RequirementActivation = { id: randomUUID(), itemId, kind, listRevision, activatedAt: Date.now() }
+      database.run("INSERT INTO todo_requirement_activations(id, list_id, item_id, request_id, kind, list_revision, activated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [activation.id, list.id, itemId, requestId, kind, listRevision, activation.activatedAt])
+      return activation
     })
   }
 
@@ -1070,10 +1123,10 @@ export class TodoRepository {
       if (evaluation.schemaVersion !== 1) throw new Error("Evaluation schemaVersion must be 1")
       if (evaluation.taskId !== row.task_id) throw new Error("Evaluation task ID does not match the reviewed task")
       if (!["accept", "revise", "needs_evidence", "blocked"].includes(evaluation.decision)) throw new Error("Evaluation decision is not supported")
-      const taskDefinition = rows<{ acceptance_json: string }>(database, "SELECT acceptance_json FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [itemId, list.id])[0]
-      const acceptanceCriteria = JSON.parse(taskDefinition.acceptance_json) as string[]
-      if (evaluation.criteria.length !== acceptanceCriteria.length || evaluation.criteria.some((criterion, index) => criterion.criterion !== acceptanceCriteria[index])) {
-        throw new Error("Evaluation criteria do not match the stored task acceptance criteria")
+      const taskDefinition = rows<{ criteria_json: string | null }>(database, "SELECT criteria_json FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [itemId, list.id])[0]
+      const stored = requiredCriteria(taskDefinition.criteria_json)
+      if (evaluation.criteria.length !== stored.length || evaluation.criteria.some((criterion, index) => criterion.criterionId !== stored[index].id)) {
+        throw new Error("Evaluation criteria do not match the stored task criteria")
       }
       const observations = rows<{ id: string; item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null }>(database,
         "SELECT observations.id, observations.item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)", [list.id, list.id])
@@ -1090,30 +1143,20 @@ export class TodoRepository {
       }
       if (evaluation.decision === "accept") {
         const byId = new Map(observations.map((observation) => [observation.id, observation]))
-        const records = retainedEvidenceFor(database, itemId, true, list.id)
-        const coverageGaps = (criterion: string) => evidenceGaps(evidenceAnchors(criterion), records)
-        const unsupported = evaluation.criteria.some((criterion) => {
-          if (criterion.reconciliation?.reuse === "accepted") {
+        const unresolved = evaluation.criteria.flatMap((criterion) => {
+          const reconciliation = criterion.reconciliation
+          if (reconciliation?.reuse === "accepted") {
             // Reused criteria rest on current accepted facts in this project, not on this task's reads.
-            return criterion.status !== "passed" || !criterion.evidenceRefs.length || criterion.evidenceRefs.some((id) => !acceptedObservationIds.has(id))
+            return criterion.status === "passed" && criterion.evidenceRefs.length > 0 && criterion.evidenceRefs.every((id) => acceptedObservationIds.has(id))
+              ? [] : [`${criterion.criterionId}: reused accepted fact is not cited`]
           }
-          if (criterion.status !== "passed") return true
-          if (coverageGaps(criterion.criterion).length > 0) return true
-          const refs = criterion.evidenceRefs.filter((id) => byId.has(id))
-          const needsCommandEvidence = /\b(test|tests|assertions?|compile|compilation|build|type.?check|command|execute|run)\b/i.test(criterion.criterion)
-          // Command results prove only the task's own runs; shared observations may support reads and searches.
-          const trusted = observations.filter((observation) => !needsCommandEvidence || observation.item_id === itemId).map((observation) => ({
-            id: observation.id, itemId: observation.item_id, toolName: observation.tool_name, arguments: JSON.parse(observation.arguments_json) as Record<string, string>, output: "",
-            failed: observation.failed !== 0, exitCode: observation.exit_code ?? undefined, createdAt: ""
-          }))
-          const evidenceFreeAnalysis = isAnalysisOnlyIntent(currentPlan.goal) && !needsCommandEvidence
-          return criterion.status !== "passed" || (!hasTrustedEvidenceForCriterion(criterion.criterion, refs, trusted) && !evidenceFreeAnalysis)
+          if (criterion.status !== "passed") return [`${criterion.criterionId}: not passed`]
+          if (reconciliation?.outcome === "proven") return []
+          // Semantic judgments stand only when they cite a trusted observation of this task or a shared one.
+          if (reconciliation?.outcome === "semantic" && criterion.evidenceRefs.some((id) => byId.has(id))) return []
+          return [`${criterion.criterionId}: ${reconciliation?.missing[0] ?? "no trusted observation establishes it"}`]
         })
-        if (unsupported) {
-          const gapMessages = evaluation.criteria.flatMap((criterion, index) =>
-            criterion.status === "passed" && criterion.reconciliation?.reuse !== "accepted" ? coverageGaps(criterion.criterion).map((gap) => `criteria[${index}]: ${describeGap(gap)}`) : [])
-          throw new Error(["Evaluation cannot accept criteria without adequate trusted tool observations", ...gapMessages].join("; "))
-        }
+        if (unresolved.length > 0) throw new Error(["Evaluation cannot accept unresolved criteria", ...unresolved].join("; "))
         const unfinishedDependency = rows<{ id: string }>(database,
           "SELECT prerequisite.id FROM todo_dependencies dependency JOIN todo_items prerequisite ON prerequisite.id = dependency.depends_on_item_id WHERE dependency.item_id = ? AND prerequisite.status != 'completed' LIMIT 1", [itemId])[0]
         if (unfinishedDependency) throw new Error("Cannot verify a task while its dependencies are incomplete")
@@ -1188,7 +1231,7 @@ export class TodoRepository {
       const row = rows<ItemRow>(
         database,
         `SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority,
-                items.created_by, items.source, tasks.acceptance_json AS acceptance_criteria, items.sort_order, items.blocked_reason, items.version, items.created_at, items.updated_at
+                items.created_by, items.source, tasks.criteria_json, items.sort_order, items.blocked_reason, items.version, items.created_at, items.updated_at
          FROM todo_items AS items LEFT JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id
          WHERE items.id = ? AND items.list_id = ?`,
         [itemId, list.id]

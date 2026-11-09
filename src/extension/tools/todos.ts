@@ -1,5 +1,5 @@
 import { logger } from "../../common/logger"
-import { assessAcceptedFacts, type CurrentSourceReader, resolveAcceptedFacts } from "../todos/feedback"
+import { assessAcceptedFacts, type CurrentSourceReader, factNamedBy, resolveAcceptedFacts } from "../todos/feedback"
 import { TodoRepository } from "../todos/repository"
 import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
 
@@ -163,7 +163,7 @@ export const todoTools = (
           evidence_id: fact.id,
           symbol: fact.symbol,
           tool_name: fact.toolName,
-          ...(fact.implementation ? { implementation: fact.implementation } : {}),
+          ...(fact.registeredTool ? { registered_tool: fact.registeredTool } : {}),
           path: fact.path,
           start_line: fact.startLine,
           end_line: fact.endLine,
@@ -411,9 +411,15 @@ const acceptedFactReference = async (
     throw new Error(`accepted fact ${factId} is ${status.freshness}${status.reason ? `: ${status.reason}` : ""}; read ${fact.path} lines ${fact.startLine}-${fact.endLine} again`)
   }
   const { item } = await repository.getItem(scope, itemId)
-  const criteria = [item.title, ...(item.acceptanceCriteria ?? [])]
-  if (!criteria.some((text) => text.includes(fact.symbol) || text.includes(fact.path))) {
-    throw new Error(`accepted fact ${factId} is not named by a criterion of this TODO`)
+  const named = (item.criteria ?? []).some(({ verification }) => {
+    if (verification.kind === "accepted_fact_exists") return factNamedBy(verification.identity, verification.symbol, fact) && (verification.path === undefined || verification.path === fact.path)
+    if (verification.kind === "source_location" || verification.kind === "source_range" || verification.kind === "source_fingerprint") {
+      return factNamedBy(verification.identity, verification.symbol, fact) && verification.path === fact.path
+    }
+    return false
+  })
+  if (!named) {
+    throw new Error(`accepted fact ${factId} is not the subject of a typed criterion of this TODO`)
   }
   return repository.addEvidence(scope, {
     itemId,

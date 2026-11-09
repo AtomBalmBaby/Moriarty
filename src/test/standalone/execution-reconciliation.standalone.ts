@@ -5,10 +5,10 @@ import {
   allIntentTasksComplete,
   continuationContext,
   ExecutionReconciliationController,
-  forbiddenDeleteReason,
-  requiresWorkspaceChanges
+  forbiddenDeleteReason
 } from "../../extension/chat/execution-reconciliation"
 import { ToolSteps } from "../../extension/chat/tool-steps"
+import { taskRequiresWorkspaceChanges } from "../../extension/todos/feedback"
 
 test("tool steps are emitted when each call starts, before it finishes, and a review updates in place", () => {
   const sent: string[] = []
@@ -39,8 +39,8 @@ test("accepted and analysis-only turns do not cause unnecessary retries", () => 
   const controller = new ExecutionReconciliationController()
   assert.equal(controller.reconcile("accept", "verified").state, "accepted")
   assert.equal(controller.claimContinuation(), false)
-  assert.equal(requiresWorkspaceChanges("Explain how the todo panel works"), false)
-  assert.equal(requiresWorkspaceChanges("Modify the todo panel to be compact"), true)
+  assert.equal(taskRequiresWorkspaceChanges([{ id: "explain", description: "Explain how the todo panel works", verification: { kind: "semantic_review" } }]), false)
+  assert.equal(taskRequiresWorkspaceChanges([{ id: "modify", description: "Modify the todo panel to be compact", verification: { kind: "workspace_mutation" } }]), true)
 })
 
 test("retry and no-progress limits block repetitive execution", () => {

@@ -1,11 +1,11 @@
-import type { TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification } from "../../common/types"
+import type { TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, TypedCriterion } from "../../common/types"
 
 import type { EvidenceHit, EvidenceSource } from "./evidence"
 
 export type { TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
 
-export type { IntentTaskDefinition, IntentTaskPlan } from "../../common/types"
+export type { CriterionVerification,IntentTaskDefinition, IntentTaskPlan, TypedCriterion } from "../../common/types"
 
 /** Every active plan task with its TODO item, for the executor to update instead of recreating. */
 export interface IntentPlanOutline {
@@ -94,7 +94,7 @@ export interface IntentPlanContext {
   constraints: string[]
   task: TodoItem
   planTaskId: string
-  acceptanceCriteria: string[]
+  criteria: TypedCriterion[]
   dependencies: { id: string; title: string; status: TodoItem["status"] }[]
   evidence: TodoEvidence[]
   observations?: TodoToolObservation[]
@@ -164,6 +164,8 @@ export interface RetainedObservationEvidence {
   exitCode?: number
   /** When the host recorded the observation (ISO time), used to tell fresh observations from earlier ones. */
   observedAt: string
+  /** The list revision that recorded the observation. Ordering proof uses this causal revision, never the clock. Legacy rows have none. */
+  listRevision?: number
   retained: boolean
   complete: boolean
   originalChars: number
@@ -171,6 +173,19 @@ export interface RetainedObservationEvidence {
   content?: string
   sources: EvidenceSource[]
   hits: EvidenceHit[]
+}
+
+/**
+ * A host-owned point at which a task's execution requirements took effect. A command run is eligible for an
+ * `after_activation` criterion only if it was recorded after this activation, by its causal list revision.
+ * `activatedAt` is Unix epoch milliseconds for display and audit; it is never used to order proof.
+ */
+export interface RequirementActivation {
+  id: string
+  itemId: string
+  kind: "activation" | "renewal"
+  listRevision: number
+  activatedAt: number
 }
 
 /**
@@ -217,7 +232,7 @@ export interface TodoReviewPackage {
   constraints: string[]
   planTaskId: string
   task: TodoItem
-  acceptanceCriteria: string[]
+  criteria: TypedCriterion[]
   dependencies: { id: string; title: string; status: TodoItem["status"] }[]
   evidence: TodoEvidence[]
   observations: TodoToolObservation[]
@@ -226,6 +241,8 @@ export interface TodoReviewPackage {
   acceptedEvidence: AcceptedFact[]
   /** Proven tool-name to implementation relationships in this project. */
   symbolAliases: SymbolAlias[]
+  /** The latest requirement activation or renewal for this task, if any. */
+  requirementActivation?: RequirementActivation
   lastEvaluation?: TodoEvaluation
 }
 

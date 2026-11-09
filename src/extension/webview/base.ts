@@ -324,6 +324,10 @@ export class BaseProvider {
         )
         return this.emitTodoSnapshot(conversationId)
       },
+      [TODO_EVENT_NAME.renewRequirement]: async ({ conversationId, itemId, requestId }) => {
+        await this._todoRepository.renewRequirement(this.todoScope(conversationId), itemId, requestId)
+        return this.emitTodoSnapshot(conversationId)
+      },
       [TODO_EVENT_NAME.evaluateItem]: async ({ conversationId, itemId }) => {
         const snapshot = await this.chat?.evaluateTodoTask(this.todoScope(conversationId), itemId)
         if (!snapshot) throw new Error("The feedback evaluator is unavailable")

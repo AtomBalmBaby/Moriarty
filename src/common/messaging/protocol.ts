@@ -105,6 +105,12 @@ export interface TodoCompleteRequest {
   expectedVersion: number
 }
 
+export interface TodoRenewRequirementRequest {
+  conversationId: string
+  requestId: string
+  itemId: string
+}
+
 export interface TodoEvaluateRequest {
   conversationId: string
   itemId: string
@@ -424,6 +430,7 @@ export interface ClientEvents {
   [TODO_EVENT_NAME.createItem]: Channel<TodoCreateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.updateItem]: Channel<TodoUpdateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.completeItem]: Channel<TodoCompleteRequest, TodoListSnapshot>
+  [TODO_EVENT_NAME.renewRequirement]: Channel<TodoRenewRequirementRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.evaluateItem]: Channel<TodoEvaluateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.retryFeedback]: Channel<{ conversationId: string }, { status: string }>
   [EVENT_NAME.twinnyToolInventory]: Channel<void, ToolInventoryItem[]>

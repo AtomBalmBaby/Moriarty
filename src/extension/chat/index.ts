@@ -81,7 +81,7 @@ import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
-import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, isAnalysisOnlyGoal, observationReference, requiresWorkspaceChanges } from "./execution-reconciliation"
+import { allIntentTasksComplete, continuationContext, ExecutionReconciliationController, observationReference } from "./execution-reconciliation"
 import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanOutcome, type FeedbackRetryOutcome, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "./feedback-planner"
 import { ChatGeneration } from "./generation"
 import { McpHost } from "./mcp-host"
@@ -289,8 +289,6 @@ export class Chat extends Base {
   private readonly _context: ChatContextBuilder
   private readonly _generation: ChatGeneration
   private _executionAbort?: AbortController
-  /** Start of the current reply; only observations made after it may prove fresh-demand criteria. */
-  private _replyStartedAt?: string
   /** The request this reply answers; it selects which accepted facts are most relevant to show. */
   private _replyText = ""
   private _activeExecution?: ExecutionReconciliationController
@@ -863,11 +861,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (!feedbackOn) logger.debug("[Feedback] planning not started: Feedback is off")
       const planning = feedbackOn ? this.startFeedbackPlanning(messages) : undefined
       const dispatch = async (): Promise<string | undefined> => {
-        this._replyStartedAt = new Date().toISOString()
         this._replyText = this.latestUserText(messages) ?? ""
         this._evidencePreflight = await this.runEvidencePreflight(this.latestUserText(messages) ?? "")
         const scope = this.activeTodoScope()
-        if (scope && !this.cancelled) await this.completeProvenTodos(scope, { since: this._replyStartedAt, isCancelled: () => this.cancelled })
+        if (scope && !this.cancelled) await this.completeProvenTodos(scope, { isCancelled: () => this.cancelled })
         this._preparing = true
         try {
           this._conversation = await buildChatTurn(messages, {
@@ -1261,7 +1258,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     scope: TodoWriteRequest,
     itemId?: string,
     changes?: ReplyChangesView,
-    options: { strict?: boolean; finalResponse?: string; requireWorkspaceChanges?: boolean; signal?: AbortSignal; attempted?: Set<string>; since?: string } = {}
+    options: { strict?: boolean; finalResponse?: string; signal?: AbortSignal; attempted?: Set<string> } = {}
   ): Promise<TodoEvaluation[]> {
     if (!this._todoRepository) return []
     const attempted = options.attempted ?? new Set<string>()
@@ -1279,7 +1276,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const readCurrentSource = this.currentSourceReader()
     const hostDecided = new Set<string>()
     for (const review of candidates) {
-      if (await hostDecidesReview(review, readCurrentSource, options.since)) hostDecided.add(review.task.id)
+      if (await hostDecidesReview(review, readCurrentSource)) hostDecided.add(review.task.id)
     }
     const { provider, error: providerError } = hostDecided.size === candidates.length
       ? { provider: undefined, error: undefined }
@@ -1330,11 +1327,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             options.signal?.removeEventListener("abort", abortFromExecution)
           }
         }, provider?.modelName ?? "host", {
-          requireWorkspaceChanges: options.requireWorkspaceChanges && taskRequiresWorkspaceChanges(review.task, review.acceptanceCriteria),
           hasVerifiedFileChanges: !!changes?.files.length,
-          allowEvidenceFreeAnalysis: isAnalysisOnlyGoal(review.goal),
-          readCurrentSource,
-          since: options.since
+          readCurrentSource
         })
         logger.debug("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
         const snapshot = await this._todoRepository!.getList(scope)
@@ -1379,7 +1373,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
 
     const goal = intent.goal
-    const requireChanges = requiresWorkspaceChanges(goal)
+    const requireChanges = taskRequiresWorkspaceChanges(intent.criteria)
     let evaluation: TodoEvaluation | undefined
     let reviewFailure: string | undefined
     let awaitingDependencies: string[] = []
@@ -1404,9 +1398,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         const results = awaitingDependencies.length ? [] : await this.reviewTodoTasks(scope, current.id, changes, {
           strict: true,
           finalResponse,
-          requireWorkspaceChanges: requireChanges,
-          signal: this._executionAbort?.signal,
-          since: this._replyStartedAt
+          signal: this._executionAbort?.signal
         })
         evaluation = results.find((result) => result.taskId === intent.planTaskId)
         if (!evaluation && !awaitingDependencies.length) throw new Error("Independent evaluator returned no decision for the active task")
@@ -1435,9 +1427,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       try {
         await this.reviewTodoTasks(scope, undefined, changes, {
           finalResponse,
-          requireWorkspaceChanges: requireChanges,
-          signal: this._executionAbort?.signal,
-          since: this._replyStartedAt
+          signal: this._executionAbort?.signal
         })
       } catch (error) {
         logger.warn("[Execution] turn-end Feedback sweep failed; pending claims remain in review: " + redact(error instanceof Error ? error.message : String(error)))
@@ -1445,7 +1435,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
 
     // Facts established by this turn's trusted observations complete their TODOs before the continuation decision.
-    if (!this.cancelled && !workflow.isCancelled()) await this.completeProvenTodos(scope, { since: this._replyStartedAt, isCancelled: () => this.cancelled || workflow.isCancelled() })
+    if (!this.cancelled && !workflow.isCancelled()) await this.completeProvenTodos(scope, { isCancelled: () => this.cancelled || workflow.isCancelled() })
     const after = await this._todoRepository.getList({ ...scope, includeCompleted: true })
     current = after.items.find((item) => item.id === intent.task.id)
     if (reviewFailure && current?.status === "in_review") {
@@ -1553,7 +1543,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const nextEvaluation = next.planTaskId === intent.planTaskId ? evaluation : undefined
     const unmetCriteria = nextEvaluation
       ? nextEvaluation.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => criterion.criterion)
-      : nextOutline?.unmetCriteria.length ? nextOutline.unmetCriteria : next.acceptanceCriteria
+      : nextOutline?.unmetCriteria.length ? nextOutline.unmetCriteria : next.criteria.map((criterion) => criterion.description)
     const hostProven = (nextEvaluation?.criteria ?? []).flatMap((criterion) => {
       const ids = criterion.reconciliation?.outcome === "proven" ? criterion.reconciliation.supportingObservationIds : []
       return ids.length ? [`${criterion.criterion} — proven by the host from [${[...new Set(ids)].join("], [")}]; do not search or re-read for it`] : []
@@ -1636,7 +1626,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         ? await selectAcceptedFacts(
           { text: this._replyText, planItemIds: outline.tasks.map((task) => task.itemId) },
           await this._todoRepository.listAcceptedEvidence(scope),
-          await this._todoRepository.listSymbolAliases(scope),
           this.currentSourceReader(),
           MAX_ACCEPTED_CONTEXT_FACTS
         )
@@ -1679,7 +1668,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * Completes pending TODOs whose every objective criterion is proven by trusted, current facts. Feedback is never
    * consulted here; a TODO with any unproven or semantic criterion is left for the implementer or Feedback.
    */
-  private async completeProvenTodos(scope: TodoWriteRequest, options: { since?: string; isCancelled?: () => boolean } = {}): Promise<void> {
+  private async completeProvenTodos(scope: TodoWriteRequest, options: { isCancelled?: () => boolean } = {}): Promise<void> {
     if (!this._todoRepository) return
     try {
       await this.repairAdministrativePlan(scope)
@@ -1697,11 +1686,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       conversationId: this._activeConversationId ?? ""
     }
     try {
-      const [facts, aliases] = await Promise.all([
-        this._todoRepository.listAcceptedEvidence(request),
-        this._todoRepository.listSymbolAliases(request)
-      ])
-      const preflight = await evidencePreflight(text, facts, aliases, this.currentSourceReader())
+      const facts = await this._todoRepository.listAcceptedEvidence(request)
+      const preflight = await evidencePreflight(text, facts, this.currentSourceReader())
       this._evidencePreflightCheck = `evidence-check-${randomUUID()}`
       logger.debug(`[Preflight] project=${request.projectFingerprint.slice(0, 12)} status=${preflight.status} subjects=${preflight.subjects.join(",") || "-"} facts=${preflight.facts.map((fact) => `${fact.path}:${fact.startLine}-${fact.endLine}/${fact.verification}`).join(" ") || "-"} reason=${preflight.reason}`)
       return renderEvidencePreflight(preflight)
@@ -1730,8 +1716,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           title: clip(active.task.title, 180),
           description: clip(active.task.details ?? "", 400),
           status: active.task.status,
-          acceptanceCriteria: active.acceptanceCriteria.slice(0, 6).map((value) => clip(value, 180)),
-          acceptanceCriteriaTruncated: active.acceptanceCriteria.length > 6,
+          acceptanceCriteria: active.criteria.slice(0, 6).map((criterion) => clip(criterion.description, 180)),
+          acceptanceCriteriaTruncated: active.criteria.length > 6,
           dependencies: active.dependencies.slice(0, 3).map((dependency) => ({
             id: dependency.id,
             title: clip(dependency.title, 120),
@@ -1838,7 +1824,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
     const todoScope = this.activeTodoScope()
     const intentAtStart = todoScope && this._todoRepository ? await this._todoRepository.getActiveIntentContext(todoScope) : undefined
-    // Native TODO actions are conversation-scoped and do not require workspace Agent mode.
+    if (todoScope && intentAtStart && this._todoRepository && intentAtStart.criteria.some((criterion) => criterion.verification.kind === "command_exit_status" && criterion.verification.execution === "after_activation")) {
+      // A reply start is where a run-again requirement takes effect; earlier runs no longer satisfy it.
+      await this._todoRepository.activateRequirement(todoScope, intentAtStart.task.id, randomUUID())
+    }
     const todoOnly = !view && !!todoScope
     const onCatastrophic = async (notice: EditRecoveryNotice) => {
       recoveryNotice = notice
@@ -1948,7 +1937,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         return this.run(provider, CONTINUATION_PREFIX, view, execution, activeCheckpoints)
       }
     } else if (reply !== undefined && feedbackEnabled && todoScope) {
-      void this.reviewTodoTasks(todoScope, undefined, changed, { since: this._replyStartedAt }).catch((error) => {
+      void this.reviewTodoTasks(todoScope, undefined, changed).catch((error) => {
         logger.error("Automatic TODO evaluation could not load review tasks: " + (error instanceof Error ? error.message : String(error)))
       })
     }

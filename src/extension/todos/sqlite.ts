@@ -83,8 +83,8 @@ CREATE TABLE IF NOT EXISTS todo_intent_tasks (
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   task_id TEXT NOT NULL,
   item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE,
-  acceptance_json TEXT NOT NULL,
   dependencies_json TEXT NOT NULL,
+  criteria_json TEXT,
   active INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(list_id, task_id)
 );
@@ -99,8 +99,10 @@ CREATE TABLE IF NOT EXISTS todo_tool_observations (
   failed INTEGER NOT NULL,
   exit_code INTEGER,
   created_at TEXT NOT NULL,
+  list_revision INTEGER,
   UNIQUE(list_id, request_id)
 );
+CREATE INDEX IF NOT EXISTS todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision);
 CREATE TABLE IF NOT EXISTS todo_evaluations (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
@@ -177,6 +179,18 @@ CREATE TABLE IF NOT EXISTS todo_symbol_aliases (
 CREATE INDEX IF NOT EXISTS todo_symbol_aliases_tool ON todo_symbol_aliases(tool_name, path);
 CREATE INDEX IF NOT EXISTS todo_symbol_aliases_list ON todo_symbol_aliases(list_id);
 PRAGMA user_version = 7;
+CREATE TABLE IF NOT EXISTS todo_requirement_activations (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('activation','renewal')),
+  list_revision INTEGER NOT NULL,
+  activated_at INTEGER NOT NULL,
+  UNIQUE(list_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS todo_requirement_activations_item ON todo_requirement_activations(list_id, item_id, list_revision);
+PRAGMA user_version = 11;
 `
 
 export class SqliteFile {
@@ -208,7 +222,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 7) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 11) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -236,6 +250,33 @@ export class SqliteFile {
         }
         if (version > 0 && version < 7) {
           database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_symbol_aliases"), SCHEMA.indexOf("PRAGMA user_version = 7;") + "PRAGMA user_version = 7;".length))
+          await this.persist(database)
+        }
+        if (version > 0 && version < 8) {
+          const taskColumns = database.exec("PRAGMA table_info(todo_intent_tasks)")[0]?.values.map((row) => row[1]) ?? []
+          if (!taskColumns.includes("criteria_json")) database.run("ALTER TABLE todo_intent_tasks ADD COLUMN criteria_json TEXT")
+          database.run("PRAGMA user_version = 8")
+          await this.persist(database)
+        }
+        if (version > 0 && version < 9) {
+          // Pre-typed plans have no criteria_json. Their links are deactivated, never deleted, and the file is kept as a backup.
+          await fs.copyFile(this.databasePath, `${this.databasePath}.v8.bak`)
+          database.run("UPDATE todo_intent_tasks SET active = 0 WHERE criteria_json IS NULL")
+          const taskColumns = database.exec("PRAGMA table_info(todo_intent_tasks)")[0]?.values.map((row) => row[1]) ?? []
+          if (taskColumns.includes("acceptance_json")) database.run("ALTER TABLE todo_intent_tasks DROP COLUMN acceptance_json")
+          database.run("PRAGMA user_version = 9")
+          await this.persist(database)
+        }
+        if (version > 0 && version < 10) {
+          // Observations record the list revision that ordered them. Legacy rows stay NULL and sort before any new observation.
+          const observationColumns = database.exec("PRAGMA table_info(todo_tool_observations)")[0]?.values.map((row) => row[1]) ?? []
+          if (!observationColumns.includes("list_revision")) database.run("ALTER TABLE todo_tool_observations ADD COLUMN list_revision INTEGER")
+          database.run("CREATE INDEX IF NOT EXISTS todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision); PRAGMA user_version = 10")
+          await this.persist(database)
+        }
+        if (version > 0 && version < 11) {
+          // Activations are host-owned and additive: no existing row changes, and a v10 database gains an empty table.
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_requirement_activations"), SCHEMA.indexOf("PRAGMA user_version = 11;") + "PRAGMA user_version = 11;".length))
           await this.persist(database)
         }
       } finally {

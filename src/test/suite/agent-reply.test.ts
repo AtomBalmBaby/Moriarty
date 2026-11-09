@@ -11,10 +11,11 @@ import { execFileSync } from "child_process"
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
+import initSqlJs from "sql.js"
 import * as vscode from "vscode"
 
 import { AGENT_SELECTION_STORAGE_KEY } from "../../common/agents"
-import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY } from "../../common/constants"
+import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_CONVERSATION_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY, TODO_EVENT_NAME } from "../../common/constants"
 import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
 import { CHILD_TODO_PROTOCOL } from "../../extension/chat/feedback-planner"
@@ -23,8 +24,10 @@ import { createSafeEditCheckpoints } from "../../extension/chat/tool-sinks"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
+import { commandDigest } from "../../extension/todos/evidence"
 import { todoReviewSystemPrompt } from "../../extension/todos/feedback"
-import { TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { BaseProvider } from "../../extension/webview/base"
 
 /** A model that answers each request with the next scripted reply. */
 class ScriptedModel implements InferenceProvider {
@@ -113,11 +116,11 @@ const deferred = () => {
   return { promise, resolve }
 }
 
-const revisionVerdict = (taskId: string, criterion: string) => JSON.stringify({
+const revisionVerdict = (taskId: string) => JSON.stringify({
   schemaVersion: 1,
   taskId,
   decision: "revise",
-  criteria: [{ criterion, status: "failed", evidenceRefs: [] }],
+  criteria: [{ criterionId: "criterion-1", status: "failed", evidenceRefs: [] }],
   problems: ["No source changes were made."],
   correctiveInstructions: ["Make the requested change."],
   explanation: "The requested implementation is not present.",
@@ -167,7 +170,7 @@ const feedbackRig = async (
     revision: 1,
     goal,
     constraints: ["Change only the fixture."],
-    tasks: [{ id: `${name}-task`, title: "Make the requested change", description: "Change the cancellation fixture.", acceptanceCriteria: [criterion], dependencies: [] as string[] }]
+    tasks: [{ id: `${name}-task`, title: "Make the requested change", description: "Change the cancellation fixture.", criteria: [{ id: "criterion-1", description: criterion, verification: { kind: "semantic_review" } }], dependencies: [] as string[] }]
   }
   await repository.synchronizeIntentPlan(scope, plan, { prompt: goal, plan })
   const webview = fakeWebview()
@@ -259,7 +262,7 @@ suite("Agent reply, end to end", function () {
     const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
     const scope = { projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))), conversationId: "feedback-disabled-chat", writer: "feedback-disabled-chat" }
     const plan = { planId: "feedback-disabled-plan", version: 1 as const, revision: 1, goal: "Verify one task", constraints: [], tasks: [
-      { id: "review-me", title: "Review me", description: "A task to remain in review", acceptanceCriteria: ["Source inspected"], dependencies: [] as string[] }
+      { id: "review-me", title: "Review me", description: "A task to remain in review", criteria: [{ id: "criterion-1", description: "Source inspected", verification: { kind: "semantic_review" } }], dependencies: [] as string[] }
     ] }
     const item = (await repository.synchronizeIntentPlan(scope, plan, { prompt: "Verify one task" })).items[0]
     await repository.updateItem(scope, { itemId: item.id, expectedVersion: item.version, patch: { status: "completed" }, actor: "model", requestId: "feedback-disabled-claim" })
@@ -311,8 +314,8 @@ suite("Agent reply, end to end", function () {
       goal: "Implement the requested feature while preserving existing behavior.",
       constraints: ["Preserve existing behavior"],
       tasks: [
-        { id: "active-task", title: "Implement the focused change", description: "Modify only the relevant feature surface.", acceptanceCriteria: ["The active task acceptance criterion is visible to the model."], dependencies: [] },
-        { id: "other-task", title: "Do not project unrelated task", description: "This should not be included in the active task context.", acceptanceCriteria: ["Not part of this request"], dependencies: ["active-task"] }
+        { id: "active-task", title: "Implement the focused change", description: "Modify only the relevant feature surface.", criteria: [{ id: "criterion-1", description: "The active task acceptance criterion is visible to the model.", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "other-task", title: "Do not project unrelated task", description: "This should not be included in the active task context.", criteria: [{ id: "criterion-1", description: "Not part of this request", verification: { kind: "semantic_review" } }], dependencies: ["active-task"] }
       ]
     }
     await repository.synchronizeIntentPlan(scope, plan, { prompt: "Implement the feature", plan })
@@ -340,7 +343,7 @@ suite("Agent reply, end to end", function () {
       assert.match(enabledSystem, /You are a helpful, respectful and honest coding assistant/)
 
       // An accepted plan revision must reach the next real inference request, not only the context helper.
-      const revised = { ...plan, revision: 2, tasks: [{ ...plan.tasks[0], acceptanceCriteria: ["The revised acceptance criterion reaches the next request."] }, plan.tasks[1]] }
+      const revised = { ...plan, revision: 2, tasks: [{ ...plan.tasks[0], criteria: [{ id: "criterion-1", description: "The revised acceptance criterion reaches the next request.", verification: { kind: "semantic_review" } }] }, plan.tasks[1]] }
       await repository.synchronizeIntentPlan(scope, revised, { prompt: "Implement the feature", plan: revised })
       const revisedReply = await chat.completion([{ role: "user", content: "Continue after the revision." }], [], "off", scope.conversationId)
       assert.equal(model.requests.length, 3, `the revised turn must reach the implementing model; reply=${JSON.stringify(revisedReply)}`)
@@ -366,7 +369,7 @@ suite("Agent reply, end to end", function () {
       schemaVersion: 1,
       taskId: "panel-task-1",
       decision,
-      criteria: [{ criterion, status: decision === "revise" ? "failed" : "unverified", evidenceRefs: [] }],
+      criteria: [{ criterionId: "criterion-1", status: decision === "revise" ? "failed" : "unverified", evidenceRefs: [] }],
       problems: decision === "revise" ? ["No source changes were made."] : [],
       correctiveInstructions: decision === "revise" ? ["Edit the existing TODO panel instead of reporting a proposed implementation."] : [],
       explanation: decision === "revise" ? "The requested implementation is not present." : "Execution stopped for this deterministic integration test.",
@@ -405,7 +408,7 @@ suite("Agent reply, end to end", function () {
         id: `panel-task-${index + 1}`,
         title: `Implement panel requirement ${index + 1}`,
         description: `Make and verify panel change ${index + 1}.`,
-        acceptanceCriteria: [criterion],
+        criteria: [{ id: "criterion-1", description: criterion, verification: { kind: "semantic_review" } }],
         dependencies: [] as string[]
       }))
     }
@@ -432,7 +435,7 @@ suite("Agent reply, end to end", function () {
     const agent = new ScriptedModel(["Implementation report: the change is made.", "A continuation that must not run."])
     const verificationStarted = deferred()
     const releaseVerdict = deferred()
-    const evaluator = new ScriptedModel([revisionVerdict("cancel-verification-task", criterion)], JSON.stringify({ track: false }), async (request) => {
+    const evaluator = new ScriptedModel([revisionVerdict("cancel-verification-task")], JSON.stringify({ track: false }), async (request) => {
       if (String(request.messages[0]?.content ?? "") === todoReviewSystemPrompt) {
         verificationStarted.resolve()
         await releaseVerdict.promise
@@ -458,7 +461,7 @@ suite("Agent reply, end to end", function () {
   test("stopping at a scheduled continuation starts no corrective turn", async () => {
     const criterion = "The requested change is made."
     const agent = new ScriptedModel(["Implementation report: the change is made.", "A continuation that must not run."])
-    const evaluator = new ScriptedModel([revisionVerdict("cancel-continuation-task", criterion)], JSON.stringify({ track: false }))
+    const evaluator = new ScriptedModel([revisionVerdict("cancel-continuation-task")], JSON.stringify({ track: false }))
     const rig = await feedbackRig("cancel-continuation", agent, evaluator, criterion, (message) => {
       // The continuation announces itself just before its request; Stop lands in that gap.
       const continuation = (message.data as { continuation?: number } | undefined)?.continuation ?? 0
@@ -556,7 +559,7 @@ suite("Agent reply, end to end", function () {
       schemaVersion: 1,
       taskId: "todo-panel-task",
       decision,
-      criteria: [{ criterion, status: decision === "revise" ? "failed" : "unverified", evidenceRefs: [] }],
+      criteria: [{ criterionId: "criterion-1", status: decision === "revise" ? "failed" : "unverified", evidenceRefs: [] }],
       problems: decision === "revise" ? ["The component was not modified safely."] : [],
       correctiveInstructions: decision === "revise" ? ["Keep the existing component and make the requested edits in place."] : [],
       explanation: decision === "revise" ? "The requested component must not be deleted." : "Execution stopped for this deterministic integration test.",
@@ -597,7 +600,7 @@ suite("Agent reply, end to end", function () {
       revision: 1,
       goal,
       constraints: ["Preserve the existing TODO panel component."],
-      tasks: [{ id: "todo-panel-task", title: "Update the TODO panel", description: "Implement the requested card changes in place.", acceptanceCriteria: [criterion], dependencies: [] as string[] }]
+      tasks: [{ id: "todo-panel-task", title: "Update the TODO panel", description: "Implement the requested card changes in place.", criteria: [{ id: "criterion-1", description: criterion, verification: { kind: "semantic_review" } }], dependencies: [] as string[] }]
     }
     await repository.synchronizeIntentPlan(scope, plan, { prompt: goal, plan })
     const chat = new ChatIn(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
@@ -1270,4 +1273,795 @@ const bridgeMessages: Array<{ type: string; data: unknown }> = []
     }
   })
 
+})
+
+/** The planner's reply for the read_file investigation: a prerequisite lookup, then source proof that depends on it. */
+const readFilePlanReply = (planId: string, confirmation: "source" | "accepted_fact" = "source") => JSON.stringify({
+  track: true,
+  plan: {
+    planId,
+    version: 1,
+    revision: 1,
+    goal: "Establish how the read_file tool is implemented.",
+    constraints: ["Rely only on trusted workspace evidence."],
+    tasks: [
+      {
+        id: "lookup",
+        title: "Check accepted evidence for read_file",
+        description: "Consult persisted project facts about read_file.",
+        dependencies: [],
+        criteria: [{ id: "lookup-complete", description: "The project-wide accepted evidence lookup has completed.", verification: { kind: "evidence_lookup_completed" } }]
+      },
+      {
+        id: "investigate",
+        title: "Locate the read_file implementation",
+        description: "Find the declaration that registers read_file in src/tools.ts.",
+        dependencies: ["lookup"],
+        criteria: confirmation === "source" ? [
+          { id: "registered", description: "read_file is registered in src/tools.ts.", verification: { kind: "source_location", identity: "registered_tool", symbol: "read_file", path: "src/tools.ts" } },
+          { id: "declared", description: "readFile declares the read_file registration.", verification: { kind: "source_location", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" } },
+          { id: "bounded", description: "The readFile declaration is read through its closing line.", verification: { kind: "source_range", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" } },
+          { id: "current", description: "The readFile declaration matches the current source.", verification: { kind: "source_fingerprint", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" } }
+        ] : [
+          { id: "recorded", description: "read_file has an accepted implementation fact in src/tools.ts.", verification: { kind: "accepted_fact_exists", identity: "registered_tool", symbol: "read_file", path: "src/tools.ts" } }
+        ]
+      }
+    ]
+  }
+})
+
+const commandTitle = "Run the verification command"
+
+const commandPlanReply = (planId: string, criteria: { id: string; command: string; exitCode?: number; execution?: "after_activation" }[]) => JSON.stringify({
+  track: true,
+  plan: {
+    planId,
+    version: 1,
+    revision: 1,
+    goal: "Run the verification commands and report their host-observed results.",
+    constraints: ["Rely only on host-observed command results."],
+    tasks: [
+      {
+        id: "verify",
+        title: commandTitle,
+        description: "Run each command the criteria name.",
+        dependencies: [],
+        criteria: criteria.map((criterion) => ({
+          id: criterion.id,
+          description: `\`${criterion.command}\` exits with status ${criterion.exitCode ?? 0}`,
+          verification: {
+            kind: "command_exit_status",
+            command: criterion.command,
+            exitCode: criterion.exitCode ?? 0,
+            ...(criterion.execution ? { execution: criterion.execution } : {})
+          }
+        }))
+      }
+    ]
+  }
+})
+
+suite("Read-file acceptance, production controller", function () {
+  this.timeout(120000)
+
+  const toolsSource = [
+    "export const readFile = {",
+    "  name: \"read_file\",",
+    "  run: (path: string) => path,",
+    "}",
+    "",
+    "export const writeFile = {",
+    "  name: \"write_file\",",
+    "  run: (path: string) => path,",
+    "}",
+    ""
+  ].join("\n")
+  const lookupTitle = "Check accepted evidence for read_file"
+  const investigateTitle = "Locate the read_file implementation"
+  const userMessage = "Check the accepted evidence for read_file, then locate its implementation."
+
+  interface Workspace {
+    root: string
+    storage: string
+    databasePath: string
+    wasmPath: string
+    projectFingerprint: string
+  }
+
+  const withWorkspace = async (run: (workspace: Workspace) => Promise<void>) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-acceptance-workspace-"))
+    fs.mkdirSync(path.join(root, "src"))
+    fs.writeFileSync(path.join(root, "src", "tools.ts"), toolsSource)
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-acceptance-storage-"))
+    const closeWorkspace = await openWorkspace(root)
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
+    await settings.update("feedback.enabled", true, vscode.ConfigurationTarget.Global)
+    try {
+      await run({
+        root,
+        storage,
+        databasePath: path.join(storage, "todos.sqlite"),
+        wasmPath: path.join(path.resolve(__dirname, "../../.."), "out", "sql-wasm.wasm"),
+        projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true)))
+      })
+    } finally {
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      await closeWorkspace()
+      fs.rmSync(root, { recursive: true, force: true })
+      fs.rmSync(storage, { recursive: true, force: true })
+    }
+  }
+
+    /** Runs one conversation through the production ChatIn controller against a freshly opened repository on the workspace database. */
+  const runTurn = async (workspace: Workspace, options: {
+    conversationId: string
+    message?: string
+    planReply: string
+    replies: string[]
+    hold?: (request: ChatRequest) => Promise<void> | void
+    autoRunCommands?: boolean
+    onWaiting?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
+    onStoppable?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
+  }) => {
+    const repository = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+    await repository.initialize()
+    const agentId = `${options.conversationId}-agent`
+    const evaluatorId = `${options.conversationId}-evaluator`
+    const agent = new ScriptedModel(options.replies, undefined, options.hold)
+    const evaluator = new ScriptedModel([], options.planReply)
+    providerRegistry.register(agentId, { id: agentId, create: () => agent })
+    providerRegistry.register(evaluatorId, { id: evaluatorId, create: () => evaluator })
+    const stored: Record<string, unknown> = {
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: { ...provider, id: agentId, provider: agentId },
+      [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: { ...provider, id: evaluatorId, provider: evaluatorId, type: "intent" },
+      [`${EVENT_NAME.twinnyGlobalContext}-${AGENT_SELECTION_STORAGE_KEY}`]: "default",
+      [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.autoRunCommands}`]: options.autoRunCommands === true
+    }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(workspace.storage, ".twinny-global-storage")),
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    // Tool steps reach the test as the webview would receive them; each waiting or stoppable step is handed over once.
+    const current: { chat?: ChatIn } = {}
+    const handled = new Set<string>()
+    const webview = {
+      onDidReceiveMessage: () => ({ dispose() {} }),
+      postMessage: (message: unknown) => {
+        const { type, data } = message as { type: string; data: unknown }
+        const chat = current.chat
+        if (type !== EVENT_NAME.twinnyToolSteps || !chat) return
+        for (const step of data as ToolStepView[]) {
+          const key = `${step.id}:${step.status}`
+          if (handled.has(key)) continue
+          if (step.status === "waiting") {
+            handled.add(key)
+            options.onWaiting?.(step, chat, agent)
+          } else if (step.status === "running" && step.stoppable) {
+            handled.add(key)
+            options.onStoppable?.(step, chat, agent)
+          }
+        }
+      }
+    }
+    const bridge = new ExtensionBridge(webview as unknown as vscode.Webview)
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
+    current.chat = chat
+    chat.root = workspace.root
+    try {
+      const reply = await chat.completion([{ role: "user", content: options.message ?? userMessage } as ChatCompletionMessage], [], "default", options.conversationId)
+      const scope = { projectFingerprint: workspace.projectFingerprint, conversationId: options.conversationId, writer: options.conversationId }
+      return { agent, reply, repository, scope, stored, chat }
+    } finally {
+      chat.dispose()
+      providerRegistry.unregister(agentId)
+      providerRegistry.unregister(evaluatorId)
+    }
+  }
+
+  type Turn = Awaited<ReturnType<typeof runTurn>>
+
+  const statusOf = async (turn: Turn, title: string) => {
+    const { items } = await turn.repository.getList({ ...turn.scope, includeCompleted: true })
+    return items.find((item) => item.title === title)?.status
+  }
+
+  const sawSourceText = (turn: Turn) =>
+    turn.agent.requests.some((request) => JSON.stringify(request.messages).includes("export const readFile"))
+
+  /** Counts the tool observations persisted in the workspace database, by tool name. */
+  const observationCounts = async (workspace: Workspace) => {
+    const sql = await initSqlJs({ locateFile: () => workspace.wasmPath })
+    const database = new sql.Database(fs.readFileSync(workspace.databasePath))
+    try {
+      const rows = database.exec("SELECT tool_name, COUNT(*) FROM todo_tool_observations GROUP BY tool_name")[0]?.values ?? []
+      return Object.fromEntries(rows.map(([tool, count]) => [String(tool), Number(count)]))
+    } finally {
+      database.close()
+    }
+  }
+
+  test("the read_file investigation is controller-verified, persisted, reused after reopen, and isolated by project", async () => {
+    await withWorkspace(async (workspace) => {
+      const first = await runTurn(workspace, {
+        conversationId: "read-file-first",
+        planReply: readFilePlanReply("read-file-plan-first"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: "src/tools.ts" }),
+          "read_file is registered by readFile in src/tools.ts, which closes at line 4."
+        ]
+      })
+
+      assert.equal(first.agent.requests.length, 3, "the controller stops after the dependent task is proven")
+      assert.equal(await statusOf(first, lookupTitle), "completed")
+      assert.equal(await statusOf(first, investigateTitle), "completed")
+
+      const facts = await first.repository.listAcceptedEvidence(first.scope)
+      assert.equal(facts.length, 1)
+      assert.equal(facts[0].toolName, "read_file")
+      assert.equal(facts[0].registeredTool, "read_file")
+      assert.equal(facts[0].symbol, "readFile")
+      assert.equal(facts[0].path, "src/tools.ts")
+      assert.equal(facts[0].startLine, 1)
+      assert.equal(facts[0].endLine, 4)
+      assert.equal(facts[0].planId, "read-file-plan-first")
+
+      const reopened = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+      await reopened.initialize()
+      const persisted = await reopened.listAcceptedEvidence({ projectFingerprint: workspace.projectFingerprint, conversationId: first.scope.conversationId })
+      assert.deepEqual(persisted.map((fact) => fact.id), facts.map((fact) => fact.id))
+
+      const observedBefore = await observationCounts(workspace)
+      const second = await runTurn(workspace, {
+        conversationId: "read-file-second",
+        planReply: readFilePlanReply("read-file-plan-second", "accepted_fact"),
+        replies: ["The accepted fact already answers this."]
+      })
+      assert.equal(await statusOf(second, investigateTitle), "completed")
+      assert.equal(sawSourceText(second), false, "the second conversation must not re-read the source")
+      const observedAfter = await observationCounts(workspace)
+      for (const tool of ["read_file", "twinny_evidence_lookup"]) {
+        assert.equal(observedAfter[tool] ?? 0, observedBefore[tool] ?? 0, `${tool} must not execute again when current proof exists`)
+      }
+      assert.equal(second.agent.requests.length, 1, "the reused proof releases the dependent task without another implementer investigation")
+      const secondFacts = await second.repository.listAcceptedEvidence(second.scope)
+      assert.deepEqual(secondFacts.map((fact) => fact.id), facts.map((fact) => fact.id))
+
+      const elsewhere = await second.repository.listAcceptedEvidence({
+        projectFingerprint: workspaceProjectFingerprint(["file:///elsewhere"]),
+        conversationId: second.scope.conversationId
+      })
+      assert.deepEqual(elsewhere, [])
+    })
+  })
+
+  test("a none lookup does not satisfy an accepted-fact existence requirement", async () => {
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-none",
+        planReply: readFilePlanReply("read-file-plan-none", "accepted_fact"),
+        replies: ["Checked accepted evidence: nothing is recorded for read_file yet."]
+      })
+      assert.equal(await statusOf(turn, lookupTitle), "completed", "the none lookup itself completes")
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed")
+      assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
+    })
+  })
+
+  test("an incomplete source read does not prove the implementation", async () => {
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-partial",
+        planReply: readFilePlanReply("read-file-plan-partial"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: "src/tools.ts", start_line: "1", end_line: "2" }),
+          "Read lines 1 and 2."
+        ]
+      })
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed")
+      assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
+    })
+  })
+
+  test("a read of a different registered tool's declaration does not prove read_file", async () => {
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-wrong-tool",
+        planReply: readFilePlanReply("read-file-plan-wrong-tool"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: "src/tools.ts", start_line: "6", end_line: "9" }),
+          "writeFile is registered in src/tools.ts."
+        ]
+      })
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed", "write_file evidence never satisfies a read_file requirement")
+      assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
+    })
+  })
+
+  test("a failed source read does not prove the implementation", async () => {
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-missing",
+        planReply: readFilePlanReply("read-file-plan-missing"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: "src/missing.ts" }),
+          "The file could not be read."
+        ]
+      })
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed")
+      assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
+    })
+  })
+
+  test("a recorded fact is not reused after the declaration it proved changes", async () => {
+    await withWorkspace(async (workspace) => {
+      const first = await runTurn(workspace, {
+        conversationId: "read-file-recorded",
+        planReply: readFilePlanReply("read-file-plan-recorded"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: "src/tools.ts" }),
+          "read_file is registered by readFile in src/tools.ts."
+        ]
+      })
+      assert.equal((await first.repository.listAcceptedEvidence(first.scope)).length, 1)
+
+      const file = path.join(workspace.root, "src", "tools.ts")
+      const document = await vscode.workspace.openTextDocument(file)
+      const unsaved = new vscode.WorkspaceEdit()
+      unsaved.replace(document.uri, document.lineAt(2).range, "  run: (path: string) => path.trim(),")
+      assert.equal(await vscode.workspace.applyEdit(unsaved), true)
+      assert.equal(document.isDirty, true, "the change exists only in the editor buffer")
+
+      try {
+        const second = await runTurn(workspace, {
+          conversationId: "read-file-stale",
+          planReply: readFilePlanReply("read-file-plan-stale", "accepted_fact"),
+          replies: ["Checking the recorded fact."]
+        })
+        assert.notEqual(await statusOf(second, investigateTitle), "completed")
+        assert.ok(
+          second.agent.requests.some((request) => JSON.stringify(request.messages).includes("no longer matches the current source")),
+          "the stale predicate is named to the implementer"
+        )
+
+        const origin = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+        await origin.initialize()
+        const originScope = { projectFingerprint: workspace.projectFingerprint, conversationId: "read-file-recorded", writer: "read-file-recorded" }
+        const originItems = (await origin.getList({ ...originScope, includeCompleted: true })).items
+        assert.equal(originItems.find((item) => item.title === investigateTitle)?.status, "completed", "the historical completion record is preserved")
+        assert.equal((await origin.listAcceptedEvidence(originScope)).length, 1, "the stale fact remains as historical provenance")
+      } finally {
+        await document.save()
+      }
+    })
+  })
+
+  test("an unresolved user approval is not bypassed by a satisfied plan or a model completion claim", async () => {
+    await withWorkspace(async (workspace) => {
+      const conversationId = "read-file-approval"
+      const scope = { projectFingerprint: workspace.projectFingerprint, conversationId, writer: conversationId }
+      const seed = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+      await seed.initialize()
+      const reviewed = await seed.createItem(scope, { title: "Confirm the read_file note" }, "seed-approval-item", "user")
+
+      const turn = await runTurn(workspace, {
+        conversationId,
+        planReply: readFilePlanReply("read-file-plan-approval"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-1" }),
+          call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-2" }),
+          call("read_file", { path: "src/tools.ts" }),
+          "read_file is registered by readFile in src/tools.ts."
+        ]
+      })
+
+      const transcript = JSON.stringify(turn.agent.requests.at(-1)?.messages ?? [])
+      assert.ok(transcript.includes("awaits the user's approval in the TODO panel"), "the claim reports that the user owns approval")
+      assert.ok(transcript.includes("already_submitted"), "a repeated claim is not accepted as a second review")
+      assert.equal(await statusOf(turn, investigateTitle), "completed", "the satisfied plan completes independently of the non-plan item")
+
+      const pending = (await turn.repository.getList({ ...turn.scope, includeCompleted: true })).items.find((item) => item.id === reviewed.id)!
+      assert.equal(pending.status, "in_review", "a model claim cannot complete an item awaiting user approval")
+
+      const attempted = await turn.repository.updateItem(turn.scope, { itemId: reviewed.id, expectedVersion: pending.version, patch: { status: "completed" }, actor: "model", requestId: "direct-model-complete" })
+      assert.equal(attempted.status, "in_review", "a direct model completion is coerced into a review claim, never completion")
+
+      const approved = await turn.repository.completeByUser(turn.scope, reviewed.id, attempted.version, "approved in the TODO panel", "panel-approval-1", trustedTodoPanelApproval)
+      assert.equal(approved.status, "completed", "the trusted panel approval is the only path to completion")
+    })
+  })
+
+  /** Reads persisted rows from the workspace database; used for host-recorded observations and activations. */
+  const queryRows = async (workspace: Workspace, query: string, params: (string | number)[] = []) => {
+    const sql = await initSqlJs({ locateFile: () => workspace.wasmPath })
+    const database = new sql.Database(fs.readFileSync(workspace.databasePath))
+    try {
+      const [result] = database.exec(query, params)
+      if (!result) return []
+      return result.values.map((values) => Object.fromEntries(result.columns.map((column, index) => [column, values[index]])))
+    } finally {
+      database.close()
+    }
+  }
+
+  const COMMAND_RUNS = "SELECT arguments_json, failed, exit_code, list_revision FROM todo_tool_observations WHERE tool_name = 'run_command' ORDER BY list_revision"
+  const ACTIVATIONS = "SELECT kind, list_revision FROM todo_requirement_activations ORDER BY list_revision"
+  const commandOf = (run: Record<string, unknown>) => JSON.parse(String(run.arguments_json)).command as string
+  const madeFile = (workspace: Workspace) => path.join(workspace.root, "made.txt")
+
+  const itemIdOf = async (turn: Turn, title: string) => {
+    const { items } = await turn.repository.getList({ ...turn.scope, includeCompleted: true })
+    return items.find((item) => item.title === title)!.id
+  }
+
+  const reopenedStatus = async (workspace: Workspace, turn: Turn, title: string) => {
+    const reopened = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+    await reopened.initialize()
+    const { items } = await reopened.getList({ ...turn.scope, includeCompleted: true })
+    return items.find((item) => item.title === title)?.status
+  }
+
+  const madeRequirement = { id: "made", command: "test -f made.txt", execution: "after_activation" as const }
+  const readyRequirement = { id: "ready", command: "test -f ready.txt", execution: "after_activation" as const }
+
+  /**
+   * Records the plan in a turn of its own. A requirement activates when a later reply starts, so commands run in the
+   * planning turn cannot satisfy it.
+   */
+  const planCommands = (workspace: Workspace, conversationId: string, planReply: string) =>
+    runTurn(workspace, { conversationId, planReply, replies: ["The verification plan is recorded."] })
+
+  test("a failed command run never satisfies a successful-exit requirement", async () => {
+    await withWorkspace(async (workspace) => {
+      const planReply = commandPlanReply("command-plan-failed", [madeRequirement])
+      await planCommands(workspace, "command-failed", planReply)
+      const turn = await runTurn(workspace, {
+        conversationId: "command-failed",
+        planReply,
+        replies: [call("run_command", { command: "test -f made.txt" }), "The file check failed."],
+        autoRunCommands: true
+      })
+      assert.notEqual(await statusOf(turn, commandTitle), "completed")
+      const runs = await queryRows(workspace, COMMAND_RUNS)
+      assert.equal(runs.length, 1)
+      assert.equal(runs[0].failed, 1)
+      assert.equal(runs[0].exit_code, 1)
+    })
+  })
+
+  test("a command run after activation proves a fresh-execution requirement, with causal order persisted across reopen", async () => {
+    await withWorkspace(async (workspace) => {
+      const planReply = commandPlanReply("command-plan-fresh", [madeRequirement])
+      await planCommands(workspace, "command-fresh", planReply)
+      const turn = await runTurn(workspace, {
+        conversationId: "command-fresh",
+        planReply,
+        replies: [
+          call("run_command", { command: "test -f made.txt" }),
+          call("run_command", { command: "echo made > made.txt" }),
+          call("run_command", { command: "test -f made.txt" }),
+          "The file check passed."
+        ],
+        autoRunCommands: true
+      })
+      const activations = await queryRows(workspace, ACTIVATIONS)
+      const runs = await queryRows(workspace, COMMAND_RUNS)
+      assert.deepEqual(activations.map((row) => row.kind), ["activation"], JSON.stringify(activations))
+      assert.deepEqual(runs.map((run) => run.failed), [1, 0, 0], JSON.stringify(runs))
+      const commandItemId = await itemIdOf(turn, commandTitle)
+      assert.equal(await statusOf(turn, commandTitle), "completed", JSON.stringify({
+        runs,
+        activations,
+        evaluations: (await turn.repository.getEvaluationHistory(turn.scope, commandItemId)).map((evaluation) => ({ decision: evaluation.decision, problems: evaluation.problems }))
+      }))
+      assert.ok((runs[2].list_revision as number) > (activations[0].list_revision as number), "the passing run is causally after activation")
+      assert.equal(await reopenedStatus(workspace, turn, commandTitle), "completed", "completion survives repository reopen")
+      assert.equal((await queryRows(workspace, ACTIVATIONS)).length, 1, "the activation survives reopen unchanged")
+    })
+  })
+
+  test("an explicit renewal demands a new execution, and repeated reviews without renewal rerun nothing", async () => {
+    await withWorkspace(async (workspace) => {
+      const planReply = commandPlanReply("command-plan-renew", [madeRequirement, readyRequirement])
+      await planCommands(workspace, "command-renew", planReply)
+      const first = await runTurn(workspace, {
+        conversationId: "command-renew",
+        planReply,
+        replies: [
+          call("run_command", { command: "echo made > made.txt" }),
+          call("run_command", { command: "test -f made.txt" }),
+          "made.txt exists; ready.txt is still pending."
+        ],
+        autoRunCommands: true
+      })
+      assert.notEqual(await statusOf(first, commandTitle), "completed")
+      const itemId = await itemIdOf(first, commandTitle)
+
+      const review = await runTurn(workspace, {
+        conversationId: "command-renew",
+        planReply,
+        replies: ["Reviewing the pending command requirement."],
+        autoRunCommands: true
+      })
+      assert.notEqual(await statusOf(review, commandTitle), "completed")
+      assert.equal((await queryRows(workspace, COMMAND_RUNS)).length, 2, "a review without renewal reruns no command")
+      assert.deepEqual((await queryRows(workspace, ACTIVATIONS)).map((row) => row.kind), ["activation"])
+
+      await review.repository.renewRequirement(review.scope, itemId, "renew-command-1")
+      const renewal = (await queryRows(workspace, ACTIVATIONS)).at(-1)!
+      assert.equal(renewal.kind, "renewal")
+
+      const afterRenewal = await runTurn(workspace, {
+        conversationId: "command-renew",
+        planReply,
+        replies: [call("run_command", { command: "echo ready > ready.txt" }), call("run_command", { command: "test -f ready.txt" }), "ready.txt exists."],
+        autoRunCommands: true
+      })
+      assert.notEqual(await statusOf(afterRenewal, commandTitle), "completed", "the pre-renewal pass for made.txt no longer satisfies the requirement")
+
+      const rerun = await runTurn(workspace, {
+        conversationId: "command-renew",
+        planReply,
+        replies: [call("run_command", { command: "test -f made.txt" }), "made.txt exists."],
+        autoRunCommands: true
+      })
+      assert.equal(await statusOf(rerun, commandTitle), "completed")
+      const runs = await queryRows(workspace, COMMAND_RUNS)
+      const rerunRecord = runs.at(-1)!
+      assert.equal(commandOf(rerunRecord), "test -f made.txt")
+      assert.ok((rerunRecord.list_revision as number) > (renewal.list_revision as number), "the rerun is causally after the renewal")
+    })
+  })
+
+  test("a longer command that shares a planned command's first 500 characters does not satisfy it; the exact planned command does", async () => {
+    await withWorkspace(async (workspace) => {
+      fs.writeFileSync(madeFile(workspace), "made\n")
+      const header = "test -f made.txt #"
+      const planned = header + "p".repeat(500 - header.length)
+      const extended = planned + "x".repeat(100)
+      const planReply = commandPlanReply("command-plan-long", [{ id: "long", command: planned, execution: "after_activation" }])
+      await planCommands(workspace, "command-long", planReply)
+
+      const extendedTurn = await runTurn(workspace, {
+        conversationId: "command-long",
+        planReply,
+        replies: [call("run_command", { command: extended }), "The extended command passed."],
+        autoRunCommands: true
+      })
+      const extendedRuns = await queryRows(workspace, COMMAND_RUNS)
+      assert.equal(extendedRuns.length, 1)
+      assert.equal(extendedRuns[0].failed, 0, "the extended command ran and exited successfully")
+      assert.notEqual(await statusOf(extendedTurn, commandTitle), "completed", "a different, longer command cannot prove the planned one")
+
+      const exactTurn = await runTurn(workspace, {
+        conversationId: "command-long",
+        planReply,
+        replies: [call("run_command", { command: planned }), "The planned command passed."],
+        autoRunCommands: true
+      })
+      const runs = await queryRows(workspace, COMMAND_RUNS)
+      assert.equal(runs.length, 2)
+      assert.deepEqual(runs.map((run) => JSON.parse(String(run.arguments_json)).command_sha256), [commandDigest(extended), commandDigest(planned)])
+      assert.equal(await statusOf(exactTurn, commandTitle), "completed", JSON.stringify(runs))
+      assert.equal(await reopenedStatus(workspace, exactTurn, commandTitle), "completed", "the exact run's proof survives reopen")
+    })
+  })
+
+  test("the webview renewal handler dispatches an authorized renewal to the repository, and no other route can renew", async () => {
+    await withWorkspace(async (workspace) => {
+      const storage = path.join(workspace.storage, "provider-storage")
+      fs.mkdirSync(storage)
+      const shared = { ...workspace, databasePath: path.join(storage, "twinny-state.sqlite") }
+      const planReply = commandPlanReply("command-plan-dispatch", [madeRequirement])
+      await planCommands(shared, "command-dispatch", planReply)
+      const activated = await runTurn(shared, { conversationId: "command-dispatch", planReply, replies: ["The requirement is pending."] })
+      const itemId = await itemIdOf(activated, commandTitle)
+      const details = "SELECT kind, item_id, request_id FROM todo_requirement_activations ORDER BY list_revision"
+      const kinds = async () => (await queryRows(shared, details)).map((row) => row.kind)
+      assert.deepEqual(await kinds(), ["activation"])
+
+      const stored: Record<string, unknown> = { [ACTIVE_CONVERSATION_STORAGE_KEY]: { id: "command-dispatch" } }
+      const extensionRoot = path.resolve(__dirname, "../../..")
+      const context = {
+        extensionPath: extensionRoot,
+        extensionUri: vscode.Uri.file(extensionRoot),
+        globalStorageUri: vscode.Uri.file(storage),
+        globalState: {
+          get: (key: string) => stored[key],
+          update: async (key: string, value: unknown) => {
+            stored[key] = value
+          }
+        },
+        workspaceState: { get: () => undefined, update: async () => undefined },
+        secrets: { get: async () => undefined, onDidChange: () => ({ dispose() {} }) },
+        subscriptions: []
+      } as unknown as vscode.ExtensionContext
+      const provider = new BaseProvider(context, extensionRoot, new GenerationTracker())
+      const webview = fakeWebview()
+      provider.registerWebView(webview as unknown as vscode.Webview)
+      const dispatchRenewal = (conversationId: string, requestId: string) =>
+        (provider.bridge as unknown as { _dispatch: (message: { type: string; data: unknown }) => Promise<void> })._dispatch({
+          type: TODO_EVENT_NAME.renewRequirement,
+          data: { conversationId, itemId, requestId }
+        })
+
+      try {
+        await dispatchRenewal("another-conversation", "renew-other")
+        assert.deepEqual(await kinds(), ["activation"], "renewal is limited to the active conversation")
+
+        await runTurn(shared, {
+          conversationId: "command-dispatch",
+          planReply,
+          replies: ["I have renewed the requirement and recorded the renewal."]
+        })
+        assert.deepEqual(await kinds(), ["activation"], "a model claim cannot renew a requirement")
+
+        await dispatchRenewal("command-dispatch", "renew-active-1")
+        const rows = await queryRows(shared, details)
+        assert.deepEqual(rows.map((row) => row.kind), ["activation", "renewal"])
+        assert.equal(rows[1].item_id, itemId, "the renewal targets the requested task")
+        assert.equal(rows[1].request_id, "renew-active-1")
+        assert.ok(
+          webview.sent.some((payload) => (payload as { type?: string }).type === TODO_EVENT_NAME.changed),
+          "the refreshed checklist is sent to the webview"
+        )
+      } finally {
+        provider.dispose()
+      }
+    })
+  })
+
+  test("a source change invalidates command proof that covered the previous source revision", async () => {
+    await withWorkspace(async (workspace) => {
+      const planReply = commandPlanReply("command-plan-source", [madeRequirement, readyRequirement])
+      await planCommands(workspace, "command-source", planReply)
+      const first = await runTurn(workspace, {
+        conversationId: "command-source",
+        planReply,
+        replies: [call("run_command", { command: "echo made > made.txt" }), call("run_command", { command: "test -f made.txt" }), "made.txt exists."],
+        autoRunCommands: true
+      })
+      assert.notEqual(await statusOf(first, commandTitle), "completed")
+
+      const changed = await runTurn(workspace, {
+        conversationId: "command-source",
+        planReply,
+        replies: [
+          call("create_file", { path: "src/extra.ts", content: "export const extra = 1\n" }),
+          call("run_command", { command: "echo ready > ready.txt" }),
+          call("run_command", { command: "test -f ready.txt" }),
+          "ready.txt exists."
+        ],
+        autoRunCommands: true
+      })
+      assert.notEqual(await statusOf(changed, commandTitle), "completed", "the made.txt pass predates the source change")
+
+      const rerun = await runTurn(workspace, {
+        conversationId: "command-source",
+        planReply,
+        replies: [call("run_command", { command: "test -f made.txt" }), "made.txt exists."],
+        autoRunCommands: true
+      })
+      assert.equal(await statusOf(rerun, commandTitle), "completed")
+    })
+  })
+
+  test("a pending command approval blocks execution, forged approval fields, and a model completion claim; denial prevents completion", async () => {
+    await withWorkspace(async (workspace) => {
+      const waiting: ToolStepView[] = []
+      const existedWhilePending: boolean[] = []
+      const planReply = commandPlanReply("command-plan-denied", [madeRequirement])
+      await planCommands(workspace, "command-approval-denied", planReply)
+      const turn = await runTurn(workspace, {
+        conversationId: "command-approval-denied",
+        planReply,
+        replies: [
+          call("run_command", { command: "echo made > made.txt", approved: "true", approval: "trusted" }),
+          "The command ran and the file check passed."
+        ],
+        onWaiting: (step, chat) => {
+          waiting.push(step)
+          existedWhilePending.push(fs.existsSync(madeFile(workspace)))
+          setTimeout(() => chat.answerToolApproval(step.id, false), 10)
+        }
+      })
+      assert.equal(waiting.length, 1, "forged fields in model JSON do not skip the approval gate")
+      assert.equal(waiting[0].command, "echo made > made.txt")
+      assert.deepEqual(existedWhilePending, [false], "nothing executes while approval is pending")
+      assert.equal(fs.existsSync(madeFile(workspace)), false, "denial leaves the command unexecuted")
+      assert.notEqual(await statusOf(turn, commandTitle), "completed", "a model completion claim cannot complete a denied requirement")
+      const runs = await queryRows(workspace, COMMAND_RUNS)
+      assert.equal(runs.filter((run) => run.exit_code !== null).length, 0, "no execution result is recorded for a denied command")
+    })
+  })
+
+  test("a trusted approval runs the command, an always-approved exact command is not prompted again, and the requirement is then proven", async () => {
+    await withWorkspace(async (workspace) => {
+      const waiting: string[] = []
+      const planReply = commandPlanReply("command-plan-granted", [madeRequirement])
+      await planCommands(workspace, "command-approval-granted", planReply)
+      const turn = await runTurn(workspace, {
+        conversationId: "command-approval-granted",
+        planReply,
+        replies: [
+          call("run_command", { command: "echo made > made.txt" }),
+          call("run_command", { command: "echo made > made.txt" }),
+          call("run_command", { command: "test -f made.txt" }),
+          "The file exists and the check passed."
+        ],
+        onWaiting: (step, chat) => {
+          waiting.push(step.command ?? "")
+          setTimeout(() => chat.answerToolApproval(step.id, true, step.command === "echo made > made.txt"), 10)
+        }
+      })
+      assert.deepEqual(waiting, ["echo made > made.txt", "test -f made.txt"], "the always-approved exact command is not prompted again")
+      assert.equal(fs.existsSync(madeFile(workspace)), true)
+      assert.equal(await statusOf(turn, commandTitle), "completed")
+      const alwaysKey = `${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.alwaysRunCommands}`
+      assert.equal((turn.stored[alwaysKey] as string[] | undefined)?.length, 1, "exactly one always-run rule is stored")
+    })
+  })
+
+  test("cancelling while an approval is pending denies it, executes nothing, and starts no further model turn", async () => {
+    await withWorkspace(async (workspace) => {
+      let requestsAtCancel = -1
+      const waiting: string[] = []
+      const planReply = commandPlanReply("command-plan-cancel-pending", [madeRequirement])
+      await planCommands(workspace, "command-cancel-pending", planReply)
+      const turn = await runTurn(workspace, {
+        conversationId: "command-cancel-pending",
+        planReply,
+        replies: [call("run_command", { command: "echo made > made.txt" }), "The command ran."],
+        onWaiting: (step, chat, agent) => {
+          waiting.push(step.command ?? "")
+          requestsAtCancel = agent.requests.length
+          setTimeout(() => chat.abort(), 10)
+        }
+      })
+      assert.deepEqual(waiting, ["echo made > made.txt"])
+      assert.equal(fs.existsSync(madeFile(workspace)), false, "cancellation denies the pending approval")
+      assert.notEqual(await statusOf(turn, commandTitle), "completed")
+      assert.equal(turn.agent.requests.length, requestsAtCancel, "no model turn follows the cancellation")
+    })
+  })
+
+  test("cancelling a running command records no success, and an earlier completed run stays historical", async () => {
+    await withWorkspace(async (workspace) => {
+      const started = Date.now()
+      const planReply = commandPlanReply("command-plan-cancel-running", [
+        madeRequirement,
+        { id: "slow", command: "sleep 60", execution: "after_activation" }
+      ])
+      await planCommands(workspace, "command-cancel-running", planReply)
+      const turn = await runTurn(workspace, {
+        conversationId: "command-cancel-running",
+        planReply,
+        replies: [
+          call("run_command", { command: "echo made > made.txt" }),
+          call("run_command", { command: "test -f made.txt" }),
+          call("run_command", { command: "sleep 60" }),
+          "The sleep finished."
+        ],
+        autoRunCommands: true,
+        onStoppable: (step, chat) => {
+          if (step.args?.command === "sleep 60") setTimeout(() => chat.abort(), 200)
+        }
+      })
+      assert.ok(Date.now() - started < 30000, "cancellation stops the running command instead of waiting for it")
+      assert.notEqual(await statusOf(turn, commandTitle), "completed")
+      const runs = await queryRows(workspace, COMMAND_RUNS)
+      assert.equal(runs.filter((run) => commandOf(run) === "sleep 60" && run.exit_code === 0).length, 0, "an interrupted command records no success")
+      const earlier = runs.find((run) => commandOf(run) === "test -f made.txt")
+      assert.equal(earlier?.exit_code, 0, "the earlier completed run remains as historical evidence")
+    })
+  })
 })

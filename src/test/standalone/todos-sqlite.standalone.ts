@@ -259,8 +259,8 @@ test("concurrent and stale plan revisions are resolved transactionally without l
       goal: "Keep the parser reliable",
       constraints: ["Preserve public API"],
       tasks: [
-        { id: "inspect", title, description: "Inspect the parser", acceptanceCriteria: ["Parser inspected"], dependencies: [] },
-        { id: "verify", title: "Verify parser", description: "Run focused checks", acceptanceCriteria: ["Checks pass"], dependencies: ["inspect"] }
+        { id: "inspect", title, description: "Inspect the parser", criteria: [{ id: "parser-inspected", description: "Parser inspected", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "verify", title: "Verify parser", description: "Run focused checks", criteria: [{ id: "checks-pass", description: "Checks pass", verification: { kind: "semantic_review" } }], dependencies: ["inspect"] }
       ]
     })
     const intentResult = (plan: ReturnType<typeof makePlan>) => ({ prompt: "Fix the parser", plan })
@@ -330,9 +330,9 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
       goal: "Make parser behavior reliable",
       constraints: ["Preserve public API"],
       tasks: [
-        { id: "inspect-parser", title, description: "Inspect the parser implementation", acceptanceCriteria: ["Identify the faulty branch"], dependencies: [] },
-        { id: "fix-parser", title: "Fix parser", description: "Correct the faulty branch", acceptanceCriteria: ["Regression test passes"], dependencies: ["inspect-parser"] },
-        { id: "verify-parser", title: "Verify parser", description: "Run focused checks", acceptanceCriteria: ["Focused tests pass"], dependencies: ["fix-parser"] }
+        { id: "inspect-parser", title, description: "Inspect the parser implementation", criteria: [{ id: "faulty-branch", description: "Identify the faulty branch", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "fix-parser", title: "Fix parser", description: "Correct the faulty branch", criteria: [{ id: "regression-test", description: "Regression test passes", verification: { kind: "semantic_review" } }], dependencies: ["inspect-parser"] },
+        { id: "verify-parser", title: "Verify parser", description: "Run focused checks", criteria: [{ id: "focused-tests", description: "Focused tests pass", verification: { kind: "semantic_review" } }], dependencies: ["fix-parser"] }
       ]
     })
     const firstPlan = makePlan(1)
@@ -340,7 +340,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
     const first = await repository.synchronizeIntentPlan(scope, firstPlan, intentResult)
     assert.equal(first.items.filter((item) => item.source === "intent_compiler").length, 3)
     assert.deepEqual(first.items.map((item) => item.title), ["Inspect parser", "Fix parser", "Verify parser"])
-    assert.deepEqual(first.items[0].acceptanceCriteria, ["Identify the faulty branch"])
+    assert.deepEqual(first.items[0].criteria?.map((criterion) => criterion.description), ["Identify the faulty branch"])
     const repeated = await repository.synchronizeIntentPlan(scope, firstPlan, intentResult)
     assert.equal(repeated.id, first.id)
     assert.equal(repeated.items.length, 3)
@@ -381,7 +381,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
 
     const otherScope = { ...scope, conversationId: "chat-plan-b", writer: "chat-plan-b" }
     const otherPlan = { ...makePlan(1), planId: "other-plan", goal: "Different chat goal", tasks: [
-      { id: "other-task", title: "Other chat task", description: "Keep chat plans isolated", acceptanceCriteria: ["Only this chat sees the task"], dependencies: [] }
+      { id: "other-task", title: "Other chat task", description: "Keep chat plans isolated", criteria: [{ id: "chat-isolated", description: "Only this chat sees the task", verification: { kind: "semantic_review" } }], dependencies: [] }
     ] }
     await repository.synchronizeIntentPlan(otherScope, otherPlan, { prompt: "Other plan", plan: otherPlan })
     assert.deepEqual((await repository.getList(otherScope)).items.map((item) => item.title), ["Other chat task"])
@@ -406,7 +406,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
     assert.equal((await reopened.getItem(scope, inspect.id)).evidence[0].summary, "The parser accepts malformed delimiters.")
     const context = await reopened.getActiveIntentContext(scope)
     assert.equal(context?.planTaskId, "fix-parser")
-    assert.deepEqual(context?.acceptanceCriteria, ["Regression test passes"])
+    assert.deepEqual(context?.criteria.map((criterion) => criterion.description), ["Regression test passes"])
     assert.equal(context?.goal, "Make parser behavior reliable")
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
@@ -425,7 +425,7 @@ test("a replacement for a completed plan relinks reused task IDs to new items an
       revision,
       goal: "Keep the parser working",
       constraints: [],
-      tasks: tasks.map((task) => ({ id: task.id, title: task.title, description: `${task.title} details`, acceptanceCriteria: [`${task.title} is done`], dependencies: [] }))
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, description: `${task.title} details`, criteria: [{ id: `${task.id}-done`, description: `${task.title} is done`, verification: { kind: "semantic_review" as const } }], dependencies: [] }))
     })
     const first = planWith("plan-first", 1, [{ id: "inspect", title: "Inspect parser" }, { id: "verify", title: "Verify parser" }])
     await repository.synchronizeIntentPlan(scope, first, { objective: "Keep the parser working", prompt: "Fix the parser", plan: first })
@@ -463,7 +463,7 @@ test("evidence records log successes at DEBUG and failures at INFO, so routine e
     const repository = new TodoRepository(databasePath, wasmPath)
     const plan = {
       planId: "plan-evidence-log", version: 1 as const, revision: 1, goal: "Locate the parser", constraints: [],
-      tasks: [{ id: "locate", title: "Locate the parser", description: "Find the parser", acceptanceCriteria: ["Parser located"], dependencies: [] }]
+      tasks: [{ id: "locate", title: "Locate the parser", description: "Find the parser", criteria: [{ id: "parser-located", description: "Parser located", verification: { kind: "semantic_review" } }], dependencies: [] }]
     }
     const [item] = (await repository.synchronizeIntentPlan(scope, plan, { objective: "Locate the parser", prompt: "Where is the parser?", plan })).items
     lines.length = 0

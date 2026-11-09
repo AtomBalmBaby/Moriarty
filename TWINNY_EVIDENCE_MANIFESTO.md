@@ -1,9 +1,22 @@
 # Twinny Evidence-First Execution Manifesto
 
 
+## Development-phase contract policy (2026-11-08)
+
+**Twinny is an unreleased development fork with no external users who depend on old state or APIs. Backward compatibility with obsolete development formats is explicitly NOT a requirement.** This decision supersedes any earlier instruction in these three documents to retain old acceptance-criterion strings, run dual interpreters, maintain legacy model protocols, or migrate abandoned test-state schemas. It does **not** relax authorization, evidence provenance, durability of the *new* system, stop/cancellation semantics, or correctness tests.
+
+- **One canonical criterion representation:** a versioned, schema-validated typed JSON criterion with a stable criterion ID, `description` for display only, `verification.kind`, typed operands, subject/scope, and evidence requirements. Do not persist a separate `acceptanceCriteria: string[]` authority or require its text to mirror the typed objects. Derive any display labels from the typed record.
+- **One live decision path:** new planner output MUST use typed contracts. Remove the old English/regex criterion classifier, automatic legacy-plan fallback, dual interpretation, and old reviewer gates once the typed path is wired through production. Unknown or malformed contracts are rejected with bounded structured correction, never silently reinterpreted as prose.
+- **Development data reset is permitted, not automatic:** inventory the current extension-host `sql.js` database, identify anything worth keeping, and offer/export a backup before any destructive reset. After an intentional reset, use the single current schema; obsolete compatibility migrations and shadow columns need not survive. Do not wipe databases implicitly on extension startup or upgrade.
+- **Preserve capabilities, not legacy representations:** project/conversation isolation, stable IDs for newly created work, accepted-evidence persistence, cross-chat read permissions, atomic task transitions, concurrency guards, current-source freshness, cancellation, approvals, and provenance remain essential. Refactor or delete only after identifying the current call sites and replacing all uses.
+- **Tests and documentation follow the new contract:** replace tests asserting obsolete string-based verification with tests of the same user-visible behavior under typed contracts. Keep historical failure fixtures as evidence of what went wrong, but never interpret them as compatibility requirements. A green helper suite alone cannot establish production integration.
+- **No architecture fork:** reuse the existing planner, `TodoRepository`, `sql.js` adapter, native tools, verifier and execution controller. Consolidate conflicting behavior rather than introducing a second state machine, database, parser or API layer.
+
+**Current verification status:** Gate 1 has been *reported* as implemented with typed criteria and passing automated suites, but the full live Mycroft/controller/evidence path is not independently proven here. The subsequent gate must remove remaining dual-format machinery and validate production behavior; do not mistake this policy for a claim that cleanup is already complete.
+
 ## Reconciled governing decisions (2026-11-08)
 
-This is **one system**, described by three complementary documents. The [intent/feedback overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW_RECONCILED.md) owns architectural boundaries and internal message protocol; the [native TODO specification](TWINNY_NATIVE_TODO_SYSTEM_RECONCILED.md) owns task identity, dependencies, state and persistence; the [evidence manifesto](TWINNY_EVIDENCE_MANIFESTO_RECONCILED.md) owns observation/fact trust, criterion proofs, freshness and live acceptance. When an older example in any document differs, this reconciled contract governs. **Design target is not evidence of implementation.**
+This is **one system**, described by three complementary documents. The [intent/feedback overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md) owns architectural boundaries and internal message protocol; the [native TODO specification](TWINNY_NATIVE_TODO_SYSTEM.md) owns task identity, dependencies, state and persistence; the [evidence manifesto](TWINNY_EVIDENCE_MANIFESTO.md) owns observation/fact trust, criterion proofs, freshness and live acceptance. When an older example in any document differs, this reconciled contract governs. **Design target is not evidence of implementation.**
 
 - **Structured internal control:** Planner, host, implementer, verifier, and reviewer exchange versioned JSON objects conforming to validated schemas. Human-readable descriptions are labels/explanations and never the executable acceptance condition. Model-facing tool calls already have structured arguments; internal prompt transport may still serialize JSON as text, but must validate the parsed object before acting.
 - **Stable responsibilities:** Models propose plans, investigations, claims and semantic judgments. Twinny owns identity, permissions, execution outcomes, evidence capture, objective verification, transitions and retries. The user owns requirements and explicit authorization. No prose explanation or model-proposed `passed` flag overrides a contradictory trusted host observation.
@@ -34,7 +47,7 @@ Responsibilities:
 - **Twinny host (TypeScript):** owns authorization, persistent observations, verification of objective facts, task state transitions, proposal checkpoints, operation-wide cancellation, evidence retrieval, and context projections.
 - **SQLite repository:** durable, queryable record of observations, accepted facts, provenance, revisions, and plan history. No second memory database is required.
 
-Preserve the working source-location workflow, existing repository/migrations, Feedback, tool approvals, tool picker, MCP, and Stop. Avoid parallel controllers or new generic rule engines.
+Preserve the working source-location capability, current repository interface, Feedback semantic-review role, tool approvals, tool picker, MCP, and Stop. Obsolete compatibility migrations and prose-driven verifiers may be removed after the typed replacement is verified. Avoid parallel controllers or new generic rule engines.
 
 ## 2. Verified observations and live regressions
 
@@ -130,7 +143,7 @@ Determine whether the original zero-result is due to missing promotion, missing 
 
 ### Schema/query considerations
 
-Use existing SQLite structures and add minimal migrations/indexes as needed. Support retrieval by project, source path, source symbol, native tool name, task/criterion, observation ID, verification status, source hash, and revision. Store explicit symbol/tool-name relationships when proven (`readFile` implements tool `read_file`). Do not use unsafe fuzzy matching. Avoid duplicating large evidence payloads.
+Use the existing `sql.js` repository and indexes. A deliberate backed-up development reset may replace obsolete schema layouts instead of carrying legacy migrations indefinitely. Support retrieval by project, source path, source symbol, native tool name, task/criterion, observation ID, verification status, source hash, and revision. Store explicit symbol/tool-name relationships when proven (`readFile` implements tool `read_file`). Do not use unsafe fuzzy matching. Avoid duplicating large evidence payloads.
 
 Allow idempotent backfill of older verified tasks **only when trusted observations and a valid acceptance decision establish the fact**; otherwise leave the record historical/unproven rather than manufacturing certainty.
 
@@ -146,7 +159,7 @@ Expected behavior: conversation A verifies `read_file`; repository closes and re
 
 ## 7. LAW: objective proof should not need an LLM judge
 
-For straightforward source facts, use TypeScript evidence reconciliation **before** requesting Cerebras review. The target contract is typed JSON emitted by the planner and validated by the host; existing English heuristics are a compatibility bridge only, not the canonical contract.
+For straightforward source facts, use TypeScript evidence reconciliation **before** requesting Cerebras review. The target contract is typed JSON emitted by the planner and validated by the host; English-heuristic verification is obsolete development code to remove, not an ongoing compatibility bridge.
 
 The task `Locate native read_file tool definition` needs: workspace-relative filename, precise definition location/range, trusted successful source read containing the real symbol/tool declaration, and a fresh authoritative source fingerprint if claiming current state.
 
@@ -282,7 +295,7 @@ If the entire scope cannot be completed, do not claim it is done: finish the hig
 
 ### Structured fact contract, never prose-driven verdicts
 
-The planner emits versioned, **typed JSON criteria**, the tool dispatcher emits host-owned structured observations, the implementer submits structured evidence references and completion claims, and Feedback emits structured criterion-scoped semantic judgments. Human English summaries are optional and cannot substitute for criterion predicates or evidence IDs. The full envelope, sample JSON and reconciliation algorithm are specified in the [system overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW_RECONCILED.md). Typed contracts are a **target architecture**; the uploaded implementation status still admits English heuristic classification.
+The planner emits versioned, **typed JSON criteria**, the tool dispatcher emits host-owned structured observations, the implementer submits structured evidence references and completion claims, and Feedback emits structured criterion-scoped semantic judgments. Human English summaries are optional and cannot substitute for criterion predicates or evidence IDs. The full envelope, sample JSON and reconciliation algorithm are specified in the [system overview](TWINNY_INTENT_FEEDBACK_SYSTEM_OVERVIEW.md). Typed contracts are mandatory for the current architecture; any remaining English-heuristic implementation is technical debt to remove and verify, not an alternative supported mode.
 
 A verifier must not infer the desired result from a word such as “exists,” “verified” or “modified.” Its decision comes from the typed predicate and scope. `lookup_completed` may accept either `found` or `none`; `accepted_fact_exists` requires a real current matching fact; `source_fingerprint` needs a trusted current `read_file` fingerprint; `execution_invariant` needs a host audit over the task interval. Store the observation's *result* separately from whether it *satisfies a criterion*.
 
@@ -293,6 +306,7 @@ A verifier must not infer the desired result from a word such as “exists,” �
 - **Criterion proof:** individually evaluated, durable association of a validated typed predicate with trusted observation/fact IDs, result, reason, verifier, scope and freshness.
 - **Accepted fact:** reusable, verified source knowledge promoted only from actual proof. Its scope and provenance outlive the producing chat.
 - **Current vs historical:** source-linked facts are current only after authoritative freshness checks; stale facts remain accessible as history; unknown freshness remains unknown.
+- **Execution freshness:** a `command_exit_status` that requires execution after activation is proven only by a run recorded after the task's latest host-owned requirement activation. A run that predates the activation or the latest renewal is unknown, not proven. Feedback reviews and completion claims never renew it. Source freshness is checked independently against the current fingerprint, not inferred from timestamps.
 
 One observation can establish more than one criterion, and multiple compatible observations can satisfy one criterion. Evidence may arrive with the first tool call, later submissions, or subsequent turns. Never require four different evidence IDs just because a task has four requirements. When a check is negated (e.g. no successful file mutation), observe the **whole interval**, not merely one `git status` result.
 
