@@ -12,6 +12,7 @@
  * file git has no copy of, and changing `.vscode/` or a `.gitignore`.
  */
 import { ChildProcess, execFile, spawn } from "child_process"
+import { randomUUID } from "crypto"
 import { existsSync, readFileSync } from "fs"
 import path from "path"
 import {
@@ -41,9 +42,11 @@ import { logger } from "../../common/logger"
 import type { ChatEditMode, ChatEditOutcome } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { stripAnsi, tailOutput } from "../terminal/output"
+import { editDigest } from "../todos/repository"
+import type { EditOperationInput } from "../todos/types"
 import type { Replacement } from "../tools/edit"
 import { isProtectedPath } from "../tools/helpers"
-import { contentHash, LineEditError, lineEditFailure, planLineEdits } from "../tools/line-edit"
+import { contentHash, LineEditError, lineEditFailure, type LinePatch, planLineEdits } from "../tools/line-edit"
 import { EditorDiagnostic, EditorLocation, EditorSink, FileOpsSink } from "../tools/more"
 import { WorkspaceView } from "../tools/view"
 import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink } from "../tools/workspace"
@@ -73,8 +76,49 @@ export interface EditRecoveryNotice {
   reason: string
 }
 
+/** Runs an editor command. The default is VS Code's own command boundary. */
+export type EditCommandRunner = <T>(command: string, ...args: unknown[]) => PromiseLike<T | undefined>
+
+/** Settles one recorded edit operation; a settlement that loses to reconciliation is a no-op. */
+export interface EditOperationTicket {
+  settle(status: "succeeded" | "failed", detail: string): Promise<void>
+}
+
+/** Records a consequential edit before it is dispatched, and throws when the record cannot be written. */
+export type EditOperationLedger = (operation: Omit<EditOperationInput, "itemId" | "ownerId">) => Promise<EditOperationTicket | undefined>
+
+const editOperationsInFlight = new Set<string>()
+
+/** Whether this host still has the edit's command running, so its outcome cannot yet be read from the buffer. */
+export const isEditOperationInFlight = (id: string) => editOperationsInFlight.has(id)
+
+/** The document text an applied replacement leaves, with the editor's inclusive line range. */
+const replacedText = ({ startLine, endLine, text }: Replacement, before: string) => {
+  const lines = before.replace(/\r\n/g, "\n").split("\n")
+  return [...lines.slice(0, startLine), ...(text ? text.split("\n") : []), ...lines.slice(endLine + 1)].join("\n")
+}
+
+/** The document text the line patches leave; offsets address the original text, end exclusive. */
+const patchedText = (before: string, patches: LinePatch[]) =>
+  [...patches].sort((a, b) => b.start - a.start).reduce((text, patch) => text.slice(0, patch.start) + patch.text + text.slice(patch.end), before)
+
+/** The precondition digest of a create: the file does not exist yet. It is not hex, so no content digest can equal it. */
+export const ABSENT_DIGEST = "absent"
+
+/** Whether the target still holds the state the operation was recorded against; an unreadable target does not. */
+const holdsPrecondition = async (target: { file: string; preDigest: string }): Promise<boolean> => {
+  if (target.preDigest === ABSENT_DIGEST) return !existsSync(target.file)
+  try {
+    return editDigest((await workspace.openTextDocument(Uri.file(target.file))).getText()) === target.preDigest
+  } catch {
+    return false
+  }
+}
+
 export interface EditSafetyOptions {
   goal?: string
+  runEditCommand?: EditCommandRunner
+  recordEditOperation?: EditOperationLedger
   checkpoints?: SafeEditCheckpoints
   errorSpikeThreshold?: number
   cumulativeErrorThreshold?: number
@@ -438,6 +482,33 @@ export const editorEdits = (
     })
     return { ...outcome, ok: false, message: reason + " Further file mutations are blocked for this execution." }
   }
+  const runCommand: EditCommandRunner = safety.runEditCommand ?? ((command, ...args) => commands.executeCommand(command, ...args))
+  type PendingEdit = { id: string; ticket?: EditOperationTicket; file: string; preDigest: string }
+  /** Records an apply before the editor is asked for it; the edit is refused if the record cannot be written. */
+  const beginEdit = async (file: string, before: string | undefined, after: string): Promise<PendingEdit | { refused: string }> => {
+    const id = randomUUID()
+    const preDigest = before === undefined ? ABSENT_DIGEST : editDigest(before)
+    editOperationsInFlight.add(id)
+    try {
+      const ticket = await safety.recordEditOperation?.({
+        id, target: view.relative(file), mode: "apply", preDigest, postDigest: editDigest(after)
+      })
+      return { id, ticket, file, preDigest }
+    } catch (error) {
+      editOperationsInFlight.delete(id)
+      return { refused: "Not changed: " + (error instanceof Error ? error.message : String(error)) }
+    }
+  }
+  /**
+   * Settles only what the editor's answer proves: a clean success, or a refusal while the target still holds its
+   * original state. A missing answer, a rejected command, or a rollback that did not restore the original stays
+   * dispatched for reconciliation.
+   */
+  const settleEdit = async (pending: PendingEdit | undefined, command: EditOutcome | undefined, checked: EditOutcome) => {
+    if (!pending?.ticket) return
+    if (checked.ok && !checked.pending) await pending.ticket.settle("succeeded", checked.message)
+    else if (command && !command.ok && (await holdsPrecondition(pending))) await pending.ticket.settle("failed", command.message)
+  }
   return {
     mode,
     async read(file) {
@@ -473,13 +544,27 @@ export const editorEdits = (
         start: document.positionAt(patches[0].start).line,
         end: document.positionAt(patches[patches.length - 1].end).line + patches.reduce((added, patch) => added + patch.text.split("\n").length - 1, 0)
       }
-      const outcome = await withNewErrors(view, file, "apply", changed, () => held(async () => {
-        await changes?.touch(file)
-        return (await commands.executeCommand<ChatEditOutcome>(
-          TWINNY_COMMAND_NAME.chatFileEdit, { file, lineEdits: request }, "apply"
-        )) ?? { ok: false, message: "Not changed: the editor did not answer.", error: lineEditFailure("application_failed", "The editor did not answer.") }
-      }), async () => { await safety.checkpoints?.markChanged([file]) })
-      const checked = await checkedOutcome(file, outcome)
+      const before = document.getText()
+      const pending = await beginEdit(file, before, patchedText(before, patches))
+      if ("refused" in pending) {
+        const error = lineEditFailure("application_failed", pending.refused)
+        return { ok: false, message: error.message, error }
+      }
+      let command: EditOutcome | undefined
+      let checked: EditOutcome
+      try {
+        const outcome = await withNewErrors(view, file, "apply", changed, () => held(async () => {
+          await changes?.touch(file)
+          return (await runCommand<ChatEditOutcome>(
+            TWINNY_COMMAND_NAME.chatFileEdit, { file, lineEdits: request }, "apply"
+          )) ?? { ok: false, message: "Not changed: the editor did not answer.", error: lineEditFailure("application_failed", "The editor did not answer.") }
+        }), async () => { await safety.checkpoints?.markChanged([file]) })
+        command = outcome
+        checked = await checkedOutcome(file, outcome)
+        await settleEdit(pending, command, checked)
+      } finally {
+        editOperationsInFlight.delete(pending.id)
+      }
       if (!checked.ok) return checked
       const hash = await contentHash(document.getText())
       if (hash !== checked.contentHash) {
@@ -492,36 +577,65 @@ export const editorEdits = (
       const denied = blocked()
       if (denied) return denied
       if (modeFor(file) === "apply") await safety.checkpoints?.capture([file])
-      const outcome = await withNewErrors(view, file, modeFor(file), changedLines(replacement), () =>
-        held(async () => {
-          if (modeFor(file) === "apply") await changes?.touch(file)
-          return (await commands.executeCommand<ChatEditOutcome>(
-            TWINNY_COMMAND_NAME.chatFileEdit,
-            { file, ...replacement },
-            modeFor(file)
-          )) ?? { ok: false, message: "Not changed: the editor did not answer." }
-        }),
-        async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
-      )
-      return checkedOutcome(file, outcome)
+      let pending: PendingEdit | undefined
+      let command: EditOutcome | undefined
+      let checked: EditOutcome
+      try {
+        if (modeFor(file) === "apply") {
+          const before = (await workspace.openTextDocument(Uri.file(file))).getText()
+          const begun = await beginEdit(file, before, replacedText(replacement, before))
+          if ("refused" in begun) return { ok: false, message: begun.refused }
+          pending = begun
+        }
+        const outcome = await withNewErrors(view, file, modeFor(file), changedLines(replacement), () =>
+          held(async () => {
+            if (modeFor(file) === "apply") await changes?.touch(file)
+            return (await runCommand<ChatEditOutcome>(
+              TWINNY_COMMAND_NAME.chatFileEdit,
+              { file, ...replacement },
+              modeFor(file)
+            )) ?? { ok: false, message: "Not changed: the editor did not answer." }
+          }),
+          async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
+        )
+        command = outcome
+        checked = await checkedOutcome(file, outcome)
+        await settleEdit(pending, command, checked)
+      } finally {
+        if (pending) editOperationsInFlight.delete(pending.id)
+      }
+      return checked
     },
     async create(file, content) {
       const denied = blocked()
       if (denied) return denied
+      if (modeFor(file) === "apply" && existsSync(file)) return { ok: false, message: "Not created: " + view.relative(file) + " already exists." }
       if (modeFor(file) === "apply") await safety.checkpoints?.capture([file])
-      const outcome = await withNewErrors(view, file, modeFor(file), undefined, () =>
-        held(async () => {
-          if (modeFor(file) === "apply") await changes?.touch(file)
-          return (await commands.executeCommand<ChatEditOutcome>(
-            TWINNY_COMMAND_NAME.chatFileCreate,
-            file,
-            content,
-            modeFor(file)
-          )) ?? { ok: false, message: "Not created: the editor did not answer." }
-        }),
-        async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
-      )
-      return checkedOutcome(file, outcome)
+      let pending: PendingEdit | undefined
+      try {
+        if (modeFor(file) === "apply") {
+          const begun = await beginEdit(file, undefined, content)
+          if ("refused" in begun) return { ok: false, message: begun.refused }
+          pending = begun
+        }
+        const outcome = await withNewErrors(view, file, modeFor(file), undefined, () =>
+          held(async () => {
+            if (modeFor(file) === "apply") await changes?.touch(file)
+            return (await runCommand<ChatEditOutcome>(
+              TWINNY_COMMAND_NAME.chatFileCreate,
+              file,
+              content,
+              modeFor(file)
+            )) ?? { ok: false, message: "Not created: the editor did not answer." }
+          }),
+          async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
+        )
+        const checked = await checkedOutcome(file, outcome)
+        await settleEdit(pending, outcome, checked)
+        return checked
+      } finally {
+        if (pending) editOperationsInFlight.delete(pending.id)
+      }
     },
     async remove(file) {
       const relative = view.relative(file)

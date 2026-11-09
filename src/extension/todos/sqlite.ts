@@ -191,6 +191,21 @@ CREATE TABLE IF NOT EXISTS todo_requirement_activations (
 );
 CREATE INDEX IF NOT EXISTS todo_requirement_activations_item ON todo_requirement_activations(list_id, item_id, list_revision);
 PRAGMA user_version = 11;
+CREATE TABLE IF NOT EXISTS todo_edit_operations (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  target TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN ('apply','review')),
+  pre_digest TEXT NOT NULL,
+  post_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('dispatched','succeeded','failed','reconciled_applied','reconciled_absent','diverged')),
+  detail TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
+PRAGMA user_version = 12;
 `
 
 export class SqliteFile {
@@ -222,7 +237,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 11) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 14) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -279,10 +294,62 @@ export class SqliteFile {
           database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_requirement_activations"), SCHEMA.indexOf("PRAGMA user_version = 11;") + "PRAGMA user_version = 11;".length))
           await this.persist(database)
         }
+        if (version > 0 && version < 12) {
+          // Edit operations are additive: an existing database gains an empty ledger and no existing row changes.
+          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_edit_operations"), SCHEMA.indexOf("PRAGMA user_version = 12;") + "PRAGMA user_version = 12;".length))
+          await this.persist(database)
+        }
+        if (version < 13) {
+          await this.migrateEditOperationsToV13(database, version)
+        }
+        if (version < 14) {
+          await this.migrateEditOperationsToV14(database)
+        }
       } finally {
         database.close()
       }
     })
+  }
+
+  // v13 makes an operation's task optional so project-scoped edits can be recorded without an active TODO.
+  // Fresh databases pass through here after SCHEMA creates the v12 shape. Only the NOT NULL item column is rebuilt.
+  private async migrateEditOperationsToV13(database: Database, version: number): Promise<void> {
+    const columns = database.exec("PRAGMA table_info(todo_edit_operations)")[0]?.values ?? []
+    const itemColumn = columns.find((row) => row[1] === "item_id")
+    if (itemColumn?.[3] === 1) {
+      if (version > 0) await fs.copyFile(this.databasePath, `${this.databasePath}.v12.bak`)
+      database.run(`
+CREATE TABLE todo_edit_operations_v13 (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT REFERENCES todo_items(id) ON DELETE CASCADE,
+  target TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN ('apply','review')),
+  pre_digest TEXT NOT NULL,
+  post_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('dispatched','succeeded','failed','reconciled_applied','reconciled_absent','diverged')),
+  detail TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO todo_edit_operations_v13 (id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at)
+  SELECT id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at FROM todo_edit_operations;
+DROP TABLE todo_edit_operations;
+ALTER TABLE todo_edit_operations_v13 RENAME TO todo_edit_operations;
+CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
+`)
+    }
+    database.run("PRAGMA user_version = 13")
+    await this.persist(database)
+  }
+
+  // v14 records the extension host that dispatched each edit. The column is additive; rows from earlier versions keep
+  // a NULL owner, which another host can never settle as absent.
+  private async migrateEditOperationsToV14(database: Database): Promise<void> {
+    const columns = database.exec("PRAGMA table_info(todo_edit_operations)")[0]?.values ?? []
+    if (!columns.some((row) => row[1] === "owner_id")) database.run("ALTER TABLE todo_edit_operations ADD COLUMN owner_id TEXT")
+    database.run("PRAGMA user_version = 14")
+    await this.persist(database)
   }
 
   async read<T>(operation: (database: Database) => T): Promise<T> {

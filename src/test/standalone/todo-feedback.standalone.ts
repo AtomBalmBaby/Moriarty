@@ -14,9 +14,9 @@ import { commandDigest, compactArguments, compactEvidenceText, compactToolEviden
 import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { validateIntentTaskPlan } from "../../extension/todos/intent-plan"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
-import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { editDigest, TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { AcceptedFact, ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, SymbolAlias, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
-import { RUNTIME_INVENTORY_TOOL } from "../../extension/todos/types"
+import { RUNTIME_INVENTORY_TOOL, TodoConflictError } from "../../extension/todos/types"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { contentHash, planLineEdits } from "../../extension/tools/line-edit"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
@@ -546,7 +546,7 @@ test("existing version-4 TODO databases gain child proposals and accepted eviden
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
     const check = new sql.Database(fs.readFileSync(state.databasePath))
-    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 11)
+    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 14)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_child_proposals'")[0].values[0][0], 1)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0].values[0][0], 1)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_symbol_aliases'")[0].values[0][0], 1)
@@ -4752,15 +4752,263 @@ test("a version-10 database with accepted evidence upgrades to version 11 with e
     await reopened.initialize()
     assert.deepEqual(await reopened.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "the accepted fact and its provenance survive the upgrade unchanged")
     const upgraded = inspect()
-    assert.equal(upgraded.version, 11)
+    assert.equal(upgraded.version, 14)
     assert.equal(upgraded.activationTable, 1, "the requirement activation table is added")
     assert.deepEqual(upgraded.observations, before.observations, "no observation row or list revision changes during the upgrade")
 
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual(await again.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "a second reopen is stable")
-    assert.equal(inspect().version, 11)
+    assert.equal(inspect().version, 14)
     assert.equal(calls.count, 0)
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("an unresolved edit target blocks other conversations in the same project, but not other projects", async () => {
+  const state = await fixture([{ id: "edit-task", criteria: [semantic("edit-task", "The edit is applied")] }], false)
+  try {
+    const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
+    const pre = editDigest("original\n")
+    const post = editDigest("changed\n")
+    await state.repository.beginEditOperation(state.scope, { id: "edit-owner", itemId, target: "src/shared.ts", mode: "apply", preDigest: pre, postDigest: post })
+
+    const otherConversation = { projectFingerprint: state.scope.projectFingerprint, conversationId: "other-chat", writer: "other-chat" }
+    await state.repository.synchronizeIntentPlan(otherConversation, plan([{ id: "other-task", criteria: [semantic("other-task", "The other edit is applied")] }], "Other goal"), { prompt: "Other goal" })
+    const otherItemId = (await state.repository.getActiveIntentContext(otherConversation))!.task.id
+    const blocked = { id: "edit-other", itemId: otherItemId, target: "src/shared.ts", mode: "apply" as const, preDigest: pre, postDigest: post }
+    assert.deepEqual(await state.repository.findUnresolvedEditTarget(otherConversation, "src/shared.ts"), { operationId: "edit-owner", conversationId: "feedback-chat" })
+    await assert.rejects(state.repository.beginEditOperation(otherConversation, blocked), TodoConflictError, "another conversation cannot duplicate an unresolved edit in the same project")
+    assert.deepEqual((await state.repository.listDispatchedEditOperations(otherConversation)), [], "a refused edit is never recorded")
+
+    const foreignProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "foreign-chat", writer: "foreign-chat" }
+    await state.repository.synchronizeIntentPlan(foreignProject, plan([{ id: "foreign-task", criteria: [semantic("foreign-task", "The foreign edit is applied")] }], "Foreign goal"), { prompt: "Foreign goal" })
+    const foreignItemId = (await state.repository.getActiveIntentContext(foreignProject))!.task.id
+    assert.equal(await state.repository.findUnresolvedEditTarget(foreignProject, "src/shared.ts"), undefined, "an unresolved edit does not block another project")
+    assert.equal((await state.repository.beginEditOperation(foreignProject, { id: "edit-foreign", itemId: foreignItemId, target: "src/shared.ts", mode: "apply", preDigest: pre, postDigest: post })).status, "dispatched")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("edit operations are recorded before dispatch, settle once, and block only unresolved targets", async () => {
+  const state = await fixture([{ id: "edit-task", criteria: [semantic("edit-task", "The edit is applied")] }], false)
+  try {
+    const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
+    const pre = editDigest("original\n")
+    const post = editDigest("changed\n")
+    const operation = (id: string, target: string) => ({ id, itemId, target, mode: "apply" as const, preDigest: pre, postDigest: post })
+
+    assert.equal((await state.repository.beginEditOperation(state.scope, operation("edit-1", "src/a.ts"))).status, "dispatched")
+    await assert.rejects(state.repository.beginEditOperation(state.scope, operation("edit-2", "src/a.ts")), TodoConflictError, "a second edit to an unresolved target is refused")
+    await state.repository.beginEditOperation(state.scope, operation("edit-3", "src/b.ts"))
+    await assert.rejects(state.repository.beginEditOperation(state.scope, { ...operation("edit-5", "src/c.ts"), itemId: "not-active" }), /limited to active Intent tasks/)
+
+    assert.equal(await state.repository.settleEditOperation(state.scope, "edit-1", "succeeded", "applied"), true)
+    assert.equal(await state.repository.settleEditOperation(state.scope, "edit-1", "failed", "late"), false, "a late settlement cannot overwrite a decided outcome")
+    assert.equal(await state.repository.settleEditOperation(state.scope, "missing", "failed", ""), false)
+    assert.deepEqual((await state.repository.listDispatchedEditOperations(state.scope)).map((record) => record.id), ["edit-3"])
+    await state.repository.beginEditOperation(state.scope, operation("edit-4", "src/a.ts"))
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    await reopened.initialize()
+    assert.deepEqual((await reopened.listDispatchedEditOperations(state.scope)).map((record) => record.id), ["edit-3", "edit-4"], "unsettled operations survive reopen")
+    assert.equal(await reopened.settleEditOperation(state.scope, "edit-3", "reconciled_absent", "The editor buffer holds the original text."), true)
+    assert.equal(await reopened.settleEditOperation(state.scope, "edit-3", "succeeded", "late"), false, "reconciliation decides the outcome once")
+
+    const sql = await initSqlJs({ locateFile: () => wasmPath })
+    const database = new sql.Database(fs.readFileSync(state.databasePath))
+    try {
+      const statuses = database.exec("SELECT id, status FROM todo_edit_operations ORDER BY id")[0].values
+      assert.deepEqual(statuses, [["edit-1", "succeeded"], ["edit-3", "reconciled_absent"], ["edit-4", "dispatched"]])
+    } finally {
+      database.close()
+    }
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("the v12 edit ledger rebuilds for optional task association, keeps its rows, and keeps a v12 backup", async () => {
+  const state = await fixture([{ id: "migrated-edit", criteria: [semantic("migrated-edit", "Migrated edit task is pending")] }], false)
+  const sql = await initSqlJs({ locateFile: () => wasmPath })
+  const backupPath = `${state.databasePath}.v12.bak`
+  const inspect = (file: string) => {
+    const database = new sql.Database(fs.readFileSync(file))
+    try {
+      const itemColumn = database.exec("PRAGMA table_info(todo_edit_operations)")[0].values.find((row) => row[1] === "item_id")
+      return {
+        version: database.exec("PRAGMA user_version")[0].values[0][0],
+        itemNullable: itemColumn?.[3] === 0,
+        ids: (database.exec("SELECT id FROM todo_edit_operations ORDER BY id")[0]?.values ?? []).map((row) => row[0]),
+        statuses: database.exec("SELECT id, status FROM todo_edit_operations ORDER BY id")[0]?.values ?? [],
+        index: database.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'todo_edit_operations_target'")[0].values[0][0],
+        cascadesFromItems: database.exec("PRAGMA foreign_key_list(todo_edit_operations)")[0].values.some((row) => row[2] === "todo_items" && row[6] === "CASCADE")
+      }
+    } finally {
+      database.close()
+    }
+  }
+  try {
+    const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
+    assert.deepEqual(inspect(state.databasePath), { version: 14, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
+    assert.equal(fs.existsSync(backupPath), false, "a new database has no earlier version to back up")
+
+    await state.repository.beginEditOperation(state.scope, { id: "v12-edit", itemId, target: "src/old.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
+    await state.repository.settleEditOperation(state.scope, "v12-edit", "succeeded", "The edit was applied.")
+
+    const downgrade = new sql.Database(fs.readFileSync(state.databasePath))
+    downgrade.run(`
+DROP INDEX todo_edit_operations_target;
+ALTER TABLE todo_edit_operations RENAME TO todo_edit_operations_old;
+CREATE TABLE todo_edit_operations (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  target TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN ('apply','review')),
+  pre_digest TEXT NOT NULL,
+  post_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('dispatched','succeeded','failed','reconciled_applied','reconciled_absent','diverged')),
+  detail TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
+INSERT INTO todo_edit_operations (id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at)
+  SELECT id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at FROM todo_edit_operations_old;
+DROP TABLE todo_edit_operations_old;
+PRAGMA user_version = 12;`)
+    fs.writeFileSync(state.databasePath, Buffer.from(downgrade.export()))
+    downgrade.close()
+    assert.equal(inspect(state.databasePath).itemNullable, false, "the simulated v12 ledger requires a task")
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    await reopened.initialize()
+    const upgraded = inspect(state.databasePath)
+    assert.equal(upgraded.version, 14)
+    assert.equal(upgraded.itemNullable, true, "the task column becomes optional")
+    assert.deepEqual(upgraded.statuses, [["v12-edit", "succeeded"]], "existing ledger rows keep their identity and settlement")
+    assert.equal(upgraded.index, 1, "the target index is recreated")
+    assert.equal(upgraded.cascadesFromItems, true, "a task deletion still removes its operations")
+    assert.equal(inspect(backupPath).version, 12, "the v12 file is kept as a backup")
+    assert.equal(inspect(backupPath).itemNullable, false)
+
+    const free = await reopened.beginEditOperation(state.scope, { id: "v13-free", target: "src/free.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
+    assert.equal(free.itemId, undefined, "a project-scoped edit is recorded without a task")
+    assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.itemId, op.conversationId]), [["v13-free", undefined, state.scope.conversationId]])
+    await assert.rejects(reopened.beginEditOperation(state.scope, { id: "v13-unknown", itemId: "missing-task", target: "src/free.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") }), /limited to active Intent tasks/, "a named task must still be active")
+
+    const again = new TodoRepository(state.databasePath, wasmPath)
+    await again.initialize()
+    assert.deepEqual(inspect(state.databasePath).ids, ["v12-edit", "v13-free"], "a second reopen is stable")
+    assert.equal(inspect(state.databasePath).version, 14)
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("the owner column is additive: legacy edit rows stay unowned and each reopened row keeps its owner", async () => {
+  const state = await fixture([{ id: "owned-edit", criteria: [semantic("owned-edit", "Owned edit task is pending")] }], false)
+  const sql = await initSqlJs({ locateFile: () => wasmPath })
+  const versionAndOwnerColumn = () => {
+    const check = new sql.Database(fs.readFileSync(state.databasePath))
+    try {
+      return {
+        version: check.exec("PRAGMA user_version")[0].values[0][0],
+        ownerColumn: check.exec("PRAGMA table_info(todo_edit_operations)")[0].values.some((row) => row[1] === "owner_id")
+      }
+    } finally {
+      check.close()
+    }
+  }
+  try {
+    await state.repository.beginEditOperation(state.scope, { id: "1-unowned-edit", target: "src/unowned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
+    const downgrade = new sql.Database(fs.readFileSync(state.databasePath))
+    downgrade.run("ALTER TABLE todo_edit_operations DROP COLUMN owner_id; PRAGMA user_version = 13")
+    fs.writeFileSync(state.databasePath, Buffer.from(downgrade.export()))
+    downgrade.close()
+    assert.deepEqual(versionAndOwnerColumn(), { version: 13, ownerColumn: false })
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    await reopened.initialize()
+    assert.deepEqual(versionAndOwnerColumn(), { version: 14, ownerColumn: true }, "the upgrade adds the owner column")
+    assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined]], "a legacy row has no owner")
+
+    await reopened.beginEditOperation(state.scope, { id: "2-owned-edit", ownerId: "host-b", target: "src/owned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
+    const again = new TodoRepository(state.databasePath, wasmPath)
+    await again.initialize()
+    assert.deepEqual((await again.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined], ["2-owned-edit", "host-b"]], "owners survive a reopen")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 14, ownerColumn: true }, "a second reopen is stable")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+
+test("project edit reconciliation settles an operation once and stays inside its project", async () => {
+  const state = await fixture([{ id: "reconcile-edit", criteria: [semantic("reconcile-edit", "The reconciled edit is applied")] }], false)
+  try {
+    const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
+    const pre = editDigest("original\n")
+    const post = editDigest("changed\n")
+    await state.repository.beginEditOperation(state.scope, { id: "reconcile-op", itemId, target: "src/race.ts", mode: "apply", preDigest: pre, postDigest: post })
+    const other = { projectFingerprint: state.scope.projectFingerprint, conversationId: "reconcile-other", writer: "reconcile-other" }
+    const foreign = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "foreign-reconcile", writer: "foreign-reconcile" }
+
+    assert.deepEqual((await state.repository.listUnresolvedEditOperations(other)).map((op) => [op.id, op.conversationId]), [["reconcile-op", state.scope.conversationId]], "another conversation of the project sees the unresolved operation")
+    assert.deepEqual(await state.repository.listUnresolvedEditOperations(foreign), [], "another project sees none of it")
+    assert.equal(await state.repository.settleProjectEditOperation(foreign, "reconcile-op", "dispatched", "reconciled_applied", "foreign"), false, "another project cannot settle it")
+
+    const raced = await Promise.all([
+      state.repository.settleProjectEditOperation(other, "reconcile-op", "dispatched", "reconciled_applied", "first reconciler"),
+      state.repository.settleProjectEditOperation(state.scope, "reconcile-op", "dispatched", "reconciled_absent", "second reconciler")
+    ])
+    assert.equal(raced.filter(Boolean).length, 1, "exactly one reconciler wins the compare-and-set")
+    assert.deepEqual(await state.repository.listUnresolvedEditOperations(other), [], "a settled operation no longer blocks the project")
+    assert.equal(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), undefined)
+
+    await state.repository.beginEditOperation(state.scope, { id: "reconcile-divergent", itemId, target: "src/race.ts", mode: "apply", preDigest: pre, postDigest: post })
+    assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "dispatched", "diverged", "matches neither text"), true)
+    assert.deepEqual(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), { operationId: "reconcile-divergent", conversationId: state.scope.conversationId }, "a diverged operation keeps its target blocked")
+    assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "dispatched", "reconciled_applied", "stale decision"), false, "a stale decision cannot release a diverged operation")
+    assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "diverged", "reconciled_applied", "The editor now holds the intended text."), true)
+    assert.equal(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), undefined, "the editor matching the intended text releases the target")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("edit digests normalize line endings and distinguish content", () => {
+  assert.equal(editDigest("a\r\nb\r\n"), editDigest("a\nb\n"))
+  assert.notEqual(editDigest("a\nb\n"), editDigest("a\nc\n"))
+})
+
+test("the v11 TODO database gains the edit operation ledger while keeping the active intent task", async () => {
+  const state = await fixture([{ id: "kept-edit", criteria: [semantic("kept-edit", "Kept edit task is pending")] }], false)
+  try {
+    const before = await state.repository.getActiveIntentContext(state.scope)
+    const sql = await initSqlJs({ locateFile: () => wasmPath })
+    const downgrade = new sql.Database(fs.readFileSync(state.databasePath))
+    downgrade.run("DROP TABLE todo_edit_operations; PRAGMA user_version = 11")
+    fs.writeFileSync(state.databasePath, Buffer.from(downgrade.export()))
+    downgrade.close()
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    await reopened.initialize()
+    const after = await reopened.getActiveIntentContext(state.scope)
+    assert.equal(after?.task.id, before?.task.id, "the active intent task survives the upgrade")
+    assert.equal(after?.planTaskId, before?.planTaskId)
+    await reopened.beginEditOperation(state.scope, { id: "edit-after-upgrade", itemId: after!.task.id, target: "src/a.ts", mode: "apply", preDigest: editDigest("a"), postDigest: editDigest("b") })
+
+    const check = new sql.Database(fs.readFileSync(state.databasePath))
+    try {
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 14)
+      assert.equal(check.exec("SELECT COUNT(*) FROM todo_edit_operations WHERE item_id = ?", [after!.task.id])[0].values[0][0], 1)
+    } finally {
+      check.close()
+    }
   } finally {
     removeAll(state.directory)
   }

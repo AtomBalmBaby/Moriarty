@@ -13,3 +13,4 @@ packages/twinny-server/*.tgz
 twinny.gateway.json
 src/test/twinny-providers.json
 .maxential/
+.github/copilot-instructions.md

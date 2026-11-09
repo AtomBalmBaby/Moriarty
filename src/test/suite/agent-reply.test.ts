@@ -15,18 +15,19 @@ import initSqlJs from "sql.js"
 import * as vscode from "vscode"
 
 import { AGENT_SELECTION_STORAGE_KEY } from "../../common/agents"
-import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_CONVERSATION_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, EVENT_NAME, GLOBAL_STORAGE_KEY, TODO_EVENT_NAME } from "../../common/constants"
+import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_CONVERSATION_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, CONTINUATION_PREFIX, EVENT_NAME, GLOBAL_STORAGE_KEY, TODO_EVENT_NAME } from "../../common/constants"
 import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
 import { CHILD_TODO_PROTOCOL } from "../../extension/chat/feedback-planner"
 import { Chat } from "../../extension/chat/index"
-import { createSafeEditCheckpoints } from "../../extension/chat/tool-sinks"
+import { createSafeEditCheckpoints, type EditCommandRunner } from "../../extension/chat/tool-sinks"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
 import { commandDigest } from "../../extension/todos/evidence"
 import { todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { contentHash } from "../../extension/tools/line-edit"
 import { BaseProvider } from "../../extension/webview/base"
 
 /** A model that answers each request with the next scripted reply. */
@@ -656,11 +657,17 @@ suite("Agent reply, end to end", function () {
 
     const webview = fakeWebview()
     const bridge = new ExtensionBridge(webview as unknown as vscode.Webview)
-    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
+    const intent = new ScriptedModel([], JSON.stringify({ track: false, plan: null }))
+    providerRegistry.register("scripted-intent", { id: "scripted-intent", create: () => intent })
+    stored[ACTIVE_INTENT_PROVIDER_STORAGE_KEY] = { ...provider, id: "scripted-intent", provider: "scripted-intent", type: "intent" }
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-webview-storage-"))
+    const repository = new TodoRepository(path.join(storage, "todos.sqlite"), path.join(path.resolve(__dirname, "../../.."), "out", "sql-wasm.wasm"))
+    await repository.initialize()
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
     chat.root = root
     bridge.handleAll({
-      [EVENT_NAME.twinnyChatMessage]: async ({ messages, mentions, agentSelection }) => {
-        await chat.completion(messages, mentions, agentSelection)
+      [EVENT_NAME.twinnyChatMessage]: async ({ messages, mentions, agentSelection, conversationId }) => {
+        await chat.completion(messages, mentions, agentSelection, conversationId)
       }
     })
 
@@ -671,7 +678,8 @@ suite("Agent reply, end to end", function () {
         type: EVENT_NAME.twinnyChatMessage,
         data: {
           messages: [{ role: "user", content: "Update the constant in a.ts to 2." }],
-          mentions: []
+          mentions: [],
+          conversationId: "webview-message-chat"
         }
       })
 
@@ -915,10 +923,16 @@ suite("Agent reply, end to end", function () {
       storageUri: vscode.Uri.file(path.join(root, ".git", "twinny-storage")),
       subscriptions: []
     } as unknown as vscode.ExtensionContext
-    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined)
+    const intent = new ScriptedModel([], JSON.stringify({ track: false, plan: null }))
+    providerRegistry.register("scripted-intent", { id: "scripted-intent", create: () => intent })
+    stored[ACTIVE_INTENT_PROVIDER_STORAGE_KEY] = { ...provider, id: "scripted-intent", provider: "scripted-intent", type: "intent" }
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-e2e-storage-"))
+    const repository = new TodoRepository(path.join(storage, "todos.sqlite"), path.join(path.resolve(__dirname, "../../.."), "out", "sql-wasm.wasm"))
+    await repository.initialize()
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
     chat.root = root
     try {
-      const reply = await chat.completion([{ role: "user", content: "Make a two, and make a file." } as ChatCompletionMessage])
+      const reply = await chat.completion([{ role: "user", content: "Make a two, and make a file." } as ChatCompletionMessage], [], undefined, "edit-end-to-end-chat")
       assert.strictEqual(reply, "I set a to 2 and made made.txt.")
 
       // What the model was told and given back.
@@ -1399,17 +1413,23 @@ suite("Read-file acceptance, production controller", function () {
     message?: string
     planReply: string
     replies: string[]
-    hold?: (request: ChatRequest) => Promise<void> | void
+    evaluations?: string[]
     autoRunCommands?: boolean
+    editCommands?: EditCommandRunner
+    editOwnerId?: string
+    hold?: () => void
+    onChat?: (chat: ChatIn) => void
+    onRepository?: (repository: TodoRepository) => void
     onWaiting?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
     onStoppable?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
   }) => {
     const repository = new TodoRepository(workspace.databasePath, workspace.wasmPath)
     await repository.initialize()
+    options.onRepository?.(repository)
     const agentId = `${options.conversationId}-agent`
     const evaluatorId = `${options.conversationId}-evaluator`
     const agent = new ScriptedModel(options.replies, undefined, options.hold)
-    const evaluator = new ScriptedModel([], options.planReply)
+    const evaluator = new ScriptedModel(options.evaluations ?? [], options.planReply)
     providerRegistry.register(agentId, { id: agentId, create: () => agent })
     providerRegistry.register(evaluatorId, { id: evaluatorId, create: () => evaluator })
     const stored: Record<string, unknown> = {
@@ -1428,10 +1448,12 @@ suite("Read-file acceptance, production controller", function () {
     // Tool steps reach the test as the webview would receive them; each waiting or stoppable step is handed over once.
     const current: { chat?: ChatIn } = {}
     const handled = new Set<string>()
+    const posted: { type: string; data: unknown }[] = []
     const webview = {
       onDidReceiveMessage: () => ({ dispose() {} }),
       postMessage: (message: unknown) => {
         const { type, data } = message as { type: string; data: unknown }
+        posted.push({ type, data })
         const chat = current.chat
         if (type !== EVENT_NAME.twinnyToolSteps || !chat) return
         for (const step of data as ToolStepView[]) {
@@ -1448,13 +1470,14 @@ suite("Read-file acceptance, production controller", function () {
       }
     }
     const bridge = new ExtensionBridge(webview as unknown as vscode.Webview)
-    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository, undefined, options.editCommands, options.editOwnerId)
     current.chat = chat
+    options.onChat?.(chat)
     chat.root = workspace.root
     try {
       const reply = await chat.completion([{ role: "user", content: options.message ?? userMessage } as ChatCompletionMessage], [], "default", options.conversationId)
       const scope = { projectFingerprint: workspace.projectFingerprint, conversationId: options.conversationId, writer: options.conversationId }
-      return { agent, reply, repository, scope, stored, chat }
+      return { agent, reply, repository, scope, stored, chat, posted }
     } finally {
       chat.dispose()
       providerRegistry.unregister(agentId)
@@ -2062,6 +2085,649 @@ suite("Read-file acceptance, production controller", function () {
       assert.equal(runs.filter((run) => commandOf(run) === "sleep 60" && run.exit_code === 0).length, 0, "an interrupted command records no success")
       const earlier = runs.find((run) => commandOf(run) === "test -f made.txt")
       assert.equal(earlier?.exit_code, 0, "the earlier completed run remains as historical evidence")
+    })
+  })
+
+  suite("edit operation recovery", () => {
+    const editTarget = "src/tools.ts"
+    const editFind = "  name: \"write_file\","
+    const editReplace = "  name: \"write_file_v2\","
+    const editCall = call("edit_file", { path: editTarget, find: editFind, replace: editReplace })
+    const editPlan = (planId: string) => commandPlanReply(planId, [{ id: "edited", command: "test -f made.txt" }])
+    const editOperations = (workspace: Workspace) => queryRows(workspace, "SELECT target, status, detail FROM todo_edit_operations ORDER BY created_at")
+    const bufferOf = async (workspace: Workspace) => (await vscode.workspace.openTextDocument(path.join(workspace.root, editTarget))).getText()
+    const occurrences = (text: string, part: string) => text.split(part).length - 1
+    const statusesOf = async (workspace: Workspace) => (await queryRows(workspace, "SELECT status FROM todo_edit_operations ORDER BY status")).map((row) => row.status)
+    const callWith = (name: string, args: unknown) => "```tool\n" + JSON.stringify({ name, arguments: args }) + "\n```"
+    const deferred = () => {
+      let resolve!: () => void
+      const promise = new Promise<void>((done) => (resolve = done))
+      return { promise, resolve }
+    }
+    /** Runs each command, then loses the editor's answer for the first one, after the editor has applied it. */
+    const losingFirstAnswer = (counts: { runs: number }) => {
+      let lost = true
+      return (async (command: string, ...args: unknown[]) => {
+        counts.runs++
+        const result = await vscode.commands.executeCommand(command, ...args)
+        if (lost) {
+          lost = false
+          throw new Error("The connection to the editor was lost after the edit was applied.")
+        }
+        return result
+      }) as EditCommandRunner
+    }
+
+    test("an edit in flight in another window is not settled absent while this window reconciles", async () => {
+      await withWorkspace(async (workspace) => {
+        let runs = 0
+        const entered = deferred()
+        const release = deferred()
+        const heldInWindowA = (async (command: string, ...args: unknown[]) => {
+          runs++
+          entered.resolve()
+          await release.promise
+          return vscode.commands.executeCommand(command, ...args)
+        }) as EditCommandRunner
+
+        const windowA = runTurn(workspace, {
+          conversationId: "edit-window-a",
+          planReply: editPlan("two-window-a-plan"),
+          replies: [editCall, "Window A reported its edit."],
+          editCommands: heldInWindowA,
+          editOwnerId: "window-a"
+        })
+        try {
+          await entered.promise
+          assert.deepEqual(await statusesOf(workspace), ["dispatched"], "window A's edit is in flight and unsettled")
+
+          const windowB = await runTurn(workspace, {
+            conversationId: "edit-window-b",
+            planReply: editPlan("two-window-b-plan"),
+            replies: ["Window B is only reading the plan while window A's edit is in flight."],
+            editOwnerId: "window-b"
+          })
+          assert.equal(runs, 1, "window B reconciles without dispatching a second edit")
+          assert.deepEqual(await statusesOf(workspace), ["dispatched"], "window B does not settle window A's live edit as absent")
+          assert.equal(occurrences(await bufferOf(workspace), editReplace), 0, "window A has not applied its edit yet")
+          assert.ok(windowB.agent.requests.length > 0, "window B's model turn completes while window A is held")
+        } finally {
+          release.resolve()
+        }
+
+        await windowA
+        assert.equal(runs, 1, "the edit is dispatched exactly once")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "exactly one edit reaches the file")
+        assert.deepEqual(await statusesOf(workspace), ["succeeded"], "window A's settlement is the only terminal state")
+      })
+    })
+
+    test("an unsettled edit from another window blocks this window and is not replayed", async () => {
+      await withWorkspace(async (workspace) => {
+        let attempts = 0
+        const lostBeforeRun = (async () => {
+          attempts++
+          throw new Error("The connection to the editor was lost before the edit reached it.")
+        }) as EditCommandRunner
+
+        await runTurn(workspace, {
+          conversationId: "edit-foreign-lost",
+          planReply: editPlan("foreign-lost-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit did not report back."],
+          editCommands: lostBeforeRun,
+          editOwnerId: "window-a"
+        })
+        assert.equal(attempts, 1)
+        assert.deepEqual(await statusesOf(workspace), ["dispatched"], "the unanswered edit stays recorded")
+
+        const windowB = await runTurn(workspace, {
+          conversationId: "edit-foreign-lost-b",
+          planReply: editPlan("foreign-lost-b-plan"),
+          replies: [editCall, "Window B is blocked."],
+          editCommands: lostBeforeRun,
+          editOwnerId: "window-b"
+        })
+        assert.equal(attempts, 1, "window B never replays another window's unsettled edit")
+        assert.deepEqual(await statusesOf(workspace), ["dispatched"], "the foreign edit is not settled as absent")
+        assert.ok(JSON.stringify(windowB.agent.requests).includes("started by another VS Code window"), "window B is told why the target is blocked")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 0, "the file is unchanged")
+      })
+    })
+
+    test("a lost response from another window is reconciled from the editor without a second application", async () => {
+      await withWorkspace(async (workspace) => {
+        let applications = 0
+        let responseLost = true
+        const lostAfterApply = (async (command: string, ...args: unknown[]) => {
+          applications++
+          const result = await vscode.commands.executeCommand(command, ...args)
+          if (responseLost) {
+            responseLost = false
+            throw new Error("The connection to the editor was lost after the edit was applied.")
+          }
+          return result
+        }) as EditCommandRunner
+
+        await runTurn(workspace, {
+          conversationId: "edit-foreign-applied",
+          planReply: editPlan("foreign-applied-plan"),
+          replies: [editCall, "The edit did not report back."],
+          editCommands: lostAfterApply,
+          editOwnerId: "window-a"
+        })
+        assert.equal(applications, 1)
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "window A's editor applied the edit")
+
+        await runTurn(workspace, {
+          conversationId: "edit-foreign-applied-b",
+          planReply: editPlan("foreign-applied-b-plan"),
+          replies: ["The edit is already in the editor."],
+          editCommands: lostAfterApply,
+          editOwnerId: "window-b"
+        })
+        assert.equal(applications, 1, "window B never repeats an edit that window A applied")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the edit is not duplicated")
+        assert.deepEqual(await editOperations(workspace), [{ target: editTarget, status: "reconciled_applied", detail: "The editor buffer holds the intended text." }])
+      })
+    })
+
+    test("an edit applied before its response is lost is reconciled from the editor and never applied again", async () => {
+      await withWorkspace(async (workspace) => {
+        let applications = 0
+        let responseLost = true
+        const editCommands = (async (command: string, ...args: unknown[]) => {
+          applications++
+          const result = await vscode.commands.executeCommand(command, ...args)
+          if (responseLost) {
+            responseLost = false
+            throw new Error("The connection to the editor was lost after the edit was applied.")
+          }
+          return result
+        }) as EditCommandRunner
+
+        await runTurn(workspace, {
+          conversationId: "edit-response-lost",
+          planReply: editPlan("edit-lost-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit did not report back."],
+          editCommands
+        })
+        assert.equal(applications, 1)
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the editor applied the edit before the response was lost")
+        assert.deepEqual(await editOperations(workspace), [{ target: editTarget, status: "dispatched", detail: "" }], "the unsettled edit stays recorded")
+
+        await runTurn(workspace, {
+          conversationId: "edit-response-lost",
+          planReply: editPlan("edit-lost-plan"),
+          replies: ["The edit is already in the editor."],
+          editCommands
+        })
+        assert.equal(applications, 1, "recovery must not dispatch the edit again")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the edit is not duplicated")
+        assert.deepEqual(await editOperations(workspace), [{ target: editTarget, status: "reconciled_applied", detail: "The editor buffer holds the intended text." }])
+      })
+    })
+
+    test("an edit cancelled before dispatch is never applied and leaves no operation record", async () => {
+      await withWorkspace(async (workspace) => {
+        const original = await bufferOf(workspace)
+        let applications = 0
+        const editCommands = (async (command: string, ...args: unknown[]) => {
+          applications++
+          return vscode.commands.executeCommand(command, ...args)
+        }) as EditCommandRunner
+        const holder: { chat?: ChatIn } = {}
+
+        await runTurn(workspace, {
+          conversationId: "edit-never-dispatched",
+          planReply: editPlan("edit-never-plan"),
+          replies: [editCall, "The request was stopped."],
+          editCommands,
+          onChat: (chat) => {
+            holder.chat = chat
+          },
+          hold: () => holder.chat?.abort()
+        })
+        assert.equal(applications, 0, "a stopped request never reaches the editor")
+        assert.equal(await bufferOf(workspace), original, "the file is unchanged")
+        assert.deepEqual(await editOperations(workspace), [], "no operation was dispatched, so none is recorded")
+      })
+    })
+
+    test("an edit still in flight when its model request is cancelled settles once and authorizes no further work", async () => {
+      await withWorkspace(async (workspace) => {
+        let runs = 0
+        const entered = deferred()
+        const release = deferred()
+        const editCommands = (async (command: string, ...args: unknown[]) => {
+          runs++
+          entered.resolve()
+          await release.promise
+          return vscode.commands.executeCommand(command, ...args)
+        }) as EditCommandRunner
+        const holder: { chat?: ChatIn } = {}
+        const settled = deferred()
+
+        const turn = runTurn(workspace, {
+          conversationId: "edit-cancelled-in-flight",
+          planReply: editPlan("edit-cancel-plan"),
+          replies: [editCall, "This reply must never be requested."],
+          editCommands,
+          onChat: (chat) => {
+            holder.chat = chat
+          },
+          onRepository: (repository) => {
+            const settle = repository.settleEditOperation.bind(repository)
+            repository.settleEditOperation = async (...args: Parameters<TodoRepository["settleEditOperation"]>) => {
+              const result = await settle(...args)
+              settled.resolve()
+              return result
+            }
+          }
+        })
+        await entered.promise
+        holder.chat?.abort()
+        release.resolve()
+        const stopped = await turn
+        // The cancelled turn returns first; the edit settles from the editor's answer once the command finishes.
+        await settled.promise
+        assert.equal(runs, 1, "the edit was dispatched once")
+        assert.equal(stopped.agent.requests.length, 1, "cancellation prevents any model request after the edit")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the editor applied the edit exactly once")
+        assert.deepEqual(await statusesOf(workspace), ["succeeded"], "the actual settlement is recorded")
+
+        await runTurn(workspace, {
+          conversationId: "edit-cancelled-in-flight",
+          planReply: editPlan("edit-cancel-plan"),
+          replies: ["The edit is settled."],
+          editCommands
+        })
+        assert.equal(runs, 1, "a later turn does not repeat the settled edit")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1)
+      })
+    })
+
+    test("an edit lost before the editor ran is reconciled as absent, is not replayed, and a new proposal is checked afresh", async () => {
+      await withWorkspace(async (workspace) => {
+        let attempts = 0
+        let applied = 0
+        const editCommands = (async (command: string, ...args: unknown[]) => {
+          attempts++
+          if (attempts === 1) throw new Error("The connection to the editor was lost before the edit ran.")
+          applied++
+          return vscode.commands.executeCommand(command, ...args)
+        }) as EditCommandRunner
+
+        await runTurn(workspace, {
+          conversationId: "edit-lost-before-run",
+          planReply: editPlan("edit-absent-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit did not report back."],
+          editCommands
+        })
+        assert.equal(attempts, 1)
+        assert.deepEqual(await statusesOf(workspace), ["dispatched"], "the unanswered edit stays recorded")
+
+        const reconciled = await runTurn(workspace, {
+          conversationId: "edit-lost-before-run",
+          planReply: editPlan("edit-absent-plan"),
+          replies: ["The edit is not in the editor."],
+          editCommands
+        })
+        assert.equal(attempts, 1, "reconciliation never replays the unexecuted edit")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_absent"])
+        assert.ok(JSON.stringify(reconciled.agent.requests[0]?.messages).includes("was not repeated"), "the model is told the edit was not repeated")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 0, "the file is unchanged")
+
+        await runTurn(workspace, {
+          conversationId: "edit-lost-before-run",
+          planReply: editPlan("edit-absent-plan"),
+          replies: [editCall, "The edit is applied."],
+          editCommands
+        })
+        assert.equal(attempts, 2, "a fresh proposal runs through the ledger after its own precondition check")
+        assert.equal(applied, 1)
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1)
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_absent", "succeeded"])
+      })
+    })
+
+    test("a lost line-edit response is reconciled once and the line is never inserted twice", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+        const marker = "// line edit recovery marker"
+        const lineCall = callWith("edit_lines", {
+          path: editTarget,
+          expected_hash: await contentHash(await bufferOf(workspace)),
+          edits: [{ operation: "insert_after", line: 1, content: [marker] }]
+        })
+
+        await runTurn(workspace, {
+          conversationId: "line-edit-response-lost",
+          planReply: editPlan("line-edit-plan"),
+          replies: ["I will insert the line.", lineCall, "The line edit did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+        assert.equal(occurrences(await bufferOf(workspace), marker), 1, "the editor applied the insertion before the response was lost")
+        assert.deepEqual(await statusesOf(workspace), ["dispatched"])
+
+        await runTurn(workspace, {
+          conversationId: "line-edit-response-lost",
+          planReply: editPlan("line-edit-plan"),
+          replies: ["The line is already in the editor."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "recovery does not dispatch the line edit again")
+        assert.equal(occurrences(await bufferOf(workspace), marker), 1, "the line is not duplicated")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_applied"])
+      })
+    })
+
+    test("an edit whose target matches neither its original nor intended text is diverged, preserved, and not retried", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+
+        await runTurn(workspace, {
+          conversationId: "edit-diverged",
+          planReply: editPlan("edit-diverged-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+
+        const document = await vscode.workspace.openTextDocument(path.join(workspace.root, editTarget))
+        const third = "export const third = true\n"
+        const unsaved = new vscode.WorkspaceEdit()
+        unsaved.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), third)
+        assert.equal(await vscode.workspace.applyEdit(unsaved), true)
+
+        const reconciled = await runTurn(workspace, {
+          conversationId: "edit-diverged",
+          planReply: editPlan("edit-diverged-plan"),
+          replies: ["The target changed outside the edit."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "a diverged target is never retried")
+        assert.deepEqual(await editOperations(workspace), [{
+          target: editTarget,
+          status: "diverged",
+          detail: "The editor buffer matches neither the original nor the intended text."
+        }])
+        assert.ok(JSON.stringify(reconciled.agent.requests[0]?.messages).includes("matches neither"), "the controller surfaces the unresolved reason to the model")
+        assert.equal(await bufferOf(workspace), third, "the unexplained text is preserved")
+      })
+    })
+
+    test("a lost file-creation response is reconciled as applied, and creating over an existing file is refused before dispatch", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+        const created = "src/created.ts"
+        const content = "export const created = true\n"
+        const original = await bufferOf(workspace)
+
+        await runTurn(workspace, {
+          conversationId: "create-response-lost",
+          planReply: editPlan("create-plan"),
+          replies: ["I will create the file.", callWith("create_file", { path: created, content }), "The creation did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+        assert.equal(fs.readFileSync(path.join(workspace.root, created), "utf8"), content, "the editor created the file before the response was lost")
+        assert.deepEqual(await editOperations(workspace), [{ target: created, status: "dispatched", detail: "" }])
+
+        await runTurn(workspace, {
+          conversationId: "create-response-lost",
+          planReply: editPlan("create-plan"),
+          replies: ["The file exists."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "recovery does not create the file again")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_applied"])
+
+        await runTurn(workspace, {
+          conversationId: "create-conflict",
+          planReply: editPlan("create-conflict-plan"),
+          replies: [callWith("create_file", { path: editTarget, content: "replacement\n" }), "The file already exists."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "a create over an existing file never reaches the editor")
+        assert.equal(await bufferOf(workspace), original, "the existing file is unchanged")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_applied"], "the refused create records no operation")
+      })
+    })
+
+    test("an untracked edit reconciles another conversation's applied edit, which releases the target, and records its own edit", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+
+        await runTurn(workspace, {
+          conversationId: "edit-holder",
+          planReply: editPlan("edit-holder-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the holder's edit is in the editor")
+
+        await runTurn(workspace, {
+          conversationId: "edit-untracked",
+          planReply: JSON.stringify({ track: false, plan: null }),
+          replies: [call("edit_file", { path: editTarget, find: editReplace, replace: "write_file_v3" }), "The edit was applied."],
+          editCommands
+        })
+        assert.equal(counts.runs, 2, "the untracked edit runs once; the holder's edit is not run again")
+        const text = await bufferOf(workspace)
+        assert.equal(occurrences(text, "write_file_v3"), 1, "the untracked edit is applied once")
+        assert.equal(occurrences(text, editReplace), 0, "the holder's edit is not reapplied over the untracked edit")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_applied", "succeeded"], "the holder's edit settles from the editor and the untracked edit is recorded")
+      })
+    })
+
+    test("an untracked edit is refused with the blocker's state while another conversation's diverged edit holds its target", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+
+        await runTurn(workspace, {
+          conversationId: "edit-holder",
+          planReply: editPlan("edit-holder-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+
+        const document = await vscode.workspace.openTextDocument(path.join(workspace.root, editTarget))
+        const third = "export const third = true\n"
+        const unsaved = new vscode.WorkspaceEdit()
+        unsaved.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), third)
+        assert.equal(await vscode.workspace.applyEdit(unsaved), true)
+
+        const refused = await runTurn(workspace, {
+          conversationId: "edit-untracked",
+          planReply: JSON.stringify({ track: false, plan: null }),
+          replies: [call("edit_file", { path: editTarget, find: "export const third", replace: "export const fourth" }), "The edit was refused."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "the untracked edit never reaches the editor")
+        assert.equal(await bufferOf(workspace), third, "the target is unchanged")
+        assert.deepEqual(await statusesOf(workspace), ["diverged"], "the diverged edit keeps holding the target")
+        assert.ok(JSON.stringify(refused.agent.requests).includes("another conversation of this project"), "the refusal names the owning conversation")
+        assert.ok(JSON.stringify(refused.agent.requests).includes("The edit was not retried"), "the refusal states the edit was not retried")
+      })
+    })
+
+    test("a no-task edit whose response is lost is recorded without a task, reconciled from the editor, and never applied again", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+        const untracked = JSON.stringify({ track: false, plan: null })
+
+        await runTurn(workspace, {
+          conversationId: "untracked-response-lost",
+          planReply: untracked,
+          replies: [editCall, "The edit did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the editor applied the untracked edit before the response was lost")
+        assert.deepEqual(await editOperations(workspace), [{ target: editTarget, status: "dispatched", detail: "" }], "the untracked edit is recorded")
+        assert.deepEqual(await queryRows(workspace, "SELECT item_id FROM todo_edit_operations"), [{ item_id: null }], "no task is fabricated for the record")
+
+        const recovered = await runTurn(workspace, {
+          conversationId: "untracked-response-lost",
+          planReply: untracked,
+          replies: ["The edit is already in the editor."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "recovery does not apply the untracked edit again")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the edit is not duplicated")
+        assert.deepEqual(await editOperations(workspace), [{ target: editTarget, status: "reconciled_applied", detail: "The editor buffer holds the intended text." }])
+        assert.ok(JSON.stringify(recovered.agent.requests).includes("not repeated"), "the model is told the earlier edit was not repeated")
+      })
+    })
+
+    test("a no-task file creation whose response is lost is never created twice, and a later create over it is refused", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+        const created = "src/untracked-created.ts"
+        const content = "export const untracked = true\n"
+        const untracked = JSON.stringify({ track: false, plan: null })
+
+        await runTurn(workspace, {
+          conversationId: "untracked-create-lost",
+          planReply: untracked,
+          replies: [callWith("create_file", { path: created, content }), "The creation did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+        assert.equal(fs.readFileSync(path.join(workspace.root, created), "utf8"), content, "the editor created the file before the response was lost")
+
+        await runTurn(workspace, {
+          conversationId: "untracked-create-lost",
+          planReply: untracked,
+          replies: ["The file exists."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "recovery does not create the file again")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_applied"])
+
+        await runTurn(workspace, {
+          conversationId: "untracked-create-conflict",
+          planReply: untracked,
+          replies: [callWith("create_file", { path: created, content: "replacement\n" }), "The file already exists."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "a second create over the file never reaches the editor")
+        assert.equal(fs.readFileSync(path.join(workspace.root, created), "utf8"), content, "the created file is unchanged")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_applied"], "the refused create records no operation")
+      })
+    })
+
+    test("recovery notes still reach the model when the TODO plan cannot be loaded", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+
+        await runTurn(workspace, {
+          conversationId: "plan-load-failure",
+          planReply: editPlan("plan-load-failure-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit did not report back."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1)
+        const [operation] = await queryRows(workspace, "SELECT id FROM todo_edit_operations")
+
+        const failing = await runTurn(workspace, {
+          conversationId: "plan-load-failure",
+          planReply: editPlan("plan-load-failure-plan"),
+          replies: ["The edit is already in the editor."],
+          editCommands,
+          onRepository: (repository) => {
+            // Fails only the request's own plan read; the post-turn reconciliation still reads the plan.
+            const outline = repository.getPlanOutline.bind(repository)
+            let failures = 1
+            repository.getPlanOutline = async (scope) => {
+              if (failures-- > 0) throw new Error("The plan store is unavailable.")
+              return outline(scope)
+            }
+          }
+        })
+        const requests = JSON.stringify(failing.agent.requests)
+        assert.ok(requests.includes("Edit recovery"), "the recovery section is still sent")
+        assert.ok(requests.includes(operation!.id as string), "the recovery note names the unresolved operation")
+        assert.ok(requests.includes("not repeated"), "the note says the edit was not repeated")
+        assert.equal(counts.runs, 1, "a missing plan does not permit a second application")
+        assert.deepEqual(await statusesOf(workspace), ["reconciled_applied"])
+      })
+    })
+
+    test("a plan read that fails after an edit settles keeps the record, pauses continuation, and says why", async () => {
+      await withWorkspace(async (workspace) => {
+        let runs = 0
+        let planReadsFail = false
+        const editThenPlanFails = (async (command: string, ...args: unknown[]) => {
+          runs++
+          const result = await vscode.commands.executeCommand(command, ...args)
+          planReadsFail = true
+          return result
+        }) as EditCommandRunner
+        const unfinished = JSON.stringify({
+          schemaVersion: 1,
+          taskId: "verify",
+          decision: "revise",
+          criteria: [],
+          problems: ["The verification command has not run yet."],
+          correctiveInstructions: [],
+          explanation: "The edit is applied; the verification command still has to run.",
+          scores: { completion: 0, correctness: 0, alignment: 0 }
+        })
+
+        const turn = await runTurn(workspace, {
+          conversationId: "plan-read-after-edit",
+          planReply: editPlan("plan-read-after-edit-plan"),
+          replies: ["I will apply the edit.", editCall, "The edit is applied."],
+          evaluations: [unfinished],
+          editCommands: editThenPlanFails,
+          onRepository: (repository) => {
+            const outline = repository.getPlanOutline.bind(repository)
+            repository.getPlanOutline = async (scope) => {
+              if (planReadsFail) throw new Error("The plan store is unavailable.")
+              return outline(scope)
+            }
+          }
+        })
+        assert.equal(runs, 1, "the edit is dispatched once")
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the edit is applied exactly once")
+        assert.deepEqual(await statusesOf(workspace), ["succeeded"], "the settled edit keeps its terminal state")
+        const messages = turn.posted
+          .filter((message) => message.type === EVENT_NAME.twinnyAddMessage)
+          .map((message) => String((message.data as ChatCompletionMessage).content ?? ""))
+        assert.ok(messages.some((content) => content.includes("the TODO plan could not be read")), "the user is told why execution paused")
+        assert.ok(!JSON.stringify(turn.agent.requests).includes(CONTINUATION_PREFIX), "no automatic continuation is sent")
+      })
+    })
+
+    test("an edit without a conversation scope is refused before the editor runs, since it cannot be recorded", async () => {
+      await withWorkspace(async (workspace) => {
+        const counts = { runs: 0 }
+        const editCommands = losingFirstAnswer(counts)
+        const original = await bufferOf(workspace)
+
+        const refused = await runTurn(workspace, {
+          conversationId: "",
+          planReply: JSON.stringify({ track: false, plan: null }),
+          replies: [editCall, "The edit was refused."],
+          editCommands
+        })
+        assert.equal(counts.runs, 0, "the editor never receives an edit that cannot be recorded")
+        assert.equal(await bufferOf(workspace), original, "the target is unchanged")
+        assert.deepEqual(await editOperations(workspace), [], "no record exists for a refused edit")
+        assert.ok(JSON.stringify(refused.agent.requests).includes("cannot be recorded"), "the refusal names the missing record")
+      })
     })
   })
 })

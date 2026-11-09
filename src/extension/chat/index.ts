@@ -66,8 +66,8 @@ import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
 import { completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanContext } from "../todos/plan-context"
-import { TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
-import { RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest } from "../todos/types"
+import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
+import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { formatCountedTokens, formatRequestBreakdown } from "../tools/context-breakdown"
 import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
@@ -92,14 +92,18 @@ import { ReplyChangesEditor } from "./reply-changes-editor"
 import { type RoleReply, type RoleResolution,structuredReply } from "./role-inference"
 import { DiagnosticRegressionMonitor, SafeEditCheckpoints } from "./safe-edit-recovery"
 import {
+  ABSENT_DIGEST,
   ChatCommandMode,
   ChatCommandPlace,
   createSafeEditCheckpoints,
+  EditCommandRunner,
+  EditOperationLedger,
   editorEdits,
   editorHint,
   editorKnowledge,
   EditRecoveryNotice,
   indexSearch,
+  isEditOperationInFlight,
   normalCommand,
   openDocumentText,
   terminalCommands
@@ -113,6 +117,25 @@ const TEMPLATES_WITH_RAG = ["explain"]
 const SUGGESTION_MAX_TOKENS = 32
 /** Whether the team's rules leave the developer's MCP servers to agent mode. */
 const mcpAllowed = (team: TeamAgentPolicy | undefined) => team?.commands !== "off" && team?.mcp !== "off"
+
+/**
+ * Identifies this extension host as the owner of the edits it dispatches. Another VS Code window is another host, so
+ * an edit it started is never settled here as absent.
+ */
+const hostEditOwnerId = randomUUID()
+
+/** Names an unresolved edit that refuses another edit to its target, with the state and the next action. */
+const describeEditBlocker = (operation: UnresolvedEditOperation, conversationId: string, ownerId: string): string => {
+  const owner = operation.conversationId === conversationId ? "this conversation" : "another conversation of this project"
+  if (operation.ownerId !== ownerId) {
+    return `${operation.target} has unresolved edit ${operation.id} from ${owner} (${operation.status}), which was started by another VS Code window or an earlier session. It is not retried or settled here, so it blocks edits to this target until that window settles it. Reread the target before editing it again.`
+  }
+  if (isEditOperationInFlight(operation.id)) {
+    return `${operation.target} has edit ${operation.id} from ${owner} still running. Wait for it to settle before editing this target.`
+  }
+  const detail = operation.detail ? " " + operation.detail : ""
+  return `${operation.target} has unresolved edit ${operation.id} from ${owner} (${operation.status}).${detail} The edit was not retried. Reread the target before editing it again.`
+}
 
 /** How long an agent reply waits for the team's policy to be re-read. */
 const POLICY_REFRESH_WAIT_MS = 1500
@@ -316,6 +339,7 @@ export class Chat extends Base {
   private _userRequestsTodo = false
   /** The host evidence preflight for this turn's explicit evidence-first request, injected into every request of the turn. */
   private _evidencePreflight: string | undefined
+  private _editRecoveryNotes: string[] = []
   /** Request ID of this turn's accepted-evidence preflight, recorded as a host observation once a task is active. */
   private _evidencePreflightCheck: string | undefined
   /** Open operations (planning, replies, reviews, continuations); Stop stays available while any is open. */
@@ -333,6 +357,10 @@ export class Chat extends Base {
   private readonly _extensionContext: ExtensionContext
   private readonly _promptInstructions: PromptInstructionResolver
   private readonly _todoRepository?: TodoRepository
+  /** Runs editor commands for file edits; tests substitute it to control the command boundary. */
+  private readonly _editCommands?: EditCommandRunner
+  /** Identifies the edits this controller dispatches; defaults to the extension host. */
+  private readonly _editOwnerId: string
   private _activeConversationId?: string
   /** Explicit draft rewriting; independent of Feedback and of sending. */
   private readonly _promptCompiler: PromptCompiler
@@ -351,12 +379,16 @@ export class Chat extends Base {
     search: WorkspaceSearch | undefined,
     agents: AgentRegistry = new AgentRegistry(extensionContext),
     todoRepository?: TodoRepository,
-    workspaceSearch?: WorkspaceSearchProvider
+    workspaceSearch?: WorkspaceSearchProvider,
+    editCommands?: EditCommandRunner,
+    editOwnerId: string = hostEditOwnerId
   ) {
     super(extensionContext)
     this._generations = generations
     this._extensionContext = extensionContext
     this._todoRepository = todoRepository
+    this._editCommands = editCommands
+    this._editOwnerId = editOwnerId
     this._promptInstructions = new PromptInstructionResolver(extensionContext)
     this._bridge = bridge
     this._search = search
@@ -774,6 +806,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     requestedSelection?: AgentSelection,
     conversationId?: string
   ): Promise<string | undefined> {
+    this._editRecoveryNotes = await this.reconcileEditOperations()
     // Gathering context can take a while (a workspace search, the team's
     // policy); a conversation left meanwhile stops this reply too.
     this._preparing = true
@@ -1500,6 +1533,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return undefined
     }
 
+    const planRead = await this.readPlanOutline(this._todoRepository, scope)
+    if (!planRead.loaded) {
+      const diagnostics = recovery?.restored ? ` ${recovery.reason} Diagnostics: ${recovery.diagnostics}` : ""
+      workflow.reconcile("blocked", "plan-unavailable:" + intent.planTaskId)
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
+        role: ASSISTANT,
+        content: `Execution is paused: the TODO plan could not be read (${planRead.error.slice(0, 300)}).${diagnostics} Recorded observations and edit records are kept, and automatic continuation is withheld until the plan can be read again.`
+      })
+      logger.warn("[Execution] paused: TODO plan unavailable for " + intent.planTaskId)
+      return undefined
+    }
+
     // Progress is new evidence for the task still open, not the files a reply touched.
     const progress = `${next.planTaskId}|${next.task.status}`
     const decision = evaluation?.decision === "revise" ? "revise" : "needs_evidence"
@@ -1530,7 +1575,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             ...(evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => `${criterion.status}: ${criterion.criterion}`) ?? [])
           ]
     if (view === undefined && requireChanges) feedback.push("No workspace editing tools are currently available; do not claim implementation completion.")
-    const outline = await this._todoRepository.getPlanOutline(scope)
+    const outline = planRead.outline
     const todoTargets = (outline?.tasks ?? [])
       .filter((task) => task.status !== "completed" && task.status !== "cancelled")
       .slice(0, 6)
@@ -1579,6 +1624,20 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     })
   }
 
+  /** A failed read is reported as such, never as an empty or completed plan. */
+  private async readPlanOutline(
+    repository: TodoRepository,
+    scope: TodoWriteRequest
+  ): Promise<{ loaded: true; outline: Awaited<ReturnType<TodoRepository["getPlanOutline"]>> } | { loaded: false; error: string }> {
+    try {
+      return { loaded: true, outline: await repository.getPlanOutline(scope) }
+    } catch (error) {
+      const message = redact(error instanceof Error ? error.message : String(error))
+      logger.warn("[Execution] Could not read the TODO plan outline: " + message)
+      return { loaded: false, error: message }
+    }
+  }
+
   /** Post the TODO repository's status when the plan is incomplete or any tool operation failed. */
   private async emitAuthoritativeReport(scope: TodoListRequest): Promise<void> {
     if (!this._todoRepository) return
@@ -1603,6 +1662,114 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
+  /**
+   * Records each edit before the editor is asked for it, with the active task when there is one. An unsettled edit on
+   * the same target in this project is reconciled first and refuses the new edit only while it remains unresolved.
+   * Without a conversation scope and a TODO store, the edit is refused rather than run unrecorded.
+   */
+  private editOperationLedger(scope: TodoWriteRequest | undefined): EditOperationLedger {
+    const repository = this._todoRepository
+    if (!scope || !repository) {
+      return async () => {
+        throw new Error("the edit cannot be recorded without a conversation and its TODO store.")
+      }
+    }
+    return async (operation) => {
+      await this.clearEditTargetBlockers(scope, operation.target)
+      const active = await repository.getActiveIntentContext(scope)
+      await repository.beginEditOperation(scope, { ...operation, itemId: active?.task.id, ownerId: this._editOwnerId })
+      return {
+        settle: async (status, detail) => {
+          if (!(await repository.settleEditOperation(scope, operation.id, status, detail))) {
+            logger.info("Edit operation " + operation.id + " was already settled by reconciliation.")
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Refuses an edit while an unsettled operation in this project holds its target. The blockers are reconciled against
+   * the editor first, so a settled operation releases the target. A blocker that is still running or diverged throws
+   * a refusal that names the operation, its state, and the next action.
+   */
+  private async clearEditTargetBlockers(scope: TodoWriteRequest, target: string): Promise<void> {
+    const repository = this._todoRepository
+    if (!repository) return
+    const blockers = (await repository.listUnresolvedEditOperations(scope)).filter((operation) => operation.target === target)
+    if (!blockers.length) return
+    await this.reconcileEditOperations(target)
+    const remaining = (await repository.listUnresolvedEditOperations(scope)).find((operation) => operation.target === target)
+    if (remaining) throw new Error(describeEditBlocker(remaining, scope.conversationId, this._editOwnerId))
+  }
+
+  /**
+   * Settles unresolved edits from the editor buffer (unsaved text included) rather than from the model's account. Only
+   * the intended text settles as applied; the original text, or a create whose file is still absent, settles as absent
+   * once no edit is running; anything else is diverged and left for the model to reread. Nothing is re-dispatched.
+   * Operations from other conversations of this host are settled the same way, and an edit's own conversation is
+   * not changed. An edit owned by another extension host, or by no recorded owner, is settled only when its intended
+   * text is already present: absence is never inferred for it, because its sink may still be running elsewhere.
+   * Returns a note for each settled outcome so the model can act on it.
+   */
+  private async reconcileEditOperations(target?: string): Promise<string[]> {
+    const scope = this.activeTodoScope()
+    const repository = this._todoRepository
+    const root = this.workspaceRoot()
+    if (!scope || !repository || !root) return []
+    const notes: string[] = []
+    for (const operation of await repository.listUnresolvedEditOperations(scope)) {
+      if (target !== undefined && operation.target !== target) continue
+      const owned = operation.ownerId === this._editOwnerId
+      // A live sink still owns its edit and settles it itself, including any rollback it performs after the editor answers.
+      if (owned && isEditOperationInFlight(operation.id)) continue
+      const outcome = await this.decideEditOutcome(operation, path.join(root, operation.target))
+      if (!owned && outcome.status !== "reconciled_applied") {
+        logger.info("Edit operation " + operation.id + " on " + operation.target + " belongs to another extension host and is not settled here.")
+        continue
+      }
+      const settled = await repository.settleProjectEditOperation(scope, operation.id, operation.status, outcome.status, outcome.detail)
+      logger.info("Reconciled edit operation " + operation.id + " on " + operation.target + ": " + outcome.status + (settled ? "" : " (already settled)"))
+      if (!settled) continue
+      const owner = operation.conversationId === scope.conversationId ? "" : " from another conversation of this project"
+      if (outcome.status === "reconciled_applied") {
+        notes.push(`${operation.target}: an earlier edit${owner} (${operation.id}) is already in the editor. It was recorded as applied and not repeated.`)
+      } else if (outcome.status === "reconciled_absent") {
+        notes.push(`${operation.target}: an earlier edit${owner} (${operation.id}) is not in the editor and was not repeated. Reread the target before editing it again.`)
+      } else {
+        notes.push(`${operation.target}: an edit${owner} (${operation.id}) changed outside the recorded edit and matches neither its original nor intended text. The edit was not retried; reread the target before editing it.`)
+      }
+    }
+    return notes
+  }
+
+  private async decideEditOutcome(operation: UnresolvedEditOperation, file: string): Promise<{ status: Exclude<EditOperationStatus, "dispatched" | "succeeded" | "failed">; detail: string }> {
+    try {
+      const text = await this.editorTextOrAbsent(file)
+      if (text === undefined && operation.preDigest === ABSENT_DIGEST) {
+        return { status: "reconciled_absent", detail: "The file does not exist and no edit is running." }
+      }
+      if (text === undefined) return { status: "diverged", detail: "The target no longer exists." }
+      const current = editDigest(text)
+      if (current === operation.postDigest) return { status: "reconciled_applied", detail: "The editor buffer holds the intended text." }
+      if (current === operation.preDigest) return { status: "reconciled_absent", detail: "The editor buffer holds the original text and no edit is running." }
+      return { status: "diverged", detail: "The editor buffer matches neither the original nor the intended text." }
+    } catch (error) {
+      return { status: "diverged", detail: "The target could not be read: " + (error instanceof Error ? error.message : String(error)) }
+    }
+  }
+
+  /** The editor's text for a file, or undefined when the file does not exist. A file that exists but cannot be read throws. */
+  private async editorTextOrAbsent(file: string): Promise<string | undefined> {
+    try {
+      return (await workspace.openTextDocument(Uri.file(file))).getText()
+    } catch (error) {
+      const exists = await fs.stat(file).then(() => true, () => false)
+      if (exists) throw error
+      return undefined
+    }
+  }
+
   /** Host reconciliation: an active plan that still holds administrative criteria is repaired before anything reads it. */
   private async repairAdministrativePlan(scope: TodoWriteRequest): Promise<void> {
     if (!this._todoRepository) return
@@ -1617,7 +1784,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   private async planRequestContext(): Promise<string | undefined> {
     const preflight = this._evidencePreflight
     const scope = this.activeTodoScope()
-    if (!scope || !this._todoRepository) return preflight
+    const recovery = this._editRecoveryNotes.length ? "Edit recovery:\n- " + this._editRecoveryNotes.join("\n- ") : undefined
+    if (!scope || !this._todoRepository) return [preflight, recovery].filter(Boolean).join("\n\n") || undefined
     try {
       await this.repairAdministrativePlan(scope)
       await this.recordEvidenceCheck(scope)
@@ -1632,10 +1800,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         : { selected: [], omitted: 0 }
       const plan = outline && outline.tasks.length ? renderPlanContext(outline, selection.selected, selection.omitted) : ""
       const task = await this.activeIntentTaskProjection()
-      return [preflight, task, plan].filter(Boolean).join("\n\n") || undefined
+      return [preflight, recovery, task, plan].filter(Boolean).join("\n\n") || undefined
     } catch (error) {
       logger.warn(`[Intent] Could not load the TODO plan for this request: ${error instanceof Error ? error.message : String(error)}`)
-      return preflight
+      return [preflight, recovery].filter(Boolean).join("\n\n") || undefined
     }
   }
 
@@ -2052,7 +2220,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ),
       canMutate: () => !mutationsBlocked,
       blockMutations: () => { mutationsBlocked = true },
-      onCatastrophic
+      onCatastrophic,
+      runEditCommand: this._editCommands,
+      recordEditOperation: this.editOperationLedger(this.activeTodoScope())
     }
     hooks.onChanges(changes)
     const approveChange = (detail: string, approval: "command" | "change") =>

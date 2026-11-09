@@ -22,6 +22,9 @@ import {
   type ChildTodoOutcome,
   type ChildTodoProposal,
   type CreateTodoInput,
+  type EditOperationInput,
+  type EditOperationRecord,
+  type EditOperationStatus,
   type IntentPlanContext,
   type IntentPlanOutline,
   type IntentPlanOutlineChild,
@@ -48,6 +51,7 @@ import {
   type TodoVerification,
   type TodoWriteRequest,
   type TypedCriterion,
+  type UnresolvedEditOperation,
   type UpdateTodoInput} from "./types"
 
 interface ProjectRow {
@@ -82,6 +86,9 @@ interface ItemRow {
 }
 
 const now = () => new Date().toISOString()
+
+/** Content digest for an edit's precondition or postcondition. Only digests are persisted, never file text. */
+export const editDigest = (text: string): string => createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex")
 /** Canonical JSON of a task's typed criteria, the only stored acceptance representation. */
 const criteriaJson = (criteria: TypedCriterion[]): string => JSON.stringify(criteria)
 const storedCriteria = (json: string | null | undefined): TypedCriterion[] | undefined => json ? JSON.parse(json) as TypedCriterion[] : undefined
@@ -297,6 +304,26 @@ const childContext = (membership: PlanMembership, plan: { plan_id: string; revis
     })
   }
 }
+
+const unresolvedEditTarget = (database: Database, projectId: string, target: string): { id: string; conversationId: string | null } | undefined =>
+  rows<{ id: string; conversationId: string | null }>(database,
+    "SELECT e.id AS id, l.conversation_id AS conversationId FROM todo_edit_operations e JOIN todo_lists l ON l.id = e.list_id WHERE l.project_id = ? AND e.target = ? AND e.status IN ('dispatched','diverged') LIMIT 1", [projectId, target])[0]
+
+type EditOperationRow = { id: string; itemId: string | null; ownerId: string | null; target: string; mode: "apply" | "review"; preDigest: string; postDigest: string; status: EditOperationStatus; detail: string; createdAt: number; updatedAt: number }
+
+const toEditOperationRecord = (row: EditOperationRow): EditOperationRecord => ({
+  id: row.id,
+  itemId: row.itemId ?? undefined,
+  ownerId: row.ownerId ?? undefined,
+  target: row.target,
+  mode: row.mode,
+  preDigest: row.preDigest,
+  postDigest: row.postDigest,
+  status: row.status,
+  detail: row.detail,
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt
+})
 
 const ensureList = (database: Database, request: TodoListRequest): ListRow => {
   const fingerprint = request.projectFingerprint.trim()
@@ -1068,6 +1095,94 @@ export class TodoRepository {
       if (row.status === "in_review") database.run("UPDATE todo_items SET version = version + 1, updated_at = ? WHERE id = ?", [observation.createdAt, row.id])
       logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
       return observation
+    })
+  }
+
+  /**
+   * Records an editor mutation before it is dispatched. The unresolved-target check and the insert run in one write
+   * transaction, so two dispatches cannot both claim the same target.
+   */
+  beginEditOperation(request: TodoWriteRequest, input: EditOperationInput): Promise<EditOperationRecord> {
+    assertWriter(request)
+    return this.sqlite.write((database) => {
+      const list = ensureList(database, request)
+      if (input.itemId !== undefined) {
+        const intentTask = rows<{ task_id: string }>(database, "SELECT task_id FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [input.itemId, list.id])[0]
+        if (!intentTask) throw new Error("Edit operations are limited to active Intent tasks")
+      }
+      const unresolved = unresolvedEditTarget(database, list.project_id, input.target)
+      if (unresolved) throw new TodoConflictError(`Edit target ${input.target} has an unresolved operation ${unresolved.id}`)
+      const timestamp = Date.now()
+      const record: EditOperationRecord = { ...input, status: "dispatched", detail: "", createdAt: timestamp, updatedAt: timestamp }
+      database.run("INSERT INTO todo_edit_operations(id, list_id, item_id, owner_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [record.id, list.id, record.itemId ?? null, record.ownerId ?? null, record.target, record.mode, record.preDigest, record.postDigest, record.status, record.detail, record.createdAt, record.updatedAt])
+      return record
+    })
+  }
+
+  /**
+   * Moves a dispatched operation to a terminal status. The update applies only while the operation is still dispatched,
+   * so a late settlement cannot overwrite a reconciliation that already decided the outcome.
+   */
+  settleEditOperation(request: TodoWriteRequest, operationId: string, status: Exclude<EditOperationStatus, "dispatched">, detail: string): Promise<boolean> {
+    assertWriter(request)
+    return this.sqlite.write((database) => {
+      const list = findList(database, request)
+      if (!list) return false
+      database.run("UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND list_id = ? AND status = 'dispatched'",
+        [status, detail.slice(0, 500), Date.now(), operationId, list.id])
+      return database.getRowsModified() === 1
+    })
+  }
+
+  /**
+   * Reports a dispatched edit on the target in any conversation of this project. Edits without an active Intent task
+   * cannot be recorded, so the controller uses this to refuse them while an earlier dispatch is still unsettled.
+   */
+  findUnresolvedEditTarget(request: TodoListRequest, target: string): Promise<{ operationId: string; conversationId: string | null } | undefined> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return undefined
+      const unresolved = unresolvedEditTarget(database, project.id, target)
+      return unresolved ? { operationId: unresolved.id, conversationId: unresolved.conversationId } : undefined
+    })
+  }
+
+  listDispatchedEditOperations(request: TodoListRequest): Promise<EditOperationRecord[]> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      if (!list) return []
+      return rows<EditOperationRow>(database,
+        "SELECT id, item_id AS itemId, owner_id AS ownerId, target, mode, pre_digest AS preDigest, post_digest AS postDigest, status, detail, created_at AS createdAt, updated_at AS updatedAt FROM todo_edit_operations WHERE list_id = ? AND status = 'dispatched' ORDER BY created_at, id", [list.id])
+        .map(toEditOperationRecord)
+    })
+  }
+
+  /**
+   * Lists unresolved operations across every conversation of the project. Operations are host-owned, so another
+   * conversation's record is visible for reconciliation and blocking, but is never replayed or re-owned here.
+   */
+  listUnresolvedEditOperations(request: TodoListRequest): Promise<UnresolvedEditOperation[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      return rows<EditOperationRow & { conversationId: string | null }>(database,
+        "SELECT e.id AS id, e.item_id AS itemId, e.owner_id AS ownerId, e.target AS target, e.mode AS mode, e.pre_digest AS preDigest, e.post_digest AS postDigest, e.status AS status, e.detail AS detail, e.created_at AS createdAt, e.updated_at AS updatedAt, l.conversation_id AS conversationId FROM todo_edit_operations e JOIN todo_lists l ON l.id = e.list_id WHERE l.project_id = ? AND e.status IN ('dispatched','diverged') ORDER BY e.created_at, e.id", [project.id])
+        .map((row) => ({ ...toEditOperationRecord(row), status: row.status as "dispatched" | "diverged", conversationId: row.conversationId }))
+    })
+  }
+
+  /**
+   * Moves an unresolved operation to its reconciled outcome only if it still has the status the caller decided from.
+   * Two reconcilers that observed the same status race on this compare-and-set, and exactly one of them wins.
+   */
+  settleProjectEditOperation(request: TodoListRequest, operationId: string, expected: "dispatched" | "diverged", status: Exclude<EditOperationStatus, "dispatched" | "succeeded" | "failed">, detail: string): Promise<boolean> {
+    return this.sqlite.write((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return false
+      database.run("UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND status = ? AND list_id IN (SELECT id FROM todo_lists WHERE project_id = ?)",
+        [status, detail.slice(0, 500), Date.now(), operationId, expected, project.id])
+      return database.getRowsModified() === 1
     })
   }
 

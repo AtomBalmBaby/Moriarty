@@ -266,3 +266,34 @@ export class TodoConflictError extends Error {
     this.name = "TodoConflictError"
   }
 }
+
+/**
+ * Host-owned lifecycle of one editor mutation. `dispatched` is unknown: the host cannot yet say whether the
+ * mutation happened, so it must be reconciled before the same target is edited again. Only apply-mode edits are ledgered;
+ * review-mode edits apply later through the user's review and are outside this lifecycle.
+ */
+export type EditOperationStatus = "dispatched" | "succeeded" | "failed" | "reconciled_applied" | "reconciled_absent" | "diverged"
+
+export interface EditOperationInput {
+  id: string
+  itemId?: string
+  /** The extension host that dispatched the edit. Only that host may settle an unresolved edit as absent. */
+  ownerId?: string
+  target: string
+  mode: "apply" | "review"
+  preDigest: string
+  postDigest: string
+}
+
+export interface EditOperationRecord extends EditOperationInput {
+  id: string
+  status: EditOperationStatus
+  detail: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface UnresolvedEditOperation extends EditOperationRecord {
+  status: "dispatched" | "diverged"
+  conversationId: string | null
+}
