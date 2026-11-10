@@ -504,7 +504,7 @@ interface AcceptedFactRow {
   created_at: string
 }
 
-const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item_id, evidence.criterion_index, evidence.criterion, evidence.observation_id, evidence.tool_name, evidence.symbol, evidence.path, evidence.start_line, evidence.end_line, evidence.source_hash, evidence.superseded_by, evidence.plan_id, evidence.plan_revision, aliases.tool_name AS registered_tool, evidence.created_at"
+const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item_id, evidence.criterion_index, evidence.criterion, evidence.observation_id, evidence.tool_name, evidence.symbol, evidence.path, evidence.start_line, evidence.end_line, evidence.source_hash, evidence.superseded_by, evidence.plan_id, evidence.plan_revision, evidence.registered_tool, evidence.created_at"
 
 /**
  * Accepted facts for a project, across all its conversations. "Current" is decided per
@@ -519,7 +519,6 @@ const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item
 const acceptedFactsFor = (database: Database, projectId: string, options: { symbol?: string; path?: string; includeSuperseded?: boolean } = {}): AcceptedFact[] => {
   const facts = rows<AcceptedFactRow>(database,
     `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id ` +
-    "LEFT JOIN todo_symbol_aliases AS aliases ON aliases.list_id = evidence.list_id AND aliases.observation_id = evidence.observation_id AND aliases.implementation = evidence.symbol AND aliases.path = evidence.path " +
     "WHERE lists.project_id = ? ORDER BY evidence.created_at DESC, evidence.id",
     [projectId]
   ).map((row) => ({
@@ -557,11 +556,13 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
 
 /**
  * Tool-name to implementation links verified from source, across all conversations of a project.
+ * Each link is an accepted evidence row that names a registered tool, so it shares that row's provenance and fingerprint.
  */
 const symbolAliasesFor = (database: Database, projectId: string): SymbolAlias[] =>
   rows<{ id: string; conversation_id: string; tool_name: string; implementation: string; path: string; start_line: number; end_line: number; observation_id: string; source_hash: string; created_at: string }>(database,
-    "SELECT aliases.id, lists.conversation_id, aliases.tool_name, aliases.implementation, aliases.path, aliases.start_line, aliases.end_line, aliases.observation_id, aliases.source_hash, aliases.created_at " +
-    "FROM todo_symbol_aliases AS aliases JOIN todo_lists AS lists ON lists.id = aliases.list_id WHERE lists.project_id = ? ORDER BY aliases.created_at DESC, aliases.id",
+    "SELECT evidence.id, lists.conversation_id, evidence.registered_tool AS tool_name, evidence.symbol AS implementation, evidence.path, evidence.start_line, evidence.end_line, evidence.observation_id, evidence.source_hash, evidence.created_at " +
+    "FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id " +
+    "WHERE lists.project_id = ? AND evidence.registered_tool IS NOT NULL ORDER BY evidence.created_at DESC, evidence.id",
     [projectId]
   ).map((row) => ({
     id: row.id,
@@ -602,24 +603,17 @@ const recordAcceptedFacts = (
     if (!Number.isInteger(fact.startLine) || !Number.isInteger(fact.endLine) || fact.startLine < 1 || fact.endLine < fact.startLine) {
       refuse(index, "fact has an invalid line range")
     }
+    if (fact.registeredTool !== undefined && !fact.registeredTool.trim()) refuse(index, "registered tool name is empty")
     const id = randomUUID()
     database.run(
-      "INSERT INTO todo_accepted_evidence(id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
-      [id, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, acceptedAt]
+      "INSERT INTO todo_accepted_evidence(id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, registered_tool, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+      [id, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, fact.registeredTool ?? null, acceptedAt]
     )
     database.run(
       "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
       [id, listId, fact.symbol, fact.path, id]
     )
     logger.debug(`[Evidence] promoted task=${itemId} criterion=${index} symbol=${fact.symbol} path=${fact.path} lines=${fact.startLine}-${fact.endLine} observation=${fact.observationId}`)
-    if (fact.registeredTool !== undefined) {
-      if (!fact.registeredTool.trim()) refuse(index, "alias has no registered tool name")
-      database.run("DELETE FROM todo_symbol_aliases WHERE list_id = ? AND observation_id = ? AND tool_name = ? AND implementation = ? AND path = ?", [listId, fact.observationId, fact.registeredTool, fact.symbol, fact.path])
-      database.run(
-        "INSERT INTO todo_symbol_aliases(id, list_id, tool_name, implementation, path, start_line, end_line, observation_id, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [randomUUID(), listId, fact.registeredTool, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.observationId, fact.sourceHash, acceptedAt]
-      )
-    }
   }
 
 }

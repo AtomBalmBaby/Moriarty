@@ -5,6 +5,7 @@ import type { CriterionFailureReason, ReplyChangesView, SourceIdentity, TodoCrit
 import { verifyContentFingerprint } from "../tools/fingerprint"
 
 import { codeIdentifiers, commandDigest, samePath } from "./evidence"
+import { analyzeSource, isAnalysableSource, type RegistrationImplementation, type SourceAnalysis } from "./source-analysis"
 import { type AcceptedFact, type CriterionVerification, type IntentPlanContext, type RequirementActivation, type RetainedObservationEvidence, type TodoReviewPackage } from "./types"
 import { capabilityOf } from "./verification-capabilities"
 
@@ -175,49 +176,6 @@ const reconciled = (
 const identityLabel = (identity: SourceIdentity): string => identity === "registered_tool" ? "a registered tool" : "an implementation symbol"
 
 const NUMBERED_SOURCE_LINE = /^(\d+): (.*)$/
-
-
-const indentOf = (text: string): number => text.length - text.trimStart().length
-
-const NAME_PROPERTY_LINE = /\bname\s*:\s*["'`]([A-Za-z_$][\w$-]*)["'`]/
-const DECLARATION_LINE = /^\s*(?:export\s+)?(?:async\s+)?(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)\b/
-const DECLARATION_SEARCH_LINES = 40
-
-/**
- * Tool registrations (`name: "read_file"`) paired with the declaration that encloses them.
- * Walking upward, each step must reach a strictly shallower line, so the first declaration
- * reached is the enclosing one, not a sibling above it. Both lines must be inside the read's
- * captured range. The pairing is a source-shape heuristic, so it is only stored with the
- * fingerprint of the file it was read from.
- */
-const implementationAliases = (record: RetainedObservationEvidence): Array<{ tool: string; implementation: string; startLine: number; registrationLine: number }> => {
-  if (!record.content) return []
-  const ranges = record.sources
-    .filter((source) => source.startLine !== undefined && source.endLine !== undefined)
-    .map((source) => [source.startLine as number, source.endLine as number])
-  const inRange = (line: number): boolean => ranges.some(([start, end]) => line >= start && line <= end)
-  const lines = record.content.split("\n").flatMap((line) => {
-    const match = NUMBERED_SOURCE_LINE.exec(line)
-    return match ? [{ line: Number(match[1]), text: match[2] }] : []
-  })
-  const aliases: Array<{ tool: string; implementation: string; startLine: number; registrationLine: number }> = []
-  lines.forEach((registration, index) => {
-    const name = NAME_PROPERTY_LINE.exec(registration.text)
-    if (!name || !inRange(registration.line)) return
-    let depth = indentOf(registration.text)
-    for (let above = index - 1; above >= Math.max(0, index - DECLARATION_SEARCH_LINES); above--) {
-      const candidate = lines[above]
-      if (!candidate.text.trim() || indentOf(candidate.text) >= depth) continue
-      depth = indentOf(candidate.text)
-      const declaration = DECLARATION_LINE.exec(candidate.text)
-      if (declaration) {
-        if (inRange(candidate.line) && declaration[1] !== name[1]) aliases.push({ tool: name[1], implementation: declaration[1], startLine: candidate.line, registrationLine: registration.line })
-        return
-      }
-    }
-  })
-  return aliases
-}
 
 /**
  * Whether an accepted fact is about a name a request mentions: its implementation symbol or its registered tool name.
@@ -488,76 +446,150 @@ const prohibitionOutcome = (records: RetainedObservationEvidence[]): CriterionOu
   return { ...reconciled("proven", records.map((record) => record.observationId), []), scope: PROHIBITION_SCOPE }
 }
 
-/** A registration (name: "read_file") paired with the declaration that implements it, and the fingerprinted read that shows it. */
-interface RegistrationRead {
-  record: RetainedObservationEvidence
-  alias: { tool: string; implementation: string; startLine: number; registrationLine: number }
-  path: string
-  sourceHash: string
-}
-
-/**
- * Registration lines that name a tool, whether or not their enclosing declaration was read. Proves the
- * registered tool name only; it never proves the implementation symbol.
- */
-const registeredNameReads = (records: RetainedObservationEvidence[]): Array<{ record: RetainedObservationEvidence; tool: string; line: number; path: string; sourceHash: string }> =>
-  records.filter((record) => !record.failed && record.retained && record.content !== undefined).flatMap((record) =>
-    (record.content ?? "").split("\n").flatMap((text) => {
-      const numbered = NUMBERED_SOURCE_LINE.exec(text)
-      const name = numbered && NAME_PROPERTY_LINE.exec(numbered[2])
-      if (!numbered || !name) return []
-      const line = Number(numbered[1])
-      const source = record.sources.find((candidate) =>
-        candidate.startLine !== undefined && candidate.endLine !== undefined
-        && candidate.startLine <= line && line <= candidate.endLine && candidate.contentHash)
-      return source?.contentHash ? [{ record, tool: name[1], line, path: source.path, sourceHash: source.contentHash }] : []
-    }))
-
-const registrationReads = (records: RetainedObservationEvidence[]): RegistrationRead[] =>
-
-  records.filter((record) => !record.failed && record.retained && record.content !== undefined).flatMap((record) =>
-    implementationAliases(record).flatMap((alias) => {
-      const source = record.sources.find((candidate) =>
-        candidate.startLine !== undefined && candidate.endLine !== undefined
-        && candidate.startLine <= alias.startLine && alias.registrationLine <= candidate.endLine && candidate.contentHash)
-      return source?.contentHash ? [{ record, alias, path: source.path, sourceHash: source.contentHash }] : []
-    }))
-
-/**
- * The line that closes a declaration: the first later line at the declaration's indentation that starts with a closing brace.
- * Measured on the current source, so the range is independent of how much a read happened to capture.
- */
-const declarationEnd = (text: string, startLine: number): number | undefined => {
-  const lines = text.split("\n")
-  const opening = lines[startLine - 1]
-  if (opening === undefined) return undefined
-  const indent = indentOf(opening)
-  for (let index = startLine; index < lines.length; index++) {
-    const line = lines[index]
-    if (line.trim() && indentOf(line) === indent && line.trimStart().startsWith("}")) return index + 1
-  }
-  return undefined
-}
-
 /** Whether a retained read captured the given line of the path, so its content is actually shown and not merely in an unread range. */
 const showsLine = (record: RetainedObservationEvidence, path: string, line: number): boolean =>
   record.sources.some((source) => samePath(source.path, path) && source.startLine !== undefined && source.endLine !== undefined
     && source.startLine <= line && line <= source.endLine)
   && !!record.content?.split("\n").some((text) => NUMBERED_SOURCE_LINE.exec(text)?.[1] === String(line))
 
-/**
- * Fresh retained reads, from any observation, that show a line of the path. Each must match the current
- * source, so a boundary read taken before an edit cannot close a range at the current revision.
- */
-const boundaryObservations = async (records: RetainedObservationEvidence[], path: string, line: number, text: string): Promise<string[]> => {
-  const ids: string[] = []
-  for (const record of records) {
-    if (record.failed || !record.retained || record.content === undefined || !showsLine(record, path, line)) continue
-    const hash = record.sources.find((source) => samePath(source.path, path))?.contentHash
-    if (hash && await verifyContentFingerprint(text, hash).catch(() => false)) ids.push(record.observationId)
-  }
-  return ids
+/** Source content authenticated against the current document, with its structural analysis. */
+interface AuthenticatedSource {
+  analysis: SourceAnalysis
+  /** Retained reads whose fingerprint and captured lines match the whole current document. */
+  reads: RetainedObservationEvidence[]
+  /** Accepted facts for this path whose fingerprint matches the whole current document. */
+  facts: AcceptedFact[]
+  sourceHash: string
+  /** Line count of the current document, used to decide whether retained reads cover all of it. */
+  lineCount: number
+  /** Retained reads of this path that were taken before the current text, so no longer describe it. */
+  staleObservationIds: string[]
 }
+
+type SourceAuthentication =
+  | ({ status: "authenticated" } & AuthenticatedSource)
+  | { status: "unobserved" }
+  | { status: "unreadable" }
+  | { status: "changed"; observationIds: string[] }
+  | { status: "unanalysed"; reason: string }
+
+/**
+ * Whether every numbered line of a retained read equals the authenticated line it names. A matching whole-document hash
+ * shows which file was read; this shows that the captured lines really came from it.
+ */
+const readMatchesText = (content: string, text: string): boolean => {
+  const lines = text.split("\n")
+  const numbered = content.split("\n").map((line) => NUMBERED_SOURCE_LINE.exec(line)).filter((match): match is RegExpExecArray => match !== null)
+  return numbered.length > 0 && numbered.every(([, line, captured]) => {
+    const expected = lines[Number(line) - 1]
+    return expected !== undefined && expected.replace(/\r$/, "") === (captured ?? "").replace(/\r$/, "")
+  })
+}
+
+/**
+ * Authenticates the current document at a path. A retained read or accepted fact counts only when its whole-document
+ * fingerprint matches the current text, and a read's captured lines match that text. Analysis then runs over that complete
+ * text, so absence is decided over the whole file, not over the window the model happened to read.
+ */
+const authenticateSource = async (
+  path: string,
+  records: RetainedObservationEvidence[],
+  accepted: AcceptedFact[],
+  current: (path: string) => Promise<string | undefined>
+): Promise<SourceAuthentication> => {
+  const reads: Array<{ record: RetainedObservationEvidence; hash: string }> = []
+  for (const record of records) {
+    if (record.failed || !record.retained || record.toolName !== "read_file" || record.content === undefined) continue
+    const hash = record.sources.find((source) => samePath(source.path, path) && source.contentHash)?.contentHash
+    if (hash) reads.push({ record, hash })
+  }
+  const facts = accepted.filter((fact) => !fact.supersededBy && samePath(fact.path, path))
+  if (!reads.length && !facts.length) return { status: "unobserved" }
+  const text = await current(path)
+  if (text === undefined) return { status: "unreadable" }
+  const matchedReads: Array<{ record: RetainedObservationEvidence; hash: string }> = []
+  const staleObservationIds: string[] = []
+  for (const read of reads) {
+    if (!(await verifyContentFingerprint(text, read.hash).catch(() => false))) {
+      staleObservationIds.push(read.record.observationId)
+      continue
+    }
+    if (readMatchesText(read.record.content ?? "", text)) matchedReads.push(read)
+  }
+  const matchedFacts: AcceptedFact[] = []
+  for (const fact of facts) {
+    if (await verifyContentFingerprint(text, fact.sourceHash).catch(() => false)) matchedFacts.push(fact)
+  }
+  const sourceHash = matchedReads[0]?.hash ?? matchedFacts[0]?.sourceHash
+  if (sourceHash === undefined) return { status: "changed", observationIds: reads.map(({ record }) => record.observationId) }
+  const analysis = analyzeSource(path, text)
+  if (analysis.status === "unanalysed") return { status: "unanalysed", reason: analysis.reason }
+  const lines = text.split("\n")
+  const lineCount = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length
+  return { status: "authenticated", analysis, reads: matchedReads.map(({ record }) => record), facts: matchedFacts, sourceHash, lineCount, staleObservationIds }
+}
+
+/**
+ * Whether the authenticated reads of a path together show every line of the current document. Only then does a missing
+ * declaration prove absence; a partial read can show that a name is not in its window, but not that it is not in the file.
+ */
+const coversWholeFile = (auth: AuthenticatedSource, path: string): boolean => {
+  const ranges = auth.reads
+    .flatMap((record) => record.sources)
+    .filter((source): source is typeof source & { startLine: number; endLine: number } =>
+      samePath(source.path, path) && source.startLine !== undefined && source.endLine !== undefined)
+    .sort((left, right) => left.startLine - right.startLine)
+  let reached = 0
+  for (const range of ranges) {
+    if (range.startLine > reached + 1) break
+    reached = Math.max(reached, range.endLine)
+  }
+  return reached >= auth.lineCount
+}
+
+const absenceNotEstablished = (symbol: string, path: string, auth: AuthenticatedSource): CriterionOutcome =>
+  reconciled("unknown", [], [`no retained successful read shows ${symbol} in ${path}, and the retained reads do not cover all ${auth.lineCount} lines, so its absence is not established; read the remaining lines of ${path}`], "missing_evidence")
+
+/** Observations among the authenticated reads whose captured content shows the given line. */
+const shownBy = (auth: AuthenticatedSource, path: string, line: number): string[] =>
+  auth.reads.filter((record) => showsLine(record, path, line)).map((record) => record.observationId)
+
+/**
+ * Whether a persisted fact still describes the current analysis. A link fact needs its registration and declaration unchanged.
+ * A registration fact needs exactly one registration of its tool with the same object span. A legacy single-line registration
+ * fact holds only where its line is the registration's name, and so cannot prove a range.
+ */
+const factHolds = (fact: AcceptedFact, analysis: SourceAnalysis, needsRange: boolean): boolean => {
+  if (fact.registeredTool !== undefined) {
+    return analysis.registrations.some((registration) => {
+      if (registration.toolName !== fact.registeredTool || registration.implementation.status !== "declared") return false
+      const declaration = registration.implementation.declaration
+      return declaration.name === fact.symbol && declaration.startLine === fact.startLine && declaration.endLine === fact.endLine
+    })
+  }
+  const named = analysis.registrations.filter((registration) => registration.toolName === fact.symbol)
+  if (named.length !== 1) return false
+  const [registration] = named
+  if (registration.startLine === fact.startLine && registration.endLine === fact.endLine) return true
+  return !needsRange && fact.startLine === fact.endLine && registration.nameLine === fact.startLine
+}
+
+/**
+ * Analysable paths a path-less source criterion may be grounded in: paths of retained source reads and of accepted facts
+ * for the identity. Being a candidate proves nothing; each one must still satisfy the criterion.
+ */
+const candidatePaths = (records: RetainedObservationEvidence[], accepted: AcceptedFact[], identity: SourceIdentity, symbol: string): string[] => [...new Set([
+  ...records.filter((record) => !record.failed && record.retained && record.toolName === "read_file")
+    .flatMap((record) => record.sources.filter((source) => source.contentHash).map((source) => source.path)),
+  ...accepted.filter((fact) => !fact.supersededBy && factNamedBy(identity, symbol, fact)).map((fact) => fact.path)
+])].filter(isAnalysableSource)
+
+const describeImplementation = (implementation: RegistrationImplementation): string =>
+  implementation.status === "declared"
+    ? `its implementation is declared as ${implementation.declaration.name} at lines ${implementation.declaration.startLine}-${implementation.declaration.endLine}`
+    : implementation.status === "anonymous"
+      ? `its implementation is inline at lines ${implementation.startLine}-${implementation.endLine} and has no declared name`
+      : `its implementation cannot be resolved: ${implementation.reason}`
 
 /** The latest successful project-wide lookup whose recorded resolution and count agree. Failed, partial, and subject-scoped lookups prove nothing. */
 const latestProjectLookup = (records: RetainedObservationEvidence[]): RetainedObservationEvidence | undefined => {
@@ -567,13 +599,6 @@ const latestProjectLookup = (records: RetainedObservationEvidence[]): RetainedOb
     return Number.isInteger(count) && count >= 0 && record.arguments.resolution === (count > 0 ? "found" : "none")
   })
   return valid[valid.length - 1]
-}
-
-/** Whether an accepted fact still matches the current source: same fingerprint, and the recorded range when one is required. */
-const liveFactMatches = async (fact: AcceptedFact, current: (path: string) => Promise<string | undefined>, needsRange: boolean): Promise<boolean> => {
-  const text = await current(fact.path)
-  if (text === undefined || !(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) return false
-  return !needsRange || declarationEnd(text, fact.startLine) === fact.endLine
 }
 
 /**
@@ -598,16 +623,17 @@ const acceptedFactOutcome = async (
 ): Promise<CriterionOutcome> => {
   const matching = accepted.filter((fact) => !fact.supersededBy && factNamedBy(subject.identity, subject.symbol, fact) && (subject.path === undefined || samePath(fact.path, subject.path)))
   const live: AcceptedFact[] = []
-  for (const fact of matching) {
-    if (await liveFactMatches(fact, current, false)) live.push(fact)
+  for (const path of new Set(matching.map((fact) => fact.path))) {
+    const auth = await authenticateSource(path, records, accepted, current)
+    if (auth.status !== "authenticated") continue
+    live.push(...matching.filter((fact) => fact.path === path && auth.facts.includes(fact) && factHolds(fact, auth.analysis, false)))
   }
   const livePaths = new Set(live.map((fact) => fact.path))
   if (livePaths.size > 1) return reconciled("unknown", [], [`${subject.symbol} is recorded at ${livePaths.size} locations; the criterion must name the file`], "invalid_identity")
   if (live.length) return { ...reconciled("proven", [live[0].observationId], []), reuse: "accepted" }
   if (subject.path === undefined) {
-    const declaredPaths = [...new Set([...registrationReads(records).map((read) => read.path), ...registeredNameReads(records).map((read) => read.path)])]
     const located: CriterionOutcome[] = []
-    for (const path of declaredPaths) {
+    for (const path of candidatePaths(records, accepted, subject.identity, subject.symbol)) {
       const outcome = await sourceContractOutcome({ kind: "source_location", identity: subject.identity, symbol: subject.symbol, path }, records, accepted, current)
       if (outcome.outcome === "proven") located.push(outcome)
     }
@@ -623,109 +649,136 @@ const acceptedFactOutcome = async (
     : `no current accepted fact for ${subject.symbol} is recorded`], matching.length ? "stale_evidence" : "missing_evidence")
 }
 
+/** A source predicate's subject: its identity type and requested name, at one path. */
+type SourceSubject = { kind: "source_location" | "source_range" | "source_fingerprint"; identity: SourceIdentity; symbol: string; path: string }
+
+/** Retained observations that were fingerprint-authenticated for the path, whether through a read or an accepted fact. */
+const authenticatedObservations = (auth: AuthenticatedSource): string[] =>
+  [...new Set([...auth.reads.map((read) => read.observationId), ...auth.facts.map((fact) => fact.observationId)])]
+
+/** Nothing retained for the path matches the current document, so the criterion can only be answered by reading it. */
+const unobservedOutcome = (subject: SourceSubject, records: RetainedObservationEvidence[]): CriterionOutcome => {
+  const evicted = records.filter((record) => !record.failed && !record.retained && record.toolName === "read_file" && samePath(record.arguments.path ?? "", subject.path))
+  const missing = evicted.map((record) => `the read of ${subject.path} in observation ${record.observationId} was evicted from retained storage; read it again`)
+  return reconciled("unknown", [], missing.length ? missing : [`no retained successful read shows ${subject.symbol} in ${subject.path}`], "missing_evidence")
+}
+
 /**
- * Source predicates for one declaration. Location and fingerprint are proven by a fingerprint-verified read that shows the
- * declaration. A range also needs a fresh retained read that shows the declaration's actual closing line, so a short read
- * cannot prove an unseen boundary.
+ * A registered tool is proven by its exact `name` registration in the authenticated file. Its registration object is the
+ * evidence; no declaration with the same name is consulted, so a tool name is never reinterpreted as a symbol. When the
+ * read also shows the declaration the registration invokes, the verified relationship is recorded as a link fact.
+ */
+const registeredToolOutcome = (subject: SourceSubject, auth: AuthenticatedSource, needsRange: boolean): CriterionOutcome => {
+  const { path, symbol } = subject
+  const matches = auth.analysis.registrations.filter((registration) => registration.toolName === symbol)
+  if (matches.length > 1) {
+    return reconciled("unknown", [], [`${symbol} is registered ${matches.length} times in ${path}, at lines ${matches.map((match) => match.nameLine).join(", ")}; the criterion cannot tell which registration it means`], "invalid_identity")
+  }
+  if (!matches.length) {
+    const dynamic = auth.analysis.dynamicRegistrations[0]
+    if (dynamic) {
+      return reconciled("unknown", [], [`${path} builds tool registrations with a computed name (line ${dynamic.line}: ${dynamic.reason}), so the verifier cannot establish that ${symbol} is absent`], "unsupported_operation")
+    }
+    if (!coversWholeFile(auth, path)) return absenceNotEstablished(symbol, path, auth)
+    return reconciled("disproven", authenticatedObservations(auth), [`${path} does not register ${symbol}; the authenticated read of the current file shows no such registration`], "contradicted_evidence")
+  }
+  const [registration] = matches
+  const nameShown = shownBy(auth, path, registration.nameLine)
+  const startShown = shownBy(auth, path, registration.startLine)
+  const endShown = shownBy(auth, path, registration.endLine)
+  const spanShown = startShown.length > 0 && endShown.length > 0
+  if (needsRange && !spanShown) {
+    return reconciled("unknown", [], [`the registration of ${symbol} in ${path} spans lines ${registration.startLine}-${registration.endLine}, which no retained read that matches the current file shows; read through line ${registration.endLine}`], "missing_evidence")
+  }
+  if (!needsRange && !nameShown.length) {
+    return reconciled("unknown", [], [`${symbol} is registered at line ${registration.nameLine} of ${path}, which no retained read that matches the current file shows; read through line ${registration.nameLine}`], "missing_evidence")
+  }
+  const observed = [...new Set([...nameShown, ...startShown, ...endShown])]
+  const { implementation } = registration
+  if (implementation.status === "declared" && nameShown.length && endShown.length) {
+    const { declaration } = implementation
+    const declarationStartShown = shownBy(auth, path, declaration.startLine)
+    const declarationEndShown = shownBy(auth, path, declaration.endLine)
+    if (declarationStartShown.length && declarationEndShown.length) {
+      return {
+        ...reconciled("proven", observed, []),
+        facts: [{ symbol: declaration.name, registeredTool: symbol, path, startLine: declaration.startLine, endLine: declaration.endLine, observationId: declarationStartShown[0], sourceHash: auth.sourceHash }]
+      }
+    }
+  }
+  const span = spanShown ? { startLine: registration.startLine, endLine: registration.endLine } : { startLine: registration.nameLine, endLine: registration.nameLine }
+  const observationId = spanShown ? startShown[0] : nameShown[0]
+  return { ...reconciled("proven", observed, []), facts: [{ symbol, path, ...span, observationId, sourceHash: auth.sourceHash }] }
+}
+
+/**
+ * An implementation symbol is proven only by a declaration that exists in the authenticated file. A registered tool name is
+ * not a declaration, and an identifier that merely appears in a registration is never accepted as one.
+ */
+const implementationOutcome = (subject: SourceSubject, auth: AuthenticatedSource, needsRange: boolean): CriterionOutcome => {
+  const { path, symbol } = subject
+  const { analysis } = auth
+  const declared = analysis.declarations.filter((declaration) => declaration.name === symbol)
+  if (declared.length > 1) {
+    return reconciled("unknown", [], [`${symbol} is declared ${declared.length} times in ${path}, at lines ${declared.map((declaration) => `${declaration.startLine}-${declaration.endLine}`).join(", ")}; the criterion cannot tell which declaration it means`], "invalid_identity")
+  }
+  const [declaration] = declared
+  if (declaration) {
+    const startShown = shownBy(auth, path, declaration.startLine)
+    const endShown = shownBy(auth, path, declaration.endLine)
+    if (!startShown.length || (needsRange && !endShown.length)) {
+      const through = needsRange ? declaration.endLine : declaration.startLine
+      return reconciled("unknown", [], [`${symbol} is declared at lines ${declaration.startLine}-${declaration.endLine} of ${path}, which no retained read that matches the current file shows; read through line ${through}`], "missing_evidence")
+    }
+    const links = analysis.registrations.filter((registration) =>
+      registration.implementation.status === "declared"
+      && registration.implementation.declaration.startLine === declaration.startLine
+      && registration.implementation.declaration.endLine === declaration.endLine)
+    const link = links.length === 1 ? links[0] : undefined
+    const linkRecorded = !!link && shownBy(auth, path, link.nameLine).length > 0 && shownBy(auth, path, link.endLine).length > 0
+    const facts = link && linkRecorded
+      ? [{ symbol, registeredTool: link.toolName, path, startLine: declaration.startLine, endLine: declaration.endLine, observationId: startShown[0], sourceHash: auth.sourceHash }]
+      : []
+    return { ...reconciled("proven", [...new Set([...startShown, ...endShown])], []), facts }
+  }
+  const [registration] = analysis.registrations.filter((candidate) => candidate.toolName === symbol)
+  if (registration) {
+    return reconciled("unknown", [], [`${symbol} is the registered tool name at line ${registration.nameLine} of ${path}, not a declaration; ${describeImplementation(registration.implementation)}`], "invalid_identity")
+  }
+  if (analysis.opaqueNames.includes(symbol)) {
+    return reconciled("unknown", [], [`${symbol} is bound by a re-export, CommonJS export, or shorthand property in ${path}, which the verifier does not resolve`], "unsupported_operation")
+  }
+  if (!coversWholeFile(auth, path)) return absenceNotEstablished(symbol, path, auth)
+  return reconciled("disproven", authenticatedObservations(auth), [`${path} does not declare ${symbol}; the authenticated read of the current file shows no such declaration`], "contradicted_evidence")
+}
+
+/**
+ * Source predicates for one path. The decision is made on the authenticated document: the current text whose fingerprint
+ * matches a retained read or accepted fact. Each identity type has its own structural rule, so a registration and a
+ * declaration are never interchangeable. A range needs both boundary lines shown by a fresh read.
  */
 const sourceContractOutcome = async (
-  subject: { kind: "source_location" | "source_range" | "source_fingerprint"; identity: SourceIdentity; symbol: string; path: string },
+  subject: SourceSubject,
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
   current: (path: string) => Promise<string | undefined>
 ): Promise<CriterionOutcome> => {
   const needsRange = subject.kind === "source_range"
-  for (const fact of accepted.filter((candidate) => !candidate.supersededBy && factNamedBy(subject.identity, subject.symbol, candidate) && samePath(candidate.path, subject.path))) {
-    if (await liveFactMatches(fact, current, needsRange)) return { ...reconciled("proven", [fact.observationId], []), reuse: "accepted" }
+  const auth = await authenticateSource(subject.path, records, accepted, current)
+  if (auth.status === "unobserved") return unobservedOutcome(subject, records)
+  if (auth.status === "unreadable") return reconciled("unknown", [], [`cannot read the current ${subject.path} to check ${subject.symbol}`], "missing_evidence")
+  if (auth.status === "changed") {
+    const observed = auth.observationIds.length ? ` after observation ${auth.observationIds.join(", ")} was read` : " since its accepted facts were recorded"
+    return reconciled("unknown", [], [`${subject.path} changed${observed}; read it again`], "stale_evidence")
   }
-  const missing: string[] = []
-  let stale = false
-  const named = (alias: RegistrationRead["alias"]) => subject.identity === "registered_tool" ? alias.tool === subject.symbol : alias.implementation === subject.symbol
-  for (const { record, alias, path, sourceHash } of registrationReads(records).filter((read) => named(read.alias) && samePath(read.path, subject.path))) {
-    const text = await current(path)
-    if (text === undefined) {
-      missing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
-      stale = true
-      continue
-    }
-    if (!(await verifyContentFingerprint(text, sourceHash).catch(() => false))) {
-      missing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
-      stale = true
-      continue
-    }
-    if (!needsRange) {
-      // The closing line is measured, and a fact is stored only when a fresh read shows it. Otherwise the location is
-      // proven for this decision without persisting a boundary the host has not observed.
-      const end = declarationEnd(text, alias.startLine)
-      const boundary = end === undefined ? [] : await boundaryObservations(records, path, end, text)
-      return {
-        ...reconciled("proven", [...new Set([record.observationId, ...boundary])], []),
-        facts: end !== undefined && boundary.length > 0
-          ? [{ symbol: alias.implementation, registeredTool: alias.tool, path, startLine: alias.startLine, endLine: end, observationId: record.observationId, sourceHash }]
-          : []
-      }
-    }
-    const end = declarationEnd(text, alias.startLine)
-    if (end === undefined) {
-      missing.push(`the closing line of ${alias.implementation} in ${path} cannot be found`)
-      continue
-    }
-    const boundary = await boundaryObservations(records, path, end, text)
-    if (!boundary.length) {
-      missing.push(`${alias.implementation} in ${path} closes at line ${end}, which no fresh retained read shows; read through line ${end}`)
-      continue
-    }
-    return {
-      ...reconciled("proven", [...new Set([record.observationId, ...boundary])], []),
-      facts: [{ symbol: alias.implementation, registeredTool: alias.tool, path, startLine: alias.startLine, endLine: end, observationId: record.observationId, sourceHash }]
-    }
-  }
-  if (subject.identity === "registered_tool" && !needsRange) {
-    for (const { record, tool, line, path, sourceHash } of registeredNameReads(records).filter((read) => read.tool === subject.symbol && samePath(read.path, subject.path))) {
-      const text = await current(path)
-      if (text === undefined) {
-        missing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
-        stale = true
-        continue
-      }
-      if (!(await verifyContentFingerprint(text, sourceHash).catch(() => false))) {
-        missing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
-        stale = true
-        continue
-      }
-      return {
-        ...reconciled("proven", [record.observationId], []),
-        facts: [{ symbol: tool, path, startLine: line, endLine: line, observationId: record.observationId, sourceHash }]
-      }
-    }
-  }
-  if (subject.identity === "implementation_symbol") {
-    const registration = registeredNameReads(records).find((read) => read.tool === subject.symbol && samePath(read.path, subject.path))
-    if (registration) missing.push(`${subject.symbol} is the registered tool name at line ${registration.line} of ${subject.path}, not a declaration; read the declaration that implements it`)
-  }
-  for (const record of records.filter((candidate) => !candidate.failed && candidate.retained && candidate.toolName === "read_file")) {
-    const source = record.sources.find((candidate) => samePath(candidate.path, subject.path) && candidate.contentHash)
-    if (!source?.contentHash) continue
-    const text = await current(subject.path)
-    if (text === undefined) continue
-    if (!(await verifyContentFingerprint(text, source.contentHash).catch(() => false))) {
-      missing.push(`${subject.path} changed after observation ${record.observationId} was read; read it again`)
-      stale = true
-      continue
-    }
-    if (!text.includes(subject.symbol)) {
-      return reconciled("disproven", [record.observationId], [`${subject.path} does not contain ${subject.symbol}, so it is not ${identityLabel(subject.identity)} there; observation ${record.observationId} matches the current file`], "contradicted_evidence")
-    }
-  }
-  if (subject.path !== undefined) {
-    const path = subject.path
-    for (const record of records) {
-      if (!record.failed && !record.retained && record.toolName === "read_file" && samePath(record.arguments.path ?? "", path)) {
-        missing.push(`the read of ${path} in observation ${record.observationId} was evicted from retained storage; read it again`)
-      }
-    }
-  }
-  return reconciled("unknown", [], missing.length ? missing : [`no retained successful read shows ${subject.symbol} in ${subject.path}`], stale ? "stale_evidence" : "missing_evidence")
+  if (auth.status === "unanalysed") return reconciled("unknown", [], [auth.reason], "unsupported_operation")
+  const holding = auth.facts.find((fact) => factNamedBy(subject.identity, subject.symbol, fact) && factHolds(fact, auth.analysis, needsRange))
+  if (holding) return { ...reconciled("proven", [holding.observationId], []), reuse: "accepted" }
+  const outcome = subject.identity === "registered_tool"
+    ? registeredToolOutcome(subject, auth, needsRange)
+    : implementationOutcome(subject, auth, needsRange)
+  if (outcome.outcome === "proven" || !auth.staleObservationIds.length) return outcome
+  return { ...outcome, missing: [...outcome.missing, `${subject.path} changed after observation ${auth.staleObservationIds.join(", ")} was read; read it again`] }
 }
 
 /** Decides one typed criterion. The descriptor's kind selects the rule; the criterion's wording is never read. */
@@ -740,25 +793,23 @@ const sourceOutcome = async (
   current: (path: string) => Promise<string | undefined>
 ): Promise<CriterionOutcome> => {
   if (subject.path !== undefined) return sourceContractOutcome({ ...subject, path: subject.path }, records, accepted, current)
-  const named = (alias: RegistrationRead["alias"]) => subject.identity === "registered_tool" ? alias.tool === subject.symbol : alias.implementation === subject.symbol
-  const candidates = new Set([
-    ...registrationReads(records).filter((read) => named(read.alias)).map((read) => read.path),
-    ...registeredNameReads(records).filter((read) => read.tool === subject.symbol).map((read) => read.path),
-    ...accepted.filter((fact) => !fact.supersededBy && factNamedBy(subject.identity, subject.symbol, fact)).map((fact) => fact.path)
-  ])
   const proven: CriterionOutcome[] = []
+  const blocking: CriterionOutcome[] = []
   const missing: string[] = []
   let stale = false
-  for (const path of candidates) {
+  for (const path of candidatePaths(records, accepted, subject.identity, subject.symbol)) {
     const outcome = await sourceContractOutcome({ ...subject, path }, records, accepted, current)
     if (outcome.outcome === "proven") proven.push(outcome)
     else {
       missing.push(...outcome.missing)
       stale ||= outcome.failureReason === "stale_evidence"
+      if (outcome.failureReason === "invalid_identity" || outcome.failureReason === "unsupported_operation") blocking.push(outcome)
     }
   }
   if (proven.length === 1) return proven[0]
   if (proven.length > 1) return reconciled("unknown", proven.flatMap((outcome) => outcome.supportingObservationIds), [`${subject.symbol} is declared in ${proven.length} files; the criterion must name the file`], "invalid_identity")
+  const decisive = blocking.find((outcome) => outcome.failureReason === "invalid_identity") ?? blocking[0]
+  if (decisive) return decisive
   const readPaths = [...new Set(records.filter((record) => !record.failed && record.retained && record.toolName === "read_file").map((record) => record.arguments.path).filter((path): path is string => !!path))]
   const gap = readPaths.length
     ? `no retained successful read shows ${subject.symbol} as ${identityLabel(subject.identity)}; retained reads of ${readPaths.join(", ")} show no such declaration, so read the declaring file or correct the criterion's identifier`

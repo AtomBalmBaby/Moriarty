@@ -237,7 +237,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 15) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 16) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -308,6 +308,9 @@ export class SqliteFile {
         if (version < 15) {
           await this.migrateIntentPlanAnswerToV15(database)
         }
+        if (version < 16) {
+          await this.migrateAcceptedEvidenceToV16(database)
+        }
       } finally {
         database.close()
       }
@@ -361,6 +364,17 @@ CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(l
     const columns = database.exec("PRAGMA table_info(todo_intent_plans)")[0]?.values ?? []
     if (!columns.some((row) => row[1] === "answer_json")) database.run("ALTER TABLE todo_intent_plans ADD COLUMN answer_json TEXT NOT NULL DEFAULT '[]'")
     database.run("PRAGMA user_version = 15")
+    await this.persist(database)
+  }
+
+  // v16 makes an accepted evidence row the single authority for a tool registration it proves: registered_tool names the
+  // tool, and symbol names the implementation. Rows from earlier versions keep a NULL registered_tool and are not
+  // backfilled from todo_symbol_aliases, because those rows came from the removed line-indentation heuristic. The alias
+  // table is kept unchanged as history and is no longer written or read.
+  private async migrateAcceptedEvidenceToV16(database: Database): Promise<void> {
+    const columns = database.exec("PRAGMA table_info(todo_accepted_evidence)")[0]?.values ?? []
+    if (!columns.some((row) => row[1] === "registered_tool")) database.run("ALTER TABLE todo_accepted_evidence ADD COLUMN registered_tool TEXT")
+    database.run("PRAGMA user_version = 16")
     await this.persist(database)
   }
 

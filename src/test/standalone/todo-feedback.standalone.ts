@@ -531,6 +531,51 @@ test("existing version-2 TODO databases migrate review tables without losing tas
   }
 })
 
+test("a version-15 database keeps its alias rows as history, gains a nullable registered_tool, and does not promote them into authoritative links", async () => {
+  const state = await evidenceFixtureFor([{ id: "registration", criteria: [sourceLocation("defined", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool", EVIDENCE_FILE)] }])
+  try {
+    const [registration] = state.itemIds
+    await startItemInReview(state.repository, state.scope, registration)
+    await observeRead(state, registration, "read-registration", EVIDENCE_FILE, 160, sourceLines.slice(159, 220))
+    const calls = { count: 0 }
+    const accepted = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, registration), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, hasVerifiedFileChanges: false })
+    assert.equal(accepted.decision, "accept", JSON.stringify(accepted.problems))
+
+    const sql = await initSqlJs({ locateFile: () => wasmPath })
+    const database = new sql.Database(fs.readFileSync(state.databasePath))
+    const [listId, observationId, sourceHash] = database.exec("SELECT list_id, observation_id, source_hash FROM todo_accepted_evidence WHERE registered_tool = 'read_file'")[0].values[0]
+    database.run("ALTER TABLE todo_accepted_evidence DROP COLUMN registered_tool; PRAGMA user_version = 15")
+    database.run(
+      "INSERT INTO todo_symbol_aliases(id, list_id, tool_name, implementation, path, start_line, end_line, observation_id, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["legacy-alias", listId, "read_file", "readFile", EVIDENCE_FILE, 169, 220, observationId, sourceHash, "2024-01-01T00:00:00.000Z"]
+    )
+    fs.writeFileSync(state.databasePath, Buffer.from(database.export()))
+    database.close()
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    await reopened.initialize()
+    const check = new sql.Database(fs.readFileSync(state.databasePath))
+    try {
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 16)
+      assert.equal(check.exec("PRAGMA table_info(todo_accepted_evidence)")[0].values.some((row) => row[1] === "registered_tool"), true, "the migration adds registered_tool")
+      assert.equal(check.exec("SELECT COUNT(*) FROM todo_symbol_aliases")[0].values[0][0], 1, "the legacy alias row is kept as history")
+    } finally {
+      check.close()
+    }
+
+    const facts = await reopened.listAcceptedEvidence(state.scope, { symbol: "readFile", path: EVIDENCE_FILE })
+    assert.equal(facts.length, 1, "the accepted fact and its provenance survive the upgrade")
+    assert.equal(facts[0].registeredTool, undefined, "a legacy row is not backfilled from the heuristic alias table")
+    assert.deepEqual(await reopened.listSymbolAliases(state.scope), [], "a legacy alias is not an authoritative link")
+
+    const [legacy] = await reviewCriteria([sourceLocation("exact", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool", EVIDENCE_FILE)], [], currentWorkspace, facts)
+    assert.equal(legacy.outcome, "unknown", JSON.stringify(legacy))
+    assert.equal(legacy.failureReason, "missing_evidence", "the legacy fact cannot prove the registration, so a fresh read is required")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("existing version-4 TODO databases gain child proposals and accepted evidence without losing tasks", async () => {
   const state = await fixture([{ id: "kept", criteria: [semantic("kept", "Kept task is inspected")] }])
   try {
@@ -542,8 +587,7 @@ test("existing version-4 TODO databases gain child proposals and accepted eviden
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
     const check = new sql.Database(fs.readFileSync(state.databasePath))
-    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 15)
-    assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_child_proposals'")[0].values[0][0], 1)
+    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 16)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0].values[0][0], 1)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_symbol_aliases'")[0].values[0][0], 1)
     check.close()
@@ -558,9 +602,14 @@ const workspaceText = Array.from({ length: 850 }, (_, index) => {
   if (index === 169) return "  const limit = clampReadLines(maxLines)"
   if (index === 170) return "  return {"
   if (index === 171) return "    name: \"read_file\","
+  if (index === 172) return "    async run(args: unknown) {"
+  if (index === 216) return "      return args"
+  if (index === 217) return "    }"
+  if (index === 218) return "  }"
   if (index === 219) return "}"
+  if (index > 172 && index < 216) return `      const filler${index + 1} = ${index + 1}`
   if (index === 779) return "    const tool = tools.find((candidate) => candidate.name === name)"
-  if (index === 799) return "    return tool.run(args)"
+  if (index === 799) return "    void tool.run(args)"
   return `const filler${index + 1} = ${index + 1}`
 }).join("\n")
 const currentWorkspace: CurrentSourceReader = async (file) => (file === WORKSPACE_FILE ? workspaceText : undefined)
@@ -1276,14 +1325,7 @@ test("feedback plans with TODO bookkeeping tasks are rejected, while distinct us
 })
 
 const EVIDENCE_FILE = "src/extension/tools/workspace.ts"
-const sourceLines = Array.from({ length: 850 }, (_, index) => {
-  if (index === 168) return "const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink): Tool => {"
-  if (index === 169) return "  const limit = clampReadLines(maxLines)"
-  if (index === 170) return "  return {"
-  if (index === 171) return "    name: \"read_file\","
-  if (index === 219) return "}"
-  return `const filler${index + 1} = ${index + 1}`
-})
+const sourceLines = workspaceText.split("\n")
 const numbered = (start: number, lines: string[]) => lines.map((text, index) => `${start + index}: ${text}`).join("\n")
 const readOutput = async (file: string, start: number, lines: string[]) =>
   `${file} (lines ${start}–${start + lines.length - 1} of 850)\ncontent_hash: ${await fingerprintContent(workspaceText)}; total_lines: 850\n${numbered(start, lines)}`
@@ -1789,10 +1831,10 @@ test("a tool name and the function that encloses its registration are stored as 
   }])
 })
 
-test("a registration read that stops before the closing line proves the location but stores no fact or alias with an invented end", async () => {
+test("a registration read that stops before the closing line proves the location and records only the observed name line", async () => {
   const [outcome] = await reviewCriteria([locate("read_file", EVIDENCE_FILE, "registered_tool")], [await workspaceRecord(160, 181)], currentWorkspace)
   assert.equal(outcome.outcome, "proven", JSON.stringify(outcome))
-  assert.ok(!outcome.facts?.length, "the closing line 220 is unseen, so no implementation range is recorded")
+  assert.ok(outcome.facts?.every((fact) => fact.startLine === 172 && fact.endLine === 172), "the closing line 220 is unseen, so no implementation range is recorded")
 })
 
 test("a registration whose enclosing declaration is outside the read stores no alias", async () => {
@@ -1824,7 +1866,7 @@ test("a stored alias lets a criterion naming the implementation reuse the fact w
     registeredTool: "read_file",
     path: EVIDENCE_FILE,
     startLine: 169,
-    endLine: 172,
+    endLine: 220,
     observationId: "obs-window",
     sourceHash
   }
@@ -1835,7 +1877,7 @@ test("a stored alias lets a criterion naming the implementation reuse the fact w
     implementation: "readFile",
     path: EVIDENCE_FILE,
     startLine: 169,
-    endLine: 172,
+    endLine: 220,
     observationId: "obs-window",
     sourceHash,
     createdAt: "2024-01-01T00:00:00.000Z"
@@ -2509,10 +2551,7 @@ test("a passed criterion whose named symbol appears in no retained evidence is r
     const item = await startInvestigation(state)
     const observation = await observeRead(state, item.id, "read-workspace-partial", EVIDENCE_FILE, 150, sourceLines.slice(149, 200))
     const review = await reviewFor(state, item.id)
-    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer", { hasVerifiedFileChanges: false })
-    assert.equal(evaluation.decision, "needs_evidence")
-    assert.equal(evaluation.criteria[0].status, "unverified")
-    assert.ok(evaluation.problems.some((problem) => problem.includes("no retained successful read shows registerNativeTool")))
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace, hasVerifiedFileChanges: false })
     assert.notEqual((await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((candidate) => candidate.id === item.id)?.status, "completed")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
@@ -4534,6 +4573,66 @@ test("Gate 1: a read ending at line 219 cannot prove the closing brace at 220; a
   }
 })
 
+const NEGATIVE_FILE = "src/fixtures/negative.ts"
+const negativeText = [
+  "import { ghost } from \"./elsewhere\"",
+  "// function ghost() {}",
+  "const label = \"class ghost\"",
+  "const unrelated = { ghost: 1 }",
+  "export const real = 1"
+].join("\n")
+const negativeReader: CurrentSourceReader = async (file) => (file === NEGATIVE_FILE ? negativeText : undefined)
+
+test("a name present only in an import, comment, string, or unrelated key never satisfies an implementation symbol, and a complete read disproves it", async () => {
+  const state = await evidenceFixture(sourceLocation("ghost", "`ghost` is established in the negative fixture", "ghost", "implementation_symbol", NEGATIVE_FILE))
+  try {
+    const item = await startInvestigation(state)
+    await observeSourceWindow(state, item.id, "read-negative", NEGATIVE_FILE, negativeText, 1, 5)
+    const review = await reviewFor(state, item.id)
+    const [reconciliation] = await reviewReconciliations(review, negativeReader)
+    assert.equal(reconciliation.outcome, "disproven", JSON.stringify(reconciliation))
+    assert.equal(reconciliation.failureReason, "contradicted_evidence")
+    assert.deepEqual(reconciliation.supportingObservationIds.length > 0, true)
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+const DYNAMIC_FILE = "src/fixtures/dynamic.ts"
+const dynamicText = [
+  "const makeName = () => \"dynamic_tool\"",
+  "export const tools = () => [",
+  "  { name: makeName(), run() { return 1 } }",
+  "]"
+].join("\n")
+const dynamicReader: CurrentSourceReader = async (file) => (file === DYNAMIC_FILE ? dynamicText : undefined)
+
+test("a tool registered under a computed name blocks disproof of an absent registered name, and the outcome says why", async () => {
+  const state = await evidenceFixture(sourceLocation("dynamic", "`dynamic_tool` is registered in the dynamic fixture", "dynamic_tool", "registered_tool", DYNAMIC_FILE))
+  try {
+    const item = await startInvestigation(state)
+    await observeSourceWindow(state, item.id, "read-dynamic", DYNAMIC_FILE, dynamicText, 1, 4)
+    const review = await reviewFor(state, item.id)
+    const [reconciliation] = await reviewReconciliations(review, dynamicReader)
+    assert.notEqual(reconciliation.outcome, "disproven", JSON.stringify(reconciliation))
+    assert.equal(reconciliation.outcome, "unknown")
+    assert.equal(reconciliation.failureReason, "unsupported_operation")
+    assert.match(reconciliation.missing.join("\n"), /computed name/)
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("a partial read establishes neither presence nor absence of a declaration, and a complete read decides both", async () => {
+  const present = sourceLocation("present", "`readFile` is established in the workspace", "readFile", "implementation_symbol", EVIDENCE_FILE)
+  const absent = sourceLocation("absent", "`nowhereFunction` is established in the workspace", "nowhereFunction", "implementation_symbol", EVIDENCE_FILE)
+  const partial = await reviewCriteria([present, absent], [await workspaceRecord(1, 100)], currentWorkspace)
+  assert.deepEqual(partial.map((outcome) => outcome.outcome), ["unknown", "unknown"], JSON.stringify(partial))
+  assert.deepEqual(partial.map((outcome) => outcome.failureReason), ["missing_evidence", "missing_evidence"])
+  const complete = await reviewCriteria([present, absent], [await workspaceRecord(1, sourceLines.length)], currentWorkspace)
+  assert.deepEqual(complete.map((outcome) => outcome.outcome), ["proven", "disproven"], JSON.stringify(complete))
+})
+
 test("Gate 1: one complete read_file observation proves location, fingerprint, and range, emits one fact, and is not reused after the file or symbol changes", async () => {
   const workspace = sourceWorkspace()
   const reads = { count: 0 }
@@ -4547,8 +4646,9 @@ test("Gate 1: one complete read_file observation proves location, fingerprint, a
     assert.deepEqual(outcomes.slice(0, 3).map((outcome) => outcome.outcome), ["proven", "proven", "proven"])
     assert.ok(outcomes.slice(0, 3).every((outcome) => outcome.supportingObservationIds.includes(observation.id)))
     assert.equal(outcomes.filter((outcome) => outcome.facts?.length).length, 1, "the range fact is emitted once")
-    assert.equal(outcomes[3].outcome, "disproven", "a declaration with another name is contradicted by a fingerprint-matched read that lacks it")
-    assert.equal(outcomes[3].failureReason, "contradicted_evidence")
+    assert.equal(outcomes[3].outcome, "unknown", "the read covers lines 169–220 only, so a declaration with another name elsewhere in the file is not established absent")
+    assert.equal(outcomes[3].failureReason, "missing_evidence")
+    assert.match(outcomes[3].missing.join("\n"), /absence is not established/)
     fs.writeFileSync(path.join(workspace, READ_FILE_SOURCE), `${realWorkspaceSource}\n// edited after the read\n`)
     const stale = await reviewReconciliations(await reviewOf(state, id), sourceReader(workspace))
     assert.ok(stale.slice(0, 3).every((outcome) => outcome.outcome !== "proven"), "a changed file does not keep its proof")
@@ -4851,14 +4951,14 @@ test("a version-10 database with accepted evidence upgrades to version 11 with e
     await reopened.initialize()
     assert.deepEqual(await reopened.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "the accepted fact and its provenance survive the upgrade unchanged")
     const upgraded = inspect()
-    assert.equal(upgraded.version, 15)
+    assert.equal(upgraded.version, 16)
     assert.equal(upgraded.activationTable, 1, "the requirement activation table is added")
     assert.deepEqual(upgraded.observations, before.observations, "no observation row or list revision changes during the upgrade")
 
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual(await again.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "a second reopen is stable")
-    assert.equal(inspect().version, 15)
+    assert.equal(inspect().version, 16)
     assert.equal(calls.count, 0)
   } finally {
     removeAll(state.directory)
@@ -4951,7 +5051,7 @@ test("the v12 edit ledger rebuilds for optional task association, keeps its rows
   }
   try {
     const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
-    assert.deepEqual(inspect(state.databasePath), { version: 15, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
+    assert.deepEqual(inspect(state.databasePath), { version: 16, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
     assert.equal(fs.existsSync(backupPath), false, "a new database has no earlier version to back up")
 
     await state.repository.beginEditOperation(state.scope, { id: "v12-edit", itemId, target: "src/old.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
@@ -4986,7 +5086,7 @@ PRAGMA user_version = 12;`)
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     await reopened.initialize()
     const upgraded = inspect(state.databasePath)
-    assert.equal(upgraded.version, 15)
+    assert.equal(upgraded.version, 16)
     assert.equal(upgraded.itemNullable, true, "the task column becomes optional")
     assert.deepEqual(upgraded.statuses, [["v12-edit", "succeeded"]], "existing ledger rows keep their identity and settlement")
     assert.equal(upgraded.index, 1, "the target index is recreated")
@@ -5002,7 +5102,7 @@ PRAGMA user_version = 12;`)
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual(inspect(state.databasePath).ids, ["v12-edit", "v13-free"], "a second reopen is stable")
-    assert.equal(inspect(state.databasePath).version, 15)
+    assert.equal(inspect(state.databasePath).version, 16)
   } finally {
     removeAll(state.directory)
   }
@@ -5032,14 +5132,14 @@ test("the owner column is additive: legacy edit rows stay unowned and each reope
 
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     await reopened.initialize()
-    assert.deepEqual(versionAndOwnerColumn(), { version: 15, ownerColumn: true }, "the upgrade adds the owner column")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 16, ownerColumn: true }, "the upgrade adds the owner column")
     assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined]], "a legacy row has no owner")
 
     await reopened.beginEditOperation(state.scope, { id: "2-owned-edit", ownerId: "host-b", target: "src/owned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual((await again.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined], ["2-owned-edit", "host-b"]], "owners survive a reopen")
-    assert.deepEqual(versionAndOwnerColumn(), { version: 15, ownerColumn: true }, "a second reopen is stable")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 16, ownerColumn: true }, "a second reopen is stable")
   } finally {
     removeAll(state.directory)
   }
@@ -5103,7 +5203,7 @@ test("the v11 TODO database gains the edit operation ledger while keeping the ac
 
     const check = new sql.Database(fs.readFileSync(state.databasePath))
     try {
-      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 15)
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 16)
       assert.equal(check.exec("SELECT COUNT(*) FROM todo_edit_operations WHERE item_id = ?", [after!.task.id])[0].values[0][0], 1)
     } finally {
       check.close()
@@ -5117,6 +5217,7 @@ const TODOS_FILE = "src/extension/tools/todos.ts"
 const todosText = fs.readFileSync(path.join(process.cwd(), TODOS_FILE), "utf8")
 const todosReader: CurrentSourceReader = async (file) => (file === TODOS_FILE ? todosText : undefined)
 const REGISTRATION_LINES = [262, 272] as const
+const WHOLE_TODOS_LINES = [1, todosText.split("\n").length - 1] as const
 
 /** Records a read_file observation of a repository file, fingerprinting the whole text it read as the host does. */
 const observeSourceWindow = async (state: EvidenceFixture, itemId: string, requestId: string, file: string, text: string, start: number, end: number) => {
@@ -5139,7 +5240,7 @@ test("a registered tool identifier keeps its exact name, underscores included, a
   const state = await evidenceFixtureFor([{ id: "investigate", criteria: [todoIdentity("exact", "twinny_todo_update", "registered_tool"), todoIdentity("camel", "twinnyTodoUpdate", "registered_tool")] }])
   try {
     const item = await startInvestigation(state)
-    const read = await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    const read = await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...WHOLE_TODOS_LINES)
     const review = await reviewFor(state, item.id)
     const reconciliations = await reviewReconciliations(review, todosReader)
     const exact = reconciliations.find((entry) => entry.criterionId === "exact")
@@ -5161,9 +5262,7 @@ test("an implementation symbol is not satisfied by the registration line that na
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, todosReader)
     assert.equal(reconciliation.outcome, "unknown", JSON.stringify(reconciliation))
-    assert.equal(reconciliation.failureReason, "missing_evidence")
-    assert.deepEqual(reconciliation.supportingObservationIds, [])
-    assert.match(reconciliation.missing.join("\n"), /registered tool name at line 267/)
+    assert.equal(reconciliation.failureReason, "invalid_identity", "the name is a registered tool, not a declaration, so the identity is wrong rather than missing")
     assert.match(reconciliation.missing.join("\n"), /not a declaration/)
     const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [read.id] }), "mock-reviewer", { readCurrentSource: todosReader, hasVerifiedFileChanges: false })
     assert.notEqual(evaluation.decision, "accept")
@@ -5176,7 +5275,7 @@ test("a demonstrably wrong implementation symbol is contradicted through determi
   const state = await evidenceFixtureFor([{ id: "investigate", criteria: [todoIdentity("camel", "twinnyTodoUpdate", "implementation_symbol"), semantic("explain", "Explain how the TODO update tool is registered")] }])
   try {
     const item = await startInvestigation(state)
-    const read = await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    const read = await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...WHOLE_TODOS_LINES)
     const review = await reviewFor(state, item.id)
     const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { decision: "accept", refs: [read.id] }), "mock-reviewer", { readCurrentSource: todosReader, hasVerifiedFileChanges: false })
     const camel = evaluation.criteria.find((criterion) => criterion.criterionId === "camel")
@@ -5193,8 +5292,8 @@ test("repeating an identical read of a contradicted identity does not change the
   const state = await evidenceFixture(todoIdentity("camel", "twinnyTodoUpdate", "implementation_symbol"))
   try {
     const item = await startInvestigation(state)
-    await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
-    await observeSourceWindow(state, item.id, "read-registration-again", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...WHOLE_TODOS_LINES)
+    await observeSourceWindow(state, item.id, "read-registration-again", TODOS_FILE, todosText, ...WHOLE_TODOS_LINES)
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, todosReader)
     assert.equal(reconciliation.outcome, "disproven", JSON.stringify(reconciliation))
