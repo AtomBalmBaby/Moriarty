@@ -38,9 +38,10 @@ export type TodoEvaluationDecision = "accept" | "revise" | "needs_evidence" | "b
  * no checkable source path or runtime fact; those remain with the Feedback AI.
  */
 /**
- * A checked source location. `symbol` is always the authoritative implementation symbol (for example readFile).
- * `registeredTool` is set only when a trusted registration read proves that this symbol is registered under that
- * tool name (for example read_file). Tool names and implementation symbols are different identities.
+ * A checked source location. For an implementation fact, `symbol` is the authoritative implementation symbol (for example
+ * readFile) and `registeredTool` is set, because a trusted registration read proved that symbol is registered under that
+ * tool name (for example read_file). A registration-only fact has no `registeredTool`, and its `symbol` holds the registered
+ * tool name; it matches only `registered_tool` criteria. Tool names and implementation symbols are different identities.
  */
 export interface TodoSourceFact {
   symbol: string
@@ -58,12 +59,27 @@ export interface TodoSourceFact {
  */
 export type SourceIdentity = "registered_tool" | "implementation_symbol"
 
+/**
+ * Why a criterion was not proven. Set only on unproven or disproven outcomes. Each reason says what the next step is:
+ * a missing or stale source needs a fresh read, contradicted evidence needs the work or the criterion corrected, and an
+ * invalid identity or unsupported operation needs the plan corrected, because re-reading cannot change the outcome.
+ */
+export type CriterionFailureReason =
+  | "missing_evidence"
+  | "stale_evidence"
+  | "contradicted_evidence"
+  | "unsupported_operation"
+  | "invalid_identity"
+  | "internal_error"
+
 export interface TodoCriterionReconciliation {
   outcome: "proven" | "disproven" | "unknown" | "semantic"
   /** Stable identity of the typed criterion this outcome decides. */
   criterionId: string
   supportingObservationIds: string[]
   missing: string[]
+  /** The deterministic reason an unproven or disproven criterion failed. */
+  failureReason?: CriterionFailureReason
   version: number
   /** Source locations this outcome proves; recorded as accepted evidence when the task is accepted. */
   facts?: TodoSourceFact[]

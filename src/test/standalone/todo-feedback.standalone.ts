@@ -14,6 +14,7 @@ import { checkDelivery, type DeliveryVerdict } from "../../extension/todos/deliv
 import { commandDigest, compactArguments, compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
 import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { validateIntentTaskPlan } from "../../extension/todos/intent-plan"
+import { capabilityOf } from "../../extension/todos/verification-capabilities"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { editDigest, TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { AcceptedFact, AnswerRequirement, ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, SymbolAlias, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
@@ -1888,7 +1889,7 @@ const deliveryRequirement: AnswerRequirement = {
 
 const deliveryFact = (sourceHash: string, overrides: Partial<AcceptedFact> = {}): AcceptedFact => ({
   id: "fact-readfile", conversationId: "conversation", itemId: "item", criterionIndex: 0, criterion: "source fingerprint",
-  toolName: "read_file", planId: "plan", planRevision: 1, symbol: "readFile", path: EVIDENCE_FILE,
+  toolName: "read_file", planId: "plan", planRevision: 1, symbol: "readFile", registeredTool: "read_file", path: EVIDENCE_FILE,
   startLine: 169, endLine: 219, observationId: "observation", sourceHash, acceptedAt: "2026-01-01T00:00:00.000Z", ...overrides
 })
 
@@ -3289,6 +3290,7 @@ const evidenceCheck = (args: Record<string, string>, failed = false): RetainedOb
 const acceptedFact = (id: string, overrides: Partial<AcceptedFact> = {}): AcceptedFact => ({
   id,
   symbol: "readFile",
+  registeredTool: "read_file",
   path: READ_FILE_SOURCE,
   startLine: 169,
   endLine: 220,
@@ -4545,7 +4547,8 @@ test("Gate 1: one complete read_file observation proves location, fingerprint, a
     assert.deepEqual(outcomes.slice(0, 3).map((outcome) => outcome.outcome), ["proven", "proven", "proven"])
     assert.ok(outcomes.slice(0, 3).every((outcome) => outcome.supportingObservationIds.includes(observation.id)))
     assert.equal(outcomes.filter((outcome) => outcome.facts?.length).length, 1, "the range fact is emitted once")
-    assert.equal(outcomes[3].outcome, "unknown", "a declaration with another name is not proven")
+    assert.equal(outcomes[3].outcome, "disproven", "a declaration with another name is contradicted by a fingerprint-matched read that lacks it")
+    assert.equal(outcomes[3].failureReason, "contradicted_evidence")
     fs.writeFileSync(path.join(workspace, READ_FILE_SOURCE), `${realWorkspaceSource}\n// edited after the read\n`)
     const stale = await reviewReconciliations(await reviewOf(state, id), sourceReader(workspace))
     assert.ok(stale.slice(0, 3).every((outcome) => outcome.outcome !== "proven"), "a changed file does not keep its proof")
@@ -5108,4 +5111,206 @@ test("the v11 TODO database gains the edit operation ledger while keeping the ac
   } finally {
     removeAll(state.directory)
   }
+})
+
+const TODOS_FILE = "src/extension/tools/todos.ts"
+const todosText = fs.readFileSync(path.join(process.cwd(), TODOS_FILE), "utf8")
+const todosReader: CurrentSourceReader = async (file) => (file === TODOS_FILE ? todosText : undefined)
+const REGISTRATION_LINES = [262, 272] as const
+
+/** Records a read_file observation of a repository file, fingerprinting the whole text it read as the host does. */
+const observeSourceWindow = async (state: EvidenceFixture, itemId: string, requestId: string, file: string, text: string, start: number, end: number) => {
+  const lines = text.split("\n")
+  return state.repository.recordToolObservation(state.scope, {
+    itemId,
+    toolName: "read_file",
+    arguments: { path: file, start_line: String(start), end_line: String(end) },
+    output: `read \`${file}:${start}\` · ${end - start + 1} lines`,
+    failed: false,
+    requestId,
+    evidenceOutput: `${file} (lines ${start}–${end} of ${lines.length})\ncontent_hash: ${await fingerprintContent(text)}; total_lines: ${lines.length}\n${numbered(start, lines.slice(start - 1, end))}`
+  })
+}
+
+const todoIdentity = (id: string, symbol: string, identity: SourceIdentity): TypedCriterion =>
+  sourceLocation(id, `\`${symbol}\` is established in ${TODOS_FILE}`, symbol, identity, TODOS_FILE)
+
+test("a registered tool identifier keeps its exact name, underscores included, and an unregistered camelCase spelling is disproven", async () => {
+  const state = await evidenceFixtureFor([{ id: "investigate", criteria: [todoIdentity("exact", "twinny_todo_update", "registered_tool"), todoIdentity("camel", "twinnyTodoUpdate", "registered_tool")] }])
+  try {
+    const item = await startInvestigation(state)
+    const read = await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    const review = await reviewFor(state, item.id)
+    const reconciliations = await reviewReconciliations(review, todosReader)
+    const exact = reconciliations.find((entry) => entry.criterionId === "exact")
+    const camel = reconciliations.find((entry) => entry.criterionId === "camel")
+    assert.equal(exact?.outcome, "proven", JSON.stringify(exact))
+    assert.deepEqual(exact?.supportingObservationIds, [read.id])
+    assert.equal(camel?.outcome, "disproven", JSON.stringify(camel))
+    assert.equal(camel?.failureReason, "contradicted_evidence")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("an implementation symbol is not satisfied by the registration line that names the tool", async () => {
+  const state = await evidenceFixture(todoIdentity("declaration", "twinny_todo_update", "implementation_symbol"))
+  try {
+    const item = await startInvestigation(state)
+    const read = await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    const review = await reviewFor(state, item.id)
+    const [reconciliation] = await reviewReconciliations(review, todosReader)
+    assert.equal(reconciliation.outcome, "unknown", JSON.stringify(reconciliation))
+    assert.equal(reconciliation.failureReason, "missing_evidence")
+    assert.deepEqual(reconciliation.supportingObservationIds, [])
+    assert.match(reconciliation.missing.join("\n"), /registered tool name at line 267/)
+    assert.match(reconciliation.missing.join("\n"), /not a declaration/)
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [read.id] }), "mock-reviewer", { readCurrentSource: todosReader, hasVerifiedFileChanges: false })
+    assert.notEqual(evaluation.decision, "accept")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("a demonstrably wrong implementation symbol is contradicted through deterministic review, and an AI reply cannot accept it", async () => {
+  const state = await evidenceFixtureFor([{ id: "investigate", criteria: [todoIdentity("camel", "twinnyTodoUpdate", "implementation_symbol"), semantic("explain", "Explain how the TODO update tool is registered")] }])
+  try {
+    const item = await startInvestigation(state)
+    const read = await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    const review = await reviewFor(state, item.id)
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { decision: "accept", refs: [read.id] }), "mock-reviewer", { readCurrentSource: todosReader, hasVerifiedFileChanges: false })
+    const camel = evaluation.criteria.find((criterion) => criterion.criterionId === "camel")
+    assert.equal(camel?.reconciliation?.outcome, "disproven", JSON.stringify(camel))
+    assert.equal(camel?.reconciliation?.failureReason, "contradicted_evidence")
+    assert.notEqual(evaluation.decision, "accept", "a deterministic disproof is not overridden by the evaluator's accept")
+    assert.equal(evaluation.decision, "revise", JSON.stringify(evaluation.problems))
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("repeating an identical read of a contradicted identity does not change the outcome, and the corrective instruction says so", async () => {
+  const state = await evidenceFixture(todoIdentity("camel", "twinnyTodoUpdate", "implementation_symbol"))
+  try {
+    const item = await startInvestigation(state)
+    await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    await observeSourceWindow(state, item.id, "read-registration-again", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    const review = await reviewFor(state, item.id)
+    const [reconciliation] = await reviewReconciliations(review, todosReader)
+    assert.equal(reconciliation.outcome, "disproven", JSON.stringify(reconciliation))
+    assert.equal(reconciliation.failureReason, "contradicted_evidence")
+
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { decision: "revise", status: "failed" }), "mock-reviewer", { readCurrentSource: todosReader, hasVerifiedFileChanges: false })
+    assert.equal(evaluation.decision, "revise")
+    assert.ok(evaluation.correctiveInstructions.some((text) => text.includes("repeating the same read cannot change this")), JSON.stringify(evaluation.correctiveInstructions))
+    assert.ok(!evaluation.correctiveInstructions.some((text) => /read the file that declares/.test(text)), JSON.stringify(evaluation.correctiveInstructions))
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("a read of an implementation symbol whose text changed after observation is stale evidence, distinct from missing evidence", async () => {
+  const state = await evidenceFixture(todoIdentity("registration", "twinny_todo_update", "registered_tool"))
+  try {
+    const item = await startInvestigation(state)
+    await observeSourceWindow(state, item.id, "read-registration", TODOS_FILE, todosText, ...REGISTRATION_LINES)
+    const edited = `${todosText}\n// edited after observation\n`
+    const [stale] = await reviewReconciliations(await reviewFor(state, item.id), async (file) => (file === TODOS_FILE ? edited : undefined))
+    assert.equal(stale.outcome, "unknown", JSON.stringify(stale))
+    assert.equal(stale.failureReason, "stale_evidence")
+    assert.match(stale.missing.join("\n"), /changed after observation/)
+
+    const absent = await evidenceFixture(todoIdentity("registration", "twinny_todo_update", "registered_tool"))
+    try {
+      const absentItem = await startInvestigation(absent)
+      const [missing] = await reviewReconciliations(await reviewFor(absent, absentItem.id), todosReader)
+      assert.equal(missing.failureReason, "missing_evidence")
+    } finally {
+      removeAll(absent.directory)
+    }
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("a path-less implementation criterion is a valid discovery task, and without evidence it is missing evidence rather than invalid", async () => {
+  const discovery: TypedCriterion = { id: "discover", description: "Locate the declaration that registers the TODO update tool", verification: { kind: "source_location", identity: "implementation_symbol", symbol: "registerNativeTool" } }
+  const validation = validateIntentTaskPlan({
+    planId: "discovery-plan", version: 1, revision: 1, goal: "Locate the TODO update declaration", constraints: [],
+    tasks: [{ id: "discover", title: "Locate", description: "Locate the declaration", dependencies: [], criteria: [discovery] }]
+  })
+  assert.ok(validation.plan, validation.diagnostic)
+
+  const state = await evidenceFixture(discovery)
+  try {
+    const item = await startInvestigation(state)
+    const [reconciliation] = await reviewReconciliations(await reviewFor(state, item.id), todosReader)
+    assert.equal(reconciliation.outcome, "unknown", JSON.stringify(reconciliation))
+    assert.equal(reconciliation.failureReason, "missing_evidence")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("a registered tool criterion with no retained read is missing evidence, not contradicted", async () => {
+  const state = await evidenceFixture(todoIdentity("registration", "twinny_todo_update", "registered_tool"))
+  try {
+    const item = await startInvestigation(state)
+    const review = await reviewFor(state, item.id)
+    const [reconciliation] = await reviewReconciliations(review, todosReader)
+    assert.equal(reconciliation.outcome, "unknown")
+    assert.equal(reconciliation.failureReason, "missing_evidence")
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review), "mock-reviewer", { readCurrentSource: todosReader, hasVerifiedFileChanges: false })
+    assert.notEqual(evaluation.decision, "accept")
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("persisted facts keep their meaning: an alias fact proves both identities, and a legacy registration-only fact proves only the tool", () => {
+  const alias = acceptedFact("alias", { symbol: "readFile", registeredTool: "read_file" })
+  assert.equal(factNamedBy("implementation_symbol", "readFile", alias), true)
+  assert.equal(factNamedBy("registered_tool", "read_file", alias), true)
+  assert.equal(factNamedBy("registered_tool", "readFile", alias), false)
+  assert.equal(factNamedBy("implementation_symbol", "read_file", alias), false)
+
+  const legacy = acceptedFact("legacy", { symbol: "read_file", registeredTool: undefined })
+  assert.equal(factNamedBy("registered_tool", "read_file", legacy), true)
+  assert.equal(factNamedBy("implementation_symbol", "read_file", legacy), false)
+
+  const registration = acceptedFact("registration", { symbol: "twinny_todo_update", registeredTool: undefined, path: TODOS_FILE })
+  assert.equal(factNamedBy("registered_tool", "twinny_todo_update", registration), true)
+  assert.equal(factNamedBy("registered_tool", "twinnyTodoUpdate", registration), false)
+  assert.equal(factNamedBy("implementation_symbol", "twinny_todo_update", registration), false, "a registration-only fact is never a declaration")
+})
+
+test("plan validation rejects a same-task contradiction and an identity the verifier cannot prove, with actionable diagnostics", () => {
+  const withTask = (criteria: unknown[]) => ({
+    planId: "contract-plan", version: 1, revision: 1, goal: "Verify the contract", constraints: [],
+    tasks: [{ id: "task", title: "Task", description: "Task", dependencies: [], criteria }]
+  })
+  const prohibition = { id: "no-mutation", description: "No edits", verification: { kind: "execution_invariant", invariant: "no_mutating_tool_calls" } }
+  const edit = { id: "edit-file", description: "Edit the file", verification: { kind: "workspace_mutation", operation: "edit" } }
+  const contradiction = validateIntentTaskPlan(withTask([prohibition, edit]))
+  assert.match(contradiction.diagnostic ?? "", /unsatisfiable/)
+  assert.match(contradiction.diagnostic ?? "", /criterion edit-file requires a workspace_mutation, but criterion no-mutation prohibits/)
+
+  assert.ok(validateIntentTaskPlan(withTask([{ ...prohibition, id: "other-task-only" }])).plan, "a prohibition alone is valid")
+
+  const invalidIdentity = validateIntentTaskPlan(withTask([{ id: "bad", description: "Locate", verification: { kind: "source_location", identity: "tool", symbol: "twinny_todo_update" } }]))
+  assert.match(invalidIdentity.diagnostic ?? "", /identity must be registered_tool or implementation_symbol; received/)
+
+  const invariantWithIdentity = validateIntentTaskPlan(withTask([{ id: "bad", description: "No edits", verification: { kind: "execution_invariant", invariant: "no_mutating_tool_calls", identity: "registered_tool" } }]))
+  assert.match(invariantWithIdentity.diagnostic ?? "", /has unsupported field identity for kind execution_invariant/)
+})
+
+test("the verifier capability table is authoritative: only implemented kinds and identities are capable, and an unknown kind is reported as unsupported", async () => {
+  assert.equal(capabilityOf("made_up_kind"), undefined)
+  assert.equal(capabilityOf("toString"), undefined, "inherited object properties are not capabilities")
+  assert.deepEqual(capabilityOf("source_location")?.identities, ["registered_tool", "implementation_symbol"])
+  assert.deepEqual(capabilityOf("workspace_mutation")?.identities, [])
+
+  const [outcome] = await reviewCriteria([typedCriterion("unsupported", "A criterion the verifier does not implement", { kind: "made_up_kind" } as unknown as TypedCriterion["verification"])], [], currentWorkspace)
+  assert.notEqual(outcome.outcome, "proven")
+  assert.equal(outcome.failureReason, "unsupported_operation", JSON.stringify(outcome))
 })

@@ -1,6 +1,7 @@
 import type { AnswerField, AnswerRequirement, CriterionVerification, CriterionVerificationKind, SourceIdentity, TypedCriterion } from "../../common/types"
 
 import type { IntentTaskDefinition, IntentTaskPlan } from "./types"
+import { VERIFICATION_CAPABILITIES, contradictoryCriteria } from "./verification-capabilities"
 
 export type IntentPlanValidation = { plan?: IntentTaskPlan; diagnostic?: string }
 
@@ -32,18 +33,10 @@ const repositoryPath = (value: unknown): string | undefined => {
 /** Describes a rejected value for a diagnostic, bounded so a long value cannot dominate the correction prompt. */
 const received = (value: unknown): string => value === undefined ? "nothing" : JSON.stringify(value).slice(0, 80)
 
-/** The fields each verification kind accepts. The planner protocol is checked against this table, so the model is told the same contract the validator enforces. */
-export const CRITERION_FIELDS: Record<TypedCriterion["verification"]["kind"], readonly string[]> = {
-  evidence_lookup_completed: ["kind"],
-  accepted_fact_exists: ["kind", "identity", "symbol", "path"],
-  source_location: ["kind", "identity", "symbol", "path"],
-  source_range: ["kind", "identity", "symbol", "path"],
-  source_fingerprint: ["kind", "identity", "symbol", "path"],
-  execution_invariant: ["kind", "invariant"],
-  workspace_mutation: ["kind", "operation"],
-  command_exit_status: ["kind", "command", "exitCode", "scope", "execution"],
-  semantic_review: ["kind"]
-}
+/** The fields each verification kind accepts, read from the shared capability table. The planner protocol is checked against this, so the model is told the same contract the validator enforces. */
+export const CRITERION_FIELDS = Object.fromEntries(
+  Object.entries(VERIFICATION_CAPABILITIES).map(([kind, capability]) => [kind, capability.fields])
+) as Record<CriterionVerificationKind, readonly string[]>
 
 /** Validates one typed verification descriptor. Required fields and allowed values are checked; wording is never interpreted. */
 const verificationOf = (value: unknown, path: string): { verification?: CriterionVerification; diagnostic?: string } => {
@@ -212,6 +205,10 @@ export const validateIntentTaskPlan = (value: unknown): IntentPlanValidation => 
     }
     const result = typedCriteriaOf(typedCriteria, path)
     if (!result.criteria) return { diagnostic: result.diagnostic }
+    const contradiction = contradictoryCriteria(result.criteria)
+    if (contradiction) {
+      return { diagnostic: path + " is unsatisfiable: criterion " + contradiction.requirement.id + " requires a workspace_mutation, but criterion " + contradiction.prohibition.id + " prohibits every mutating tool call in the same task. Move one of them to a different task or remove it." }
+    }
     const taskDependencies = dependencies === undefined ? [] : stringList(dependencies, 0)
     if (!taskDependencies || taskDependencies.some((dependency) => dependency === id) || new Set(taskDependencies).size !== taskDependencies.length) return { diagnostic: path + ".dependencies must contain unique task identifiers other than itself." }
     normalizedTasks.push({ id, title: title.trim(), description: description.trim(), criteria: result.criteria, dependencies: taskDependencies })

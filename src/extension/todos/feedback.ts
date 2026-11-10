@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto"
 
 import { logger, redact } from "../../common/logger"
-import type { ReplyChangesView, SourceIdentity, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TypedCriterion, WorkspaceMutationOperation } from "../../common/types"
+import type { CriterionFailureReason, ReplyChangesView, SourceIdentity, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TypedCriterion, WorkspaceMutationOperation } from "../../common/types"
 import { verifyContentFingerprint } from "../tools/fingerprint"
 
 import { codeIdentifiers, commandDigest, samePath } from "./evidence"
 import { type AcceptedFact, type CriterionVerification, type IntentPlanContext, type RequirementActivation, type RetainedObservationEvidence, type TodoReviewPackage } from "./types"
+import { capabilityOf } from "./verification-capabilities"
 
 /** A task needs a successful workspace change only when its typed contract says so. Wording is never read. */
 export const taskRequiresWorkspaceChanges = (criteria: readonly TypedCriterion[]): boolean =>
@@ -160,13 +161,18 @@ type CriterionOutcome = Omit<TodoCriterionReconciliation, "criterionId">
 const reconciled = (
   outcome: TodoCriterionReconciliation["outcome"],
   supportingObservationIds: string[],
-  missing: string[]
+  missing: string[],
+  failureReason?: CriterionFailureReason
 ): CriterionOutcome => ({
   outcome,
   supportingObservationIds: [...new Set(supportingObservationIds)],
   missing,
-  version: RECONCILIATION_VERSION
+  version: RECONCILIATION_VERSION,
+  ...(failureReason ? { failureReason } : {})
 })
+
+/** Names the identity type in a gap message, so the implementer sees which entity a missing fact is about. */
+const identityLabel = (identity: SourceIdentity): string => identity === "registered_tool" ? "a registered tool" : "an implementation symbol"
 
 const NUMBERED_SOURCE_LINE = /^(\d+): (.*)$/
 
@@ -571,11 +577,14 @@ const liveFactMatches = async (fact: AcceptedFact, current: (path: string) => Pr
 }
 
 /**
- * Whether a criterion's name denotes an accepted fact under the criterion's identity. A registered-tool name matches only the
- * fact's registered tool; an implementation name matches only the fact's own symbol. Neither is inferred from spelling.
+ * Whether a criterion's name denotes an accepted fact under the criterion's identity. A registered-tool name matches the fact's
+ * registered tool, or a registration-only fact's tool name. An implementation name matches only an alias fact's own declaration
+ * symbol, never a registration-only fact, so a tool name cannot prove a declaration. Neither is inferred from spelling.
  */
 export const factNamedBy = (identity: SourceIdentity, name: string, fact: AcceptedFact): boolean =>
-  identity === "registered_tool" ? fact.registeredTool === name : fact.symbol === name
+  identity === "registered_tool"
+    ? fact.registeredTool === name || (fact.registeredTool === undefined && fact.symbol === name)
+    : fact.registeredTool !== undefined && fact.symbol === name
 
 /**
  * `accepted_fact_exists` is proven by a current accepted fact. A completed project-wide lookup that found no facts, with no
@@ -593,7 +602,7 @@ const acceptedFactOutcome = async (
     if (await liveFactMatches(fact, current, false)) live.push(fact)
   }
   const livePaths = new Set(live.map((fact) => fact.path))
-  if (livePaths.size > 1) return reconciled("unknown", [], [`${subject.symbol} is recorded at ${livePaths.size} locations; the criterion must name the file`])
+  if (livePaths.size > 1) return reconciled("unknown", [], [`${subject.symbol} is recorded at ${livePaths.size} locations; the criterion must name the file`], "invalid_identity")
   if (live.length) return { ...reconciled("proven", [live[0].observationId], []), reuse: "accepted" }
   if (subject.path === undefined) {
     const declaredPaths = [...new Set([...registrationReads(records).map((read) => read.path), ...registeredNameReads(records).map((read) => read.path)])]
@@ -603,15 +612,15 @@ const acceptedFactOutcome = async (
       if (outcome.outcome === "proven") located.push(outcome)
     }
     if (located.length === 1) return located[0]
-    if (located.length > 1) return reconciled("unknown", located.flatMap((outcome) => outcome.supportingObservationIds), [`${subject.symbol} is declared in ${located.length} files; the criterion must name the file`])
+    if (located.length > 1) return reconciled("unknown", located.flatMap((outcome) => outcome.supportingObservationIds), [`${subject.symbol} is declared in ${located.length} files; the criterion must name the file`], "invalid_identity")
   }
   const check = latestProjectLookup(records)
   if (check?.arguments.resolution === "none" && !accepted.some((fact) => fact.acceptedAt > check.observedAt)) {
-    return reconciled("disproven", [check.observationId], [`no accepted fact for ${subject.symbol} existed at the project-wide check`])
+    return reconciled("disproven", [check.observationId], [`no accepted fact for ${subject.symbol} existed at the project-wide check`], "contradicted_evidence")
   }
   return reconciled("unknown", [], [matching.length
     ? `the accepted fact for ${subject.symbol} no longer matches the current source`
-    : `no current accepted fact for ${subject.symbol} is recorded`])
+    : `no current accepted fact for ${subject.symbol} is recorded`], matching.length ? "stale_evidence" : "missing_evidence")
 }
 
 /**
@@ -630,15 +639,18 @@ const sourceContractOutcome = async (
     if (await liveFactMatches(fact, current, needsRange)) return { ...reconciled("proven", [fact.observationId], []), reuse: "accepted" }
   }
   const missing: string[] = []
+  let stale = false
   const named = (alias: RegistrationRead["alias"]) => subject.identity === "registered_tool" ? alias.tool === subject.symbol : alias.implementation === subject.symbol
   for (const { record, alias, path, sourceHash } of registrationReads(records).filter((read) => named(read.alias) && samePath(read.path, subject.path))) {
     const text = await current(path)
     if (text === undefined) {
       missing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
+      stale = true
       continue
     }
     if (!(await verifyContentFingerprint(text, sourceHash).catch(() => false))) {
       missing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
+      stale = true
       continue
     }
     if (!needsRange) {
@@ -673,16 +685,36 @@ const sourceContractOutcome = async (
       const text = await current(path)
       if (text === undefined) {
         missing.push(`cannot read the current ${path} to confirm observation ${record.observationId}`)
+        stale = true
         continue
       }
       if (!(await verifyContentFingerprint(text, sourceHash).catch(() => false))) {
         missing.push(`${path} changed after observation ${record.observationId} was read; read it again`)
+        stale = true
         continue
       }
       return {
         ...reconciled("proven", [record.observationId], []),
         facts: [{ symbol: tool, path, startLine: line, endLine: line, observationId: record.observationId, sourceHash }]
       }
+    }
+  }
+  if (subject.identity === "implementation_symbol") {
+    const registration = registeredNameReads(records).find((read) => read.tool === subject.symbol && samePath(read.path, subject.path))
+    if (registration) missing.push(`${subject.symbol} is the registered tool name at line ${registration.line} of ${subject.path}, not a declaration; read the declaration that implements it`)
+  }
+  for (const record of records.filter((candidate) => !candidate.failed && candidate.retained && candidate.toolName === "read_file")) {
+    const source = record.sources.find((candidate) => samePath(candidate.path, subject.path) && candidate.contentHash)
+    if (!source?.contentHash) continue
+    const text = await current(subject.path)
+    if (text === undefined) continue
+    if (!(await verifyContentFingerprint(text, source.contentHash).catch(() => false))) {
+      missing.push(`${subject.path} changed after observation ${record.observationId} was read; read it again`)
+      stale = true
+      continue
+    }
+    if (!text.includes(subject.symbol)) {
+      return reconciled("disproven", [record.observationId], [`${subject.path} does not contain ${subject.symbol}, so it is not ${identityLabel(subject.identity)} there; observation ${record.observationId} matches the current file`], "contradicted_evidence")
     }
   }
   if (subject.path !== undefined) {
@@ -693,7 +725,7 @@ const sourceContractOutcome = async (
       }
     }
   }
-  return reconciled("unknown", [], missing.length ? missing : [`no retained successful read shows ${subject.symbol} in ${subject.path}`])
+  return reconciled("unknown", [], missing.length ? missing : [`no retained successful read shows ${subject.symbol} in ${subject.path}`], stale ? "stale_evidence" : "missing_evidence")
 }
 
 /** Decides one typed criterion. The descriptor's kind selects the rule; the criterion's wording is never read. */
@@ -711,19 +743,27 @@ const sourceOutcome = async (
   const named = (alias: RegistrationRead["alias"]) => subject.identity === "registered_tool" ? alias.tool === subject.symbol : alias.implementation === subject.symbol
   const candidates = new Set([
     ...registrationReads(records).filter((read) => named(read.alias)).map((read) => read.path),
-    ...(subject.identity === "registered_tool" ? registeredNameReads(records).filter((read) => read.tool === subject.symbol).map((read) => read.path) : []),
+    ...registeredNameReads(records).filter((read) => read.tool === subject.symbol).map((read) => read.path),
     ...accepted.filter((fact) => !fact.supersededBy && factNamedBy(subject.identity, subject.symbol, fact)).map((fact) => fact.path)
   ])
   const proven: CriterionOutcome[] = []
   const missing: string[] = []
+  let stale = false
   for (const path of candidates) {
     const outcome = await sourceContractOutcome({ ...subject, path }, records, accepted, current)
     if (outcome.outcome === "proven") proven.push(outcome)
-    else missing.push(...outcome.missing)
+    else {
+      missing.push(...outcome.missing)
+      stale ||= outcome.failureReason === "stale_evidence"
+    }
   }
   if (proven.length === 1) return proven[0]
-  if (proven.length > 1) return reconciled("unknown", proven.flatMap((outcome) => outcome.supportingObservationIds), [`${subject.symbol} is declared in ${proven.length} files; the criterion must name the file`])
-  return reconciled("unknown", [], missing.length ? missing : [`no retained read shows the declaration of ${subject.symbol}; read the file that declares it`])
+  if (proven.length > 1) return reconciled("unknown", proven.flatMap((outcome) => outcome.supportingObservationIds), [`${subject.symbol} is declared in ${proven.length} files; the criterion must name the file`], "invalid_identity")
+  const readPaths = [...new Set(records.filter((record) => !record.failed && record.retained && record.toolName === "read_file").map((record) => record.arguments.path).filter((path): path is string => !!path))]
+  const gap = readPaths.length
+    ? `no retained successful read shows ${subject.symbol} as ${identityLabel(subject.identity)}; retained reads of ${readPaths.join(", ")} show no such declaration, so read the declaring file or correct the criterion's identifier`
+    : `no retained successful read shows ${subject.symbol} as ${identityLabel(subject.identity)}; read the file that declares it`
+  return reconciled("unknown", [], missing.length ? missing : [gap], stale ? "stale_evidence" : "missing_evidence")
 }
 
 const typedOutcome = async (
@@ -734,6 +774,11 @@ const typedOutcome = async (
   current: (path: string) => Promise<string | undefined>,
   activation: RequirementActivation | undefined
 ): Promise<CriterionOutcome> => {
+  const capability = capabilityOf(verification.kind)
+  if (!capability) return reconciled("unknown", [], [`the verifier does not implement ${verification.kind}; the plan criterion must be corrected`], "unsupported_operation")
+  if ("identity" in verification && !capability.identities.includes(verification.identity)) {
+    return reconciled("unknown", [], [`${verification.kind} cannot be proven for identity ${String(verification.identity)}; the plan criterion must be corrected`], "invalid_identity")
+  }
   switch (verification.kind) {
     case "semantic_review":
       return reconciled("semantic", [], [])
@@ -766,9 +811,21 @@ export const reviewReconciliations = async (
   const current = cachedCurrentReader(readCurrentSource)
   const outcomes: TodoCriterionReconciliation[] = []
   for (const criterion of review.criteria) {
-    outcomes.push({ ...await typedOutcome(criterion.verification, review.task.id, review.retainedEvidence, review.acceptedEvidence, current, review.requirementActivation), criterionId: criterion.id })
+    const outcome = await typedOutcome(criterion.verification, review.task.id, review.retainedEvidence, review.acceptedEvidence, current, review.requirementActivation).catch((error: unknown) => {
+      logger.error("[Feedback] verifier.criterion_failed criterion=" + criterion.id + " error=" + String(error))
+      return reconciled("unknown", [], ["the verifier could not evaluate this criterion; the fault was logged"], "internal_error")
+    })
+    outcomes.push({ ...withDefaultReason(outcome), criterionId: criterion.id })
   }
   return carryWidestFacts(outcomes)
+}
+
+/** Every non-final outcome names its failure reason. Outcomes that set one keep it. */
+const withDefaultReason = (outcome: CriterionOutcome): CriterionOutcome => {
+  if (outcome.failureReason) return outcome
+  if (outcome.outcome === "unknown") return { ...outcome, failureReason: "missing_evidence" }
+  if (outcome.outcome === "disproven") return { ...outcome, failureReason: "contradicted_evidence" }
+  return outcome
 }
 
 /**
@@ -805,6 +862,23 @@ const hostCriterion = (criterion: TypedCriterion, reconciliation: TodoCriterionR
 }
 
 /**
+ * The corrective instruction for one criterion the host did not prove, or undefined when it needs no instruction. Re-reading cannot
+ * change an identity contradiction or an unsupported contract, so those name the plan correction instead of asking for another read.
+ */
+const correctiveInstruction = (criterion: TodoEvaluationCriterion): string | undefined => {
+  const gap = criterion.reconciliation?.missing[0] ?? ""
+  switch (criterion.reconciliation?.failureReason) {
+    case "invalid_identity":
+    case "unsupported_operation":
+      return `"${criterion.criterion}" cannot be proven as written: ${gap}. Re-reading cannot change this; the plan criterion must be corrected.`.slice(0, 500)
+    case "contradicted_evidence":
+      return `Trusted observations contradict "${criterion.criterion}": ${gap}. Correct the work, or correct the criterion if its identity is wrong; repeating the same read cannot change this.`.slice(0, 500)
+    default:
+      return criterion.status === "failed" ? ("Correct the work so trusted observations support: " + criterion.criterion).slice(0, 500) : undefined
+  }
+}
+
+/**
  * Decides a review from host-verified reconciliations alone. Returns undefined
  * when any criterion is semantic, so only genuinely interpretive questions
  * reach Feedback. Ordinary workspace-change and approval gates still apply
@@ -830,7 +904,7 @@ export const deterministicTodoEvaluation = (
     decision,
     criteria,
     problems: decision === "accept" ? [] : problems,
-    correctiveInstructions: failed.map((criterion) => ("Correct the work so trusted observations support: " + criterion.criterion).slice(0, 500)),
+    correctiveInstructions: criteria.flatMap((criterion) => correctiveInstruction(criterion) ?? []),
     explanation: decision === "accept"
       ? ["Every criterion was verified deterministically from trusted observations of the current source.", ...new Set(reconciliations.map((reconciliation) => reconciliation.scope).filter((scope): scope is string => !!scope))].join(" ")
       : "Deterministic verification found the missing or contradicted facts listed in problems.",
