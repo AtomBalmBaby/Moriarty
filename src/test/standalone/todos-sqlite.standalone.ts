@@ -451,6 +451,89 @@ test("a replacement for a completed plan relinks reused task IDs to new items an
   }
 })
 
+test("failed tool operations report only the active plan's tasks across revisions and replacements, and keep superseded history", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-failure-scope-"))
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-failure-scope"]), conversationId: "chat-failure-scope", writer: "chat-failure-scope" }
+    const repository = new TodoRepository(databasePath, wasmPath)
+    const planWith = (planId: string, revision: number, tasks: { id: string; title: string }[]) => ({
+      planId,
+      version: 1 as const,
+      revision,
+      goal: "Keep the parser working",
+      constraints: [],
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, description: `${task.title} details`, criteria: [{ id: `${task.id}-done`, description: `${task.title} is done`, verification: { kind: "semantic_review" as const } }], dependencies: [] }))
+    })
+    const sync = (plan: ReturnType<typeof planWith>) => repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: plan.goal, plan })
+    const failure = (itemId: string, output: string) => repository.recordToolObservation(scope, {
+      itemId, toolName: "run_command", arguments: { command: "npm test" }, output, failed: true, exitCode: 1, requestId: `fail-${output}`
+    })
+    const failureLine = (output: string) => `run_command {"command":"npm test"} (exit 1): ${output}`
+    const idOf = (snapshot: { items: { id: string; title: string }[] }, title: string) => snapshot.items.find((item) => item.title === title)!.id
+
+    const first = await sync(planWith("plan-failures", 1, [{ id: "inspect", title: "Inspect parser" }, { id: "fix", title: "Fix parser" }, { id: "verify", title: "Verify parser" }]))
+    const inspectOld = idOf(first, "Inspect parser")
+    const fixOld = idOf(first, "Fix parser")
+    await failure(fixOld, "fix failed in revision one")
+    await failure(inspectOld, "inspect failed in revision one")
+    assert.deepEqual(await repository.failedToolOperations(scope), [failureLine("fix failed in revision one"), failureLine("inspect failed in revision one")])
+
+    const revised = await sync(planWith("plan-failures", 2, [{ id: "inspect", title: "Inspect parser" }, { id: "verify", title: "Verify parser" }]))
+    const verifyNew = idOf(revised, "Verify parser")
+    await failure(verifyNew, "verify failed in revision two")
+    assert.deepEqual(await repository.failedToolOperations(scope), [
+      failureLine("inspect failed in revision one"),
+      failureLine("verify failed in revision two")
+    ], "a task dropped by the revision leaves the report; the still-active task keeps its record")
+
+    const items = (await repository.getList({ ...scope, includeCompleted: true })).items
+    for (const item of items) {
+      if (item.status !== "completed") await repository.completeByUser(scope, item.id, item.version, "Verified by user", `complete-${item.id}`, trustedTodoPanelApproval)
+    }
+    const replacement = await sync(planWith("plan-replacement", 3, [{ id: "inspect", title: "Inspect renderer" }]))
+    assert.deepEqual(await repository.failedToolOperations(scope), [], "a completed plan's failures do not leak into its replacement")
+    await failure(idOf(replacement, "Inspect renderer"), "renderer failed in replacement")
+    assert.deepEqual(await repository.failedToolOperations(scope), [failureLine("renderer failed in replacement")])
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("a review of a task the plan superseded names the supersession, while unknown and other conversations' items stay generic", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-superseded-review-"))
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    const project = workspaceProjectFingerprint(["file:///project-superseded-review"])
+    const scope = { projectFingerprint: project, conversationId: "chat-superseded", writer: "chat-superseded" }
+    const other = { projectFingerprint: project, conversationId: "chat-other", writer: "chat-other" }
+    const repository = new TodoRepository(databasePath, wasmPath)
+    const planWith = (planId: string, revision: number, tasks: { id: string; title: string }[]) => ({
+      planId,
+      version: 1 as const,
+      revision,
+      goal: "Keep the parser working",
+      constraints: [],
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, description: `${task.title} details`, criteria: [{ id: `${task.id}-done`, description: `${task.title} is done`, verification: { kind: "semantic_review" as const } }], dependencies: [] }))
+    })
+    const sync = (request: typeof scope, plan: ReturnType<typeof planWith>) => repository.synchronizeIntentPlan(request, plan, { objective: plan.goal, prompt: plan.goal, plan })
+    const first = await sync(scope, planWith("plan-review", 1, [{ id: "inspect", title: "Inspect parser" }, { id: "fix", title: "Fix parser" }]))
+    const fixId = first.items.find((item) => item.title === "Fix parser")!.id
+    await sync(scope, planWith("plan-review", 2, [{ id: "inspect", title: "Inspect parser" }]))
+    const otherId = (await sync(other, planWith("plan-other", 1, [{ id: "other", title: "Other chat task" }]))).items[0].id
+    const evaluation = {} as Parameters<TodoRepository["applyEvaluation"]>[3]
+
+    await assert.rejects(() => repository.applyEvaluation(scope, fixId, 1, evaluation, "review-superseded"),
+      { message: "TODO item belongs to a superseded plan revision and is no longer part of the active plan" })
+    await assert.rejects(() => repository.applyEvaluation(scope, "no-such-item", 1, evaluation, "review-unknown"),
+      { message: "Review task was not found in the active conversation" })
+    await assert.rejects(() => repository.applyEvaluation(scope, otherId, 1, evaluation, "review-other"),
+      { message: "Review task was not found in the active conversation" }, "another conversation's item is indistinguishable from an unknown one")
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test("evidence records log successes at DEBUG and failures at INFO, so routine evidence stays out of INFO", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-evidence-log-"))
   const lines: { level: "info" | "debug"; message: string }[] = []

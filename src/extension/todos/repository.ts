@@ -200,6 +200,15 @@ interface PlanMembership {
   tasks: Map<string, PlanTaskLink>
 }
 
+/**
+ * Names an item that this list's plan superseded, for a lookup that only accepts active tasks. Returns undefined for
+ * any other item, so other conversations' items and unknown IDs keep the caller's generic message.
+ */
+const supersededItemMessage = (database: Database, listId: string, itemId: string): string | undefined =>
+  rows<{ item_id: string }>(database, "SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND item_id = ? AND active = 0", [listId, itemId])[0]
+    ? "TODO item belongs to a superseded plan revision and is no longer part of the active plan"
+    : undefined
+
 const planMembership = (database: Database, listId: string): PlanMembership => {
   const items = new Map<string, ItemRow>(
     rows<ItemRow>(database, "SELECT * FROM todo_items WHERE list_id = ? AND status != 'cancelled' ORDER BY sort_order, created_at", [listId])
@@ -964,7 +973,10 @@ export class TodoRepository {
     })
   }
 
-  /** Every failed tool operation recorded for this conversation's TODO list, oldest first. */
+  /**
+   * Failed tool operations recorded against the active plan's tasks in this conversation, oldest first. Observations of
+   * tasks a later plan revision or replacement dropped stay in storage but are not part of the current plan's report.
+   */
   failedToolOperations(request: TodoListRequest): Promise<string[]> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
@@ -972,7 +984,9 @@ export class TodoRepository {
       const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
       if (!list) return []
       return rows<{ tool_name: string; arguments_json: string; exit_code: number | null; output: string }>(database,
-        "SELECT tool_name, arguments_json, exit_code, output FROM todo_tool_observations WHERE list_id = ? AND failed = 1 ORDER BY created_at ASC", [list.id]
+        `SELECT tool_name, arguments_json, exit_code, output FROM todo_tool_observations
+         WHERE list_id = ? AND failed = 1 AND item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)
+         ORDER BY created_at ASC`, [list.id, list.id]
       ).map((row) => {
         const args = displayArguments(JSON.parse(row.arguments_json) as Record<string, unknown>)
         const target = typeof args.path === "string" ? args.path : JSON.stringify(args).slice(0, 160)
@@ -1244,7 +1258,7 @@ export class TodoRepository {
       if (prior) return JSON.parse(prior.evaluation_json) as TodoEvaluation
       const row = rows<ItemRow & { task_id: string }>(database,
         "SELECT items.*, tasks.task_id FROM todo_items AS items JOIN todo_intent_tasks AS tasks ON tasks.item_id = items.id WHERE items.id = ? AND items.list_id = ? AND tasks.active = 1", [itemId, list.id])[0]
-      if (!row) throw new Error("Review task was not found in the active conversation")
+      if (!row) throw new Error(supersededItemMessage(database, list.id, itemId) ?? "Review task was not found in the active conversation")
       if (row.status !== "in_review") throw new TodoConflictError("Cannot review a TODO in " + row.status + " status")
       if (row.version !== expectedVersion) throw new TodoConflictError("TODO changed since review version " + expectedVersion + "; current version is " + row.version)
       const currentPlan = rows<{ plan_id: string; revision: number; goal: string }>(database, "SELECT plan_id, revision, goal FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]

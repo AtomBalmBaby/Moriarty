@@ -1161,6 +1161,32 @@ test("file-mutation criteria require a successful matching mutation tool, not an
   }
 })
 
+test("move and rename tools count as file mutations, and read-only navigation never does", async () => {
+  const cases: { description: string; operation?: WorkspaceMutationOperation; tool: string; expectAccept: boolean }[] = [
+    { description: "Move twinny_index_smoke_test.ts into the tests folder", tool: "move_file", expectAccept: true },
+    { description: "Rename the ALPHA symbol to BETA across the workspace", tool: "rename_symbol", expectAccept: true },
+    { description: "Rename the ALPHA symbol to BETA across the workspace", operation: "edit", tool: "rename_symbol", expectAccept: true },
+    { description: "Rename the ALPHA symbol to BETA across the workspace", operation: "edit", tool: "find_references", expectAccept: false },
+    { description: "Move twinny_index_smoke_test.ts into the tests folder", tool: "find_files", expectAccept: false }
+  ]
+  for (const example of cases) {
+    const verification: { kind: "workspace_mutation"; operation?: WorkspaceMutationOperation } = example.operation
+      ? { kind: "workspace_mutation", operation: example.operation }
+      : { kind: "workspace_mutation" }
+    const state = await fixture([{ id: "mutation", criteria: [{ id: "mutation", description: example.description, verification }] }])
+    try {
+      const observation = await recordTool(state.repository, state.scope, state.items[0].id, example.tool)
+      const review = (await state.repository.getReviewPackages(state.scope))[0]
+      const evaluation = await evaluateTodoReview(state.repository, state.scope, review,
+        async () => responseFor(review, { refs: [observation.id] }), "mock-reviewer", { hasVerifiedFileChanges: example.expectAccept })
+      assert.equal(evaluation.decision === "accept", example.expectAccept, `${example.tool} for "${example.description}"`)
+    } finally {
+      fs.rmSync(state.directory, { recursive: true, force: true })
+    }
+  }
+})
+
+
 test("a failed mutation observation never supports a file-change claim", async () => {
   const state = await fixture([{ id: "create", criteria: [{ id: "create", description: "Create twinny_index_smoke_test.ts", verification: { kind: "workspace_mutation" } }] }])
   try {

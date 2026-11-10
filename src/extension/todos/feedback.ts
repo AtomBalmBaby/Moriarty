@@ -119,9 +119,10 @@ const sharedObservationRecords = (review: TodoReviewPackage, visible: TodoReview
     .map((record) => ({ id: record.observationId, taskId: record.itemId, toolName: record.toolName, arguments: record.arguments, failed: record.failed, exitCode: record.exitCode }))
 
 const FILE_CREATE_TOOLS = ["create_file"]
-const FILE_EDIT_TOOLS = ["edit_lines", "edit_file"]
+const FILE_EDIT_TOOLS = ["edit_lines", "edit_file", "rename_symbol"]
 const FILE_DELETE_TOOLS = ["delete_file"]
-const MUTATING_TOOLS = [...FILE_CREATE_TOOLS, ...FILE_EDIT_TOOLS, ...FILE_DELETE_TOOLS]
+const FILE_MOVE_TOOLS = ["move_file"]
+const MUTATING_TOOLS = [...FILE_CREATE_TOOLS, ...FILE_EDIT_TOOLS, ...FILE_DELETE_TOOLS, ...FILE_MOVE_TOOLS]
 const OPERATION_TOOLS: Record<WorkspaceMutationOperation, readonly string[]> = { create: FILE_CREATE_TOOLS, edit: FILE_EDIT_TOOLS, delete: FILE_DELETE_TOOLS }
 
 /** Host-recorded tool facts usable as evidence, whether captured for this task or a sibling. */
@@ -411,7 +412,7 @@ export const evidenceCheckRecord = (live: AcceptedFact[]): { arguments: Record<s
 }
 
 /** Scope of the prohibition outcome. The host records only operations Twinny itself executes, so the claim stops there. */
-const PROHIBITION_SCOPE = "Covers file operations Twinny controls (create_file, edit_lines, edit_file, delete_file). Writes made by other mechanisms, including shell commands, are not audited."
+const PROHIBITION_SCOPE = "Covers file operations Twinny controls (create_file, edit_lines, edit_file, rename_symbol, delete_file, move_file). Writes made by other mechanisms, including shell commands, are not audited."
 
 /**
  * Proves a required workspace change from the host's record of this task. Failed mutations changed nothing,
