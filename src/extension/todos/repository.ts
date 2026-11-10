@@ -16,6 +16,7 @@ import { SqliteFile } from "./sqlite"
 import {
   type AcceptedFact,
   type AddTodoEvidenceInput,
+  type AnswerRequirement,
   type ChildTodoContext,
   type ChildTodoDecision,
   type ChildTodoDecisionKind,
@@ -749,12 +750,13 @@ export class TodoRepository {
     const plan = validation.plan
     const resultJson = JSON.stringify(intentResult)
     if (!resultJson || resultJson.length > 100_000) throw new Error("Intent result must be serializable and no larger than 100,000 characters")
+    const answerJson = JSON.stringify(plan.answer ?? [])
 
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
       const existing = rows<{
-        plan_id: string; revision: number; goal: string; constraints_json: string; intent_result_json: string
-      }>(database, "SELECT plan_id, revision, goal, constraints_json, intent_result_json FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
+        plan_id: string; revision: number; goal: string; constraints_json: string; intent_result_json: string; answer_json: string
+      }>(database, "SELECT plan_id, revision, goal, constraints_json, intent_result_json, answer_json FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
       // A closed plan is finished work: new work replaces it under a new planId, and its items and history stay.
       const replacing = !!existing && intentPlanClosed(database, list.id)
       if (existing && !replacing) {
@@ -777,7 +779,7 @@ export class TodoRepository {
       const priorById = new Map(priorTasks.filter(() => !replacing).map((task) => [task.task_id, task]))
       const unchanged = !!existing && !replacing && plan.revision === existing.revision
       if (unchanged) {
-        if (existing.goal !== plan.goal || existing.constraints_json !== JSON.stringify(plan.constraints)) {
+        if (existing.goal !== plan.goal || existing.constraints_json !== JSON.stringify(plan.constraints) || existing.answer_json !== answerJson) {
           throw new TodoConflictError("Intent plan definitions changed without increasing plan.revision")
         }
         if (priorTasks.filter((task) => task.active).length !== plan.tasks.length || plan.tasks.some((task) => {
@@ -837,13 +839,13 @@ export class TodoRepository {
       }
       if (existing) {
         database.run(
-          "UPDATE todo_intent_plans SET plan_id = ?, revision = ?, goal = ?, constraints_json = ?, intent_result_json = ?, updated_at = ? WHERE list_id = ?",
-          [plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, createdAt, list.id]
+          "UPDATE todo_intent_plans SET plan_id = ?, revision = ?, goal = ?, constraints_json = ?, intent_result_json = ?, answer_json = ?, updated_at = ? WHERE list_id = ?",
+          [plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, answerJson, createdAt, list.id]
         )
       } else {
         database.run(
-          "INSERT INTO todo_intent_plans(list_id, plan_id, revision, goal, constraints_json, intent_result_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          [list.id, plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, createdAt]
+          "INSERT INTO todo_intent_plans(list_id, plan_id, revision, goal, constraints_json, intent_result_json, answer_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          [list.id, plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, answerJson, createdAt]
         )
       }
       bumpList(database, list.id, undefined, "intent_plan_synchronized", "model", "intent-plan:" + plan.planId + ":" + plan.revision, {
@@ -859,8 +861,8 @@ export class TodoRepository {
       if (!project) return undefined
       const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
       if (!list) return undefined
-      const plan = rows<{ plan_id: string; revision: number; goal: string; constraints_json: string }>(
-        database, "SELECT plan_id, revision, goal, constraints_json FROM todo_intent_plans WHERE list_id = ?", [list.id]
+      const plan = rows<{ plan_id: string; revision: number; goal: string; constraints_json: string; answer_json: string }>(
+        database, "SELECT plan_id, revision, goal, constraints_json, answer_json FROM todo_intent_plans WHERE list_id = ?", [list.id]
       )[0]
       if (!plan) return undefined
       const tasks = rows<ItemRow & { task_id: string; dependencies_json: string; criteria_json: string | null }>(
@@ -897,6 +899,7 @@ export class TodoRepository {
         revision: plan.revision,
         goal: plan.goal,
         constraints: JSON.parse(plan.constraints_json) as string[],
+        answer: JSON.parse(plan.answer_json) as AnswerRequirement[],
         task: itemOf(current),
         planTaskId: current.task_id,
         criteria: requiredCriteria(current.criteria_json),
@@ -1041,6 +1044,17 @@ export class TodoRepository {
           lastEvaluation: lastEvaluation ? JSON.parse(lastEvaluation.evaluation_json) as TodoEvaluation : undefined
         }
       })
+    })
+  }
+
+  /** Retained output of every observation for this conversation's active plan, completed tasks included. */
+  listIntentEvidence(request: TodoListRequest): Promise<RetainedObservationEvidence[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
+      if (!list) return []
+      return retainedEvidenceFor(database, "", true, list.id)
     })
   }
 

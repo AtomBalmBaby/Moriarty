@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { useTranslation } from "react-i18next"
 
 import { TODO_EVENT_NAME } from "../common/constants"
+import { isStaleTodoSnapshot } from "../common/guards"
 import { TodoFeedbackStatus, TodoItem, TodoListSnapshot } from "../common/types"
 
 import { bridge, useServerEvent } from "./messaging"
@@ -46,7 +47,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     try {
       const next = await bridge.request(TODO_EVENT_NAME.getList, { conversationId })
       if (conversationIdRef.current === conversationId) {
-        setSnapshot(next)
+        setSnapshot((current) => (isStaleTodoSnapshot(current, next) ? current : next))
         setError("")
       }
     } catch (reason) {
@@ -62,7 +63,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
 
   useServerEvent(TODO_EVENT_NAME.changed, (next) => {
     if (next.conversationId === conversationId) {
-      setSnapshot(next)
+      setSnapshot((current) => (isStaleTodoSnapshot(current, next) ? current : next))
       setError("")
     }
   })
@@ -121,7 +122,8 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     setBusy(true)
     setError("")
     try {
-      setSnapshot(await action())
+      const next = await action()
+      setSnapshot((current) => (isStaleTodoSnapshot(current, next) ? current : next))
       return true
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))

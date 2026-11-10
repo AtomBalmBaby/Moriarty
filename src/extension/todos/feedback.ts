@@ -183,7 +183,7 @@ const DECLARATION_SEARCH_LINES = 40
  * captured range. The pairing is a source-shape heuristic, so it is only stored with the
  * fingerprint of the file it was read from.
  */
-const implementationAliases = (record: RetainedObservationEvidence): Array<{ tool: string; implementation: string; startLine: number; endLine: number }> => {
+const implementationAliases = (record: RetainedObservationEvidence): Array<{ tool: string; implementation: string; startLine: number; registrationLine: number }> => {
   if (!record.content) return []
   const ranges = record.sources
     .filter((source) => source.startLine !== undefined && source.endLine !== undefined)
@@ -193,7 +193,7 @@ const implementationAliases = (record: RetainedObservationEvidence): Array<{ too
     const match = NUMBERED_SOURCE_LINE.exec(line)
     return match ? [{ line: Number(match[1]), text: match[2] }] : []
   })
-  const aliases: Array<{ tool: string; implementation: string; startLine: number; endLine: number }> = []
+  const aliases: Array<{ tool: string; implementation: string; startLine: number; registrationLine: number }> = []
   lines.forEach((registration, index) => {
     const name = NAME_PROPERTY_LINE.exec(registration.text)
     if (!name || !inRange(registration.line)) return
@@ -204,7 +204,7 @@ const implementationAliases = (record: RetainedObservationEvidence): Array<{ too
       depth = indentOf(candidate.text)
       const declaration = DECLARATION_LINE.exec(candidate.text)
       if (declaration) {
-        if (inRange(candidate.line) && declaration[1] !== name[1]) aliases.push({ tool: name[1], implementation: declaration[1], startLine: candidate.line, endLine: registration.line })
+        if (inRange(candidate.line) && declaration[1] !== name[1]) aliases.push({ tool: name[1], implementation: declaration[1], startLine: candidate.line, registrationLine: registration.line })
         return
       }
     }
@@ -484,7 +484,7 @@ const prohibitionOutcome = (records: RetainedObservationEvidence[]): CriterionOu
 /** A registration (name: "read_file") paired with the declaration that implements it, and the fingerprinted read that shows it. */
 interface RegistrationRead {
   record: RetainedObservationEvidence
-  alias: { tool: string; implementation: string; startLine: number; endLine: number }
+  alias: { tool: string; implementation: string; startLine: number; registrationLine: number }
   path: string
   sourceHash: string
 }
@@ -512,7 +512,7 @@ const registrationReads = (records: RetainedObservationEvidence[]): Registration
     implementationAliases(record).flatMap((alias) => {
       const source = record.sources.find((candidate) =>
         candidate.startLine !== undefined && candidate.endLine !== undefined
-        && candidate.startLine <= alias.startLine && alias.endLine <= candidate.endLine && candidate.contentHash)
+        && candidate.startLine <= alias.startLine && alias.registrationLine <= candidate.endLine && candidate.contentHash)
       return source?.contentHash ? [{ record, alias, path: source.path, sourceHash: source.contentHash }] : []
     }))
 
@@ -641,9 +641,15 @@ const sourceContractOutcome = async (
       continue
     }
     if (!needsRange) {
+      // The closing line is measured, and a fact is stored only when a fresh read shows it. Otherwise the location is
+      // proven for this decision without persisting a boundary the host has not observed.
+      const end = declarationEnd(text, alias.startLine)
+      const boundary = end === undefined ? [] : await boundaryObservations(records, path, end, text)
       return {
-        ...reconciled("proven", [record.observationId], []),
-        facts: [{ symbol: alias.implementation, registeredTool: alias.tool, path, startLine: alias.startLine, endLine: alias.endLine, observationId: record.observationId, sourceHash }]
+        ...reconciled("proven", [...new Set([record.observationId, ...boundary])], []),
+        facts: end !== undefined && boundary.length > 0
+          ? [{ symbol: alias.implementation, registeredTool: alias.tool, path, startLine: alias.startLine, endLine: end, observationId: record.observationId, sourceHash }]
+          : []
       }
     }
     const end = declarationEnd(text, alias.startLine)
@@ -690,6 +696,35 @@ const sourceContractOutcome = async (
 }
 
 /** Decides one typed criterion. The descriptor's kind selects the rule; the criterion's wording is never read. */
+/**
+ * A source predicate without a path is decided by the single file the host observed declaring the symbol, found in retained
+ * registration reads and accepted facts. Several proven files, or none, leave the criterion unknown and say what is missing.
+ */
+const sourceOutcome = async (
+  subject: { kind: "source_location" | "source_range" | "source_fingerprint"; identity: SourceIdentity; symbol: string; path?: string },
+  records: RetainedObservationEvidence[],
+  accepted: AcceptedFact[],
+  current: (path: string) => Promise<string | undefined>
+): Promise<CriterionOutcome> => {
+  if (subject.path !== undefined) return sourceContractOutcome({ ...subject, path: subject.path }, records, accepted, current)
+  const named = (alias: RegistrationRead["alias"]) => subject.identity === "registered_tool" ? alias.tool === subject.symbol : alias.implementation === subject.symbol
+  const candidates = new Set([
+    ...registrationReads(records).filter((read) => named(read.alias)).map((read) => read.path),
+    ...(subject.identity === "registered_tool" ? registeredNameReads(records).filter((read) => read.tool === subject.symbol).map((read) => read.path) : []),
+    ...accepted.filter((fact) => !fact.supersededBy && factNamedBy(subject.identity, subject.symbol, fact)).map((fact) => fact.path)
+  ])
+  const proven: CriterionOutcome[] = []
+  const missing: string[] = []
+  for (const path of candidates) {
+    const outcome = await sourceContractOutcome({ ...subject, path }, records, accepted, current)
+    if (outcome.outcome === "proven") proven.push(outcome)
+    else missing.push(...outcome.missing)
+  }
+  if (proven.length === 1) return proven[0]
+  if (proven.length > 1) return reconciled("unknown", proven.flatMap((outcome) => outcome.supportingObservationIds), [`${subject.symbol} is declared in ${proven.length} files; the criterion must name the file`])
+  return reconciled("unknown", [], missing.length ? missing : [`no retained read shows the declaration of ${subject.symbol}; read the file that declares it`])
+}
+
 const typedOutcome = async (
   verification: CriterionVerification,
   taskId: string,
@@ -718,7 +753,7 @@ const typedOutcome = async (
     case "source_location":
     case "source_range":
     case "source_fingerprint":
-      return sourceContractOutcome(verification, records, accepted, current)
+      return sourceOutcome(verification, records, accepted, current)
   }
 }
 

@@ -171,12 +171,12 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
   return {
     name: "read_file",
     readOnly: true,
-    description: `A file's lines, numbered; at most ${limit} at a time. Source lines are complete. Includes the content fingerprint of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
+    description: `A file's lines, numbered; at most ${limit} at a time. Read a range with start_line and end_line, or a single line with full_line. Source lines are complete. Includes the content fingerprint of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
     parameters: [
       { name: "path", description: "The file." },
-      { name: "start_line", description: "First line to read, from 1.", optional: true, type: "integer" },
-      { name: "end_line", description: "Last line to read.", optional: true, type: "integer" },
-      { name: "full_line", description: "Return the exact text of the single line at start_line.", optional: true, type: "boolean" }
+      { name: "start_line", description: "First line to read, from 1. For a range, pass start_line with end_line; for full_line, pass the one line.", optional: true, type: "integer" },
+      { name: "end_line", description: "Last line of a range to read. Omit it with full_line, which returns only start_line.", optional: true, type: "integer" },
+      { name: "full_line", description: "Set to true only for a one-line read: returns the exact text of the line at start_line. Do not combine with end_line or a multiline range; use start_line and end_line for ranges.", optional: true, type: "boolean" }
     ],
     async run({ path: file, start_line, end_line, full_line }) {
       if (!file) throw new ToolInputError("read_file needs a path.")

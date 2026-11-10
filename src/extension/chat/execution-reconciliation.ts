@@ -132,10 +132,14 @@ export class ExecutionReconciliationController {
 
     this._iterations++
     this._providerFailures = 0
+    // Progress is a passed criterion or a changed set of unsatisfied criteria. Observations that leave that set unchanged are
+    // not progress: they spend the evidence budget and count toward the no-progress limit.
     const moved = this._lastProgress !== undefined && progress !== this._lastProgress
-    if (progressKind === "criteria" || moved) this._evidenceOnly = 0
+    const advanced = progressKind === "criteria" || moved
+    if (advanced) this._evidenceOnly = 0
     else if (progressKind === "observations") this._evidenceOnly++
-    this._noProgress = progressKind !== "none" ? 0 : progress === this._lastProgress ? this._noProgress + 1 : 1
+    const baseline = this._lastProgress === undefined
+    this._noProgress = advanced || (baseline && progressKind === "observations") ? 0 : progress === this._lastProgress ? this._noProgress + 1 : 1
     this._lastProgress = progress
     if (this._iterations > this._limits.maxIterations) {
       return { state: this._state = "blocked", continue: false, reason: `Execution exceeded ${this._limits.maxIterations} reconciliation iterations.` }

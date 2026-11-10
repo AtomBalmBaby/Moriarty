@@ -8,8 +8,11 @@ import {
   inferenceEvent,
   InferenceTraceContext
 } from "../inference/trace"
+import { samePath } from "../todos/evidence"
+import { factNamedBy } from "../todos/feedback"
 import { validateIntentTaskPlan } from "../todos/intent-plan"
 import type {
+  AcceptedFact,
   ChildTodoContext,
   ChildTodoDecision,
   ChildTodoDecisionKind,
@@ -27,18 +30,22 @@ export const FEEDBACK_PLAN_PROTOCOL =
   "You maintain the task plan Twinny uses to track progress on the user's request. " +
   "Return exactly one valid JSON object, with no prose or Markdown fences, with keys track (boolean) and plan. " +
   "Use {\"track\": false, \"plan\": null} when the message needs no tracked work (a question, greeting, or a follow-up that the existing plan already covers). " +
-  "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, criteria: [{id: stable string, description: string, verification: object}], dependencies: string[]}]}. " +
+  "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, criteria: [{id: stable string, description: string, verification: object}], dependencies: string[]}], answer?: [{id: stable string, source: {identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string}, fields: subset of [\"path\", \"range\", \"fingerprint\"]}]}. " +
+  "answer lists the objective values the final reply must state for a source; omit it when the reply needs none. Each field is proven only by a source criterion of the same plan that names the same identity and symbol, and the same path when the answer gives one: path by source_location, range by source_range, fingerprint by source_fingerprint. " +
   "Each criterion's verification is a typed descriptor chosen by what must be proven, never by its wording. Allowed verification objects: " +
   "{kind: \"evidence_lookup_completed\"} proves only that a project-scoped evidence lookup succeeded, whether or not facts matched; " +
-  "{kind: \"accepted_fact_exists\", symbol: string, path?: string} requires a current accepted fact about the symbol; " +
-  "{kind: \"source_location\", symbol: string, path: string} requires the declaration's start line; " +
-  "{kind: \"source_range\", symbol: string, path: string} requires the declaration's complete start-to-closing range; " +
-  "{kind: \"source_fingerprint\", symbol: string, path: string} requires the authoritative content fingerprint of the declaration; " +
+  "{kind: \"accepted_fact_exists\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires a current accepted fact about the symbol; " +
+  "{kind: \"source_location\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the declaration's start line; " +
+  "{kind: \"source_range\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the declaration's complete start-to-closing range; " +
+  "{kind: \"source_fingerprint\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the authoritative content fingerprint of the declaration; " +
   "{kind: \"execution_invariant\", invariant: \"no_mutating_tool_calls\"} requires that no mutating tool ran in this conversation; " +
   "{kind: \"workspace_mutation\", operation?: \"create\"|\"edit\"|\"delete\"} requires that a successful file create, edit, or delete ran during this task (narrowed to one operation when given), and is the only way to require a workspace change; " +
-  "{kind: \"command_exit_status\", command: string, exitCode: number, execution?: \"recorded\"|\"after_activation\"} requires the latest Twinny run of that exact command to exit with exitCode; execution \"after_activation\" also requires that run to come after the task's requirement activation, which is how a criterion demands a run made now (for example, \"is run again\"); " +
+  "{kind: \"command_exit_status\", command: string, exitCode: number, scope?: \"current\"|\"historical\", execution?: \"recorded\"|\"after_activation\"} requires the latest Twinny run of that exact command to exit with exitCode, with no later successful workspace mutation; scope \"historical\" states a diagnostic about an earlier revision and ignores later mutations; execution \"after_activation\" also requires that run to come after the task's requirement activation, which is how a criterion demands a run made now (for example, \"is run again\"); " +
   "{kind: \"semantic_review\"} is only for a criterion that genuinely needs judgment. " +
-  "symbol is a bare identifier and path is repository-relative. Each criterion description must match its descriptor exactly and must not weaken the user's requirement. " +
+  "identity is required on every accepted_fact_exists and source_* descriptor and says what symbol names: \"registered_tool\" when symbol is the tool name Twinny registers (for example read_file), and \"implementation_symbol\" when symbol is the TypeScript declaration that implements it (for example readFile). " +
+  "Use only the fields listed for each kind, with the listed values. Omit path when the request does not name the file; Twinny then uses the single file it observes declaring the symbol. Include path only when the request names it. " +
+  "Accepted facts listed with the request are authoritative: a path the request does not name must agree with them, and a path they contradict is rejected, so omit path rather than guess it. " +
+  "symbol is a bare identifier, and path, when present, is repository-relative. Each criterion description must match its descriptor exactly and must not weaken the user's requirement. " +
   "Include 1-100 ordered tasks with stable IDs and no unknown or cyclic dependencies. Ground every task in the user's request; do not invent requirements. " +
   "Keep the plan as small as the objective allows: one task per distinct piece of user work, with factual, specific, measurable acceptance criteria proportional to that task. " +
   "Planning workflow is not a user deliverable. Twinny creates and updates the TODO list itself, so no title, description, or criterion may ask Mycroft to create, update, verify, or report on TODO entries, statuses, or the list, even when the user says to use TODOs. " +
@@ -49,6 +56,9 @@ export const FEEDBACK_PLAN_PROTOCOL =
   "When an existing plan is supplied, preserve its planId and unchanged task IDs, and increase revision only when task definitions change."
 
 export const DEFAULT_FEEDBACK_PLAN_TIMEOUT_MS = 60_000
+
+/** Planning calls per request: the first reply plus bounded corrections. Planning repair is separate from tool-execution retries. */
+export const FEEDBACK_PLAN_ATTEMPTS = 3
 
 export type FeedbackPlanFailure = JsonFailure | "output-limit" | "schema" | "administrative"
 
@@ -170,7 +180,40 @@ const administrativeMessage = (found: AdministrativeClause[]): string => {
 const reasoningOnly = (reply: string | RoleReply | undefined) =>
   typeof reply === "object" && !replyText(reply).trim() && (reply.reasoningChars ?? 0) > 0
 
-const parseFeedbackPlanBody = (reply: string | RoleReply | undefined, objective: string): FeedbackPlanParse => {
+/**
+ * A criterion's source path that the request does not name must agree with the trusted accepted facts for the same identity and
+ * symbol. A contradicted path is a guess, so it is reported for repair instead of becoming a binding requirement. Without
+ * trusted facts for the symbol nothing contradicts the path, and the omitted-path form remains available.
+ */
+export const pathContradiction = (plan: IntentTaskPlan, request: string, trusted: AcceptedFact[]): string | undefined => {
+  const live = trusted.filter((fact) => !fact.supersededBy)
+  const named = request.toLowerCase()
+  for (const task of plan.tasks) {
+    for (const criterion of task.criteria) {
+      const verification = criterion.verification
+      if (!("identity" in verification) || !verification.path) continue
+      const { identity, symbol, path } = verification
+      if (named.includes(path.toLowerCase())) continue
+      const known = live.filter((fact) => factNamedBy(identity, symbol, fact))
+      if (!known.length || known.some((fact) => samePath(fact.path, path))) continue
+      const actual = [...new Set(known.map((fact) => fact.path))].join(", ")
+      return `Criterion "${criterion.id}" in task "${task.id}" names ${path} for ${identity} ${symbol}, but accepted evidence places ${symbol} in ${actual}. Use that path, or omit path so Twinny locates the declaration.`
+    }
+  }
+  return undefined
+}
+
+const TRUSTED_FACT_LIMIT = 20
+
+/** The live accepted facts shown to the planner, bounded so a long project history cannot dominate the prompt. */
+export const trustedFactsBlock = (facts: AcceptedFact[]): string => {
+  const live = facts.filter((fact) => !fact.supersededBy).slice(0, TRUSTED_FACT_LIMIT)
+  if (!live.length) return ""
+  const lines = live.map((fact) => `- ${fact.registeredTool ? `registered tool ${fact.registeredTool} implemented by ${fact.symbol}` : `symbol ${fact.symbol}`} at ${fact.path} lines ${fact.startLine}-${fact.endLine}`)
+  return `Trusted accepted facts (authoritative project evidence):\n${lines.join("\n")}`
+}
+
+const parseFeedbackPlanBody = (reply: string | RoleReply | undefined, objective: string, trusted: AcceptedFact[]): FeedbackPlanParse => {
   if (reasoningOnly(reply)) return { error: "The provider returned reasoning but no answer.", failure: "reasoning-only" }
   const extraction = extractJsonObject(replyText(reply))
   const { value } = extraction
@@ -191,6 +234,8 @@ const parseFeedbackPlanBody = (reply: string | RoleReply | undefined, objective:
   if (!validation.plan) {
     return { error: "Invalid task plan: " + (validation.diagnostic ?? "validation failed"), failure: "schema" }
   }
+  const contradiction = pathContradiction(validation.plan, objective, trusted)
+  if (contradiction) return { error: "Invalid task plan: " + contradiction, failure: "schema" }
   return { track: true, plan: validation.plan }
 }
 
@@ -243,8 +288,8 @@ export const reconcileAdministrativeCriteria = async (repository: FeedbackPlanRe
 }
 
 /** Parses a planning reply. A reply that stopped at the output limit is reported as such, never repaired. */
-export const parseFeedbackPlanResponse = (reply: string | RoleReply | undefined, objective = ""): FeedbackPlanParse => {
-  const parsed = parseFeedbackPlanBody(reply, objective)
+export const parseFeedbackPlanResponse = (reply: string | RoleReply | undefined, objective = "", trusted: AcceptedFact[] = []): FeedbackPlanParse => {
+  const parsed = parseFeedbackPlanBody(reply, objective, trusted)
   if ("error" in parsed && typeof reply === "object" && reply.finishReason === "length") {
     return { error: OUTPUT_LIMIT_MESSAGE, failure: "output-limit" }
   }
@@ -440,6 +485,7 @@ const diagnose = (
 export interface FeedbackPlanRepository {
   getIntentTaskPlan(request: TodoListRequest): Promise<IntentTaskPlan | undefined>
   intentPlanClosed(request: TodoListRequest): Promise<boolean>
+  listAcceptedEvidence(request: TodoListRequest): Promise<AcceptedFact[]>
 
   synchronizeIntentPlan(request: TodoWriteRequest, candidate: unknown, intentResult: unknown): Promise<TodoListSnapshot>
 }
@@ -594,13 +640,16 @@ export class FeedbackPlanner {
     let state = "completed"
     try {
       const existing = await repository.getIntentTaskPlan(scope)
+      const trusted = await repository.listAcceptedEvidence(scope)
       // A finished plan is not offered for revision: the request gets its own planning decision.
       const closed = !!existing && await repository.intentPlanClosed(scope)
-      const user = !existing
+      const base = !existing
         ? request
         : closed
           ? `${request}\n\nThe earlier TODO plan is complete: every task in it is finished. Plan this request on its own; it needs a new plan only if it asks for tracked work.`
           : `${request}\n\nExisting TODO plan (revise only if the request changes the work):\n${JSON.stringify(existing)}`
+      const facts = trustedFactsBlock(trusted)
+      const user = facts ? `${base}\n\n${facts}` : base
       const ask = (prompt: string) =>
         untilAborted(endpoint.infer({ system: FEEDBACK_PLAN_PROTOCOL, user: prompt, json: true }, { signal: controller.signal, trace }), controller.signal)
       let reply = await ask(user)
@@ -610,10 +659,11 @@ export class FeedbackPlanner {
         inferenceEvent("feedback.late_response_discarded", { operation_id: trace.operationId }, "warn")
         return { status: "stale" }
       }
-      let parsed = parseFeedbackPlanResponse(reply, request)
+      let parsed = parseFeedbackPlanResponse(reply, request, trusted)
       diagnose(trace, endpoint, "initial", reply, parsed)
-      // Bounded recovery: one correction with the same provider and request. Output-limit stops are not retried.
-      if ("error" in parsed && parsed.failure !== "output-limit") {
+      // Bounded recovery: each correction re-asks with the same provider and request plus the exact validator diagnostic,
+      // within FEEDBACK_PLAN_ATTEMPTS planning calls in total. Output-limit stops are not retried.
+      for (let attempt = 2; "error" in parsed && parsed.failure !== "output-limit" && attempt <= FEEDBACK_PLAN_ATTEMPTS; attempt++) {
         this._deps.onStatus?.({ conversationId: scope.conversationId, state: "retrying" })
         reply = await ask(correctionPrompt(user, parsed.error))
         if (controller.signal.reason instanceof RoleTimeoutError) throw controller.signal.reason
@@ -622,7 +672,7 @@ export class FeedbackPlanner {
           inferenceEvent("feedback.late_response_discarded", { operation_id: trace.operationId }, "warn")
           return { status: "stale" }
         }
-        parsed = parseFeedbackPlanResponse(reply, request)
+        parsed = parseFeedbackPlanResponse(reply, request, trusted)
         diagnose(trace, endpoint, "correction", reply, parsed)
       }
       if ("error" in parsed) {

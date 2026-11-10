@@ -6,12 +6,13 @@ import { test } from "node:test"
 
 import { logger } from "../../common/logger"
 import type { TodoListSnapshot } from "../../common/types"
-import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository, findAdministrativeClauses, parseChildTodoDecision, parseFeedbackPlanResponse, requestsTodoMachineryWork, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
+import { ChildTodoReviewer, FEEDBACK_PLAN_ATTEMPTS, FEEDBACK_PLAN_PROTOCOL, FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository, findAdministrativeClauses, parseChildTodoDecision, parseFeedbackPlanResponse, requestsTodoMachineryWork, trustedFactsBlock, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { replyText, type RoleInference, type RoleReply, type RoleResolution, structuredReply } from "../../extension/chat/role-inference"
 import { readReply } from "../../extension/inference/stream"
 import type { ChatChunk } from "../../extension/inference/types"
+import { CRITERION_FIELDS } from "../../extension/todos/intent-plan"
 import { TodoRepository, trustedTodoPanelApproval } from "../../extension/todos/repository"
-import type { ChildTodoContext, ChildTodoProposal } from "../../extension/todos/types"
+import type { AcceptedFact, ChildTodoContext, ChildTodoProposal } from "../../extension/todos/types"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
 
@@ -101,7 +102,7 @@ test("an administrative plan gets one corrective retry that names the offending 
     })
     const { result } = await quietly(() => planner.start(scope, "Locate read_file."))
     assert.equal(result.status, "failed")
-    assert.equal(calls, 2, "the first reply and one corrective retry, then no further attempts")
+    assert.equal(calls, FEEDBACK_PLAN_ATTEMPTS, "the first reply and bounded corrections, then no further attempts")
     assert.equal(await repository.getIntentTaskPlan(scope), undefined, "an invalid plan is never written")
   })
 })
@@ -445,6 +446,23 @@ type Sent = { user: string; json?: boolean }
 
 const validReply = () => JSON.stringify({ track: true, plan: plan() })
 
+/** A read_file lookup plan whose second criterion carries the given verification descriptor. */
+const lookupReply = (verification: Record<string, unknown>) => JSON.stringify({
+  track: true,
+  plan: plan({
+    tasks: [{
+      id: "lookup",
+      title: "Check accepted evidence for read_file",
+      description: "Consult persisted project facts about read_file.",
+      dependencies: [],
+      criteria: [
+        { id: "criterion-1", description: "The project-wide accepted evidence lookup has completed.", verification: { kind: "evidence_lookup_completed" } },
+        { id: "criterion-2", description: "read_file is described by the descriptor.", verification }
+      ]
+    }]
+  })
+})
+
 const failureOf = (parsed: ReturnType<typeof parseFeedbackPlanResponse>) => ("error" in parsed ? parsed.failure : undefined)
 
 async function* streamOf(...parts: Partial<ChatChunk>[]): AsyncIterable<ChatChunk> {
@@ -485,6 +503,7 @@ const deferred = <T>() => {
 const spied = (repository: TodoRepository, order: string[]): FeedbackPlanRepository => ({
   getIntentTaskPlan: (request) => repository.getIntentTaskPlan(request),
   intentPlanClosed: (request) => repository.intentPlanClosed(request),
+  listAcceptedEvidence: (request) => repository.listAcceptedEvidence(request),
   synchronizeIntentPlan: (request, candidate, result) => {
     order.push("sync")
     return repository.synchronizeIntentPlan(request, candidate, result)
@@ -779,18 +798,80 @@ test("one invalid reply is corrected by a single follow-up call that carries the
   })
 })
 
-test("repeated invalid replies stop with one visible failure and write nothing", async () => {
+test("repeated invalid replies stop within the planning budget with one visible failure and write nothing", async () => {
   await withRepository(async (repository) => {
     const requests: Sent[] = []
     const failures: string[] = []
-    const planner = plannerWith(repository, scripted(["nope", "still nope"], requests), failures)
+    const planner = plannerWith(repository, scripted(["nope", "still nope", "nope again", "unused"], requests), failures)
     const { result } = await quietly(() => planner.start(scope, "Fix the parser."))
     assert.equal(result.status, "failed")
-    assert.equal(requests.length, 2)
+    assert.equal(requests.length, FEEDBACK_PLAN_ATTEMPTS)
     assert.equal(failures.length, 1)
     assert.match(failures[0], /Feedback could not plan TODOs/)
     assert.equal((await repository.getList(scope)).items.length, 0)
   })
+})
+
+test("an invalid identity is corrected from the exact diagnostic and the corrected plan is written", async () => {
+  await withRepository(async (repository) => {
+    const requests: Sent[] = []
+    const planner = plannerWith(repository, scripted([
+      lookupReply({ kind: "accepted_fact_exists", symbol: "read_file" }),
+      lookupReply({ kind: "accepted_fact_exists", identity: "registered_tool", symbol: "read_file" })
+    ], requests))
+    const { result } = await quietly(() => planner.start(scope, "Check read_file."))
+    assert.equal(result.status, "planned")
+    assert.equal(requests.length, 2)
+    assert.match(requests[1].user, /Your previous reply was rejected: Invalid task plan: plan\.tasks\[0\]\.criteria\[1\]\.verification\.identity must be registered_tool or implementation_symbol; received nothing\./)
+    assert.ok(await repository.getIntentTaskPlan(scope))
+  })
+})
+
+test("repeated invalid identities exhaust the planning budget with the exact unresolved diagnostic and write nothing", async () => {
+  await withRepository(async (repository) => {
+    const invalid = lookupReply({ kind: "accepted_fact_exists", identity: "tool", symbol: "read_file" })
+    const requests: Sent[] = []
+    const failures: string[] = []
+    const planner = plannerWith(repository, scripted([invalid, invalid, invalid, invalid], requests), failures)
+    const { result } = await quietly(() => planner.start(scope, "Check read_file."))
+    assert.equal(result.status, "failed")
+    assert.equal(requests.length, 3)
+    assert.deepEqual(failures, ["Feedback could not plan TODOs: Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol; received \"tool\"."])
+    assert.equal(await repository.getIntentTaskPlan(scope), undefined)
+  })
+})
+
+test("the planner protocol describes exactly the fields the validator accepts for every verification kind", () => {
+  for (const [kind, fields] of Object.entries(CRITERION_FIELDS)) {
+    const descriptor = FEEDBACK_PLAN_PROTOCOL.match(new RegExp(`\\{kind: "${kind}"[^}]*\\}`))?.[0]
+    assert.ok(descriptor, `the protocol describes ${kind}`)
+    const described = [...descriptor.matchAll(/([A-Za-z]+)\??:/g)].map((match) => match[1]).sort()
+    assert.deepEqual(described, [...fields].sort(), `the protocol fields for ${kind} match the validator`)
+  }
+})
+
+test("each identity-bearing kind parses with its identity, with and without the optional path", () => {
+  const descriptors = [
+    { kind: "accepted_fact_exists", identity: "registered_tool", symbol: "read_file" },
+    { kind: "accepted_fact_exists", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" },
+    { kind: "source_location", identity: "registered_tool", symbol: "read_file" },
+    { kind: "source_range", identity: "implementation_symbol", symbol: "readFile" },
+    { kind: "source_fingerprint", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" }
+  ]
+  for (const verification of descriptors) {
+    const parsed = parseFeedbackPlanResponse(lookupReply(verification), "Locate read_file.")
+    assert.ok("plan" in parsed, JSON.stringify(verification))
+    assert.equal("path" in parsed.plan.tasks[0].criteria[1].verification, verification.path !== undefined, JSON.stringify(verification))
+  }
+})
+
+test("a source criterion with an unsupported identity is rejected, and a missing identity names the field", () => {
+  const unknown = parseFeedbackPlanResponse(lookupReply({ kind: "source_location", identity: "tool", symbol: "read_file" }), "Locate read_file.")
+  assert.ok("error" in unknown)
+  assert.equal(unknown.error, "Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol; received \"tool\".")
+  const missing = parseFeedbackPlanResponse(lookupReply({ kind: "source_fingerprint", symbol: "readFile", path: "src/tools.ts" }), "Locate readFile.")
+  assert.ok("error" in missing)
+  assert.equal(missing.error, "Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol; received nothing.")
 })
 
 test("a reply stopped at the output limit is reported without a correction call", async () => {
@@ -826,7 +907,7 @@ test("a failed initial plan does not start Mycroft", async () => {
 test("a successful retry synchronizes the plan before Mycroft starts", async () => {
   await withRepository(async (repository) => {
     const order: string[] = []
-    const planner = plannerWith(spied(repository, order), scripted(["nope", "nope", validReply()]))
+    const planner = plannerWith(spied(repository, order), scripted(["nope", "nope", "nope", validReply()]))
     const { gate } = gated(planner)
     const turn = async () => {
       order.push("dispatch")
@@ -844,7 +925,7 @@ test("a successful retry synchronizes the plan before Mycroft starts", async () 
 test("concurrent Retry actions plan once and start the turn once", async () => {
   await withRepository(async (repository) => {
     const requests: Sent[] = []
-    const planner = plannerWith(repository, scripted(["nope", "nope", validReply()], requests))
+    const planner = plannerWith(repository, scripted(["nope", "nope", "nope", validReply()], requests))
     const { gate } = gated(planner)
     let turns = 0
     await quietly(() =>
@@ -857,7 +938,7 @@ test("concurrent Retry actions plan once and start the turn once", async () => {
     assert.equal(first.status, "planned")
     assert.equal(second.status, "planned")
     assert.equal(turns, 1)
-    assert.equal(requests.length, 3, "two failed attempts, then one retry planning")
+    assert.equal(requests.length, FEEDBACK_PLAN_ATTEMPTS + 1, "the bounded failed attempts, then one retry planning")
     assert.equal((await repository.getList(scope)).items.length, 2)
   })
 })
@@ -1082,4 +1163,73 @@ test("the abandoned string acceptanceCriteria contract is rejected with an actio
   assert.ok("error" in parsed, "a legacy string criterion never becomes an accepted plan")
   assert.match(parsed.error, /acceptanceCriteria is no longer accepted/)
   assert.match(parsed.error, /criteria\[\]/)
+})
+
+const acceptedFact = (overrides: Partial<AcceptedFact> = {}): AcceptedFact => ({
+  id: "fact-1",
+  conversationId: "chat",
+  itemId: "item-1",
+  criterionIndex: 0,
+  criterion: "read_file implementation located",
+  toolName: "read_file",
+  planId: "plan-a",
+  planRevision: 1,
+  symbol: "readFile",
+  registeredTool: "read_file",
+  path: "src/extension/tools/workspace.ts",
+  startLine: 169,
+  endLine: 220,
+  observationId: "observation-1",
+  sourceHash: "hash-1",
+  acceptedAt: "2026-01-01T00:00:00.000Z",
+  ...overrides
+})
+
+const locateReadFile = (verification: Record<string, unknown>) => plan({
+  tasks: [{ id: "locate", title: "Locate read_file", description: "Find the implementation.", criteria: [{ id: "criterion-1", description: "readFile located", verification }], dependencies: [] }]
+})
+
+test("a planner path that contradicts live accepted evidence for the same symbol is reported for repair", () => {
+  const guessed = locateReadFile({ kind: "source_location", identity: "implementation_symbol", symbol: "readFile", path: "tools/read_file.ts" })
+  const reply = JSON.stringify({ track: true, plan: guessed })
+  const parsed = parseFeedbackPlanResponse(reply, "Locate the native read_file tool implementation.", [acceptedFact()])
+  assert.ok("error" in parsed, "a guessed path never becomes a binding requirement")
+  assert.match(parsed.error, /Invalid task plan/)
+  assert.match(parsed.error, /tools\/read_file\.ts/)
+  assert.match(parsed.error, /src\/extension\/tools\/workspace\.ts/)
+  assert.match(parsed.error, /omit path/)
+})
+
+test("the same contradiction is accepted when the request itself names the path", () => {
+  const named = locateReadFile({ kind: "source_location", identity: "implementation_symbol", symbol: "readFile", path: "tools/read_file.ts" })
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: named }), "Check tools/read_file.ts for readFile.", [acceptedFact()])
+  assert.ok("plan" in parsed, "a path the user named is the user's own authority, not a guess")
+})
+
+test("a plan that omits the path is accepted and never contradicted by accepted evidence", () => {
+  const discovery = locateReadFile({ kind: "source_location", identity: "implementation_symbol", symbol: "readFile" })
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: discovery }), "Locate the native read_file tool implementation.", [acceptedFact()])
+  assert.ok("plan" in parsed, "discovery before source-specific verification is expressible without a fabricated path")
+})
+
+test("a plan path that matches the live accepted source is accepted", () => {
+  const matching = locateReadFile({ kind: "source_location", identity: "implementation_symbol", symbol: "readFile", path: "src/extension/tools/workspace.ts" })
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: matching }), "Locate readFile.", [acceptedFact()])
+  assert.ok("plan" in parsed)
+})
+
+test("superseded accepted evidence and the absence of evidence never contradict a planner path", () => {
+  const guessed = JSON.stringify({ track: true, plan: locateReadFile({ kind: "source_location", identity: "implementation_symbol", symbol: "readFile", path: "tools/read_file.ts" }) })
+  assert.ok("plan" in parseFeedbackPlanResponse(guessed, "Locate readFile.", [acceptedFact({ supersededBy: "fact-2" })]))
+  assert.ok("plan" in parseFeedbackPlanResponse(guessed, "Locate readFile.", []))
+})
+
+test("the trusted-facts prompt block lists live facts with exact locations and is bounded", () => {
+  assert.equal(trustedFactsBlock([]), "")
+  assert.equal(trustedFactsBlock([acceptedFact({ supersededBy: "fact-2" })]), "", "superseded facts are not presented as authoritative")
+  const block = trustedFactsBlock([acceptedFact()])
+  assert.match(block, /^Trusted accepted facts \(authoritative project evidence\):/)
+  assert.match(block, /registered tool read_file implemented by readFile at src\/extension\/tools\/workspace\.ts lines 169-220/)
+  const many = Array.from({ length: 30 }, (_, index) => acceptedFact({ id: `fact-${index}`, path: `src/file-${index}.ts`, registeredTool: undefined, symbol: `symbol${index}` }))
+  assert.equal(trustedFactsBlock(many).split("\n").length, 21, "one heading plus at most twenty facts")
 })

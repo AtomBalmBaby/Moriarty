@@ -414,7 +414,7 @@ const acceptedFactReference = async (
   const named = (item.criteria ?? []).some(({ verification }) => {
     if (verification.kind === "accepted_fact_exists") return factNamedBy(verification.identity, verification.symbol, fact) && (verification.path === undefined || verification.path === fact.path)
     if (verification.kind === "source_location" || verification.kind === "source_range" || verification.kind === "source_fingerprint") {
-      return factNamedBy(verification.identity, verification.symbol, fact) && verification.path === fact.path
+      return factNamedBy(verification.identity, verification.symbol, fact) && (verification.path === undefined || verification.path === fact.path)
     }
     return false
   })

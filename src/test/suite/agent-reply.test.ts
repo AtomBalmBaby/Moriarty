@@ -16,9 +16,9 @@ import * as vscode from "vscode"
 
 import { AGENT_SELECTION_STORAGE_KEY } from "../../common/agents"
 import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_CONVERSATION_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, CONTINUATION_PREFIX, EVENT_NAME, GLOBAL_STORAGE_KEY, TODO_EVENT_NAME } from "../../common/constants"
-import { ChatCompletionMessage, ReplyChangesView, ToolStepView, TwinnyProvider } from "../../common/types"
+import { ChatCompletionMessage, ReplyChangesView, TodoListSnapshot, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
-import { CHILD_TODO_PROTOCOL } from "../../extension/chat/feedback-planner"
+import { CHILD_TODO_PROTOCOL, FEEDBACK_PLAN_ATTEMPTS } from "../../extension/chat/feedback-planner"
 import { Chat } from "../../extension/chat/index"
 import { createSafeEditCheckpoints, type EditCommandRunner } from "../../extension/chat/tool-sinks"
 import { GenerationTracker } from "../../extension/generations"
@@ -34,12 +34,16 @@ import { BaseProvider } from "../../extension/webview/base"
 class ScriptedModel implements InferenceProvider {
   public readonly id = "scripted-agent"
   public requests: ChatRequest[] = []
+  private readonly _plans: string[]
 
+  /** `planReply` answers planning requests in order; the last one repeats once the list is used up. */
   constructor(
     private readonly _replies: Array<string | Error>,
-    private readonly _planReply?: string,
+    planReply?: string | string[],
     private readonly _hold?: (request: ChatRequest) => Promise<void> | void
-  ) {}
+  ) {
+    this._plans = planReply === undefined ? [] : Array.isArray(planReply) ? [...planReply] : [planReply]
+  }
 
   capabilities() {
     return ["chat" as const]
@@ -48,10 +52,10 @@ class ScriptedModel implements InferenceProvider {
   async *chat(request: ChatRequest) {
     this.requests.push(structuredClone(request))
     const system = String(request.messages[0]?.content ?? "")
-    const planning = this._planReply !== undefined && /track \(boolean\)/.test(system)
+    const planning = this._plans.length > 0 && /track \(boolean\)/.test(system)
     // A held reply is a provider response that may arrive after the test has stopped the operation.
     await this._hold?.(request)
-    const next = planning ? this._planReply! : this._replies.shift() ?? "Done."
+    const next = planning ? (this._plans.length > 1 ? this._plans.shift()! : this._plans[0]) : this._replies.shift() ?? "Done."
     // A scripted failure is thrown the way the provider throws it, before any content streams.
     if (next instanceof Error) throw next
     for (let i = 0; i < next.length; i += 9) yield { content: next.slice(i, i + 9) }
@@ -1290,8 +1294,15 @@ const bridgeMessages: Array<{ type: string; data: unknown }> = []
 
 })
 
+/** The source proof of the readFile declaration; the answer's path, range, and fingerprint are each proven by one of these. */
+const readFileSourceCriteria = (file: string) => [
+  { id: "declared", description: "readFile declares the read_file registration.", verification: { kind: "source_location", identity: "implementation_symbol", symbol: "readFile", path: file } },
+  { id: "bounded", description: "The readFile declaration is read through its closing line.", verification: { kind: "source_range", identity: "implementation_symbol", symbol: "readFile", path: file } },
+  { id: "current", description: "The readFile declaration matches the current source.", verification: { kind: "source_fingerprint", identity: "implementation_symbol", symbol: "readFile", path: file } }
+]
+
 /** The planner's reply for the read_file investigation: a prerequisite lookup, then source proof that depends on it. */
-const readFilePlanReply = (planId: string, confirmation: "source" | "accepted_fact" = "source") => JSON.stringify({
+const readFilePlanReply = (planId: string, confirmation: "source" | "accepted_fact" = "source", file = "src/tools.ts") => JSON.stringify({
   track: true,
   plan: {
     planId,
@@ -1313,17 +1324,44 @@ const readFilePlanReply = (planId: string, confirmation: "source" | "accepted_fa
         description: "Find the declaration that registers read_file in src/tools.ts.",
         dependencies: ["lookup"],
         criteria: confirmation === "source" ? [
-          { id: "registered", description: "read_file is registered in src/tools.ts.", verification: { kind: "source_location", identity: "registered_tool", symbol: "read_file", path: "src/tools.ts" } },
-          { id: "declared", description: "readFile declares the read_file registration.", verification: { kind: "source_location", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" } },
-          { id: "bounded", description: "The readFile declaration is read through its closing line.", verification: { kind: "source_range", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" } },
-          { id: "current", description: "The readFile declaration matches the current source.", verification: { kind: "source_fingerprint", identity: "implementation_symbol", symbol: "readFile", path: "src/tools.ts" } }
+          { id: "registered", description: "read_file is registered in the source file.", verification: { kind: "source_location", identity: "registered_tool", symbol: "read_file", path: file } },
+          ...readFileSourceCriteria(file)
         ] : [
-          { id: "recorded", description: "read_file has an accepted implementation fact in src/tools.ts.", verification: { kind: "accepted_fact_exists", identity: "registered_tool", symbol: "read_file", path: "src/tools.ts" } }
+          { id: "recorded", description: "read_file has an accepted implementation fact in the source file.", verification: { kind: "accepted_fact_exists", identity: "registered_tool", symbol: "read_file", path: file } },
+          ...readFileSourceCriteria(file)
         ]
       }
+    ],
+    answer: [
+      { id: "read-file-answer", source: { identity: "implementation_symbol", symbol: "readFile", path: file }, fields: ["path", "range", "fingerprint"] }
     ]
   }
 })
+
+/** The same plan with one criterion's verification identity replaced, or removed when identity is undefined. */
+const withIdentity = (reply: string, criterionId: string, identity: string | undefined) => {
+  const body = JSON.parse(reply) as { plan: { tasks: { criteria: { id: string; verification: Record<string, unknown> }[] }[] } }
+  for (const task of body.plan.tasks) {
+    for (const criterion of task.criteria) {
+      if (criterion.id !== criterionId) continue
+      if (identity === undefined) delete criterion.verification.identity
+      else criterion.verification.identity = identity
+    }
+  }
+  return JSON.stringify(body)
+}
+
+/** The planner requests a model received, identified by the planner's protocol text. */
+const planningRequests = (model: ScriptedModel) =>
+  model.requests.filter((request) => /track \(boolean\)/.test(String(request.messages[0]?.content ?? "")))
+
+/** Every file under a directory, keyed by its path relative to the root. */
+const treeOf = (root: string, dir = root): Record<string, string> => Object.fromEntries(
+  fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry): Array<[string, string]> => {
+    const full = path.join(dir, entry.name)
+    return entry.isDirectory() ? Object.entries(treeOf(root, full)) : [[path.relative(root, full), fs.readFileSync(full, "utf8")]]
+  })
+)
 
 const commandTitle = "Run the verification command"
 
@@ -1383,10 +1421,12 @@ suite("Read-file acceptance, production controller", function () {
     projectFingerprint: string
   }
 
-  const withWorkspace = async (run: (workspace: Workspace) => Promise<void>) => {
+  const withWorkspace = async (run: (workspace: Workspace) => Promise<void>, sources: Record<string, string> = { "src/tools.ts": toolsSource }) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-acceptance-workspace-"))
-    fs.mkdirSync(path.join(root, "src"))
-    fs.writeFileSync(path.join(root, "src", "tools.ts"), toolsSource)
+    for (const [file, text] of Object.entries(sources)) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
+      fs.writeFileSync(path.join(root, file), text)
+    }
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-acceptance-storage-"))
     const closeWorkspace = await openWorkspace(root)
     const settings = vscode.workspace.getConfiguration("twinny")
@@ -1412,7 +1452,7 @@ suite("Read-file acceptance, production controller", function () {
   const runTurn = async (workspace: Workspace, options: {
     conversationId: string
     message?: string
-    planReply: string
+    planReply: string | string[]
     replies: Array<string | Error>
     evaluations?: string[]
     autoRunCommands?: boolean
@@ -1478,7 +1518,7 @@ suite("Read-file acceptance, production controller", function () {
     try {
       const reply = await chat.completion([{ role: "user", content: options.message ?? userMessage } as ChatCompletionMessage], [], "default", options.conversationId)
       const scope = { projectFingerprint: workspace.projectFingerprint, conversationId: options.conversationId, writer: options.conversationId }
-      return { agent, reply, repository, scope, stored, chat, posted }
+      return { agent, evaluator, reply, repository, scope, stored, chat, posted }
     } finally {
       chat.dispose()
       providerRegistry.unregister(agentId)
@@ -1509,6 +1549,7 @@ suite("Read-file acceptance, production controller", function () {
   }
 
   test("the read_file investigation is controller-verified, persisted, reused after reopen, and isolated by project", async () => {
+    const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {
       const first = await runTurn(workspace, {
         conversationId: "read-file-first",
@@ -1516,7 +1557,7 @@ suite("Read-file acceptance, production controller", function () {
         replies: [
           "Checked accepted evidence: nothing is recorded for read_file yet.",
           call("read_file", { path: "src/tools.ts" }),
-          "read_file is registered by readFile in src/tools.ts, which closes at line 4."
+          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
         ]
       })
 
@@ -1543,7 +1584,7 @@ suite("Read-file acceptance, production controller", function () {
       const second = await runTurn(workspace, {
         conversationId: "read-file-second",
         planReply: readFilePlanReply("read-file-plan-second", "accepted_fact"),
-        replies: ["The accepted fact already answers this."]
+        replies: [`read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`]
       })
       assert.equal(await statusOf(second, investigateTitle), "completed")
       assert.equal(sawSourceText(second), false, "the second conversation must not re-read the source")
@@ -1555,6 +1596,15 @@ suite("Read-file acceptance, production controller", function () {
       const secondFacts = await second.repository.listAcceptedEvidence(second.scope)
       assert.deepEqual(secondFacts.map((fact) => fact.id), facts.map((fact) => fact.id))
 
+      // The completion persisted after the final reply must reach the open panel as the last snapshot, not only on reopen.
+      const changed = second.posted.filter((message) => message.type === TODO_EVENT_NAME.changed).map((message) => message.data as TodoListSnapshot)
+      const panel = changed[changed.length - 1]
+      const persistedList = await second.repository.getList({ ...second.scope, includeCompleted: true })
+      assert.ok(panel, "the active conversation receives a TODO snapshot")
+      assert.equal(panel.revision, persistedList.revision, "the last pushed snapshot is the persisted revision")
+      assert.deepEqual(panel.items.map((item) => [item.id, item.status]), persistedList.items.map((item) => [item.id, item.status]))
+      assert.equal(panel.items.find((item) => item.title === investigateTitle)?.status, "completed")
+
       const elsewhere = await second.repository.listAcceptedEvidence({
         projectFingerprint: workspaceProjectFingerprint(["file:///elsewhere"]),
         conversationId: second.scope.conversationId
@@ -1563,7 +1613,391 @@ suite("Read-file acceptance, production controller", function () {
     })
   })
 
+  test("a placeholder answer is not delivered after the tasks complete; the authoritative read_file fingerprint is delivered instead", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const source = fs.readFileSync(path.resolve(__dirname, "../../..", file), "utf8")
+    const lines = source.split("\n")
+    const declared = lines.findIndex((line) => line.startsWith("const readFile = "))
+    const closing = lines.findIndex((line, index) => index > declared && line === "}")
+    assert.ok(declared >= 0 && closing > declared, "the readFile declaration is found in the repository source")
+    const start = declared + 1
+    const end = closing + 1
+    const fingerprint = await contentHash(source)
+    const request = "Locate the native read_file tool implementation. Check project-wide accepted evidence first. If no current accepted evidence exists, locate and read the implementation once. Return its filename, implementation line range, and the authoritative source fingerprint supplied by read_file. Do not modify files."
+
+    await withWorkspace(async (workspace) => {
+      const before = treeOf(workspace.root)
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-placeholder-answer",
+        message: request,
+        planReply: readFilePlanReply("read-file-plan-placeholder", "source", file),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: file, start_line: String(start), end_line: String(end) }),
+          `read_file is implemented in ${file}, lines ${start} to ${end}, fingerprint xxh64:<hash_value>.`,
+          `read_file is implemented in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`
+        ]
+      })
+
+      assert.equal(await statusOf(turn, lookupTitle), "completed")
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      const counts = await observationCounts(workspace)
+      assert.equal(counts.read_file, 1, "the implementation is read once by the host")
+      assert.equal(counts.run_command ?? 0, 0, "no fingerprint is recalculated with a command")
+      assert.deepEqual(treeOf(workspace.root), before, "no file is mutated")
+
+      assert.ok(JSON.stringify(turn.agent.requests[2].messages).includes(fingerprint), "the authoritative fingerprint is exposed to the implementer after read_file")
+      const reply = turn.reply ?? ""
+      assert.ok(!reply.includes("<hash_value>"), "a placeholder is never delivered")
+      assert.ok(!JSON.stringify(turn.posted).includes("<hash_value>"), "the rejected placeholder is never posted to the webview")
+      assert.ok(reply.includes(fingerprint), "the delivered answer carries the authoritative fingerprint")
+      assert.ok(reply.includes(file) && reply.includes(`lines ${start} to ${end}`), "the delivered answer carries the verified filename and range")
+      assert.equal(turn.agent.requests.length, 4, "the placeholder is rejected by a correction, then the corrected answer is delivered")
+    }, { [file]: source })
+  })
+
+  const mycroftRequest = "Locate the native read_file tool implementation. Check project-wide accepted evidence first. If no current accepted evidence exists, locate and read the implementation once. Return its filename, implementation line range, and the authoritative source fingerprint supplied by read_file. Do not modify files."
+
+  /** The readFile declaration in a repository source file, as 1-based inclusive lines. */
+  const repositoryDeclaration = (file: string) => {
+    const source = fs.readFileSync(path.resolve(__dirname, "../../..", file), "utf8")
+    const lines = source.split("\n")
+    const declared = lines.findIndex((line) => line.startsWith("const readFile = "))
+    const closing = lines.findIndex((line, index) => index > declared && line === "}")
+    assert.ok(declared >= 0 && closing > declared, "the readFile declaration is found in the repository source")
+    return { source, start: declared + 1, end: closing + 1 }
+  }
+
+  /** Seeds one current accepted readFile fact through the production controller, so later turns start with trusted evidence. */
+  const seedImplementationFact = async (workspace: Workspace, file: string, conversationId: string) => {
+    const { source, start, end } = repositoryDeclaration(file)
+    const fingerprint = await contentHash(source)
+    const seed = await runTurn(workspace, {
+      conversationId,
+      planReply: readFilePlanReply(`${conversationId}-plan`, "source", file),
+      replies: [
+        "Checked accepted evidence: nothing is recorded for read_file yet.",
+        call("read_file", { path: file, start_line: String(start), end_line: String(end) }),
+        `read_file is registered by readFile in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`
+      ]
+    })
+    assert.equal(await statusOf(seed, investigateTitle), "completed", "the seed proof is accepted")
+    return { start, end, fingerprint }
+  }
+
+  /** The same investigation with every source path removed, so the source is discovered rather than named. */
+  const discoveryPlanReply = (planId: string, file: string) => {
+    const body = JSON.parse(readFilePlanReply(planId, "source", file)) as {
+      plan: { tasks: { criteria: { verification: Record<string, unknown> }[] }[]; answer: { source: Record<string, unknown> }[] }
+    }
+    for (const criterion of body.plan.tasks[1].criteria) delete criterion.verification.path
+    delete body.plan.answer[0].source.path
+    return JSON.stringify(body)
+  }
+
+  test("a planner path that contradicts current accepted evidence is repaired before the implementer runs, and the trusted fact completes the task", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const guessed = "tools/read_file.ts"
+    const { source } = repositoryDeclaration(file)
+    await withWorkspace(async (workspace) => {
+      const seed = await seedImplementationFact(workspace, file, "contradiction-seed")
+      const observedBefore = await observationCounts(workspace)
+      const turn = await runTurn(workspace, {
+        conversationId: "contradiction-guess",
+        planReply: [readFilePlanReply("contradiction-plan-guessed", "source", guessed), readFilePlanReply("contradiction-plan-repaired", "accepted_fact", file)],
+        replies: [`read_file is implemented in ${file}, lines ${seed.start} to ${seed.end}, fingerprint ${seed.fingerprint}.`]
+      })
+
+      const planning = planningRequests(turn.evaluator)
+      assert.equal(planning.length, 2, "one contradicted plan, then one repaired plan")
+      const correction = JSON.stringify(planning[1].messages)
+      assert.ok(correction.includes(guessed) && correction.includes(file), "the repair names the guessed path and the trusted path")
+      assert.equal(turn.agent.requests.length, 1, "the implementer runs only once, against the repaired plan")
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      const facts = await turn.repository.listAcceptedEvidence(turn.scope)
+      assert.ok(facts.every((fact) => fact.path === file), "no fact is recorded for the guessed path")
+      assert.equal((await observationCounts(workspace)).read_file ?? 0, observedBefore.read_file ?? 0, "no file is re-read for the repaired plan")
+    }, { [file]: source })
+  })
+
+  test("a fresh accepted fact that satisfies the request is delivered with its exact values, without another source read", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const { source } = repositoryDeclaration(file)
+    await withWorkspace(async (workspace) => {
+      const seed = await seedImplementationFact(workspace, file, "fresh-fact-seed")
+      const observedBefore = await observationCounts(workspace)
+      const turn = await runTurn(workspace, {
+        conversationId: "fresh-fact-answer",
+        message: mycroftRequest,
+        planReply: readFilePlanReply("fresh-fact-plan", "accepted_fact", file),
+        replies: [`read_file is implemented in ${file}, lines ${seed.start} to ${seed.end}, fingerprint ${seed.fingerprint}.`]
+      })
+
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      assert.equal(sawSourceText(turn), false, "the trusted fact is used without re-reading the source")
+      const observedAfter = await observationCounts(workspace)
+      for (const tool of ["read_file", "twinny_evidence_lookup"]) {
+        assert.equal(observedAfter[tool] ?? 0, observedBefore[tool] ?? 0, `${tool} must not execute again`)
+      }
+      assert.equal(turn.agent.requests.length, 1, "no redundant continuation runs")
+      const reply = turn.reply ?? ""
+      assert.ok(reply.includes(file) && reply.includes(`lines ${seed.start} to ${seed.end}`) && reply.includes(seed.fingerprint), "the delivered answer carries the exact current values")
+    }, { [file]: source })
+  })
+
+  test("with no accepted fact, discovery locates the source and captures authoritative evidence without inventing a path", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const { source, start, end } = repositoryDeclaration(file)
+    const fingerprint = await contentHash(source)
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "discovery-no-facts",
+        message: mycroftRequest,
+        planReply: discoveryPlanReply("discovery-plan", file),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("find_symbol", { name: "readFile" }),
+          call("read_file", { path: file, start_line: String(start), end_line: String(end) }),
+          `read_file is implemented in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`
+        ]
+      })
+
+      const planned = planningRequests(turn.evaluator)
+      assert.equal(planned.length, 1, "the discovery plan is accepted without a correction")
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      const facts = await turn.repository.listAcceptedEvidence(turn.scope)
+      assert.equal(facts.length, 1)
+      assert.equal(facts[0].path, file, "the source is the one discovered and read")
+      assert.equal(facts[0].sourceHash, fingerprint)
+      assert.equal((await observationCounts(workspace)).read_file, 1, "the source is read once, after discovery")
+      assert.ok((turn.reply ?? "").includes(fingerprint), "the answer carries the discovered fingerprint")
+    }, { [file]: source })
+  })
+
+  test("a successful read of the correct source does not satisfy criteria that name another path, and the controller stops instead of looping", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const wrong = "tools/read_file.ts"
+    const { source, start, end } = repositoryDeclaration(file)
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "impossible-predicate",
+        message: mycroftRequest,
+        planReply: readFilePlanReply("impossible-predicate-plan", "source", wrong),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: file, start_line: String(start), end_line: String(end) }),
+          "The implementation is read.",
+          "The implementation is read.",
+          "The implementation is read.",
+          "The implementation is read.",
+          "The implementation is read."
+        ]
+      })
+
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed", "the impossible predicate is never satisfied")
+      assert.equal((await observationCounts(workspace)).read_file, 1, "the correct read is not repeated to chase the predicate")
+      assert.ok(turn.agent.requests.length <= 5, "the continuations are bounded")
+      const stopped = turn.posted.find((message) => message.type === EVENT_NAME.twinnyAddMessage && JSON.stringify(message.data).includes("Execution stopped"))
+      assert.ok(stopped, "the stop is visible")
+      assert.ok(JSON.stringify(stopped.data).includes("no measurable progress"), "the stop names the no-progress cause")
+    }, { [file]: source })
+  })
+
+  test("repeated unchanged Feedback rejection stops on the no-progress budget, however often the model claims completion", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const { source } = repositoryDeclaration(file)
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "unchanged-rejection",
+        message: mycroftRequest,
+        planReply: readFilePlanReply("unchanged-rejection-plan", "source", file),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          "The implementation is complete.",
+          "The implementation is complete.",
+          "The implementation is complete.",
+          "The implementation is complete.",
+          "The implementation is complete."
+        ]
+      })
+
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed")
+      assert.equal((await observationCounts(workspace)).read_file ?? 0, 0, "no evidence is produced")
+      assert.ok(turn.agent.requests.length <= 5, "version churn and completion claims do not extend the turn")
+      const stopped = turn.posted.find((message) => message.type === EVENT_NAME.twinnyAddMessage && JSON.stringify(message.data).includes("Execution stopped"))
+      assert.ok(stopped && JSON.stringify(stopped.data).includes("no measurable progress"), "the stop names the no-progress cause")
+    }, { [file]: source })
+  })
+
+  test("an invalid full_line range read is rejected with corrective guidance, and a corrected ranged read succeeds", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const { source, start, end } = repositoryDeclaration(file)
+    const fingerprint = await contentHash(source)
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "full-line-range",
+        message: mycroftRequest,
+        planReply: readFilePlanReply("full-line-plan", "source", file),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: file, start_line: String(start), end_line: String(end), full_line: "true" }),
+          call("read_file", { path: file, start_line: String(start), end_line: String(end) }),
+          `read_file is registered by readFile in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`
+        ]
+      })
+
+      const rejection = JSON.stringify(turn.agent.requests[2]?.messages ?? [])
+      assert.ok(rejection.includes("full_line returns exactly one line"), "the invalid combination is named")
+      assert.ok(rejection.includes("drop full_line and pass start_line and end_line"), "the error says how to correct the range")
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      const facts = await turn.repository.listAcceptedEvidence(turn.scope)
+      assert.equal(facts.length, 1)
+      assert.equal(facts[0].startLine, start, "only the corrected ranged read is accepted as the source proof")
+      assert.equal(facts[0].endLine, end)
+      assert.equal((await observationCounts(workspace)).read_file, 2, "the rejected call and the corrected read are both observed; only the corrected read is proof")
+    }, { [file]: source })
+  })
+
+  test("an answer missing its fingerprint is withheld from the webview and corrected before delivery", async () => {
+    const fingerprint = await contentHash(toolsSource)
+    const incomplete = "read_file is implemented in src/tools.ts, lines 1 to 4."
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-missing-fingerprint",
+        planReply: readFilePlanReply("read-file-plan-missing-fingerprint"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: "src/tools.ts" }),
+          incomplete,
+          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
+        ]
+      })
+
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      assert.equal(turn.agent.requests.length, 4, "the incomplete answer is rejected by a correction, then the corrected answer is delivered")
+      assert.ok(!JSON.stringify(turn.posted).includes(incomplete), "the incomplete answer is never posted to the webview")
+      assert.ok(JSON.stringify(turn.posted).includes(`fingerprint ${fingerprint}`), "the corrected answer carries the authoritative fingerprint")
+      assert.ok(!turn.reply?.includes(incomplete), "the delivered reply is the corrected answer")
+    }, { "src/tools.ts": toolsSource })
+  })
+
+  test("an answer that never supplies its required values exhausts the correction budget and is not delivered", async () => {
+    const incomplete = "read_file is implemented in src/tools.ts, lines 1 to 4."
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-exhausted-delivery",
+        planReply: readFilePlanReply("read-file-plan-exhausted-delivery"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: "src/tools.ts" }),
+          incomplete,
+          incomplete,
+          incomplete,
+          incomplete,
+          incomplete,
+          incomplete
+        ]
+      })
+
+      const posted = JSON.stringify(turn.posted)
+      assert.ok(!posted.includes(incomplete), "no incomplete answer is posted to the webview")
+      assert.ok(posted.includes("Execution stopped"), "the exhausted correction stops the turn with a visible notice")
+    }, { "src/tools.ts": toolsSource })
+  })
+
+  test("an invalid verification identity is repaired from its exact diagnostic, then the real read_file implementation is located", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const source = fs.readFileSync(path.resolve(__dirname, "../../..", file), "utf8")
+    const lines = source.split("\n")
+    const declared = lines.findIndex((line) => line.startsWith("const readFile = "))
+    const closing = lines.findIndex((line, index) => index > declared && line === "}")
+    assert.ok(declared >= 0 && closing > declared, "the readFile declaration is found in the repository source")
+    const start = declared + 1
+    const end = closing + 1
+    const fingerprint = await contentHash(source)
+
+    await withWorkspace(async (workspace) => {
+      const before = treeOf(workspace.root)
+      const invalid = withIdentity(readFilePlanReply("read-file-plan-invalid", "source", file), "declared", undefined)
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-repaired-plan",
+        planReply: [invalid, readFilePlanReply("read-file-plan-repaired", "source", file)],
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: file, start_line: String(start), end_line: String(end) }),
+          `read_file is registered by readFile in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`
+        ]
+      })
+
+      const planning = planningRequests(turn.evaluator)
+      assert.equal(planning.length, 2, "one invalid plan, then one corrected plan")
+      const correction = JSON.stringify(planning[1].messages)
+      assert.ok(correction.includes("plan.tasks[1].criteria[1].verification.identity must be registered_tool or implementation_symbol; received nothing."), "the correction carries the exact validator diagnostic")
+      assert.ok(correction.includes(userMessage), "the correction keeps the original request")
+
+      assert.equal(turn.agent.requests.length, 3, "the controller stops after the dependent task is proven")
+      assert.equal(await statusOf(turn, lookupTitle), "completed")
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+
+      const facts = await turn.repository.listAcceptedEvidence(turn.scope)
+      assert.equal(facts.length, 1)
+      assert.equal(facts[0].toolName, "read_file")
+      assert.equal(facts[0].registeredTool, "read_file")
+      assert.equal(facts[0].symbol, "readFile")
+      assert.equal(facts[0].path, file)
+      assert.equal(facts[0].startLine, start)
+      assert.equal(facts[0].endLine, end)
+      assert.equal(facts[0].sourceHash, fingerprint, "the fingerprint is the one read_file reported for the document")
+      assert.equal(facts[0].planId, "read-file-plan-repaired")
+
+      const counts = await observationCounts(workspace)
+      assert.equal(counts.read_file, 1, "the implementation is read once by the host")
+      assert.deepEqual(Object.keys(counts).filter((tool) => /write|edit|replace|create|delete|rename/.test(tool)), [], "no mutating tool runs")
+      assert.deepEqual(treeOf(workspace.root), before, "no file is mutated")
+
+      const observedBefore = await observationCounts(workspace)
+      const second = await runTurn(workspace, {
+        conversationId: "read-file-repaired-reuse",
+        planReply: readFilePlanReply("read-file-plan-reuse", "accepted_fact", file),
+        replies: [`read_file is implemented in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`]
+      })
+      assert.equal(await statusOf(second, investigateTitle), "completed")
+      assert.equal(second.agent.requests.length, 1, "the reused proof releases the dependent task without another implementer investigation")
+      const observedAfter = await observationCounts(workspace)
+      for (const tool of ["read_file", "twinny_evidence_lookup"]) {
+        assert.equal(observedAfter[tool] ?? 0, observedBefore[tool] ?? 0, `${tool} must not execute again when current proof exists`)
+      }
+    }, { [file]: source })
+  })
+
+  test("a planner that keeps returning invalid contracts stops at the planning budget with the exact diagnostic and changes nothing", async () => {
+    await withWorkspace(async (workspace) => {
+      const before = treeOf(workspace.root)
+      const invalid = (identity: string | undefined) => withIdentity(readFilePlanReply("read-file-plan-exhausted"), "declared", identity)
+      const plans = [invalid(undefined), invalid(undefined), invalid("tool")]
+      assert.equal(plans.length, FEEDBACK_PLAN_ATTEMPTS, "the script covers every planning attempt in the budget")
+
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-exhausted-plan",
+        planReply: plans,
+        replies: []
+      })
+
+      assert.equal(planningRequests(turn.evaluator).length, FEEDBACK_PLAN_ATTEMPTS, "planning stops at its own budget")
+      const exact = "plan.tasks[1].criteria[1].verification.identity must be registered_tool or implementation_symbol; received \"tool\"."
+      assert.ok(JSON.stringify(turn.posted).includes(JSON.stringify(exact).slice(1, -1)), "the unresolved exact diagnostic is shown to the user")
+      assert.ok(!turn.reply?.startsWith(CONTINUATION_PREFIX), "a planning failure does not auto-continue")
+      assert.equal(turn.agent.requests.length, 0, "no implementer request starts")
+      assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
+      const { items } = await turn.repository.getList({ ...turn.scope, includeCompleted: true })
+      assert.equal(items.filter((item) => item.status === "completed").length, 0, "nothing is marked complete")
+      assert.deepEqual(await observationCounts(workspace), {}, "no tool runs")
+      assert.deepEqual(treeOf(workspace.root), before, "no file is mutated")
+    })
+  })
+
   test("a retryable provider parser failure resumes the same task without another user message", async () => {
+    const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {
       const parserFailure = () => new InferenceError("inference-failure", "llama.cpp HTTP 500: failed to parse tool call", { status: 500, reason: "parser-failure" })
       const turn = await runTurn(workspace, {
@@ -1575,7 +2009,7 @@ suite("Read-file acceptance, production controller", function () {
           parserFailure(),
           parserFailure(),
           call("read_file", { path: "src/tools.ts" }),
-          "read_file is registered by readFile in src/tools.ts, which closes at line 4."
+          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
         ]
       })
 
@@ -1660,6 +2094,7 @@ suite("Read-file acceptance, production controller", function () {
   })
 
   test("a restarted conversation reuses the persisted read and resumes the blocked task without re-reading", async () => {
+    const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {
       const blocked = await runTurn(workspace, {
         conversationId: "read-file-restart",
@@ -1679,7 +2114,7 @@ suite("Read-file acceptance, production controller", function () {
         planReply: readFilePlanReply("read-file-plan-restart"),
         replies: [
           call("read_file", { path: "src/tools.ts" }),
-          "read_file is registered by readFile in src/tools.ts, which closes at line 4."
+          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
         ]
       })
 
@@ -1798,6 +2233,7 @@ suite("Read-file acceptance, production controller", function () {
   })
 
   test("an unresolved user approval is not bypassed by a satisfied plan or a model completion claim", async () => {
+    const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {
       const conversationId = "read-file-approval"
       const scope = { projectFingerprint: workspace.projectFingerprint, conversationId, writer: conversationId }
@@ -1813,7 +2249,7 @@ suite("Read-file acceptance, production controller", function () {
           call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-1" }),
           call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-2" }),
           call("read_file", { path: "src/tools.ts" }),
-          "read_file is registered by readFile in src/tools.ts."
+          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
         ]
       })
 

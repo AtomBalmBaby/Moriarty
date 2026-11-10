@@ -37,6 +37,11 @@ export interface ReplyExtras {
   meta?(): Partial<ReplyMeta>
   /** True when the reply is worth keeping with no text: its tools ran, and their steps are its record. */
   keepEmpty?(): boolean
+  /**
+   * Asked as the reply starts. When true, nothing of the reply is shown until `releaseHeld` or `discardHeld`, so the host
+   * can check it against its evidence first.
+   */
+  hold?(): boolean
   /** Waited for once the reply has ended, before it is kept: work that reads the workspace as the reply left it. */
   settle?(): Promise<void>
   /** The files the reply changed, kept with it (read after `settle`). */
@@ -60,6 +65,8 @@ export class ChatGeneration {
   private _trace?: InferenceTraceContext
   /** Runs stopped because the user left their conversation: what they wrote is not kept. */
   private readonly _discarded = new WeakSet<GenerationRun>()
+  /** The last reply, held back by `ReplyExtras.hold`, as the call that would show it. */
+  private _held?: () => void
   private readonly _stopSubscription: { dispose(): void }
 
   constructor(
@@ -155,6 +162,7 @@ export class ChatGeneration {
     let finishReason: string | undefined
     const elapsed = this.logRequest(request.messages, provider)
     const started = Date.now()
+    const holding = extras.hold?.() ?? false
     const meta: ReplyMeta = { model: provider.modelName, provider: provider.label }
     const finish = (): ReplyMeta => ({
       ...meta,
@@ -180,7 +188,7 @@ export class ChatGeneration {
           streamChunks++
           streamedContentChars += chunk.content.length
           reasoningChars += chunk.reasoning?.length ?? 0
-          if (chunk.reasoning) this._bridge.emit(EVENT_NAME.twinnyOnReasoning, redactEvidence(chunk.reasoning))
+          if (chunk.reasoning && !holding) this._bridge.emit(EVENT_NAME.twinnyOnReasoning, redactEvidence(chunk.reasoning))
           if (chunk.finishReason) finishReason = chunk.finishReason
           if (chunk.usage?.completionTokens) {
             meta.completionTokens = chunk.usage.completionTokens
@@ -189,10 +197,12 @@ export class ChatGeneration {
             meta.promptTokens = chunk.usage.promptTokens
           }
           text += chunk.content
-          this._bridge.emit(EVENT_NAME.twinnyOnCompletion, {
-            content: text.trimStart() || " ",
-            role: ASSISTANT
-          })
+          if (!holding) {
+            this._bridge.emit(EVENT_NAME.twinnyOnCompletion, {
+              content: text.trimStart() || " ",
+              role: ASSISTANT
+            })
+          }
         }
       } catch (error) {
         // Stopping is not a failure: what arrived is the reply.
@@ -217,7 +227,7 @@ export class ChatGeneration {
       await extras.settle?.()
       // A discarded reply is nobody's: not shown, and not part of the conversation.
       if (this._discarded.has(run)) return ""
-      if (reply || extras.keepEmpty?.()) this.addMessage(reply, finish(), extras.toolNotes?.(), extras.changes?.())
+      if (reply || extras.keepEmpty?.()) this.present(holding, reply, finish(), extras.toolNotes?.(), extras.changes?.())
       return reply
     } catch (error) {
       operationState = run.signal.aborted ? "cancelled" : "failed"
@@ -227,7 +237,7 @@ export class ChatGeneration {
       const partial = text.trim() === prefix.trim() ? "" : text.trim()
       if (this._discarded.has(run)) return ""
       await extras.settle?.().catch(() => undefined)
-      if (partial || extras.keepEmpty?.()) this.addMessage(partial, finish(), extras.toolNotes?.(), extras.changes?.())
+      if (partial || extras.keepEmpty?.()) this.present(holding, partial, finish(), extras.toolNotes?.(), extras.changes?.())
       if (!run.signal.aborted) extras.onFailure?.(error)
       this.report(error, provider)
       return partial
@@ -241,6 +251,27 @@ export class ChatGeneration {
       if (this._trace === trace) this._trace = undefined
       if (this._run === run) this._run = undefined
     }
+  }
+
+  /** Shows the reply now, or keeps it back until the host releases or discards it. */
+  private present(holding: boolean, content: string, meta: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView) {
+    if (!holding) {
+      this.addMessage(content, meta, toolNotes, changes)
+      return
+    }
+    this._held = () => this.addMessage(content, meta, toolNotes, changes)
+  }
+
+  /** Shows the reply the last generation held back. */
+  public releaseHeld() {
+    const show = this._held
+    this._held = undefined
+    show?.()
+  }
+
+  /** Forgets the reply the last generation held back, without showing it. */
+  public discardHeld() {
+    this._held = undefined
   }
 
   private addMessage(content: string, meta?: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView) {

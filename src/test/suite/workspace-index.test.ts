@@ -17,6 +17,9 @@ suite("Persistent workspace intelligence index", () => {
   let storage: string
   let originalFolders: Array<{ uri: vscode.Uri; name: string }>
   let index: WorkspaceIntelligenceIndex
+  const waitUntil = async (condition: () => Promise<boolean>) => {
+    for (let attempt = 0; attempt < 50 && !(await condition()); attempt++) await new Promise((resolve) => setTimeout(resolve, 200))
+  }
 
   setup(async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-index-main-"))
@@ -140,15 +143,16 @@ suite("Persistent workspace intelligence index", () => {
     assert.match(edit.output, /"ok":true/)
     const sourceDocument = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(root, sourcePath)))
     await sourceDocument.save()
-    await new Promise((resolve) => setTimeout(resolve, 600))
-    const changedSource = await index.search({ query: "workspaceSearchAcceptanceMarker = 'after'", mode: "literal" }, root)
+    const changedQuery = { query: "workspaceSearchAcceptanceMarker = 'after'", mode: "literal" as const }
+    await waitUntil(async () => (await index.search(changedQuery, root)).results[0]?.source === "index")
+    const changedSource = await index.search(changedQuery, root)
     assert.equal(changedSource.results[0]?.source, "index")
     const oldUri = vscode.Uri.file(path.join(secondRoot, "src", "other.ts"))
     const renamedUri = vscode.Uri.file(path.join(secondRoot, "src", "renamed.ts"))
     const rename = new vscode.WorkspaceEdit()
     rename.renameFile(oldUri, renamedUri)
     assert.equal(await vscode.workspace.applyEdit(rename), true)
-    await new Promise((resolve) => setTimeout(resolve, 600))
+    await waitUntil(async () => (await index.search({ query: "multiRootMarker", mode: "literal" }, secondRoot)).results.some((hit) => hit.path.endsWith("src/renamed.ts")))
     const renamed = await index.search({ query: "multiRootMarker", mode: "literal" }, secondRoot)
     assert.ok(renamed.results.some((hit) => hit.path.endsWith("src/renamed.ts")))
     const remove = new vscode.WorkspaceEdit()
@@ -157,8 +161,7 @@ suite("Persistent workspace intelligence index", () => {
       await vscode.workspace.fs.delete(renamedUri)
       await index.rebuild()
     }
-    await new Promise((resolve) => setTimeout(resolve, 400))
-    assert.equal((await index.search({ query: "multiRootMarker", mode: "literal" }, secondRoot)).total, 0)
+    await waitUntil(async () => (await index.search({ query: "multiRootMarker", mode: "literal" }, secondRoot)).total === 0)
     const uri = vscode.Uri.file(path.join(root, "src", "native.ts"))
     const document = await vscode.workspace.openTextDocument(uri)
     const editor = await vscode.window.showTextDocument(document)
@@ -167,7 +170,7 @@ suite("Persistent workspace intelligence index", () => {
     const live = await index.search({ query: "read_file_dirty", mode: "literal" }, root)
     assert.equal(live.results[0]?.source, "live")
     await document.save()
-    await new Promise((resolve) => setTimeout(resolve, 600))
+    await waitUntil(async () => (await index.search({ query: "read_file_dirty", mode: "literal" }, root)).results[0]?.source === "index")
     const saved = await index.search({ query: "read_file_dirty", mode: "literal" }, root)
     assert.equal(saved.results[0]?.source, "index", JSON.stringify({ state: index.snapshot, dirty: document.isDirty, result: saved.results[0] }))
 

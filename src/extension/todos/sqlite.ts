@@ -237,7 +237,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 14) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 15) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -305,6 +305,9 @@ export class SqliteFile {
         if (version < 14) {
           await this.migrateEditOperationsToV14(database)
         }
+        if (version < 15) {
+          await this.migrateIntentPlanAnswerToV15(database)
+        }
       } finally {
         database.close()
       }
@@ -349,6 +352,15 @@ CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(l
     const columns = database.exec("PRAGMA table_info(todo_edit_operations)")[0]?.values ?? []
     if (!columns.some((row) => row[1] === "owner_id")) database.run("ALTER TABLE todo_edit_operations ADD COLUMN owner_id TEXT")
     database.run("PRAGMA user_version = 14")
+    await this.persist(database)
+  }
+
+  // v15 stores the objective answer requirements of an intent plan. The column is additive; plans from earlier versions
+  // have no requirements, which is the same as a plan that asks for none.
+  private async migrateIntentPlanAnswerToV15(database: Database): Promise<void> {
+    const columns = database.exec("PRAGMA table_info(todo_intent_plans)")[0]?.values ?? []
+    if (!columns.some((row) => row[1] === "answer_json")) database.run("ALTER TABLE todo_intent_plans ADD COLUMN answer_json TEXT NOT NULL DEFAULT '[]'")
+    database.run("PRAGMA user_version = 15")
     await this.persist(database)
   }
 

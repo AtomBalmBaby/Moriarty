@@ -15,6 +15,7 @@ import { AGENT_GLYPHS, agentGlyphState, nextAgentSelection, withAgentSelection }
 import { ASSISTANT, EVENT_NAME, TODO_EVENT_NAME, USER } from "../common/constants"
 import { exportConversation } from "../common/conversation-export"
 import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
+import { isStaleTodoSnapshot } from "../common/guards"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
 import type { EntireChatAction, PromptCompileResult } from "../common/messaging/protocol"
 import { attachLateSteps } from "../common/reply-steps"
@@ -360,7 +361,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const reasoningRef = useRef("")
   const reasoningTimerRef = useRef<ReturnType<typeof setTimeout>>()
   const celebrationTimerRef = useRef<ReturnType<typeof setTimeout>>()
-  const progressRef = useRef<{ conversationId: string; verified: number }>()
+  const progressRef = useRef<Pick<TodoListSnapshot, "id" | "conversationId" | "revision"> & { verified: number }>()
 
   useEffect(() => () => {
     clearTimeout(reasoningTimerRef.current)
@@ -386,11 +387,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
   const acceptTodoSnapshot = (next: TodoListSnapshot) => {
     if (next.conversationId !== conversationIdRef.current) return
+    const previous = progressRef.current
+    if (isStaleTodoSnapshot(previous, next)) return
     setTodoSnapshot(next)
     const live = next.items.filter((item) => item.status !== "cancelled")
     const verified = live.filter((item) => item.verification === "passed").length
-    const previous = progressRef.current
-    progressRef.current = { conversationId: next.conversationId, verified }
+    progressRef.current = { id: next.id, conversationId: next.conversationId, revision: next.revision, verified }
     // The first snapshot of a conversation is a load, not a result.
     if (!previous || previous.conversationId !== next.conversationId || verified <= previous.verified) return
     const finished = live.length > 0 && live.every((item) => item.status === "completed" && item.verification === "passed")

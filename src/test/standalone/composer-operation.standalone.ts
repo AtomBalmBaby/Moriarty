@@ -4,7 +4,9 @@ import Module from "node:module"
 import path from "node:path"
 import { test } from "node:test"
 
-import { EVENT_NAME } from "../../common/constants/events"
+import { EVENT_NAME, TODO_EVENT_NAME } from "../../common/constants/events"
+import { isStaleTodoSnapshot } from "../../common/guards"
+import type { TodoItem, TodoListSnapshot } from "../../common/types"
 import {
   composerIsBusy,
   ComposerOperationEvent,
@@ -63,10 +65,14 @@ test("a reply message alone never returns the composer to Send", () => {
 
 const outbound: { type: string; data?: unknown; id?: string }[] = []
 
+// `getList` answers from the lists the host holds for each conversation.
+const todoLists = new Map<string, TodoListSnapshot>()
+
 /** The host's answer to a webview request on mount, shaped as the webview expects each reply. */
-const hostReply = (type: string): unknown => {
+const hostReply = (type: string, request?: unknown): unknown => {
   if (type === EVENT_NAME.twinnyAgentRegistry) return []
   if (type === EVENT_NAME.twinnyTextSelection) return ""
+  if (type === TODO_EVENT_NAME.getList) return todoLists.get((request as { conversationId: string }).conversationId)
   return {}
 }
 
@@ -116,7 +122,7 @@ const startWebview = async () => {
           queueMicrotask(() =>
             window.dispatchEvent(
               new window.MessageEvent("message", {
-                data: { type: message.type, id: message.id, data: hostReply(message.type) }
+                data: { type: message.type, id: message.id, data: hostReply(message.type, message.data) }
               })
             )
           )
@@ -297,3 +303,93 @@ test("a webview reconnect during an operation restores Stop once the host re-ann
   }
 })
 
+// The TODO panel under the same harness. Snapshots arrive as host `changed` messages, as the bridge delivers them.
+
+const TODO_CONVERSATION = "todo-conversation"
+const OTHER_CONVERSATION = "todo-other-conversation"
+
+const todoSnapshot = (conversationId: string, revision: number, statuses: Record<string, TodoItem["status"]>): TodoListSnapshot => ({
+  id: `list-${conversationId}`,
+  projectId: "project",
+  conversationId,
+  revision,
+  items: Object.entries(statuses).map(
+    ([name, status], sortOrder) =>
+      ({ id: name, title: `Task ${name}`, details: "", status, priority: "normal", sortOrder, source: "model", criteria: [], verification: "none", version: revision }) as unknown as TodoItem
+  )
+})
+
+const mountTodoPanel = async (conversationId: string) => {
+  const { act, createElement, createRoot, window } = await loadWebview()
+  const { TodoPanel } = await import("../../webview/todo-panel")
+  const container = window.document.createElement("div")
+  window.document.body.append(container)
+  const root = createRoot(container)
+  const render = async (id: string) => {
+    await act(async () => {
+      root.render(createElement(TodoPanel, { conversationId: id }))
+    })
+  }
+  await render(conversationId)
+  return {
+    document: window.document,
+    render,
+    unmount: async () => {
+      await act(async () => {
+        root.unmount()
+      })
+      container.remove()
+    }
+  }
+}
+
+const showsTask = (document: Document, name: string) => !!document.body.textContent?.includes(`Task ${name}`)
+const inProgressCount = (document: Document) => document.querySelectorAll("[aria-label=\"in progress\"]").length
+
+test("the open TODO panel shows each completion as it is pushed, and an older snapshot cannot undo it", async () => {
+  todoLists.set(TODO_CONVERSATION, todoSnapshot(TODO_CONVERSATION, 3, { first: "in_progress", second: "in_progress", third: "pending" }))
+  const panel = await mountTodoPanel(TODO_CONVERSATION)
+  try {
+    assert.equal(showsTask(panel.document, "second"), true)
+    assert.equal(inProgressCount(panel.document), 2)
+
+    await sendHost(TODO_EVENT_NAME.changed, todoSnapshot(TODO_CONVERSATION, 4, { first: "completed", second: "in_progress", third: "pending" }))
+    assert.equal(showsTask(panel.document, "first"), false)
+    assert.equal(showsTask(panel.document, "second"), true)
+
+    // The second TODO completes during final reconciliation, after the last reply has been emitted.
+    const finalList = todoSnapshot(TODO_CONVERSATION, 5, { first: "completed", second: "completed", third: "pending" })
+    todoLists.set(TODO_CONVERSATION, finalList)
+    await sendHost(TODO_EVENT_NAME.changed, finalList)
+    assert.equal(showsTask(panel.document, "second"), false, "the completed TODO leaves the active list without a conversation switch")
+    assert.equal(showsTask(panel.document, "third"), true)
+    assert.equal(inProgressCount(panel.document), 0)
+
+    // A snapshot from before the completion arrives late and must not bring the TODO back.
+    await sendHost(TODO_EVENT_NAME.changed, todoSnapshot(TODO_CONVERSATION, 4, { first: "completed", second: "in_progress", third: "pending" }))
+    assert.equal(showsTask(panel.document, "second"), false, "an older revision cannot overwrite the final completion")
+    assert.equal(inProgressCount(panel.document), 0)
+
+    // Switching conversations restores each conversation's own persisted state, and back again.
+    todoLists.set(OTHER_CONVERSATION, todoSnapshot(OTHER_CONVERSATION, 1, { other: "in_progress" }))
+    await panel.render(OTHER_CONVERSATION)
+    assert.equal(showsTask(panel.document, "other"), true)
+    assert.equal(showsTask(panel.document, "third"), false)
+    await panel.render(TODO_CONVERSATION)
+    assert.equal(showsTask(panel.document, "third"), true)
+    assert.equal(showsTask(panel.document, "other"), false)
+    assert.equal(showsTask(panel.document, "second"), false)
+  } finally {
+    await panel.unmount()
+  }
+})
+
+test("a snapshot is stale only when an older revision of the same list arrives", () => {
+  const list = { id: "list-a", conversationId: "conv-a", revision: 5 }
+  assert.equal(isStaleTodoSnapshot(undefined, list), false)
+  assert.equal(isStaleTodoSnapshot(list, { ...list, revision: 4 }), true)
+  assert.equal(isStaleTodoSnapshot(list, { ...list, revision: 5 }), false)
+  assert.equal(isStaleTodoSnapshot(list, { ...list, revision: 6 }), false)
+  assert.equal(isStaleTodoSnapshot(list, { ...list, id: "list-b", revision: 1 }), false)
+  assert.equal(isStaleTodoSnapshot(list, { ...list, conversationId: "conv-b", revision: 1 }), false)
+})

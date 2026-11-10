@@ -1,11 +1,11 @@
-import type { TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, TypedCriterion } from "../../common/types"
+import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, TypedCriterion } from "../../common/types"
 
 import type { EvidenceHit, EvidenceSource } from "./evidence"
 
 export type { TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
 
-export type { CriterionVerification,IntentTaskDefinition, IntentTaskPlan, TypedCriterion } from "../../common/types"
+export type { AnswerField, AnswerRequirement, CriterionVerification,IntentTaskDefinition, IntentTaskPlan, TypedCriterion } from "../../common/types"
 
 /** Every active plan task with its TODO item, for the executor to update instead of recreating. */
 export interface IntentPlanOutline {
@@ -92,6 +92,7 @@ export interface IntentPlanContext {
   revision: number
   goal: string
   constraints: string[]
+  answer: AnswerRequirement[]
   task: TodoItem
   planTaskId: string
   criteria: TypedCriterion[]
