@@ -251,7 +251,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     <section className={styles.panel} aria-label={t("todo-title")}>
       <div className={styles.header}>
         <button type="button" className={styles.toggle} aria-expanded={expanded} onClick={() => setExpanded(prev => !prev)}>
-                    <span className={"codicon codicon-chevron-right"} aria-hidden="true" />
+                    <span className={`codicon codicon-chevron-${expanded ? "down" : "right"}`} aria-hidden="true" />
                     <strong>{t("todo-title")}</strong>
                     <span className={styles.count}>{pendingCount} {t("todo-of")} {(snapshot?.items.length ?? 0)} {t("todo-open")}</span>
                   </button>
