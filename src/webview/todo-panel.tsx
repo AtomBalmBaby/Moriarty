@@ -62,14 +62,14 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
   }, [refresh])
 
   useServerEvent(TODO_EVENT_NAME.changed, (next) => {
-    if (next.conversationId === conversationId) {
+    if (next.conversationId === conversationIdRef.current) {
       setSnapshot((current) => (isStaleTodoSnapshot(current, next) ? current : next))
       setError("")
     }
   })
 
   useServerEvent(TODO_EVENT_NAME.feedbackStatus, (next) => {
-    if (next.conversationId === conversationId) setFeedbackStatus(next)
+    if (next.conversationId === conversationIdRef.current) setFeedbackStatus(next)
   })
 
   const retryFeedback = () => {
