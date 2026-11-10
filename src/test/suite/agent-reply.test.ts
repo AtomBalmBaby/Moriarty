@@ -22,7 +22,7 @@ import { CHILD_TODO_PROTOCOL } from "../../extension/chat/feedback-planner"
 import { Chat } from "../../extension/chat/index"
 import { createSafeEditCheckpoints, type EditCommandRunner } from "../../extension/chat/tool-sinks"
 import { GenerationTracker } from "../../extension/generations"
-import { ChatRequest, InferenceProvider, providerRegistry } from "../../extension/inference"
+import { ChatRequest, InferenceError, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
 import { commandDigest } from "../../extension/todos/evidence"
 import { todoReviewSystemPrompt } from "../../extension/todos/feedback"
@@ -36,7 +36,7 @@ class ScriptedModel implements InferenceProvider {
   public requests: ChatRequest[] = []
 
   constructor(
-    private readonly _replies: string[],
+    private readonly _replies: Array<string | Error>,
     private readonly _planReply?: string,
     private readonly _hold?: (request: ChatRequest) => Promise<void> | void
   ) {}
@@ -51,10 +51,11 @@ class ScriptedModel implements InferenceProvider {
     const planning = this._planReply !== undefined && /track \(boolean\)/.test(system)
     // A held reply is a provider response that may arrive after the test has stopped the operation.
     await this._hold?.(request)
-    const reply = planning ? this._planReply! : this._replies.shift() ?? "Done."
-    for (let i = 0; i < reply.length; i += 9) yield { content: reply.slice(i, i + 9) }
+    const next = planning ? this._planReply! : this._replies.shift() ?? "Done."
+    // A scripted failure is thrown the way the provider throws it, before any content streams.
+    if (next instanceof Error) throw next
+    for (let i = 0; i < next.length; i += 9) yield { content: next.slice(i, i + 9) }
   }
-
 }
 
 const provider: TwinnyProvider = {
@@ -1412,7 +1413,7 @@ suite("Read-file acceptance, production controller", function () {
     conversationId: string
     message?: string
     planReply: string
-    replies: string[]
+    replies: Array<string | Error>
     evaluations?: string[]
     autoRunCommands?: boolean
     editCommands?: EditCommandRunner
@@ -1559,6 +1560,135 @@ suite("Read-file acceptance, production controller", function () {
         conversationId: second.scope.conversationId
       })
       assert.deepEqual(elsewhere, [])
+    })
+  })
+
+  test("a retryable provider parser failure resumes the same task without another user message", async () => {
+    await withWorkspace(async (workspace) => {
+      const parserFailure = () => new InferenceError("inference-failure", "llama.cpp HTTP 500: failed to parse tool call", { status: 500, reason: "parser-failure" })
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-parser-failure",
+        planReply: readFilePlanReply("read-file-plan-parser-failure"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          parserFailure(),
+          parserFailure(),
+          parserFailure(),
+          call("read_file", { path: "src/tools.ts" }),
+          "read_file is registered by readFile in src/tools.ts, which closes at line 4."
+        ]
+      })
+
+      assert.equal(await statusOf(turn, lookupTitle), "completed")
+      assert.equal(await statusOf(turn, investigateTitle), "completed", "the controller resumes the eligible task after the provider failure")
+      assert.ok(turn.reply?.startsWith(CONTINUATION_PREFIX), "the resumed reply is produced by the controller, not by a second user message")
+      assert.equal((await observationCounts(workspace)).read_file, 1, "the read executes exactly once, after the failure")
+      assert.equal(turn.agent.requests.length, 6, "lookup, three bounded attempts at the failed read request, the resumed read, then the answer")
+    })
+  })
+
+  test("a provider timeout is not retried and stops the task with the provider error", async () => {
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-timeout",
+        planReply: readFilePlanReply("read-file-plan-timeout"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          new InferenceError("timeout", "llama.cpp request timed out")
+        ]
+      })
+
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed")
+      assert.equal(turn.agent.requests.length, 2, "a timeout is not dispatched again")
+      assert.ok(["pending", "in_progress"].includes(String(await statusOf(turn, investigateTitle))), "the blocked task stays open and resumable, neither completed nor abandoned")
+      assert.ok(!turn.reply?.startsWith(CONTINUATION_PREFIX), "a timeout does not auto-resume")
+      assert.equal((await observationCounts(workspace)).read_file ?? 0, 0, "the read has not run when the timeout blocks the task")
+      const stopped = turn.posted.find((message) => message.type === EVENT_NAME.twinnyAddMessage && JSON.stringify(message.data).includes("Execution stopped"))
+      assert.ok(stopped, "the stop is reported to the user")
+      assert.ok(JSON.stringify(stopped.data).includes("Last provider error"), "the stop keeps the provider diagnostic")
+    })
+  })
+
+  test("stopping during a provider parser failure starts no retry and no resume", async () => {
+    await withWorkspace(async (workspace) => {
+      const parserFailure = () => new InferenceError("inference-failure", "llama.cpp HTTP 500: failed to parse tool call", { status: 500, reason: "parser-failure" })
+      let chat: ChatIn | undefined
+      let agentRequests = 0
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-parser-stop",
+        planReply: readFilePlanReply("read-file-plan-parser-stop"),
+        onChat: (value) => {
+          chat = value
+        },
+        // The second agent request is the failing one; Stop lands while it is in flight.
+        hold: () => {
+          agentRequests += 1
+          if (agentRequests === 2) chat?.abort()
+        },
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          parserFailure(),
+          parserFailure(),
+          call("read_file", { path: "src/tools.ts" })
+        ]
+      })
+
+      assert.equal(turn.agent.requests.length, 2, "a stopped operation dispatches no retry of the failed request")
+      assert.ok(!turn.reply?.startsWith(CONTINUATION_PREFIX), "a stopped operation does not auto-resume")
+      assert.equal((await observationCounts(workspace)).read_file ?? 0, 0, "the read does not run after the stop")
+    })
+  })
+
+  test("repeated failed tool calls with no new evidence stop the task with a no-progress reason", async () => {
+  await withWorkspace(async (workspace) => {
+    const missing = () => call("read_file", { path: "src/missing.ts" })
+    // Twenty identical failing reads are scripted; the controller must stop long before they are spent.
+    const turn = await runTurn(workspace, {
+      conversationId: "read-file-no-progress",
+      planReply: readFilePlanReply("read-file-plan-no-progress"),
+      replies: ["Checked accepted evidence: nothing is recorded for read_file yet.", ...Array.from({ length: 20 }, missing)]
+    })
+
+    assert.notEqual(await statusOf(turn, investigateTitle), "completed")
+    const stopped = turn.posted.find((message) => message.type === EVENT_NAME.twinnyAddMessage && JSON.stringify(message.data).includes("Execution stopped"))
+    assert.ok(stopped, "the stop is reported to the user")
+    assert.ok(JSON.stringify(stopped.data).includes("no measurable progress"), "the stop names the no-progress cause")
+    // The baseline turn, then two turns without progress: each is a continuation request, the identical read with its three repeats, and the answer-only request.
+    assert.ok(turn.agent.requests.length <= 13, `the same failed call must not repeat until the context is spent (saw ${turn.agent.requests.length} requests of 21 scripted)`)
+    assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
+    })
+  })
+
+  test("a restarted conversation reuses the persisted read and resumes the blocked task without re-reading", async () => {
+    await withWorkspace(async (workspace) => {
+      const blocked = await runTurn(workspace, {
+        conversationId: "read-file-restart",
+        planReply: readFilePlanReply("read-file-plan-restart"),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          new InferenceError("timeout", "llama.cpp request timed out")
+        ]
+      })
+      assert.notEqual(await statusOf(blocked, investigateTitle), "completed")
+      const before = await observationCounts(workspace)
+      assert.equal(before.read_file ?? 0, 0)
+
+      const restarted = await runTurn(workspace, {
+        conversationId: "read-file-restart",
+        message: "Continue the read_file investigation.",
+        planReply: readFilePlanReply("read-file-plan-restart"),
+        replies: [
+          call("read_file", { path: "src/tools.ts" }),
+          "read_file is registered by readFile in src/tools.ts, which closes at line 4."
+        ]
+      })
+
+      assert.equal(await statusOf(restarted, lookupTitle), "completed", "the completed lookup is restored, not repeated")
+      assert.equal(await statusOf(restarted, investigateTitle), "completed", "the blocked task resumes from the repository")
+      const after = await observationCounts(workspace)
+      assert.equal(after.twinny_evidence_lookup ?? 0, before.twinny_evidence_lookup ?? 0, "the lookup is not repeated after restart")
+      assert.equal(after.read_file, 1, "the read executes once, after restart")
+      assert.equal(restarted.agent.requests.length, 2, "one read request and one answer request")
     })
   })
 
@@ -2255,12 +2385,15 @@ suite("Read-file acceptance, production controller", function () {
         assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the editor applied the edit before the response was lost")
         assert.deepEqual(await editOperations(workspace), [{ target: editTarget, status: "dispatched", detail: "" }], "the unsettled edit stays recorded")
 
-        await runTurn(workspace, {
+        const recovered = await runTurn(workspace, {
           conversationId: "edit-response-lost",
           planReply: editPlan("edit-lost-plan"),
           replies: ["The edit is already in the editor."],
           editCommands
         })
+        assert.ok(JSON.stringify(recovered.agent.requests[0]?.messages).includes("was recorded as applied and not repeated"), "the model is told the edit was recorded, not repeated")
+        assert.ok(recovered.posted.some((message) => JSON.stringify(message.data).includes("Execution stopped: Execution made no measurable progress")), "the continuation over the still-open command step stops on the no-progress budget")
+        assert.ok(recovered.agent.requests.length <= 3, "continuation after recovery is bounded by the no-progress budget")
         assert.equal(applications, 1, "recovery must not dispatch the edit again")
         assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the edit is not duplicated")
         assert.deepEqual(await editOperations(workspace), [{ target: editTarget, status: "reconciled_applied", detail: "The editor buffer holds the intended text." }])
@@ -2456,6 +2589,17 @@ suite("Read-file acceptance, production controller", function () {
         }])
         assert.ok(JSON.stringify(reconciled.agent.requests[0]?.messages).includes("matches neither"), "the controller surfaces the unresolved reason to the model")
         assert.equal(await bufferOf(workspace), third, "the unexplained text is preserved")
+
+        const retriedCall = call("edit_file", { path: editTarget, find: "export const third = true", replace: "export const third = false" })
+        const retried = await runTurn(workspace, {
+          conversationId: "edit-diverged",
+          planReply: editPlan("edit-diverged-plan"),
+          replies: [retriedCall, "The target is still blocked."],
+          editCommands
+        })
+        assert.equal(counts.runs, 1, "a later proposal for the diverged target is refused before dispatch")
+        assert.ok(JSON.stringify(retried.agent.requests).includes("has unresolved edit"), "the refusal names the unresolved edit")
+        assert.equal(await bufferOf(workspace), third, "the refused proposal leaves the text untouched")
       })
     })
 
@@ -2707,7 +2851,8 @@ suite("Read-file acceptance, production controller", function () {
           .filter((message) => message.type === EVENT_NAME.twinnyAddMessage)
           .map((message) => String((message.data as ChatCompletionMessage).content ?? ""))
         assert.ok(messages.some((content) => content.includes("the TODO plan could not be read")), "the user is told why execution paused")
-        assert.ok(!JSON.stringify(turn.agent.requests).includes(CONTINUATION_PREFIX), "no automatic continuation is sent")
+        // The first plain reply legitimately continued once before the edit; after the plan read fails, no further request is sent.
+        assert.equal(turn.agent.requests.length, 3, "no request is sent after the plan read fails")
       })
     })
 

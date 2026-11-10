@@ -31,6 +31,7 @@ import {
   isCancelled
 } from "../inference"
 import { hostedTakesTools } from "../inference/adapters/fluency"
+import { isRetryableProviderFailure } from "../inference/errors"
 import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
 import { ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
@@ -60,6 +61,9 @@ const MIN_RESULT_CHARS = 1000
 const MAX_REPEATED_CALLS = 3
 const MAX_UNREADABLE_IN_A_ROW = 3
 const MAX_NO_PROGRESS_STEPS = 3
+/** Provider requests re-sent after a failure that showed the user nothing. */
+const MAX_PROVIDER_RETRIES = 2
+const PROVIDER_RETRY_DELAY_MS = 750
 
 /** Why the host stopped one request, rather than the model finishing it. */
 export type GenerationStopReason = "duration_limit" | "no_progress" | "output_limit"
@@ -255,6 +259,8 @@ export interface ToolLoopOptions {
   onFallback?(reason: string, what: "tools" | "reasoning-effort"): void
   /** Called when old results were trimmed so the next request fits. */
   onTrim?(results: number, estimatedTokens: number): void
+  /** Wait before re-sending a provider request that failed; tests shorten it. */
+  providerRetryDelayMs?: number
   /**
    * Asked before each request after the first: messages the user sent
    * while the reply was working, handed over (and so taken) for the
@@ -375,6 +381,20 @@ const refusesReasoningEffort = (error: unknown) =>
 
 const cancelled = (reason?: unknown) =>
   new InferenceError("cancelled", "The request was cancelled.", { cause: reason })
+
+/** Resolves after `ms`, or rejects as cancelled as soon as `signal` aborts. */
+export const pause = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+  if (signal?.aborted) return reject(cancelled(signal.reason))
+  const onAbort = () => {
+    clearTimeout(timer)
+    reject(cancelled(signal?.reason))
+  }
+  const timer = setTimeout(() => {
+    signal?.removeEventListener("abort", onAbort)
+    resolve()
+  }, ms)
+  signal?.addEventListener("abort", onAbort, { once: true })
+})
 
 /**
  * Native arguments as the tools take them, or why they could not be read.
@@ -614,6 +634,7 @@ class ToolLoop {
     // Set once a tool's result says to answer now (an edit waits for review).
     let settled = false
     let requestSequence = 0
+    let providerRetries = 0
     const operationId = options?.trace?.operationId ?? this._logicalRequestId
     for (let step = 0; ; step++) {
       if (outer?.aborted) {
@@ -721,6 +742,7 @@ class ToolLoop {
             reply.shown = safe
           }
         }
+        providerRetries = 0
       } catch (error) {
         if (outer?.aborted) {
           throw error
@@ -779,6 +801,32 @@ class ToolLoop {
             step--
             continue
           }
+        }
+        // Nothing was shown, reasoned, or called, so the same request is safe to send again.
+        if (
+          isRetryableProviderFailure(error) &&
+          !reply.shown &&
+          !reply.reasoning &&
+          !reply.toolCalls &&
+          providerRetries < MAX_PROVIDER_RETRIES &&
+          !outer?.aborted
+        ) {
+          providerRetries++
+          const delay = (this._options.providerRetryDelayMs ?? PROVIDER_RETRY_DELAY_MS) * providerRetries
+          inferenceEvent("tool_loop.retry_decision", {
+            operation_id: operationId,
+            request_id: requestId,
+            tool_loop_step: step + 1,
+            reason: "provider-failure-before-output",
+            failure_reason: (error as InferenceError).reason ?? (error as InferenceError).kind,
+            attempt: providerRetries,
+            max_attempts: MAX_PROVIDER_RETRIES,
+            delay_ms: delay,
+            next_action: "re-send-same-request"
+          }, "warn")
+          await pause(delay, outer)
+          step--
+          continue
         }
         if (!isCancelled(error)) throw error
       } finally {

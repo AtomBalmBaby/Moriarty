@@ -3,6 +3,7 @@ import { formatCount, logger } from "../../common/logger"
 import { ChatCompletionMessage, ReplyChangesView, ReplyMeta, TwinnyProvider } from "../../common/types"
 import { GenerationRun, GenerationTracker, StopInitiator } from "../generations"
 import { ChatRequest, InferenceClient, isCancelled } from "../inference"
+import { InferenceError } from "../inference/errors"
 import {
   cancelInferenceOperation,
   createInferenceTrace,
@@ -40,6 +41,8 @@ export interface ReplyExtras {
   settle?(): Promise<void>
   /** The files the reply changed, kept with it (read after `settle`). */
   changes?(): ReplyChangesView | undefined
+  /** Told when the reply ended in a failure, not a stop; what arrived is still kept. */
+  onFailure?(error: unknown): void
 }
 
 /**
@@ -209,7 +212,7 @@ export class ChatGeneration {
             ? "the stream contained no visible text"
             : "Twinny received content but no usable text or completed tool call remained after response parsing"
         const reasoning = reasoningChars ? `; ${reasoningChars} reasoning characters were received without visible content` : ""
-        throw new Error(`The provider completed without usable chat content or a completed tool call (${streamState}; finish reason: ${finishReason ?? "not provided"}${reasoning}). Check the model/server response and tool-call support, then retry.`)
+        throw new InferenceError("inference-failure", `The provider completed without usable chat content or a completed tool call (${streamState}; finish reason: ${finishReason ?? "not provided"}${reasoning}). Check the model/server response and tool-call support, then retry.`, { reason: "malformed-response" })
       }
       await extras.settle?.()
       // A discarded reply is nobody's: not shown, and not part of the conversation.
@@ -225,6 +228,7 @@ export class ChatGeneration {
       if (this._discarded.has(run)) return ""
       await extras.settle?.().catch(() => undefined)
       if (partial || extras.keepEmpty?.()) this.addMessage(partial, finish(), extras.toolNotes?.(), extras.changes?.())
+      if (!run.signal.aborted) extras.onFailure?.(error)
       this.report(error, provider)
       return partial
     } finally {

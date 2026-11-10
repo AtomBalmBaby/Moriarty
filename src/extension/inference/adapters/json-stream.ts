@@ -5,6 +5,11 @@
  */
 import { logger } from "../../../common/logger"
 import {
+  InferenceError,
+  isAbortError,
+  toInferenceError
+} from "../errors"
+import {
   createInferenceAttemptId,
   createInferenceTrace,
   inferenceEvent,
@@ -37,6 +42,54 @@ export function safeParseJsonResponse(
     return undefined
   }
 }
+
+/** Not blank, a comment, or the end marker: a line that ought to have been JSON. */
+const isMalformedStreamLine = (line: string) => {
+  const text = line.trim()
+  return (
+    !!text &&
+    !text.startsWith(":") &&
+    text !== "[DONE]" &&
+    text !== "data:" &&
+    text !== "data: [DONE]"
+  )
+}
+
+/**
+ * A server that fails part-way says so inside the stream. Left alone, that
+ * object would parse as an empty chunk and the reply would end quietly.
+ */
+const throwIfStreamError = (json: StreamResponse, endpoint: string) => {
+  const served = (json as { error?: unknown }).error
+  if (!served) return
+  const body = served as { message?: unknown; code?: unknown }
+  const message = typeof served === "string" ? served : body.message
+  const detail =
+    typeof message === "string" && message ? message : JSON.stringify(served)
+  const code = Number(body.code)
+  const error = Object.assign(
+    new Error(`${endpoint} reported an error in its stream: ${detail}`),
+    { status: Number.isInteger(code) && code >= 100 ? code : undefined }
+  )
+  throw toInferenceError(error)
+}
+
+const interruptedStream = (endpoint: string, cause: unknown) =>
+  new InferenceError(
+    "provider-unavailable",
+    `The response from ${endpoint} was cut off before it finished: ${
+      cause instanceof Error ? cause.message : String(cause)
+    }`,
+    { cause, reason: "interrupted" }
+  )
+
+const malformedStream = (endpoint: string, sample: string) =>
+  new InferenceError(
+    "inference-failure",
+    `${endpoint} sent no readable response. The first line was not JSON: ` +
+      sample.trim().slice(0, MAX_ERROR_BODY),
+    { reason: "malformed-response" }
+  )
 
 /**
  * The server usually says what went wrong in the body ("model not found",
@@ -247,7 +300,7 @@ export async function* streamJsonLines(
 
     if (!response.ok) {
       terminalState = "http-error"
-      throw await responseError(response)
+      throw toInferenceError(await responseError(response))
     }
     if (!response.body) {
       terminalState = "failed"
@@ -256,11 +309,17 @@ export async function* streamJsonLines(
 
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
     let buffer = ""
+    let parsed = 0
+    const malformed: string[] = []
     cleanupState = "pending"
     try {
       for (;;) {
         throwIfAborted()
-        const { value, done } = await reader.read()
+        const { value, done } = await reader.read().catch((error: unknown) => {
+          throwIfAborted()
+          if (isAbortError(error)) throw error
+          throw interruptedStream(endpoint, error)
+        })
         throwIfAborted()
         if (done) break
         if (value && firstByteMs === undefined) {
@@ -278,7 +337,10 @@ export async function* streamJsonLines(
           const line = buffer.slice(0, newline)
           buffer = buffer.slice(newline + 1)
           const json = safeParseJsonResponse(line)
+          if (!json && isMalformedStreamLine(line)) malformed.push(line)
           if (json) {
+            throwIfStreamError(json, endpoint)
+            parsed += 1
             if (recordStreamTaskId(json, trace, attemptId)) {
               serverTaskIdState = "confirmed-response-stream-metadata"
             }
@@ -296,7 +358,10 @@ export async function* streamJsonLines(
         }
       }
       const rest = safeParseJsonResponse(buffer)
+      const truncated = !rest && isMalformedStreamLine(buffer)
       if (rest) {
+        throwIfStreamError(rest, endpoint)
+        parsed += 1
         if (recordStreamTaskId(rest, trace, attemptId)) {
           serverTaskIdState = "confirmed-response-stream-metadata"
         }
@@ -310,6 +375,18 @@ export async function* streamJsonLines(
           })
         }
         yield rest
+      }
+      // A cut-off final line after real content is an interrupted reply;
+      // no content at all means the server never spoke JSON to us.
+      if (truncated && parsed > 0) throw interruptedStream(endpoint, "the last line was incomplete")
+      if (parsed === 0 && (truncated || malformed.length)) {
+        throw malformedStream(endpoint, truncated ? buffer : malformed[0])
+      }
+      if (malformed.length) {
+        logger.warn(
+          `${endpoint} sent ${malformed.length} line${malformed.length === 1 ? "" : "s"} that were not JSON and were skipped. ` +
+            `The first: ${malformed[0].trim().slice(0, MAX_ERROR_BODY)}`
+        )
       }
       terminalState = "completed"
     } finally {
@@ -335,9 +412,9 @@ export async function* streamJsonLines(
       terminalState = "cancelled"
     } else if (error instanceof Error) {
       if (terminalState === "consumer-closed") terminalState = "failed"
-      // The caller reports this with the provider named; here only the
-      // raw detail, for when that summary is not enough.
-      logger.debug(`Request to ${endpoint} failed: ${error.name}`)
+      // The caller reports this with the provider named; here the server's
+      // own words, which a parser failure would otherwise lose.
+      logger.warn(`Request to ${endpoint} failed: ${error.message.slice(0, MAX_ERROR_BODY)}`)
     }
     throw error
   } finally {

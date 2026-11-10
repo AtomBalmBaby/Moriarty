@@ -16,23 +16,35 @@ export type InferenceErrorKind =
   | "cancelled"
   | "inference-failure"
 
+/**
+ * Why a provider failed, where the kind alone does not say. These are kept
+ * off the wire enum: a peer that predates them still sees a valid kind.
+ */
+export type ProviderFailureReason =
+  | "parser-failure"
+  | "malformed-response"
+  | "interrupted"
+  | "bad-request"
+
 export class InferenceError extends Error {
   public readonly kind: InferenceErrorKind
   /** The HTTP status when the provider answered with one. */
   public readonly status?: number
   /** What the provider's client actually threw. */
   public readonly cause?: unknown
+  public readonly reason?: ProviderFailureReason
 
   constructor(
     kind: InferenceErrorKind,
     message: string,
-    details: { status?: number; cause?: unknown } = {}
+    details: { status?: number; cause?: unknown; reason?: ProviderFailureReason } = {}
   ) {
     super(message)
     this.name = "InferenceError"
     this.kind = kind
     this.status = details.status
     this.cause = details.cause
+    this.reason = details.reason
   }
 }
 
@@ -97,6 +109,10 @@ export const collectMessages = (error: unknown): string => {
   }
   return parts.join(" | ")
 }
+
+/** llama.cpp and other servers say this when the model's output does not parse. */
+const PARSER_FAILURE =
+  /failed to parse|parse error|unable to parse|unexpected empty grammar|peg parser/i
 
 const findStatus = (error: unknown): number | undefined => {
   const e = error as ErrorLike | undefined
@@ -173,8 +189,27 @@ export const toInferenceError = (error: unknown): InferenceError => {
   if (isInferenceError(error)) return error
   const raw = collectMessages(error) || "Unknown error"
   const status = findStatus(error)
+  const reason = PARSER_FAILURE.test(raw)
+    ? "parser-failure"
+    : status === 400
+      ? "bad-request"
+      : undefined
   return new InferenceError(classify(error, raw, status), raw, {
     status,
-    cause: error
+    cause: error,
+    reason
   })
+}
+
+/**
+ * Whether asking the same provider again can succeed without a human. A
+ * timeout is not retried: the server may still be generating the first one.
+ * Whether a retry is safe also depends on what the caller has shown, which
+ * the caller decides.
+ */
+export const isRetryableProviderFailure = (error: unknown): boolean => {
+  if (!isInferenceError(error)) return false
+  if (error.reason === "bad-request") return false
+  if (error.reason) return true
+  return error.kind === "provider-unavailable" || error.kind === "rate-limited"
 }

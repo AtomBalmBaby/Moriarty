@@ -71,13 +71,69 @@ test("continuation context stays bounded and marks prior prose as untrusted", ()
   assert.match(message, /No file edits were verified/)
 })
 
+test("a tool result that could not be recorded stays blocking for the whole request, across continuations", () => {
+  const execution = new ExecutionReconciliationController({ maxIterations: 8, maxNoProgress: 2 })
+  assert.equal(execution.hasUnrecordedTool, false)
+  execution.markUnrecordedTool()
+  assert.equal(execution.hasUnrecordedTool, true)
+  assert.equal(execution.advanceAcceptedTask("next-task").continue, true)
+  execution.continuationStarted()
+  assert.equal(execution.hasUnrecordedTool, true, "a later continuation must not forget the unrecorded effect")
+  assert.equal(execution.reconcile("revise", "retry", "criteria").continue, true)
+  assert.equal(execution.hasUnrecordedTool, true)
+})
+
 test("cancellation prevents dispatching a continuation", () => {
+
   const controller = new ExecutionReconciliationController()
   controller.cancel()
   assert.equal(controller.reconcile("revise", "no-progress").state, "cancelled")
   assert.equal(controller.claimContinuation(), false)
 })
 
+
+test("a repeated runtime inventory snapshot is progress once per controller and cannot reset the no-progress budget", () => {
+  const inventory = { toolName: "twinny_runtime_inventory", arguments: {}, failed: false }
+  const controller = new ExecutionReconciliationController({ maxIterations: 8, maxNoProgress: 2 })
+  assert.equal(controller.recordEvidence({ observations: [inventory], passedCriteria: [] }), "observations", "the first snapshot is initial context")
+  assert.equal(controller.recordEvidence({ observations: [inventory], passedCriteria: [] }), "none", "the same snapshot is not new evidence")
+  assert.equal(controller.reconcile("revise", "task", "observations").continue, true)
+  assert.equal(controller.reconcile("revise", "task", "none").continue, true)
+  const stopped = controller.reconcile("revise", "task", "none")
+  assert.equal(stopped.continue, false)
+  assert.match(stopped.reason ?? "", /no measurable progress for 3 consecutive turns/)
+})
+
+test("a provider failure resumes only while it keeps producing evidence, and stops on repetition", () => {
+  const nonRetryable = new ExecutionReconciliationController({ maxIterations: 8, maxNoProgress: 2 })
+  assert.equal(nonRetryable.providerFailed(false, "observations").continue, false)
+  assert.equal(nonRetryable.state, "blocked")
+
+  const repeated = new ExecutionReconciliationController({ maxIterations: 8, maxNoProgress: 2 })
+  assert.equal(repeated.providerFailed(true, "none").continue, true)
+  assert.equal(repeated.providerFailed(true, "none").continue, true)
+  const stopped = repeated.providerFailed(true, "none")
+  assert.equal(stopped.continue, false)
+  assert.equal(stopped.state, "blocked")
+  assert.match(stopped.reason ?? "", /failed 3 times in a row/)
+
+  const bounded = new ExecutionReconciliationController({ maxIterations: 2, maxNoProgress: 2 })
+  assert.equal(bounded.providerFailed(true, "observations").continue, true)
+  assert.equal(bounded.providerFailed(true, "observations").continue, true)
+  assert.match(bounded.providerFailed(true, "observations").reason ?? "", /exceeded 2 reconciliation iterations/)
+
+  const reset = new ExecutionReconciliationController({ maxIterations: 8, maxNoProgress: 2 })
+  assert.equal(reset.providerFailed(true, "none").continue, true)
+  assert.equal(reset.providerFailed(true, "none").continue, true)
+  assert.equal(reset.reconcile("revise", "next-task", "criteria").continue, true)
+  assert.equal(reset.providerFailed(true, "none").continue, true)
+  assert.equal(reset.providerFailed(true, "none").continue, true)
+  assert.equal(reset.providerFailed(true, "none").continue, false)
+
+  const cancelled = new ExecutionReconciliationController()
+  cancelled.cancel()
+  assert.equal(cancelled.providerFailed(true, "none").state, "cancelled")
+})
 
 test("an accepted task advances to the next task without accepting the overall goal", () => {
   const controller = new ExecutionReconciliationController({ maxIterations: 4, maxNoProgress: 2 })

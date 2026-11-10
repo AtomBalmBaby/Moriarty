@@ -9,6 +9,8 @@ export interface ReconciliationLimits {
   maxNoProgress: number
   /** Turns in a row that may add observations while no criterion passes and the task does not move on. */
   maxEvidenceOnlyTurns?: number
+  /** Provider failures in a row with no new evidence before the request is no longer repeated. */
+  maxProviderFailures?: number
 }
 
 /**
@@ -27,7 +29,8 @@ export interface ReconciliationResult {
 export const DEFAULT_RECONCILIATION_LIMITS: ReconciliationLimits = {
   maxIterations: 12,
   maxNoProgress: 2,
-  maxEvidenceOnlyTurns: 3
+  maxEvidenceOnlyTurns: 3,
+  maxProviderFailures: 3
 }
 
 export interface ObservedEvidence {
@@ -43,6 +46,9 @@ export class ExecutionReconciliationController {
   private _iterations = 0
   private _noProgress = 0
   private _evidenceOnly = 0
+  private _providerFailures = 0
+  // Sticky for the whole request: a result whose effect is not in the ledger must never be resent.
+  private _unrecordedTool = false
   private _lastProgress?: string
   private _continuationClaimed = false
   private _continuations = 0
@@ -63,6 +69,15 @@ export class ExecutionReconciliationController {
 
   isCancelled(): boolean {
     return this._cancelled
+  }
+
+  /** A tool ran and its result could not be written to the ledger, so resuming could repeat its effect. */
+  markUnrecordedTool(): void {
+    this._unrecordedTool = true
+  }
+
+  get hasUnrecordedTool(): boolean {
+    return this._unrecordedTool
   }
 
   cancel(): void {
@@ -102,6 +117,7 @@ export class ExecutionReconciliationController {
     this._lastProgress = progress
     this._noProgress = 0
     this._evidenceOnly = 0
+    this._providerFailures = 0
     if (this._iterations > this._limits.maxIterations) {
       return { state: this._state = "blocked", continue: false, reason: "Execution exceeded " + this._limits.maxIterations + " reconciliation iterations." }
     }
@@ -115,6 +131,7 @@ export class ExecutionReconciliationController {
     if (decision === "blocked") return { state: this._state = "blocked", continue: false, reason: "The evaluator identified a genuine blocker." }
 
     this._iterations++
+    this._providerFailures = 0
     const moved = this._lastProgress !== undefined && progress !== this._lastProgress
     if (progressKind === "criteria" || moved) this._evidenceOnly = 0
     else if (progressKind === "observations") this._evidenceOnly++
@@ -141,6 +158,34 @@ export class ExecutionReconciliationController {
     if (this._cancelled || this._continuationClaimed || this._state === "blocked" || this._state === "accepted") return false
     this._continuationClaimed = true
     return true
+  }
+
+  /**
+   * A provider request ended before its turn completed. Nothing it wrote is
+   * a finished result, so the turn is not judged. It may be resent only if
+   * the failure is one resending can fix, and only while the failures keep
+   * producing new evidence or have not yet repeated without it.
+   */
+  providerFailed(retryable: boolean, progressKind: ProgressKind): ReconciliationResult {
+    this._state = "reconciling"
+    if (this._cancelled) return { state: this._state = "cancelled", continue: false }
+    if (!retryable) {
+      return { state: this._state = "blocked", continue: false, reason: "The provider request failed in a way that resending it would not fix." }
+    }
+    this._iterations++
+    this._providerFailures = progressKind === "none" ? this._providerFailures + 1 : 1
+    if (this._iterations > this._limits.maxIterations) {
+      return { state: this._state = "blocked", continue: false, reason: `Execution exceeded ${this._limits.maxIterations} reconciliation iterations.` }
+    }
+    const limit = this._limits.maxProviderFailures ?? DEFAULT_RECONCILIATION_LIMITS.maxProviderFailures ?? 0
+    if (this._providerFailures >= limit) {
+      return {
+        state: this._state = "blocked",
+        continue: false,
+        reason: `The provider failed ${this._providerFailures} times in a row with no new evidence, so the request is not repeated.`
+      }
+    }
+    return { state: this._state = "continue", continue: true }
   }
 
   continuationStarted(): void {

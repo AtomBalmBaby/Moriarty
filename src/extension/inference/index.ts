@@ -5,6 +5,7 @@ export {
   isAbortError,
   isCancelled,
   isInferenceError,
+  isRetryableProviderFailure,
   toInferenceError,
   unsupportedCapability
 } from "./errors"

@@ -6,6 +6,7 @@ import { logger } from "../../common/logger"
 import { TwinnyProvider } from "../../common/types"
 import { ChatRequest } from "../../extension/inference"
 import { fluencyChat } from "../../extension/inference/adapters/fluency"
+import { isInferenceError, isRetryableProviderFailure } from "../../extension/inference/errors"
 
 const provider: TwinnyProvider = {
   id: "llama-test",
@@ -243,4 +244,115 @@ test("llama.cpp request timeout fails once without dispatching a retry", async (
     await assert.rejects(collect(fluencyChat({} as never, provider, request)), /timed out/i)
   })
   assert.equal(requests, 1)
+})
+
+const sse = (...payloads: unknown[]) =>
+  payloads.map((payload) => `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`).join("")
+
+const content = (text: string) => ({ choices: [{ delta: { content: text } }] })
+
+const failureOf = async (stream: AsyncIterable<{ content: string }>) => {
+  const received: string[] = []
+  try {
+    for await (const chunk of stream) received.push(chunk.content)
+  } catch (error) {
+    return { received, error }
+  }
+  return { received, error: undefined }
+}
+
+test("a llama.cpp parser failure streamed in-band is a typed failure, not a silent empty reply", async () => {
+  let requests = 0
+  const parserError = { error: { code: 500, message: "Failed to parse input at pos 12: <tool_call>", type: "server_error" } }
+  await withFetch(async () => {
+    requests += 1
+    return new Response(sse(parserError), { status: 200 })
+  }, async () => {
+    const { received, error } = await failureOf(fluencyChat({} as never, provider, request))
+    assert.deepStrictEqual(received, [])
+    assert.ok(isInferenceError(error), "the failure is an InferenceError")
+    assert.equal(error.kind, "provider-unavailable")
+    assert.equal(error.status, 500)
+    assert.equal(error.reason, "parser-failure")
+    assert.match(error.message, /Failed to parse input at pos 12/)
+    assert.equal(isRetryableProviderFailure(error), true)
+  })
+  assert.equal(requests, 1, "the adapter itself does not retry a parser failure")
+})
+
+test("an HTTP 500 parser error keeps the server's words, and the warning reaches the log", async () => {
+  const body = JSON.stringify({ error: { code: 500, message: "Failed to parse input at pos 3", type: "server_error" } })
+  const { result, records } = await captureInferenceLogs(() => withFetch(async () => new Response(body, { status: 500 }), async () =>
+    failureOf(fluencyChat({} as never, provider, request))
+  ))
+  assert.ok(isInferenceError(result.error))
+  assert.equal(result.error.reason, "parser-failure")
+  assert.equal(result.error.status, 500)
+  assert.ok(records.some((record) => record.includes("Failed to parse input at pos 3")), "the parser message is logged")
+})
+
+test("an HTTP 400 is a bad request: typed, and never retried", async () => {
+  let requests = 0
+  await withFetch(async () => {
+    requests += 1
+    return new Response("messages must not be empty", { status: 400 })
+  }, async () => {
+    const { error } = await failureOf(fluencyChat({} as never, provider, request))
+    assert.ok(isInferenceError(error))
+    assert.equal(error.reason, "bad-request")
+    assert.equal(error.status, 400)
+    assert.equal(isRetryableProviderFailure(error), false)
+  })
+  assert.equal(requests, 1)
+})
+
+test("a stream that never carries JSON is a malformed response, not an empty reply", async () => {
+  await withFetch(async () => new Response("<html>proxy error</html>", { status: 200 }), async () => {
+    const { received, error } = await failureOf(fluencyChat({} as never, provider, request))
+    assert.deepStrictEqual(received, [])
+    assert.ok(isInferenceError(error))
+    assert.equal(error.kind, "inference-failure")
+    assert.equal(error.reason, "malformed-response")
+    assert.match(error.message, /proxy error/)
+    assert.equal(isRetryableProviderFailure(error), true)
+  })
+})
+
+test("a stray non-JSON line between good chunks is skipped and the reply still completes", async () => {
+  const { records } = await captureInferenceLogs(() => withFetch(async () => new Response(
+    sse(content("a")) + "keep-alive noise\n" + sse(content("b"), { choices: [{ delta: {}, finish_reason: "stop" }] }),
+    { status: 200 }
+  ), async () => assert.deepStrictEqual(await collect(fluencyChat({} as never, provider, request)), ["a", "b", ""])));
+  assert.ok(records.some((record) => record.includes("were not JSON and were skipped")))
+})
+
+test("a reply cut off by the connection after some text is interrupted, and that text is kept", async () => {
+  const encoder = new TextEncoder()
+  let sent = false
+  const cut = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!sent) {
+        sent = true
+        controller.enqueue(encoder.encode(sse(content("partial"))))
+        return
+      }
+      controller.error(new TypeError("terminated"))
+    }
+  })
+  await withFetch(async () => new Response(cut, { status: 200 }), async () => {
+    const { received, error } = await failureOf(fluencyChat({} as never, provider, request))
+    assert.deepStrictEqual(received, ["partial"])
+    assert.ok(isInferenceError(error))
+    assert.equal(error.reason, "interrupted")
+    assert.equal(error.kind, "provider-unavailable")
+    assert.equal(isRetryableProviderFailure(error), true)
+  })
+})
+
+test("a final line cut off mid-JSON after real content is interrupted, not silently dropped", async () => {
+  await withFetch(async () => new Response(sse(content("half")) + "data: {\"choices\":[{\"delta\":{\"content\":\"tr", { status: 200 }), async () => {
+    const { received, error } = await failureOf(fluencyChat({} as never, provider, request))
+    assert.deepStrictEqual(received, ["half"])
+    assert.ok(isInferenceError(error))
+  })
 })

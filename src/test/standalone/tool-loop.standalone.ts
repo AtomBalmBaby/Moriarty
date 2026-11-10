@@ -13,7 +13,7 @@ import { test } from "node:test"
 import { shouldResumeQueuedChat } from "../../common/messaging/chat-stop"
 import { ChatCompletionMessage } from "../../common/types"
 import { buildChatTurn } from "../../extension/chat/turn"
-import { ChatChunk, ChatRequest, InferenceClient, InferenceOptions, isCancelled } from "../../extension/inference"
+import { ChatChunk, ChatRequest, InferenceClient, InferenceError, InferenceErrorKind, InferenceOptions, isCancelled, isInferenceError } from "../../extension/inference"
 import { abortable } from "../../extension/inference/stream"
 import {
   fitResult,
@@ -39,7 +39,14 @@ import { parsePeerFrame } from "../../protocol/peer"
 type Call = { id: string; name: string; arguments: string }
 type Reply =
   | string
-  | { text?: string; calls?: Call[]; fail?: string; usage?: { promptTokens?: number; completionTokens?: number } }
+  | {
+    text?: string
+    calls?: Call[]
+    fail?: string
+    /** Thrown once the text has been streamed, as a provider error would be. */
+    error?: Error
+    usage?: { promptTokens?: number; completionTokens?: number }
+  }
 
 /** A client that plays the scripted replies in turn and records each request. */
 const scripted = (replies: Reply[]) => {
@@ -54,6 +61,7 @@ const scripted = (replies: Reply[]) => {
         if (reply.fail) throw new Error(reply.fail)
         const text = reply.text ?? ""
         for (let i = 0; i < text.length; i += 7) yield { content: text.slice(i, i + 7) }
+        if (reply.error) throw reply.error
         if (reply.calls) yield { content: "", toolCalls: reply.calls, finishReason: "stop" }
         if (reply.usage) yield { content: "", usage: reply.usage }
       })()
@@ -632,6 +640,85 @@ test("a gateway from before tools refuses the field by name, and the loop carrie
   assert.match(text, /It exports a\./)
   // The call was keyed `args`, and its path still reached the tool.
   assert.match(String(requests[2].messages[requests[2].messages.length - 1].content), /a\.ts \(lines 1–1 of 1\)\ncontent_hash: xxh64:[a-f0-9]{16}; total_lines: 1\n1: export const a = 1/)
+})
+
+const failure = (reason: "interrupted" | "bad-request" | "parser-failure", kind: InferenceErrorKind = "provider-unavailable") =>
+  new InferenceError(kind, `provider ${reason}`, { reason, status: reason === "bad-request" ? 400 : 500 })
+
+test("a provider failure before any output is sent again, and no tool runs twice", async () => {
+  const root = workspace({ "a.ts": "const a = 1\n" })
+  const { client, requests } = scripted([
+    { calls: [read("1", "a.ts")] },
+    { error: failure("interrupted") },
+    "Done."
+  ])
+  const decisions: string[] = []
+  const reply = await collect(
+    withTools(client, workspaceTools(root), {
+      mode: "native",
+      providerRetryDelayMs: 0,
+      onRequest: () => decisions.push("request")
+    }).chat(ask("Read it."))
+  )
+  assert.ok(reply.text.endsWith("Done."), `the answer follows the tool note: ${reply.text}`)
+  assert.strictEqual(requests.length, 3, "the failed request is sent again once")
+  assert.deepStrictEqual(requests[2].messages, requests[1].messages, "the retry carries exactly the request that failed")
+  const results = requests[2].messages.filter((m) => m.role === "tool")
+  assert.strictEqual(results.length, 1, "the read ran once, before the failure")
+  assert.strictEqual(decisions.length, 3)
+})
+
+test("a provider failure after output is shown is not sent again", async () => {
+  const { client, requests } = scripted([{ text: "The answer begins here and then the stream dies.", error: failure("interrupted") }])
+  await assert.rejects(
+    collect(withTools(client, workspaceTools(workspace({})), { mode: "native", providerRetryDelayMs: 0 }).chat(ask("Answer."))),
+    (error: unknown) => isInferenceError(error) && error.reason === "interrupted"
+  )
+  assert.strictEqual(requests.length, 1, "what the user has seen is not repeated")
+})
+
+test("a failure the provider will not change on retry is thrown at once", async () => {
+  const { client, requests } = scripted([{ error: failure("bad-request", "inference-failure") }])
+  await assert.rejects(
+    collect(withTools(client, workspaceTools(workspace({})), { mode: "native", providerRetryDelayMs: 0 }).chat(ask("Answer."))),
+    (error: unknown) => isInferenceError(error) && error.reason === "bad-request"
+  )
+  assert.strictEqual(requests.length, 1)
+})
+
+test("provider retries are bounded, and a successful request starts the count again", async () => {
+  const exhausted = scripted([{ error: failure("parser-failure") }, { error: failure("parser-failure") }, { error: failure("parser-failure") }])
+  await assert.rejects(
+    collect(withTools(exhausted.client, workspaceTools(workspace({})), { mode: "native", providerRetryDelayMs: 0 }).chat(ask("Answer."))),
+    (error: unknown) => isInferenceError(error) && error.reason === "parser-failure"
+  )
+  assert.strictEqual(exhausted.requests.length, 3, "two retries, then the last failure is thrown")
+
+  const { client, requests } = scripted([
+    { error: failure("interrupted") },
+    { calls: [read("1", "a.ts")] },
+    { error: failure("interrupted") },
+    { error: failure("interrupted") },
+    "Done."
+  ])
+  const reply = await collect(
+    withTools(client, workspaceTools(workspace({ "a.ts": "x\n" })), { mode: "native", providerRetryDelayMs: 0 }).chat(ask("Read it."))
+  )
+  assert.ok(reply.text.endsWith("Done."))
+  assert.strictEqual(requests.length, 5, "a success between failures restores the retry budget")
+})
+
+test("a retry waits, and a stop during the wait sends nothing further", async () => {
+  const { client, requests } = scripted([{ error: failure("interrupted") }, "Done."])
+  const host = new AbortController()
+  const started = Date.now()
+  const stream = collect(
+    withTools(client, workspaceTools(workspace({})), { mode: "native", providerRetryDelayMs: 5000 }).chat(ask("Answer."), { signal: host.signal })
+  )
+  setTimeout(() => host.abort(new Error("host stopped")), 50)
+  await assert.rejects(stream, (error: unknown) => isCancelled(error))
+  assert.ok(Date.now() - started < 2000, "the wait ends when the host stops")
+  assert.strictEqual(requests.length, 1, "no second request after the stop")
 })
 
 test("arguments keyed args, input or params reach the tool", async () => {

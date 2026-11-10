@@ -50,7 +50,7 @@ import { agentToolSelectionDiagnostic, projectTaskRelevantTools, resolveAgentToo
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
-import { isCancelled, readReply, readText, resolveInferenceProvider } from "../inference"
+import { isCancelled, isRetryableProviderFailure, readReply, readText, resolveInferenceProvider } from "../inference"
 import {
   assumedContextWindow,
   contextWindowOf,
@@ -60,7 +60,7 @@ import { ExtensionBridge } from "../messaging/bridge"
 import { PromptInstructionResolver } from "../prompts/instructions"
 import { Base } from "../providers/base"
 import { resolveProviderEndpoint } from "../providers/endpoint"
-import { describeProviderError, stripThinking } from "../providers/errors"
+import { describeProviderError, describeProviderErrorPlain, stripThinking } from "../providers/errors"
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
@@ -70,7 +70,7 @@ import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todo
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
 import { formatCountedTokens, formatRequestBreakdown } from "../tools/context-breakdown"
-import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
+import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import { type ToolCall, toolDefinition } from "../tools/protocol"
 import { type TodoToolOptions, todoTools, todoWorkspaceTools } from "../tools/todos"
@@ -139,6 +139,7 @@ const describeEditBlocker = (operation: UnresolvedEditOperation, conversationId:
 
 /** How long an agent reply waits for the team's policy to be re-read. */
 const POLICY_REFRESH_WAIT_MS = 1500
+const PROVIDER_RESUME_DELAY_MS = 1000
 /** The steps an agent reply may take, as `twinny.chatToolsMaxSteps` may set them. */
 const MIN_STEPS_SETTING = 4
 const MAX_STEPS_SETTING = 100
@@ -1390,7 +1391,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     changes: ReplyChangesView | undefined,
     view: WorkspaceView | undefined,
     workflow: ExecutionReconciliationController,
-    recovery?: EditRecoveryNotice
+    recovery?: EditRecoveryNotice,
+    failure?: { error: unknown; provider: TwinnyProvider; unrecordedTool: boolean }
   ): Promise<string | undefined> {
     if (!this._todoRepository || this.cancelled || workflow.isCancelled()) {
       if (this.cancelled) workflow.cancel()
@@ -1413,7 +1415,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const before = await this._todoRepository.getList({ ...scope, includeCompleted: true })
     let current = before.items.find((item) => item.id === intent.task.id)
 
-    if (current && current.status !== "completed" && current.status !== "cancelled" && current.status !== "blocked") {
+    // A failed request has no finished turn to judge, so Feedback does not review it.
+    if (!failure && current && current.status !== "completed" && current.status !== "cancelled" && current.status !== "blocked") {
       if (current.status !== "in_review") {
         current = await this._todoRepository.updateItem(scope, {
           itemId: current.id,
@@ -1455,7 +1458,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return undefined
     }
 
-    if (!reviewFailure) {
+    if (!reviewFailure && !failure) {
       // Other plan tasks may hold pending claims; the active task was just evaluated and its new version excludes it.
       try {
         await this.reviewTodoTasks(scope, undefined, changes, {
@@ -1545,25 +1548,39 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return undefined
     }
 
-    // Progress is new evidence for the task still open, not the files a reply touched.
-    const progress = `${next.planTaskId}|${next.task.status}`
+    // Progress is the open plan task moving on; the controller's own status writes and new evidence are not counted here.
+    const progress = next.planTaskId
     const decision = evaluation?.decision === "revise" ? "revise" : "needs_evidence"
     const passedCriteria = evaluation?.criteria.filter((criterion) => criterion.status === "passed").map((criterion) => criterion.criterion) ?? []
-    const outcome = evaluation?.decision === "accept" || awaitingDependencies.length
-      ? workflow.advanceAcceptedTask(progress)
-      : workflow.reconcile(decision, progress, workflow.recordEvidence({ observations: next.observations ?? [], passedCriteria }))
+    const outcome = failure
+      ? workflow.providerFailed(isRetryableProviderFailure(failure.error) && !failure.unrecordedTool, workflow.recordEvidence({ observations: next.observations ?? [], passedCriteria: [] }))
+      : evaluation?.decision === "accept" || awaitingDependencies.length
+        ? workflow.advanceAcceptedTask(progress)
+        : workflow.reconcile(decision, progress, workflow.recordEvidence({ observations: next.observations ?? [], passedCriteria }))
     logger.debug(`[Execution] continuation task=${next.planTaskId} decision=${evaluation?.decision ?? "none"} state=${outcome.state} continue=${outcome.continue}${outcome.reason ? ` reason=${outcome.reason}` : ""}`)
     if (!outcome.continue) {
       const open = evaluation?.criteria.filter((criterion) => criterion.status !== "passed").map((criterion) => criterion.criterion) ?? []
-      const reason = (outcome.reason ?? "The autonomous execution retry budget was exhausted.") + (open.length ? ` Unsatisfied: ${open.slice(0, 3).join("; ")}.` : "")
+      const detail = failure ? " Last provider error: " + describeProviderErrorPlain(failure.error, failure.provider) : ""
+      const reason = failure?.unrecordedTool
+        ? "A tool ran but its result could not be recorded in the task ledger before the provider failed, so resuming could repeat its effect."
+        : (outcome.reason ?? "The autonomous execution retry budget was exhausted.") + (open.length ? ` Unsatisfied: ${open.slice(0, 3).join("; ")}.` : "") + detail
       this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution stopped: ${reason}` })
       logger.warn("[Execution] stopped: " + reason)
       return undefined
     }
+    if (failure) {
+      await pause(PROVIDER_RESUME_DELAY_MS, this._executionAbort?.signal).catch(() => undefined)
+      if (this.cancelled || workflow.isCancelled()) {
+        workflow.cancel()
+        return undefined
+      }
+    }
 
     const feedback = recovery?.restored
       ? [recovery.reason, "Diagnostics: " + recovery.diagnostics, "The regression was rolled back. Reinspect diagnostics before making a corrected edit."]
-      : reviewFailure
+      : failure
+        ? [`The previous provider request did not finish (${describeProviderErrorPlain(failure.error, failure.provider)}). Nothing from it was recorded as a result. Resume from the verified observations below and do not repeat operations they cover.`]
+        : reviewFailure
         ? [`Independent evaluation failed: ${reviewFailure}. Do not treat this as approval; continue with verifiable work.`]
         : awaitingDependencies.length
           ? [`The completion claim for ${intent.task.title} is preserved and waits for its prerequisites (${awaitingDependencies.join(", ")}). It is reviewed automatically once they verify, so do not resubmit it. Continue with the next unresolved task.`]
@@ -1932,6 +1949,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const activeCheckpoints = checkpoints ?? (view ? createSafeEditCheckpoints(this._extensionContext.globalStorageUri) : undefined)
     const usage: ToolLoopUsage = {}
     let outOfSteps = false
+    const providerFailures: unknown[] = []
     // Asked now, so the reply can say how much of the context it used.
     void contextWindowOf(provider)
     this._steering = []
@@ -1946,9 +1964,14 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onChanges: (changes: ReplyChanges) => (tracked = changes),
       onOutOfSteps: () => (outOfSteps = true),
       onToolResult: async (call: ToolCall, result: ToolResult) => {
-        if (!this._todoRepository || call.name.startsWith("twinny_todo_") || (call.name === "run_command" && !result.execution)) return
-        const scope = this.activeTodoScope()
-        if (!scope) return
+        // A declined command ran nothing, and todo tools record their own results.
+        if (call.name.startsWith("twinny_todo_") || (call.name === "run_command" && !result.execution)) return
+        const scope = this._todoRepository ? this.activeTodoScope() : undefined
+        if (!this._todoRepository || !scope) {
+          execution.markUnrecordedTool()
+          logger.debug(`[Evidence] result of ${call.name} has no task ledger to record in`)
+          return
+        }
         const invocationId = randomUUID()
         const rawOutput = result.execution?.output ?? result.output
         const evidence = compactToolEvidence({
@@ -1962,7 +1985,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         let itemId: string | undefined
         try {
           const active = await this._todoRepository.getActiveIntentContext(scope)
-          if (!active) return
+          if (!active) {
+            execution.markUnrecordedTool()
+            logger.debug(`[Evidence] result of ${call.name} has no active task to record against`)
+            return
+          }
           itemId = active.task.id
           await this._todoRepository.recordToolObservation(scope, {
             itemId,
@@ -1977,6 +2004,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           logger.debug(`[Evidence] observation tool=${call.name} task=${itemId} failed=${evidence.failed} invocation=${invocationId}`)
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
+          execution.markUnrecordedTool()
           logger.error(`[Todo] todo.evidence.missing ${JSON.stringify({ tool_name: call.name, invocation_id: invocationId, reason })}`)
           if (itemId) {
             await this._todoRepository.addEvidence(scope, {
@@ -2052,6 +2080,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           }
         },
         changes: () => changed,
+        onFailure: (error) => {
+          providerFailures.push(error)
+        },
         meta: () => {
           const contextWindow = knownContextWindow(provider)
           const instructions = instructionFiles()
@@ -2091,9 +2122,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         }
       }
     }
-    if (reply !== undefined && !this.cancelled && feedbackEnabled && todoScope && intentForTurn) {
+    // A provider failure resumes or stops through the controller; it is never sent to Feedback as a finished turn.
+    const failure = providerFailures.length ? { error: providerFailures[0], provider, unrecordedTool: execution.hasUnrecordedTool } : undefined
+    if ((reply !== undefined || failure) && !this.cancelled && feedbackEnabled && todoScope && intentForTurn) {
       const priorSteps = new Set(this._steps.steps)
-      const continuation = await this.reconcileIntentTurn(todoScope, intentForTurn, reply, changed, view, execution, recoveryNotice)
+      const continuation = await this.reconcileIntentTurn(todoScope, intentForTurn, reply, changed, view, execution, recoveryNotice, failure)
       // Reviews run after this reply was saved; the webview attaches them to it.
       const late = this._steps.steps.filter((step) => step.name === "feedback" && !priorSteps.has(step))
       if (late.length) this._bridge.emit(EVENT_NAME.twinnyReplySteps, late)
@@ -2104,7 +2137,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         execution.continuationStarted()
         return this.run(provider, CONTINUATION_PREFIX, view, execution, activeCheckpoints)
       }
-    } else if (reply !== undefined && feedbackEnabled && todoScope) {
+    } else if (reply !== undefined && !failure && feedbackEnabled && todoScope) {
       void this.reviewTodoTasks(todoScope, undefined, changed).catch((error) => {
         logger.error("Automatic TODO evaluation could not load review tasks: " + (error instanceof Error ? error.message : String(error)))
       })
