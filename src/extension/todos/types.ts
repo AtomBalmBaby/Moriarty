@@ -210,6 +210,19 @@ export interface AcceptedFact extends TodoSourceFact {
 }
 
 /**
+ * How an execution used a current accepted fact. `lookup` is an explicit successful lookup that returned the fact;
+ * `reuse` is an accepted attach of the fact to a criterion. Automatic context injection is never a use.
+ */
+export type EvidenceUseKind = "lookup" | "reuse"
+
+/** Project-wide usage of one accepted fact, counted once per execution and kind. */
+export interface AcceptedFactUsage {
+  fact: AcceptedFact
+  lookups: number
+  reuses: number
+}
+
+/**
  * A proven relationship between a registered tool name (read_file) and the symbol that implements it (readFile),
  * with the observation and fingerprint that proved it. Project knowledge, like accepted facts.
  */

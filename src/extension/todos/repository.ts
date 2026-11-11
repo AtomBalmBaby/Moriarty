@@ -15,6 +15,7 @@ import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile } from "./sqlite"
 import {
   type AcceptedFact,
+  type AcceptedFactUsage,
   type AddTodoEvidenceInput,
   type AnswerRequirement,
   type ChildTodoContext,
@@ -26,6 +27,7 @@ import {
   type EditOperationInput,
   type EditOperationRecord,
   type EditOperationStatus,
+  type EvidenceUseKind,
   type IntentPlanContext,
   type IntentPlanOutline,
   type IntentPlanOutlineChild,
@@ -888,7 +890,7 @@ export class TodoRepository {
       )
       const retainedEvidence = retainedEvidenceFor(database, current.id, false, list.id)
       const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string; executionId: string | null }>(database,
-        "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt, execution_id AS executionId FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [current.id]
+        "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt, execution_id AS executionId FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC, rowid DESC", [current.id]
       ).map((observation) => ({
         id: observation.id, itemId: observation.itemId, toolName: observation.toolName,
         arguments: JSON.parse(observation.arguments_json) as Record<string, string>, output: observation.output,
@@ -1323,6 +1325,49 @@ export class TodoRepository {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
       if (!project) return []
       return acceptedFactsFor(database, project.id, { ...options, includeSuperseded: true })
+    })
+  }
+
+  /**
+   * Records successful, distinct uses of current accepted facts by one execution. A row is keyed by fact, kind and
+   * execution, so repeating the same use inside an execution is ignored. Facts that are superseded or outside the
+   * project are skipped. Freshness is checked by the caller, which reads source; this write only checks structure.
+   */
+  recordEvidenceUse(request: TodoListRequest, input: { kind: EvidenceUseKind; executionId: string; factIds: string[] }): Promise<number> {
+    return this.sqlite.write((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return 0
+      const current = new Set(acceptedFactsFor(database, project.id).map((fact) => fact.id))
+      let recorded = 0
+      for (const factId of new Set(input.factIds)) {
+        if (!current.has(factId)) continue
+        database.run(
+          "INSERT OR IGNORE INTO todo_evidence_usage (id, fact_id, project_id, conversation_id, execution_id, kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [randomUUID(), factId, project.id, request.conversationId.trim(), input.executionId, input.kind, now()]
+        )
+        recorded += database.getRowsModified()
+      }
+      return recorded
+    })
+  }
+
+  /**
+   * Every current accepted fact in the project with its lifetime lookup and reuse counts. Counts are per distinct
+   * execution and kind, so the ranking is decided by independent use. Superseded facts are excluded from the candidates.
+   */
+  promotionCandidates(request: TodoListRequest): Promise<AcceptedFactUsage[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      const counts = new Map<string, { lookups: number; reuses: number }>()
+      for (const row of rows<{ fact_id: string; kind: EvidenceUseKind; uses: number }>(database,
+        "SELECT fact_id, kind, COUNT(*) AS uses FROM todo_evidence_usage WHERE project_id = ? GROUP BY fact_id, kind", [project.id])) {
+        const entry = counts.get(row.fact_id) ?? { lookups: 0, reuses: 0 }
+        if (row.kind === "lookup") entry.lookups = row.uses
+        else entry.reuses = row.uses
+        counts.set(row.fact_id, entry)
+      }
+      return acceptedFactsFor(database, project.id).map((fact) => ({ fact, lookups: 0, reuses: 0, ...counts.get(fact.id) }))
     })
   }
 

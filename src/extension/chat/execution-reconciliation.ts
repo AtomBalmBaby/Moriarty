@@ -285,7 +285,7 @@ export const continuationContext = (input: {
   finalResponse: string
 }): string => {
   const section = (name: string, values: string[], limit: number) =>
-    `${name}:\n${values.slice(0, 8).map((value) => `- ${value.slice(0, limit)}`).join("\n") || "- None"}`
+    `${name}:\n${values.slice(0, 8).map((value) => `- ${value.slice(0, limit)}`).join("\n") || "- None"}${values.length > 8 ? `\n- … ${values.length - 8} more not shown` : ""}`
   return [
     "Twinny is automatically resuming this execution after independent review. This is an instruction to continue the existing task, not a new user request.",
     `Original goal: ${input.goal.slice(0, 1200)}`,

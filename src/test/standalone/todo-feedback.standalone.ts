@@ -11,6 +11,7 @@ import { resolveAgentToolSelection } from "../../extension/agents/tool-selection
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
 import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, FeedbackPlanner, parseFeedbackPlanResponse, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { checkDelivery, type DeliveryVerdict } from "../../extension/todos/delivery"
+import { EVIDENCE_BUDGET, type EvidenceBudget, projectEvidence, rankPromotionCandidates, renderRecentObservations, renderRequiredEvidence } from "../../extension/todos/evidence-context"
 import { commandDigest, compactArguments, compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
 import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { validateIntentTaskPlan } from "../../extension/todos/intent-plan"
@@ -556,7 +557,7 @@ test("a version-15 database keeps its alias rows as history, gains a nullable re
     await reopened.initialize()
     const check = new sql.Database(fs.readFileSync(state.databasePath))
     try {
-      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 18)
       assert.equal(check.exec("PRAGMA table_info(todo_accepted_evidence)")[0].values.some((row) => row[1] === "registered_tool"), true, "the migration adds registered_tool")
       assert.equal(check.exec("SELECT COUNT(*) FROM todo_symbol_aliases")[0].values[0][0], 1, "the legacy alias row is kept as history")
     } finally {
@@ -602,7 +603,7 @@ test("a version-16 database keeps its tool observations as history with no execu
     await reopened.initialize()
     const check = new sql.Database(fs.readFileSync(state.databasePath))
     try {
-      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 18)
       assert.equal(check.exec("PRAGMA table_info(todo_tool_observations)")[0].values.some((row) => row[1] === "execution_id"), true, "the migration adds execution_id")
       assert.equal(check.exec("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'todo_tool_observations_execution'")[0]?.values.length, 1)
       const [row] = check.exec(`SELECT output, failed, execution_id FROM todo_tool_observations WHERE id = '${historical.id}'`)[0].values
@@ -630,7 +631,7 @@ test("existing version-4 TODO databases gain child proposals and accepted eviden
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
     const check = new sql.Database(fs.readFileSync(state.databasePath))
-    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
+    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 18)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0].values[0][0], 1)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_symbol_aliases'")[0].values[0][0], 1)
     check.close()
@@ -5192,14 +5193,14 @@ test("a version-10 database with accepted evidence upgrades to version 11 with e
     await reopened.initialize()
     assert.deepEqual(await reopened.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "the accepted fact and its provenance survive the upgrade unchanged")
     const upgraded = inspect()
-    assert.equal(upgraded.version, 17)
+    assert.equal(upgraded.version, 18)
     assert.equal(upgraded.activationTable, 1, "the requirement activation table is added")
     assert.deepEqual(upgraded.observations, before.observations, "no observation row or list revision changes during the upgrade")
 
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual(await again.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "a second reopen is stable")
-    assert.equal(inspect().version, 17)
+    assert.equal(inspect().version, 18)
     assert.equal(calls.count, 0)
   } finally {
     removeAll(state.directory)
@@ -5292,7 +5293,7 @@ test("the v12 edit ledger rebuilds for optional task association, keeps its rows
   }
   try {
     const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
-    assert.deepEqual(inspect(state.databasePath), { version: 17, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
+    assert.deepEqual(inspect(state.databasePath), { version: 18, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
     assert.equal(fs.existsSync(backupPath), false, "a new database has no earlier version to back up")
 
     await state.repository.beginEditOperation(state.scope, { id: "v12-edit", itemId, target: "src/old.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
@@ -5327,7 +5328,7 @@ PRAGMA user_version = 12;`)
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     await reopened.initialize()
     const upgraded = inspect(state.databasePath)
-    assert.equal(upgraded.version, 17)
+    assert.equal(upgraded.version, 18)
     assert.equal(upgraded.itemNullable, true, "the task column becomes optional")
     assert.deepEqual(upgraded.statuses, [["v12-edit", "succeeded"]], "existing ledger rows keep their identity and settlement")
     assert.equal(upgraded.index, 1, "the target index is recreated")
@@ -5343,7 +5344,7 @@ PRAGMA user_version = 12;`)
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual(inspect(state.databasePath).ids, ["v12-edit", "v13-free"], "a second reopen is stable")
-    assert.equal(inspect(state.databasePath).version, 17)
+    assert.equal(inspect(state.databasePath).version, 18)
   } finally {
     removeAll(state.directory)
   }
@@ -5373,14 +5374,14 @@ test("the owner column is additive: legacy edit rows stay unowned and each reope
 
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     await reopened.initialize()
-    assert.deepEqual(versionAndOwnerColumn(), { version: 17, ownerColumn: true }, "the upgrade adds the owner column")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 18, ownerColumn: true }, "the upgrade adds the owner column")
     assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined]], "a legacy row has no owner")
 
     await reopened.beginEditOperation(state.scope, { id: "2-owned-edit", ownerId: "host-b", target: "src/owned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual((await again.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined], ["2-owned-edit", "host-b"]], "owners survive a reopen")
-    assert.deepEqual(versionAndOwnerColumn(), { version: 17, ownerColumn: true }, "a second reopen is stable")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 18, ownerColumn: true }, "a second reopen is stable")
   } finally {
     removeAll(state.directory)
   }
@@ -5444,7 +5445,7 @@ test("the v11 TODO database gains the edit operation ledger while keeping the ac
 
     const check = new sql.Database(fs.readFileSync(state.databasePath))
     try {
-      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 18)
       assert.equal(check.exec("SELECT COUNT(*) FROM todo_edit_operations WHERE item_id = ?", [after!.task.id])[0].values[0][0], 1)
     } finally {
       check.close()
@@ -5653,4 +5654,450 @@ test("the verifier capability table is authoritative: only implemented kinds and
   const [outcome] = await reviewCriteria([typedCriterion("unsupported", "A criterion the verifier does not implement", { kind: "made_up_kind" } as unknown as TypedCriterion["verification"])], [], currentWorkspace)
   assert.notEqual(outcome.outcome, "proven")
   assert.equal(outcome.failureReason, "unsupported_operation", JSON.stringify(outcome))
+})
+
+// Stage H: the promoted and recent windows over real repository, lookup, reuse, and review paths. Each test owns its database.
+const PROMOTION_PROJECT = workspaceProjectFingerprint(["file:///evidence-project"])
+const PROJECT_COPY = workspaceProjectFingerprint(["file:///evidence-project-copy"])
+const SEARCH_FILE = "src/extension/tools/search.ts"
+const LIST_FILE = "src/extension/tools/list.ts"
+/** Same registration layout as workspaceText, so the structural analyzer finds `name` as a registered tool. */
+const toolSource = (name: string, fn: string): string => Array.from({ length: 850 }, (_, index) => {
+  if (index === 168) return `const ${fn} = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink): Tool => {`
+  if (index === 169) return "  const limit = clampReadLines(maxLines)"
+  if (index === 170) return "  return {"
+  if (index === 171) return `    name: "${name}",`
+  if (index === 172) return "    async run(args: unknown) {"
+  if (index === 216) return "      return args"
+  if (index === 217) return "    }"
+  if (index === 218) return "  }"
+  if (index === 219) return "}"
+  if (index > 172 && index < 216) return `      const filler${index + 1} = ${index + 1}`
+  return `const filler${index + 1} = ${index + 1}`
+}).join("\n")
+const PROMOTION_SOURCES: Record<string, string> = {
+  [WORKSPACE_FILE]: workspaceText,
+  [SEARCH_FILE]: toolSource("search_files", "searchFiles"),
+  [LIST_FILE]: toolSource("list_files", "listFiles")
+}
+const sourcesNow: CurrentSourceReader = async (file) => PROMOTION_SOURCES[file]
+const sourcesWithChangedRead: CurrentSourceReader = async (file) => (file === WORKSPACE_FILE ? CHANGED_TEXT : PROMOTION_SOURCES[file])
+const sourcesUnreadable: CurrentSourceReader = async () => undefined
+const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+const readCriterion = () => sourceLocation("defined", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool")
+const searchCriterion = () => sourceLocation("defined", "`search_files` is defined in src/extension/tools/search.ts", "search_files", "registered_tool", SEARCH_FILE)
+const listCriterion = () => sourceLocation("defined", "`list_files` is defined in src/extension/tools/list.ts", "list_files", "registered_tool", LIST_FILE)
+const READ_ARGS = { symbol: "read_file", path: WORKSPACE_FILE }
+
+type PromotionStore = { directory: string; databasePath: string; repository: TodoRepository }
+const openPromotionStore = (): PromotionStore => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-promotion-"))
+  const databasePath = path.join(directory, "twinny-state.sqlite")
+  return { directory, databasePath, repository: new TodoRepository(databasePath, wasmPath) }
+}
+const scopeOf = (conversationId: string, projectFingerprint = PROMOTION_PROJECT): TodoWriteRequest => ({ projectFingerprint, conversationId, writer: conversationId })
+const planTasks = async (repository: TodoRepository, scope: TodoWriteRequest, tasks: Parameters<typeof plan>[0]): Promise<string[]> =>
+  (await repository.synchronizeIntentPlan(scope, plan(tasks), { prompt: "Work through the evidence tasks" })).items.map((item) => item.id)
+
+/** Accepts a source fact through the real path: a read in this execution, then the deterministic review. */
+const acceptSource = async (repository: TodoRepository, scope: TodoWriteRequest, itemId: string, file: string, executionId: string, tag: string, text = PROMOTION_SOURCES[file]) => {
+  await startItemInReview(repository, scope, itemId)
+  await repository.recordToolObservation(scope, {
+    itemId,
+    toolName: "read_file",
+    arguments: { path: file, start_line: "150", end_line: "220" },
+    output: `read \`${file}:150\` · 71 lines`,
+    failed: false,
+    requestId: `${tag}-read`,
+    evidenceOutput: await readCurrentOutput(text, file, 150, text.split("\n").slice(149, 220)),
+    executionId
+  })
+  const review = (await repository.getReviewPackages(scope)).find((candidate) => candidate.task.id === itemId)!
+  const calls = { count: 0 }
+  const readCurrentSource: CurrentSourceReader = async (candidate) => (candidate === file ? text : PROMOTION_SOURCES[candidate])
+  const evaluation = await evaluateTodoReview(repository, scope, review, countingEvaluator(calls), "mock-reviewer", { readCurrentSource, hasVerifiedFileChanges: false })
+  assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+  assert.equal(calls.count, 0)
+}
+const factFor = async (repository: TodoRepository, scope: TodoWriteRequest, symbol: string, file: string) =>
+  (await repository.listAcceptedEvidence(scope, { symbol, path: file })).find((fact) => !fact.supersededBy)!
+
+/** Conversation A accepts read, search, and list facts in that order, 5 ms apart, and holds one pending task for later use. */
+const seedProject = async (repository: TodoRepository, projectFingerprint = PROMOTION_PROJECT) => {
+  const scope = scopeOf("chat-a", projectFingerprint)
+  const [read, search, list, again] = await planTasks(repository, scope, [
+    { id: "read", criteria: [readCriterion()] },
+    { id: "search", criteria: [searchCriterion()] },
+    { id: "list", criteria: [listCriterion()] },
+    { id: "again", criteria: [readCriterion()] }
+  ])
+  await acceptSource(repository, scope, read, WORKSPACE_FILE, "exec-accept-read", "read")
+  await waitMs(5)
+  await acceptSource(repository, scope, search, SEARCH_FILE, "exec-accept-search", "search")
+  await waitMs(5)
+  await acceptSource(repository, scope, list, LIST_FILE, "exec-accept-list", "list")
+  return {
+    scope,
+    again,
+    facts: {
+      read: await factFor(repository, scope, "read_file", WORKSPACE_FILE),
+      search: await factFor(repository, scope, "search_files", SEARCH_FILE),
+      list: await factFor(repository, scope, "list_files", LIST_FILE)
+    }
+  }
+}
+
+const lookupAs = async (repository: TodoRepository, scope: TodoWriteRequest, executionId: string, args: Record<string, string>, sources: CurrentSourceReader = sourcesNow) => {
+  const tools = todoWorkspaceTools(repository, scope, () => undefined, { readCurrentSource: sources, executionId })
+  return tools.run({ name: "twinny_evidence_lookup", args })
+}
+const countsOf = async (repository: TodoRepository, scope: TodoWriteRequest, factId: string) => {
+  const entry = (await repository.promotionCandidates(scope)).find((candidate) => candidate.fact.id === factId)
+  return { lookups: entry?.lookups ?? 0, reuses: entry?.reuses ?? 0 }
+}
+/** The projection as the controller builds it: repository reads, then the shared service, with no rendering side effects. */
+const projectFor = async (repository: TodoRepository, scope: TodoWriteRequest, executionId: string | undefined, requestText: string, sources: CurrentSourceReader, budget?: EvidenceBudget) => {
+  const [facts, usage, active] = await Promise.all([repository.listAcceptedEvidence(scope), repository.promotionCandidates(scope), repository.getActiveIntentContext(scope)])
+  return projectEvidence({
+    requestText,
+    planItemIds: [],
+    criteria: active?.criteria ?? [],
+    executionId,
+    facts,
+    usage,
+    observations: active?.observations ?? [],
+    observationText: (observation) => `${observation.toolName} ${observation.output}`,
+    readCurrent: sources,
+    budget
+  })
+}
+
+test("accepted evidence from one conversation is promoted into another conversation of the same project without knowing its ID", async () => {
+  const store = openPromotionStore()
+  try {
+    const { facts } = await seedProject(store.repository)
+    const other = scopeOf("chat-b")
+    await planTasks(store.repository, other, [{ id: "summary", criteria: [semantic("summary")] }])
+    const projection = await projectFor(store.repository, other, "exec-b", "Summarize the project", sourcesNow)
+    const promoted = projection.promoted.map((status) => status.fact.id)
+    assert.deepEqual([...promoted].sort(), [facts.read.id, facts.search.id, facts.list.id].sort(), JSON.stringify(projection.omitted))
+    assert.deepEqual(projection.requiredFacts, [])
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("repeated meaningful use moves a fact to the top of the promoted ranking", async () => {
+  const store = openPromotionStore()
+  try {
+    const { scope, facts } = await seedProject(store.repository)
+    assert.equal(rankPromotionCandidates(await store.repository.promotionCandidates(scope), "", [])[0].fact.id, facts.list.id, "with no use, the newest acceptance leads")
+    for (const executionId of ["exec-1", "exec-2"]) {
+      const lookup = await lookupAs(store.repository, scope, executionId, READ_ARGS)
+      assert.notEqual(lookup.failed, true, lookup.output)
+    }
+    assert.deepEqual(await countsOf(store.repository, scope, facts.read.id), { lookups: 2, reuses: 0 })
+    assert.equal(rankPromotionCandidates(await store.repository.promotionCandidates(scope), "", [])[0].fact.id, facts.read.id)
+
+    const other = scopeOf("chat-b")
+    await planTasks(store.repository, other, [{ id: "summary", criteria: [semantic("summary")] }])
+    assert.equal((await projectFor(store.repository, other, "exec-b", "Summarize the project", sourcesNow)).promoted[0].fact.id, facts.read.id)
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("duplicate lookups inside one execution count once, and failed or empty lookups count nothing", async () => {
+  const store = openPromotionStore()
+  try {
+    const { scope, facts } = await seedProject(store.repository)
+    await lookupAs(store.repository, scope, "exec-1", READ_ARGS)
+    await lookupAs(store.repository, scope, "exec-2", READ_ARGS)
+    for (let attempt = 0; attempt < 3; attempt++) await lookupAs(store.repository, scope, "exec-3", READ_ARGS)
+    assert.deepEqual(await countsOf(store.repository, scope, facts.read.id), { lookups: 3, reuses: 0 }, "one use per execution, not per call")
+
+    const factsBefore = JSON.stringify(await store.repository.listAcceptedEvidence(scope))
+    const failed = await lookupAs(store.repository, scope, "exec-4", {})
+    assert.equal(failed.failed, true, "a lookup naming neither symbol nor path is a failed call")
+    await lookupAs(store.repository, scope, "exec-4", { symbol: "no_such_tool" })
+    assert.deepEqual(await countsOf(store.repository, scope, facts.read.id), { lookups: 3, reuses: 0 })
+    assert.equal(JSON.stringify(await store.repository.listAcceptedEvidence(scope)), factsBefore, "usage never rewrites accepted facts")
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("usage from separate conversations adds up, and reuse is counted apart from lookups", async () => {
+  const store = openPromotionStore()
+  try {
+    const { scope, facts } = await seedProject(store.repository)
+    await lookupAs(store.repository, scope, "exec-1", READ_ARGS)
+    const chatC = scopeOf("chat-c")
+    const [use] = await planTasks(store.repository, chatC, [{ id: "use", criteria: [readCriterion()] }])
+    await lookupAs(store.repository, chatC, "exec-c", READ_ARGS)
+    assert.deepEqual(await countsOf(store.repository, chatC, facts.read.id), { lookups: 2, reuses: 0 })
+
+    const tools = todoWorkspaceTools(store.repository, chatC, () => undefined, { readCurrentSource: sourcesNow, executionId: "exec-c" })
+    const claim = await tools.run({ name: "twinny_todo_evidence", args: { item_id: use, kind: "observation", summary: "read_file is defined in workspace.ts", result: "passed", request_id: "claim-1" } })
+    assert.notEqual(claim.failed, true, claim.output)
+    assert.deepEqual(await countsOf(store.repository, chatC, facts.read.id), { lookups: 2, reuses: 0 }, "a model-authored claim adds no authority or reuse")
+
+    const attach = await tools.run({ name: "twinny_todo_evidence", args: { item_id: use, kind: "observation", summary: "accepted fact", result: "observed", request_id: "attach-1", accepted_fact_id: facts.read.id } })
+    assert.notEqual(attach.failed, true, attach.output)
+    assert.deepEqual(await countsOf(store.repository, chatC, facts.read.id), { lookups: 2, reuses: 1 })
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("building and rendering the evidence windows never counts as reuse", async () => {
+  const store = openPromotionStore()
+  try {
+    const { scope, facts } = await seedProject(store.repository)
+    const chatC = scopeOf("chat-c")
+    await planTasks(store.repository, chatC, [{ id: "use", criteria: [readCriterion()] }])
+    const before = JSON.stringify(await store.repository.promotionCandidates(scope))
+    for (let pass = 0; pass < 3; pass++) {
+      const projection = await projectFor(store.repository, chatC, "exec-c", "Explain read_file", sourcesNow)
+      assert.ok(projection.requiredFacts.some((status) => status.fact.id === facts.read.id), "the fact is shown to the implementer")
+      renderRequiredEvidence(projection)
+      renderRecentObservations(projection)
+    }
+    assert.equal(JSON.stringify(await store.repository.promotionCandidates(scope)), before)
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("stale and unverifiable facts leave the promoted window and never count as use, while their records remain", async () => {
+  const store = openPromotionStore()
+  try {
+    const { scope, facts } = await seedProject(store.repository)
+    await lookupAs(store.repository, scope, "exec-1", READ_ARGS)
+    await lookupAs(store.repository, scope, "exec-2", READ_ARGS)
+    const other = scopeOf("chat-b")
+    await planTasks(store.repository, other, [{ id: "summary", criteria: [semantic("summary")] }])
+
+    assert.equal((await projectFor(store.repository, other, "exec-b", "Summarize", sourcesNow)).promoted[0].fact.id, facts.read.id, "the most used fact leads while it is current")
+    const stale = await projectFor(store.repository, other, "exec-b", "Summarize", sourcesWithChangedRead)
+    assert.equal(stale.promoted.some((status) => status.fact.id === facts.read.id), false, "a stale fingerprint is never promoted")
+    assert.deepEqual(stale.promoted.map((status) => status.fact.id).sort(), [facts.search.id, facts.list.id].sort())
+
+    const staleLookup = await lookupAs(store.repository, scope, "exec-stale", READ_ARGS, sourcesWithChangedRead)
+    assert.notEqual(staleLookup.failed, true, staleLookup.output)
+    assert.deepEqual(await countsOf(store.repository, scope, facts.read.id), { lookups: 2, reuses: 0 }, "a historical lookup is not a successful use")
+
+    const unverifiable = await projectFor(store.repository, other, "exec-b", "Summarize", sourcesUnreadable)
+    assert.equal(unverifiable.promoted.length, 0)
+    assert.equal(unverifiable.omitted.promoted, 3)
+
+    const history = await store.repository.listAcceptedEvidence(scope, { symbol: "read_file", path: WORKSPACE_FILE })
+    assert.equal(history.length, 1)
+    assert.equal(history[0].supersededBy, undefined, "the fact is kept with its provenance")
+    assert.equal((await projectFor(store.repository, other, "exec-b", "Summarize", sourcesNow)).promoted[0].fact.id, facts.read.id, "it returns once the source matches again")
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("a newer acceptance supersedes an older fact, which leaves promotion but stays stored", async () => {
+  const store = openPromotionStore()
+  try {
+    const { scope, again, facts } = await seedProject(store.repository)
+    await acceptSource(store.repository, scope, again, WORKSPACE_FILE, "exec-accept-again", "again", CHANGED_TEXT)
+    const current = await factFor(store.repository, scope, "read_file", WORKSPACE_FILE)
+    assert.notEqual(current.id, facts.read.id, "changed content is a new fact, not a repeat of the old one")
+
+    const history = await store.repository.listAcceptedEvidence(scope, { symbol: "read_file", path: WORKSPACE_FILE })
+    assert.equal(history.length, 2, "both facts remain stored")
+    assert.equal(history.find((fact) => fact.id === facts.read.id)?.supersededBy, current.id)
+
+    const candidates = (await store.repository.promotionCandidates(scope)).map((entry) => entry.fact.id)
+    assert.equal(candidates.includes(facts.read.id), false, "a superseded fact is not a candidate")
+    assert.equal(candidates.includes(current.id), true)
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("required evidence outranks promoted evidence, and a fact appears in one window only", async () => {
+  const store = openPromotionStore()
+  try {
+    const { facts } = await seedProject(store.repository)
+    const chatC = scopeOf("chat-c")
+    await planTasks(store.repository, chatC, [{ id: "use", criteria: [readCriterion()] }])
+    const projection = await projectFor(store.repository, chatC, "exec-c", "Explain read_file", sourcesNow)
+    assert.deepEqual(projection.requiredFacts.map((status) => status.fact.id), [facts.read.id])
+    assert.equal(projection.promoted.some((status) => status.fact.id === facts.read.id), false)
+    assert.deepEqual(projection.promoted.map((status) => status.fact.id).sort(), [facts.search.id, facts.list.id].sort())
+    assert.equal(renderRequiredEvidence(projection)!.split(facts.read.id).length - 1, 1)
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("a required fact that does not fit its budget is reported as incomplete rather than presented as the whole", async () => {
+  const store = openPromotionStore()
+  try {
+    await seedProject(store.repository)
+    const chatC = scopeOf("chat-c")
+    await planTasks(store.repository, chatC, [{ id: "use", criteria: [readCriterion()] }])
+    const tight = await projectFor(store.repository, chatC, "exec-c", "Explain read_file", sourcesNow, { required: 10, promoted: 2400, recent: 2400 })
+    assert.equal(tight.requiredFacts.length, 0)
+    assert.equal(tight.omitted.required, 1)
+    assert.match(renderRequiredEvidence(tight) ?? "", /1 required item\(s\) not shown\. This excerpt is incomplete/)
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("an early unresolved failure stays available after more than ten later observations, until a later success of the same operation resolves it", async () => {
+  const store = openPromotionStore()
+  try {
+    const scope = scopeOf("chat-d")
+    const [work] = await planTasks(store.repository, scope, [{ id: "work", criteria: [semantic("work")] }])
+    await store.repository.recordToolObservation(scope, { itemId: work, toolName: "read_file", arguments: { path: WORKSPACE_FILE, start_line: "1", end_line: "40" }, output: "read failed: EARLY-FAILURE", failed: true, requestId: "early-failure", executionId: "exec-long" })
+    for (let index = 0; index < 12; index++) {
+      await store.repository.recordToolObservation(scope, { itemId: work, toolName: "list_files", arguments: { path: `src/dir${index}` }, output: `listed dir${index}`, failed: false, requestId: `list-${index}`, executionId: "exec-long" })
+    }
+    const before = await projectFor(store.repository, scope, "exec-long", "Continue the investigation", sourcesNow)
+    assert.equal(before.requiredFailures.length, 1)
+    assert.match(before.requiredFailures[0], /EARLY-FAILURE/)
+    assert.match(renderRequiredEvidence(before) ?? "", /unresolved failure/)
+
+    await store.repository.recordToolObservation(scope, { itemId: work, toolName: "read_file", arguments: { path: WORKSPACE_FILE, start_line: "1", end_line: "40" }, output: "read ok", failed: false, requestId: "resolving-read", executionId: "exec-long" })
+    const after = await projectFor(store.repository, scope, "exec-long", "Continue the investigation", sourcesNow)
+    assert.deepEqual(after.requiredFailures, [], "a later success of the same operation resolves the failure")
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("failures from another execution never reach the current execution's windows, and stay in the stored history", async () => {
+  const store = openPromotionStore()
+  try {
+    const scope = scopeOf("chat-d")
+    const [work] = await planTasks(store.repository, scope, [{ id: "work", criteria: [semantic("work")] }])
+    await store.repository.recordToolObservation(scope, { itemId: work, toolName: "read_file", arguments: { path: WORKSPACE_FILE, start_line: "1", end_line: "40" }, output: "OLD-FAILURE-MARKER", failed: true, requestId: "old-failure", executionId: "exec-old" })
+    await store.repository.recordToolObservation(scope, { itemId: work, toolName: "list_files", arguments: { path: "src/new.ts" }, output: "NEW-OBSERVATION-MARKER", failed: false, requestId: "new-observation", executionId: "exec-new" })
+
+    const projection = await projectFor(store.repository, scope, "exec-new", "Continue", sourcesNow)
+    assert.deepEqual(projection.requiredFailures, [])
+    assert.equal(projection.recent.length, 1)
+    assert.match(projection.recent[0], /NEW-OBSERVATION-MARKER/)
+    assert.equal(projection.recent.some((line) => line.includes("OLD-FAILURE-MARKER")), false)
+    assert.equal((((await store.repository.getActiveIntentContext(scope))!.observations) ?? []).some((observation) => observation.output === "OLD-FAILURE-MARKER"), true, "the earlier failure is kept")
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("large tool outputs cannot exceed the configured projection budget, and omissions are named", async () => {
+  const store = openPromotionStore()
+  try {
+    const scope = scopeOf("chat-d")
+    const [work] = await planTasks(store.repository, scope, [{ id: "work", criteria: [semantic("work")] }])
+    await store.repository.recordToolObservation(scope, { itemId: work, toolName: "read_file", arguments: { path: WORKSPACE_FILE, start_line: "1", end_line: "40" }, output: "F".repeat(5000), failed: true, requestId: "big-failure", executionId: "exec-big" })
+    for (let index = 0; index < 40; index++) {
+      await store.repository.recordToolObservation(scope, { itemId: work, toolName: "list_files", arguments: { path: `src/big${index}.ts` }, output: `${index}:` + "x".repeat(5000), failed: false, requestId: `big-${index}`, executionId: "exec-big" })
+    }
+    const projection = await projectFor(store.repository, scope, "exec-big", "Inspect", sourcesNow)
+    const size = (lines: string[]) => lines.reduce((total, line) => total + line.length + 1, 0)
+    assert.ok(size(projection.recent) <= EVIDENCE_BUDGET.recent, `recent ${size(projection.recent)}`)
+    assert.ok(size(projection.requiredFailures) <= EVIDENCE_BUDGET.required, `required ${size(projection.requiredFailures)}`)
+    assert.ok(projection.recent.every((line) => line.length <= 602), "each recent line is bounded to its entry limit and prefix")
+    assert.ok(projection.requiredFailures.every((line) => line.length <= 640), "a failure line is bounded to its entry limit and prefix")
+    assert.ok(projection.omitted.recent > 0)
+    assert.match(renderRecentObservations(projection) ?? "", /older observation\(s\) from this execution not shown/)
+    assert.equal((((await store.repository.getActiveIntentContext(scope))!.observations) ?? []).length, 41, "the stored observations are complete")
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("promoted and recent windows each get their own space, so neither starves the other", async () => {
+  const store = openPromotionStore()
+  try {
+    await seedProject(store.repository)
+    const scope = scopeOf("chat-b")
+    await planTasks(store.repository, scope, [{ id: "summary", criteria: [semantic("summary")] }])
+    for (let index = 0; index < 3; index++) {
+      await store.repository.recordToolObservation(scope, { itemId: (await store.repository.getActiveIntentContext(scope))!.task.id, toolName: "list_files", arguments: { path: `src/b${index}.ts` }, output: `observation ${index}`, failed: false, requestId: `b-${index}`, executionId: "exec-b" })
+    }
+    const projection = await projectFor(store.repository, scope, "exec-b", "Summarize", sourcesNow, { required: 3000, promoted: 600, recent: 600 })
+    assert.ok(projection.promoted.length >= 1, "promoted evidence keeps part of its space")
+    assert.equal(projection.promoted.length + projection.omitted.promoted, 3, "omitted promoted facts are counted")
+    assert.equal(projection.recent.length, 3, "recent observations keep their space")
+    assert.equal(projection.omitted.recent, 0)
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("two projects with the same file and symbol stay isolated in counts and promotion", async () => {
+  const store = openPromotionStore()
+  try {
+    const first = await seedProject(store.repository, PROMOTION_PROJECT)
+    const second = await seedProject(store.repository, PROJECT_COPY)
+    assert.notEqual(second.facts.read.id, first.facts.read.id)
+
+    await lookupAs(store.repository, first.scope, "exec-p1", READ_ARGS)
+    assert.deepEqual(await countsOf(store.repository, first.scope, first.facts.read.id), { lookups: 1, reuses: 0 })
+    assert.deepEqual(await countsOf(store.repository, second.scope, second.facts.read.id), { lookups: 0, reuses: 0 })
+
+    const firstIds = (await store.repository.promotionCandidates(first.scope)).map((entry) => entry.fact.id)
+    const secondIds = (await store.repository.promotionCandidates(second.scope)).map((entry) => entry.fact.id)
+    assert.equal(firstIds.some((id) => secondIds.includes(id)), false, "no candidate crosses projects")
+    const secondProjection = await projectFor(store.repository, second.scope, "exec-p2", "Summarize", sourcesNow)
+    const shown = [...secondProjection.requiredFacts, ...secondProjection.promoted].map((status) => status.fact.id)
+    assert.deepEqual([...shown].sort(), [second.facts.read.id, second.facts.search.id, second.facts.list.id].sort(), "each project fact is shown once, across both windows")
+    assert.deepEqual(secondProjection.requiredFacts.map((status) => status.fact.id), [second.facts.read.id], "the open task's criterion names read_file, so it is required")
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("promotion usage and facts survive closing the database and reopening it", async () => {
+  const store = openPromotionStore()
+  try {
+    const { scope, facts } = await seedProject(store.repository)
+    await lookupAs(store.repository, scope, "exec-1", READ_ARGS)
+    const factsBefore = JSON.stringify(await store.repository.listAcceptedEvidence(scope))
+
+    const reopened = new TodoRepository(store.databasePath, wasmPath)
+    assert.deepEqual(await countsOf(reopened, scope, facts.read.id), { lookups: 1, reuses: 0 })
+    assert.equal(JSON.stringify(await reopened.listAcceptedEvidence(scope)), factsBefore)
+    await lookupAs(reopened, scope, "exec-2", READ_ARGS)
+    assert.deepEqual(await countsOf(reopened, scope, facts.read.id), { lookups: 2, reuses: 0 })
+
+    const other = scopeOf("chat-b")
+    await planTasks(reopened, other, [{ id: "summary", criteria: [semantic("summary")] }])
+    assert.equal((await projectFor(reopened, other, "exec-b", "Summarize", sourcesNow)).promoted[0].fact.id, facts.read.id, "the reopened store ranks the same fact first")
+  } finally {
+    fs.rmSync(store.directory, { recursive: true, force: true })
+  }
+})
+
+test("promotion ranking orders by lifetime use, then reuse, then relevance, then acceptance time, then ID", () => {
+  const entry = (id: string, acceptedAt: string, lookups: number, reuses: number, overrides: Partial<AcceptedFact> = {}) => ({
+    fact: acceptedFact(id, { acceptedAt, ...overrides }),
+    lookups,
+    reuses
+  })
+  const ranked = rankPromotionCandidates([
+    entry("c", "2024-01-03T00:00:00.000Z", 0, 0),
+    entry("a", "2024-01-01T00:00:00.000Z", 2, 0),
+    entry("b", "2024-01-02T00:00:00.000Z", 1, 1),
+    entry("d", "2024-01-04T00:00:00.000Z", 1, 1),
+    entry("e", "2024-01-04T00:00:00.000Z", 0, 0),
+    entry("g", "2024-01-05T00:00:00.000Z", 0, 0),
+    entry("f", "2024-01-05T00:00:00.000Z", 0, 0)
+  ], "", [])
+  assert.deepEqual(ranked.map((candidate) => candidate.fact.id), ["d", "b", "a", "f", "g", "e", "c"])
+
+  const relevant = rankPromotionCandidates([
+    entry("x", "2024-01-01T00:00:00.000Z", 0, 0, { symbol: "other", registeredTool: "other_tool" }),
+    entry("y", "2024-01-01T00:00:00.000Z", 0, 0, { symbol: "readFile", registeredTool: "read_file" })
+  ], "How does readFile choose a path?", [])
+  assert.deepEqual(relevant.map((candidate) => candidate.fact.id), ["y", "x"], "a fact the request names leads when use is equal")
 })

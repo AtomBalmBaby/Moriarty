@@ -237,7 +237,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 17) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 18) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -314,6 +314,9 @@ export class SqliteFile {
         if (version < 17) {
           await this.migrateObservationExecutionToV17(database)
         }
+        if (version < 18) {
+          await this.migrateEvidenceUsageToV18(database)
+        }
       } finally {
         database.close()
       }
@@ -389,6 +392,26 @@ CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(l
     if (!columns.some((row) => row[1] === "execution_id")) database.run("ALTER TABLE todo_tool_observations ADD COLUMN execution_id TEXT")
     database.run("CREATE INDEX IF NOT EXISTS todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id)")
     database.run("PRAGMA user_version = 17")
+    await this.persist(database)
+  }
+
+  // v18 records project-wide accepted-evidence usage. One row per fact, kind, and execution, so repeated identical
+  // requests within one execution count once, while each execution in any conversation of the project counts once.
+  // Usage rows never change the accepted fact they reference; they are removed only if their fact is removed.
+  private async migrateEvidenceUsageToV18(database: Database): Promise<void> {
+    database.run(`
+CREATE TABLE IF NOT EXISTS todo_evidence_usage (
+  id TEXT PRIMARY KEY,
+  fact_id TEXT NOT NULL REFERENCES todo_accepted_evidence(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('lookup', 'reuse')),
+  created_at TEXT NOT NULL,
+  UNIQUE (fact_id, kind, execution_id)
+);
+CREATE INDEX IF NOT EXISTS todo_evidence_usage_project ON todo_evidence_usage(project_id, fact_id);
+PRAGMA user_version = 18;`)
     await this.persist(database)
   }
 

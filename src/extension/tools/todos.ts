@@ -12,6 +12,26 @@ export interface TodoToolOptions {
   isUserAuthorized?: () => boolean
   /** Reads the authoritative workspace source, so accepted facts can be judged current or historical. */
   readCurrentSource?: CurrentSourceReader
+  /** Host-generated execution that performs these calls. Absent outside an execution, so no use is counted. */
+  executionId?: string
+}
+
+/**
+ * Counts a successful, current use of accepted facts for the project ranking. Usage is best-effort: a failed write is logged
+ * and never fails the tool call that used the evidence.
+ */
+const recordEvidenceUse = (
+  repository: TodoRepository,
+  scope: TodoWriteRequest,
+  options: TodoToolOptions,
+  kind: "lookup" | "reuse",
+  factIds: string[]
+): Promise<void> => {
+  if (!options.executionId || !factIds.length) return Promise.resolve()
+  return repository.recordEvidenceUse(scope, { kind, executionId: options.executionId, factIds })
+    .then(() => undefined, (error: unknown) => {
+      logger.warn(`[Evidence] could not record ${kind} use: ${error instanceof Error ? error.message : String(error)}`)
+    })
 }
 
 const result = (value: unknown, summary: string): ToolResult => ({
@@ -159,6 +179,7 @@ export const todoTools = (
         const resolution = resolveAcceptedFacts(statuses)
         logger.debug(`[Evidence] lookup project=${scope.projectFingerprint.slice(0, 12)} symbol=${symbol ?? "-"} path=${path ?? "-"} matches=${statuses.length} resolution=${resolution}`)
         if (!statuses.length) logger.trace("[Evidence] lookup found no accepted fact for this project; facts are recorded only after a deterministic proof, so a missing fact means none was proven yet")
+        await recordEvidenceUse(repository, scope, options, "lookup", statuses.filter((status) => status.freshness === "current").map((status) => status.fact.id))
         const found = statuses.map(({ fact, freshness, reason }) => ({
           evidence_id: fact.id,
           symbol: fact.symbol,
@@ -421,13 +442,15 @@ const acceptedFactReference = async (
   if (!named) {
     throw new Error(`accepted fact ${factId} is not the subject of a typed criterion of this TODO`)
   }
-  return repository.addEvidence(scope, {
+  const evidence = await repository.addEvidence(scope, {
     itemId,
     kind: "accepted_fact",
     summary: `Host-verified accepted fact ${fact.id}: ${fact.symbol} in ${fact.path} lines ${fact.startLine}-${fact.endLine}, fingerprint ${fact.sourceHash}, observation ${fact.observationId}, from conversation ${fact.conversationId}, accepted ${fact.acceptedAt}.`,
     result: "observed",
     requestId
   })
+  await recordEvidenceUse(repository, scope, options, "reuse", [fact.id])
+  return evidence
 }
 
 export const todoWorkspaceTools = (

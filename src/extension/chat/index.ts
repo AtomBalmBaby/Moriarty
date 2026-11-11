@@ -65,8 +65,9 @@ import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, selectAcceptedFacts, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
-import { authoritativeExecutionReport, MAX_ACCEPTED_CONTEXT_FACTS, renderPlanContext } from "../todos/plan-context"
+import { type AcceptedFactStatus, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
+import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
 import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
@@ -670,7 +671,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         ? (proposal, context, signal) => this._childReviewer.review(proposal, context, signal)
         : undefined,
       isUserAuthorized: () => this._userRequestsTodo,
-      readCurrentSource: this.currentSourceReader()
+      readCurrentSource: this.currentSourceReader(),
+      executionId: this._activeExecution?.executionId
     }
   }
 
@@ -1672,14 +1674,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       feedback,
       verifiedObservations: [
         ...hostProven,
-        ...(intent.observations ?? []).filter((observation) => !observation.failed).slice(0, 5).map((observation) => {
-          return observationReference(observation)
-        }),
+        ...fitForSection((intent.observations ?? []).filter((observation) => !observation.failed).map((observation) => observationReference(observation)), EVIDENCE_BUDGET.recent, "verified observation(s)"),
         ...(changes?.files ?? []).slice(0, 5).map((file) => "Current reply change: " + file.path + " (" + file.status + ", +" + file.added + "/-" + file.removed + ")")
       ],
-      failedActions: (intent.observations ?? []).filter((observation) => observation.failed && observation.executionId === workflow.executionId).slice(0, 3).map((observation) =>
-        observationReference(observation)
-      ),
+      failedActions: fitForSection(unresolvedFailures(intent.observations ?? [], workflow.executionId).map((observation) => observationReference(observation)), EVIDENCE_BUDGET.required, "unresolved failure(s)"),
       finalResponse
     })
   }
@@ -1850,20 +1848,45 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       await this.repairAdministrativePlan(scope)
       await this.recordEvidenceCheck(scope)
       const outline = await this._todoRepository.getPlanOutline(scope)
-      const selection = outline && outline.tasks.length
-        ? await selectAcceptedFacts(
-          { text: this._replyText, planItemIds: outline.tasks.map((task) => task.itemId) },
-          await this._todoRepository.listAcceptedEvidence(scope),
-          this.currentSourceReader(),
-          MAX_ACCEPTED_CONTEXT_FACTS
-        )
-        : { selected: [], omitted: 0 }
-      const plan = outline && outline.tasks.length ? renderPlanContext(outline, selection.selected, selection.omitted) : ""
+      const windows = outline && outline.tasks.length
+        ? await this.evidenceWindows(scope, outline.tasks.map((item) => item.itemId))
+        : undefined
+      const plan = outline && windows ? renderPlanContext(outline, windows.promoted, windows.promotedOmitted) : ""
       const task = await this.activeIntentTaskProjection()
-      return [preflight, recovery, task, plan].filter(Boolean).join("\n\n") || undefined
+      return [preflight, recovery, task, windows?.required, plan, windows?.recent].filter(Boolean).join("\n\n") || undefined
     } catch (error) {
       logger.warn(`[Intent] Could not load the TODO plan for this request: ${error instanceof Error ? error.message : String(error)}`)
       return [preflight, recovery].filter(Boolean).join("\n\n") || undefined
+    }
+  }
+
+  /**
+   * The evidence windows for one request. Required evidence and recent observations belong to the active task and this
+   * execution. Promoted evidence is the project's ranked current facts, so a new conversation sees it without knowing IDs.
+   */
+  private async evidenceWindows(scope: TodoWriteRequest, planItemIds: string[]): Promise<{ required?: string; promoted: AcceptedFactStatus[]; promotedOmitted: number; recent?: string }> {
+    const repository = this._todoRepository!
+    const [facts, usage, active] = await Promise.all([
+      repository.listAcceptedEvidence(scope),
+      repository.promotionCandidates(scope),
+      repository.getActiveIntentContext(scope)
+    ])
+    const projection = await projectEvidence({
+      requestText: this._replyText,
+      planItemIds,
+      criteria: active?.criteria ?? [],
+      executionId: this._activeExecution?.executionId,
+      facts,
+      usage,
+      observations: active?.observations ?? [],
+      observationText: observationReference,
+      readCurrent: this.currentSourceReader()
+    })
+    return {
+      required: renderRequiredEvidence(projection),
+      promoted: projection.promoted,
+      promotedOmitted: projection.omitted.promoted,
+      recent: renderRecentObservations(projection)
     }
   }
 

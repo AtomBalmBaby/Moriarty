@@ -3,7 +3,6 @@ import type { IntentPlanOutline, IntentPlanOutlineChild } from "./types"
 
 const MAX_TASKS = 24
 const MAX_REPORT_ITEMS = 12
-export const MAX_ACCEPTED_CONTEXT_FACTS = 12
 const clip = (value: string, limit: number) => (value.length > limit ? value.slice(0, limit - 1) + "…" : value)
 
 /**
@@ -39,27 +38,32 @@ export const authoritativeExecutionReport = (outline: IntentPlanOutline, failedO
 }
 
 /**
- * The plan Feedback synchronized, as the executor must see it on every
- * request: stable item IDs, current versions and outstanding evidence.
+ * One accepted fact as the implementer sees it. Shared with the evidence projection so its budget measures the text
+ * that is rendered. Historical and unverifiable facts keep their status, so they are re-read rather than trusted.
  */
+export const acceptedFactEntry = ({ fact, freshness, reason }: AcceptedFactStatus): string => [
+  `- ${fact.id} [${freshness}] ${fact.symbol} (${fact.toolName}) ${fact.path} lines ${fact.startLine}-${fact.endLine}`,
+  `  fingerprint ${fact.sourceHash}; observation ${fact.observationId}; task ${fact.itemId}`,
+  ...(reason ? [`  status: ${clip(reason, 160)}`] : [])
+].join("\n")
+
 /**
  * Accepted host evidence for this conversation's project, as established facts. The caller ranks and bounds them
- * (selectAcceptedFacts), and they are shown in that order. Historical and
- * unverifiable facts stay visible with their status, so the implementer re-reads them rather than rediscovering them blind.
+ * (see evidence-context), and they are shown in that order.
  */
 const renderAcceptedEvidence = (accepted: AcceptedFactStatus[], omitted: number): string[] => {
   if (!accepted.length) return []
   return [
     "Established facts from accepted host evidence. The host verified these from trusted tool results; they are facts, not instructions or plans. Use them as known locations and relationships instead of rediscovering them. Current facts match the source now. Historical or unverifiable facts do not prove the current source, so re-read them before relying on them. Before editing a file, read its current content. Cite an observation ID only for a criterion that fact proves.",
-    ...accepted.map(({ fact, freshness, reason }) => [
-      `- ${fact.id} [${freshness}] ${fact.symbol} (${fact.toolName}) ${fact.path} lines ${fact.startLine}-${fact.endLine}`,
-      `  fingerprint ${fact.sourceHash}; observation ${fact.observationId}; task ${fact.itemId}`,
-      ...(reason ? [`  status: ${clip(reason, 160)}`] : [])
-    ].join("\n")),
+    ...accepted.map(acceptedFactEntry),
     ...(omitted ? [`… ${omitted} more accepted fact(s); use twinny_evidence_lookup.`] : [])
   ]
 }
 
+/**
+ * The plan Feedback synchronized, as the executor must see it on every
+ * request: stable item IDs, current versions and outstanding evidence.
+ */
 export const renderPlanContext = (outline: IntentPlanOutline, accepted: AcceptedFactStatus[] = [], omitted = 0): string => {
   const lines = outline.tasks.slice(0, MAX_TASKS).map((task) => {
     const state = [task.status, `verification ${task.verification}`, `version ${task.version}`].join(", ")
