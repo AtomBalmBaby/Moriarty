@@ -3,9 +3,11 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
+import initSqlJs from "sql.js"
 
 import { logger } from "../../common/logger"
 import { TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { type LegacyTodoRetirement, prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase } from "../../extension/todos/sqlite"
 import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
 
 const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
@@ -692,3 +694,273 @@ test("eleven repeated completion requests produce one accepted claim, one review
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })
+
+const TMP_SIDECAR = "twinny-state.sqlite.4242.0f8fad5b-d9cb-469f-a165-8c45a5d2c123.tmp"
+
+const projectLocation = (folders: { scheme: string; fsPath: string }[]) => async () => prepareProjectTodoStorage(resolveProjectTodoStorage(folders))
+const projectRepository = (root: string) => new TodoRepository(projectLocation([{ scheme: "file", fsPath: root }]), wasmPath)
+const projectScope = (root: string, conversationId = "project-chat") => ({
+  projectFingerprint: workspaceProjectFingerprint([`file://${root}`]),
+  conversationId,
+  writer: conversationId
+})
+const withDirectory = async (prefix: string, run: (directory: string) => Promise<void>) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  try {
+    await run(directory)
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+const makeProject = (directory: string, name = "project") => {
+  const root = path.join(directory, name)
+  fs.mkdirSync(path.join(root, "src"), { recursive: true })
+  return root
+}
+const legacyDatabaseIn = async (globalStorageDir: string, root: string) => {
+  const legacyPath = path.join(globalStorageDir, "twinny-state.sqlite")
+  await new TodoRepository(legacyPath, wasmPath).createItem(projectScope(root), { title: "Legacy task" }, "legacy-create")
+  return legacyPath
+}
+const blockedReason = (outcome: LegacyTodoRetirement): string => {
+  if (outcome.status !== "blocked") assert.fail(`expected a blocked legacy removal, got ${outcome.status}`)
+  return outcome.reason
+}
+
+test("a project creates .twinny/evidence.sqlite with the current schema and git-ignores it on first initialization", async () => {
+  await withDirectory("twinny-project-init-", async (directory) => {
+    const root = makeProject(directory)
+    await projectRepository(root).initialize()
+
+    const databasePath = path.join(root, ".twinny", "evidence.sqlite")
+    assert.equal(fs.existsSync(databasePath), true)
+    const sql = await initSqlJs({ locateFile: () => wasmPath })
+    const database = new sql.Database(fs.readFileSync(databasePath))
+    try {
+      assert.equal(database.exec("PRAGMA user_version")[0].values[0][0], 18)
+    } finally {
+      database.close()
+    }
+    assert.equal(fs.readFileSync(path.join(root, ".gitignore"), "utf8"), ".twinny/\n")
+  })
+})
+
+test("restarting with an unchanged project database preserves its TODO records", async () => {
+  await withDirectory("twinny-project-restart-", async (directory) => {
+    const root = makeProject(directory)
+    const scope = projectScope(root)
+    const created = await projectRepository(root).createItem(scope, { title: "Survives restart" }, "restart-create")
+
+    const reopened = await projectRepository(root).getList(scope)
+    assert.deepEqual(reopened.items.map((item) => [item.id, item.title]), [[created.id, "Survives restart"]])
+  })
+})
+
+test("separate projects receive independent project-local databases", async () => {
+  await withDirectory("twinny-project-separate-", async (directory) => {
+    const first = makeProject(directory, "first")
+    const second = makeProject(directory, "second")
+    await projectRepository(first).createItem(projectScope(first), { title: "Only in first" }, "first-create")
+
+    assert.equal((await projectRepository(second).getList(projectScope(second))).items.length, 0)
+    assert.equal((await projectRepository(first).getList(projectScope(first))).items.length, 1)
+    const firstDatabase = path.join(first, ".twinny", "evidence.sqlite")
+    const secondDatabase = path.join(second, ".twinny", "evidence.sqlite")
+    assert.notEqual(firstDatabase, secondDatabase)
+    assert.equal(fs.existsSync(firstDatabase) && fs.existsSync(secondDatabase), true)
+  })
+})
+
+test("a fresh project database contains no legacy TODOs even when the legacy database holds data for the same project", async () => {
+  await withDirectory("twinny-project-fresh-", async (directory) => {
+    const globalStorageDir = path.join(directory, "global")
+    fs.mkdirSync(globalStorageDir)
+    const root = makeProject(directory)
+    await legacyDatabaseIn(globalStorageDir, root)
+    assert.equal((await new TodoRepository(path.join(globalStorageDir, "twinny-state.sqlite"), wasmPath).getList(projectScope(root))).items.length, 1)
+
+    const fresh = projectRepository(root)
+    assert.equal((await fresh.getList(projectScope(root))).items.length, 0)
+    assert.deepEqual(await fresh.listAcceptedEvidence(projectScope(root)), [])
+  })
+})
+
+test("legacy removal deletes only the verified legacy database and its exact sidecars", async () => {
+  await withDirectory("twinny-legacy-remove-", async (directory) => {
+    const globalStorageDir = path.join(directory, "global")
+    fs.mkdirSync(path.join(globalStorageDir, "intent-compiler-traces"), { recursive: true })
+    const root = makeProject(directory)
+    const legacyPath = await legacyDatabaseIn(globalStorageDir, root)
+    const sidecars = ["-wal", "-shm", "-journal", ".v8.bak", ".v12.bak"]
+    for (const suffix of sidecars) fs.writeFileSync(`${legacyPath}${suffix}`, "stale")
+    fs.writeFileSync(path.join(globalStorageDir, TMP_SIDECAR), "stale")
+    const unrelated = ["workspace-index.sqlite", "workspace-index.sqlite-wal", "workspace-index.sqlite-shm", "active-execution-edit-checkpoint.json", "twinny-state.sqlite.notes.txt"]
+    for (const name of unrelated) fs.writeFileSync(path.join(globalStorageDir, name), "keep")
+    fs.writeFileSync(path.join(globalStorageDir, "intent-compiler-traces", "trace.json"), "{}")
+
+    const outcome = await retireLegacyTodoDatabase(globalStorageDir, path.join(root, ".twinny", "evidence.sqlite"))
+    assert.equal(outcome.status, "removed")
+    assert.equal(outcome.legacyPath, legacyPath)
+    assert.deepEqual(fs.readdirSync(globalStorageDir).sort(), [...unrelated, "intent-compiler-traces"].sort())
+    assert.equal(fs.existsSync(`${legacyPath}.lock`), false)
+  })
+})
+
+test("legacy removal is refused for unverified or live legacy storage and deletes nothing", async () => {
+  await withDirectory("twinny-legacy-refuse-", async (directory) => {
+    const root = makeProject(directory)
+    const activePath = path.join(root, ".twinny", "evidence.sqlite")
+
+    const textDir = path.join(directory, "text")
+    fs.mkdirSync(textDir)
+    fs.writeFileSync(path.join(textDir, "twinny-state.sqlite"), "not a database")
+    const textOutcome = await retireLegacyTodoDatabase(textDir, activePath)
+    assert.equal(textOutcome.status, "blocked")
+    assert.match(blockedReason(textOutcome), /not a SQLite database/)
+    assert.equal(fs.readFileSync(path.join(textDir, "twinny-state.sqlite"), "utf8"), "not a database")
+
+    const linkDir = path.join(directory, "link")
+    fs.mkdirSync(linkDir)
+    const realPath = await legacyDatabaseIn(path.join(directory, "real"), root)
+    fs.symlinkSync(realPath, path.join(linkDir, "twinny-state.sqlite"))
+    const linkOutcome = await retireLegacyTodoDatabase(linkDir, activePath)
+    assert.equal(linkOutcome.status, "blocked")
+    assert.match(blockedReason(linkOutcome), /not a regular file/)
+    assert.equal(fs.existsSync(realPath), true)
+
+    const sameDir = path.join(directory, "same")
+    fs.mkdirSync(sameDir)
+    const samePath = await legacyDatabaseIn(sameDir, root)
+    const sameOutcome = await retireLegacyTodoDatabase(sameDir, samePath)
+    assert.equal(sameOutcome.status, "blocked")
+    assert.match(blockedReason(sameOutcome), /active project database/)
+    assert.equal(fs.existsSync(samePath), true)
+
+    const sidecarDir = path.join(directory, "sidecar")
+    fs.mkdirSync(sidecarDir)
+    const sidecarLegacy = await legacyDatabaseIn(sidecarDir, root)
+    fs.symlinkSync(realPath, `${sidecarLegacy}-wal`)
+    const sidecarOutcome = await retireLegacyTodoDatabase(sidecarDir, activePath)
+    assert.equal(sidecarOutcome.status, "blocked")
+    assert.equal(fs.existsSync(sidecarLegacy), true, "a blocked sidecar check must not delete the database")
+    assert.equal(fs.lstatSync(`${sidecarLegacy}-wal`).isSymbolicLink(), true)
+
+    const lockedDir = path.join(directory, "locked")
+    fs.mkdirSync(lockedDir)
+    const lockedLegacy = await legacyDatabaseIn(lockedDir, root)
+    fs.writeFileSync(`${lockedLegacy}.lock`, `${process.pid}\n`)
+    const lockedOutcome = await retireLegacyTodoDatabase(lockedDir, activePath)
+    assert.equal(lockedOutcome.status, "blocked")
+    assert.match(blockedReason(lockedOutcome), /holds the legacy database lock/)
+    assert.equal(fs.existsSync(lockedLegacy), true)
+    assert.equal(fs.existsSync(`${lockedLegacy}.lock`), true, "another process's lock is left in place")
+  })
+})
+
+test("a stale legacy lock is taken over and an absent legacy database is reported without deletion", async () => {
+  await withDirectory("twinny-legacy-stale-", async (directory) => {
+    const root = makeProject(directory)
+    const activePath = path.join(root, ".twinny", "evidence.sqlite")
+    const staleDir = path.join(directory, "stale")
+    fs.mkdirSync(staleDir)
+    const legacyPath = await legacyDatabaseIn(staleDir, root)
+    fs.writeFileSync(`${legacyPath}.lock`, "999999\n")
+    const old = new Date(Date.now() - 300_000)
+    fs.utimesSync(`${legacyPath}.lock`, old, old)
+    assert.equal((await retireLegacyTodoDatabase(staleDir, activePath)).status, "removed")
+    assert.equal(fs.existsSync(legacyPath), false)
+    assert.equal(fs.existsSync(`${legacyPath}.lock`), false)
+
+    const emptyDir = path.join(directory, "empty")
+    fs.mkdirSync(emptyDir)
+    assert.equal((await retireLegacyTodoDatabase(emptyDir, activePath)).status, "absent")
+    assert.deepEqual(fs.readdirSync(emptyDir), [])
+  })
+})
+
+test("ambiguous, empty, and non-local workspace folders fail explicitly and create no .twinny directory", async () => {
+  await withDirectory("twinny-project-resolve-", async (directory) => {
+    const first = makeProject(directory, "first")
+    const second = makeProject(directory, "second")
+    assert.throws(() => resolveProjectTodoStorage([]), /needs an open project folder/)
+    assert.throws(() => resolveProjectTodoStorage([{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]), /cannot choose between multiple workspace folders/)
+    assert.throws(() => resolveProjectTodoStorage([{ scheme: "vscode-remote", fsPath: first }]), /not a "vscode-remote" folder/)
+
+    const ambiguous = new TodoRepository(projectLocation([{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]), wasmPath)
+    await assert.rejects(ambiguous.getList(projectScope(first)), /cannot choose between multiple workspace folders/)
+    const none = new TodoRepository(projectLocation([]), wasmPath)
+    await assert.rejects(none.getList(projectScope(first)), /needs an open project folder/)
+    assert.equal(fs.existsSync(path.join(first, ".twinny")), false)
+    assert.equal(fs.existsSync(path.join(second, ".twinny")), false)
+  })
+})
+
+test("a symlinked .twinny directory or database is refused rather than followed outside the project", async () => {
+  await withDirectory("twinny-project-symlink-", async (directory) => {
+    const outside = path.join(directory, "outside")
+    fs.mkdirSync(outside)
+    const linkedDirectoryRoot = makeProject(directory, "linked-directory")
+    fs.symlinkSync(outside, path.join(linkedDirectoryRoot, ".twinny"), "dir")
+    await assert.rejects(projectRepository(linkedDirectoryRoot).initialize(), /symbolic link/)
+    assert.equal(fs.existsSync(path.join(outside, "evidence.sqlite")), false)
+
+    const linkedFileRoot = makeProject(directory, "linked-file")
+    fs.mkdirSync(path.join(linkedFileRoot, ".twinny"))
+    fs.symlinkSync(path.join(outside, "elsewhere.sqlite"), path.join(linkedFileRoot, ".twinny", "evidence.sqlite"))
+    await assert.rejects(projectRepository(linkedFileRoot).initialize(), /symbolic link/)
+    assert.equal(fs.existsSync(path.join(outside, "elsewhere.sqlite")), false)
+  })
+})
+
+test("the project ignore rule preserves existing .gitignore content and is not duplicated", async () => {
+  await withDirectory("twinny-project-gitignore-", async (directory) => {
+    const root = makeProject(directory)
+    const gitignore = path.join(root, ".gitignore")
+    fs.writeFileSync(gitignore, "node_modules/\r\ndist")
+    await projectRepository(root).initialize()
+    assert.equal(fs.readFileSync(gitignore, "utf8"), "node_modules/\r\ndist\r\n.twinny/\r\n")
+
+    await projectRepository(root).initialize()
+    assert.equal(fs.readFileSync(gitignore, "utf8"), "node_modules/\r\ndist\r\n.twinny/\r\n", "an equivalent rule is not added twice")
+
+    const rooted = makeProject(directory, "rooted")
+    fs.writeFileSync(path.join(rooted, ".gitignore"), "/.twinny/\n")
+    await projectRepository(rooted).initialize()
+    assert.equal(fs.readFileSync(path.join(rooted, ".gitignore"), "utf8"), "/.twinny/\n")
+  })
+})
+
+test("deleting the project database and its sidecars then reopening creates a clean database", async () => {
+  await withDirectory("twinny-project-reset-", async (directory) => {
+    const root = makeProject(directory)
+    const scope = projectScope(root)
+    await projectRepository(root).createItem(scope, { title: "Before reset" }, "before-reset")
+
+    const databasePath = path.join(root, ".twinny", "evidence.sqlite")
+    for (const suffix of ["", "-wal", "-shm", "-journal", ".lock"]) fs.rmSync(`${databasePath}${suffix}`, { force: true })
+
+    const reopened = projectRepository(root)
+    assert.deepEqual((await reopened.getList(scope)).items, [])
+    assert.equal(fs.existsSync(databasePath), true)
+    await reopened.createItem(scope, { title: "After reset" }, "after-reset")
+    assert.deepEqual((await reopened.getList(scope)).items.map((item) => item.title), ["After reset"])
+  })
+})
+
+test("a project database from a newer Twinny schema is refused and left untouched", async () => {
+  await withDirectory("twinny-project-future-", async (directory) => {
+    const root = makeProject(directory)
+    await projectRepository(root).initialize()
+    const databasePath = path.join(root, ".twinny", "evidence.sqlite")
+    const sql = await initSqlJs({ locateFile: () => wasmPath })
+    const database = new sql.Database(fs.readFileSync(databasePath))
+    database.run("PRAGMA user_version = 19")
+    fs.writeFileSync(databasePath, Buffer.from(database.export()))
+    database.close()
+    const before = fs.readFileSync(databasePath)
+
+    await assert.rejects(projectRepository(root).initialize(), /newer than this Twinny version/)
+    assert.deepEqual(fs.readFileSync(databasePath), before, "no automatic reset or deletion occurs")
+  })
+})
+

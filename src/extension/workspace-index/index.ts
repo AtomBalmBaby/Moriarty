@@ -136,7 +136,7 @@ const openDatabase = (filename: string): Promise<Database> =>
 const DEFAULT_EXCLUDES = [
   "**/.git/**", "**/node_modules/**", "**/vendor/**", "**/dist/**", "**/build/**",
   "**/out/**", "**/coverage/**", "**/.next/**", "**/target/**", "**/.venv/**",
-  "**/venv/**", "**/.vscode-test/**", "**/.cache/**", "**/.turbo/**", "**/.parcel-cache/**",
+  "**/venv/**", "**/.vscode-test/**", "**/.cache/**", "**/.turbo/**", "**/.twinny/**", "**/.parcel-cache/**",
   "**/*.min.js", "**/*.map", "**/*.lockb", "**/.env", "**/.env.*",
   "**/*.pem", "**/*.key", "**/*credentials*", "**/*secret*"
 ]

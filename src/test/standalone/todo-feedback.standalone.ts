@@ -532,6 +532,25 @@ test("existing version-2 TODO databases migrate review tables without losing tas
   }
 })
 
+test("accepted evidence is shared across conversations of the same project while TODO lists stay conversation-scoped", async () => {
+  const state = await evidenceFixtureFor([{ id: "registration", criteria: [sourceLocation("defined", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool", EVIDENCE_FILE)] }])
+  try {
+    const [registration] = state.itemIds
+    await startItemInReview(state.repository, state.scope, registration)
+    await observeRead(state, registration, "read-shared", EVIDENCE_FILE, 160, sourceLines.slice(159, 220))
+    const accepted = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, registration), countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: currentWorkspace, hasVerifiedFileChanges: false })
+    assert.equal(accepted.decision, "accept", JSON.stringify(accepted.problems))
+
+    const otherConversation = { ...state.scope, conversationId: "second-chat", writer: "second-chat" }
+    const shared = await state.repository.listAcceptedEvidence(otherConversation, { symbol: "readFile", path: EVIDENCE_FILE })
+    assert.equal(shared.length, 1, "the other conversation sees the project's accepted fact")
+    assert.equal(shared[0].registeredTool, "read_file")
+    assert.equal((await state.repository.getList(otherConversation)).items.length, 0, "the TODO list is not shared")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("a version-15 database keeps its alias rows as history, gains a nullable registered_tool, and does not promote them into authoritative links", async () => {
   const state = await evidenceFixtureFor([{ id: "registration", criteria: [sourceLocation("defined", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool", EVIDENCE_FILE)] }])
   try {

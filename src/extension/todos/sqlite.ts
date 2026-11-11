@@ -208,17 +208,26 @@ CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(l
 PRAGMA user_version = 12;
 `
 
+/** A database path, or a resolver awaited on first use so a failure is reported by the operation that needed the database. */
+export type SqliteLocation = string | (() => Promise<string>)
+
 export class SqliteFile {
-  private readonly databasePath: string
-  private readonly lockPath: string
+  private databasePath = ""
+  private lockPath = ""
+  private readonly location: SqliteLocation
   private readonly wasmPath: string
   private sqlPromise?: Promise<SqlJsStatic>
   private initialization?: Promise<void>
 
-  constructor(databasePath: string, wasmPath: string) {
+  constructor(location: SqliteLocation, wasmPath: string) {
+    this.location = location
+    this.wasmPath = wasmPath
+    if (typeof location === "string") this.assignDatabasePath(location)
+  }
+
+  private assignDatabasePath(databasePath: string) {
     this.databasePath = databasePath
     this.lockPath = `${databasePath}.lock`
-    this.wasmPath = wasmPath
   }
 
   initialize(): Promise<void> {
@@ -232,6 +241,7 @@ export class SqliteFile {
   }
 
   private async initializeOnce(): Promise<void> {
+    if (typeof this.location !== "string") this.assignDatabasePath(await this.location())
     await this.withLock(async () => {
       const database = await this.openDatabase()
       try {
@@ -512,5 +522,168 @@ PRAGMA user_version = 18;`)
       await lock.close()
       await fs.unlink(this.lockPath)
     }
+  }
+}
+
+export const PROJECT_TODO_DIRECTORY = ".twinny"
+export const PROJECT_TODO_DATABASE_NAME = "evidence.sqlite"
+
+const LEGACY_TODO_DATABASE_NAME = "twinny-state.sqlite"
+const LEGACY_TODO_SIDECAR = /^twinny-state\.sqlite(?:-wal|-shm|-journal|\.v\d+\.bak|\.\d+\.[0-9a-f-]{36}\.tmp)$/
+const SQLITE_HEADER = "SQLite format 3\u0000"
+const LOCK_STALE_MS = 120_000
+const GITIGNORE_ENTRY = ".twinny/"
+const GITIGNORE_EQUIVALENTS = new Set([".twinny", ".twinny/", "/.twinny", "/.twinny/"])
+
+export interface WorkspaceFolderLocation {
+  readonly scheme: string
+  readonly fsPath: string
+}
+
+export interface ProjectTodoStorage {
+  readonly projectRoot: string
+  readonly databasePath: string
+}
+
+/** Resolves the single project that owns the TODO database. Never selects one root from several. */
+export const resolveProjectTodoStorage = (folders: readonly WorkspaceFolderLocation[]): ProjectTodoStorage => {
+  if (folders.length === 0) {
+    throw new Error("Twinny TODO storage needs an open project folder to create .twinny/evidence.sqlite")
+  }
+  if (folders.length > 1) {
+    throw new Error("Twinny TODO storage cannot choose between multiple workspace folders; open a single project folder")
+  }
+  const [folder] = folders
+  if (folder.scheme !== "file") {
+    throw new Error(`Twinny TODO storage needs a local project folder, not a "${folder.scheme}" folder`)
+  }
+  const projectRoot = path.resolve(folder.fsPath)
+  return {
+    projectRoot,
+    databasePath: path.join(projectRoot, PROJECT_TODO_DIRECTORY, PROJECT_TODO_DATABASE_NAME)
+  }
+}
+
+const refuseSymbolicLink = async (target: string): Promise<void> => {
+  try {
+    if ((await fs.lstat(target)).isSymbolicLink()) {
+      throw new Error(`Refusing to use ${target} for TODO storage because it is a symbolic link`)
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+  }
+}
+
+/** Creates `.twinny/`, ensures it is git-ignored, and returns the database path. Symlinked storage is refused. */
+export const prepareProjectTodoStorage = async (storage: ProjectTodoStorage): Promise<string> => {
+  const directory = path.dirname(storage.databasePath)
+  await refuseSymbolicLink(directory)
+  await fs.mkdir(directory, { recursive: true })
+  await refuseSymbolicLink(storage.databasePath)
+  await ensureProjectGitignore(storage.projectRoot)
+  return storage.databasePath
+}
+
+/** Appends `.twinny/` to the project's .gitignore without changing existing lines. */
+export const ensureProjectGitignore = async (projectRoot: string): Promise<void> => {
+  const gitignorePath = path.join(projectRoot, ".gitignore")
+  await refuseSymbolicLink(gitignorePath)
+  let existing: string | undefined
+  try {
+    existing = await fs.readFile(gitignorePath, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+  }
+  if (existing === undefined) {
+    await fs.writeFile(gitignorePath, `${GITIGNORE_ENTRY}\n`, { flag: "wx" })
+    return
+  }
+  if (existing.split(/\r?\n/).some((line) => GITIGNORE_EQUIVALENTS.has(line.trim()))) return
+  const eol = existing.includes("\r\n") ? "\r\n" : "\n"
+  const separator = existing.length > 0 && !existing.endsWith("\n") ? eol : ""
+  await fs.appendFile(gitignorePath, `${separator}${GITIGNORE_ENTRY}${eol}`)
+}
+
+export type LegacyTodoRetirement =
+  | { readonly status: "absent"; readonly legacyPath: string }
+  | { readonly status: "removed"; readonly legacyPath: string; readonly removed: readonly string[] }
+  | { readonly status: "blocked"; readonly legacyPath: string; readonly reason: string }
+
+const acquireLegacyLock = async (lockPath: string): Promise<boolean> => {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await (await fs.open(lockPath, "wx", 0o600)).close()
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+    }
+    try {
+      const stat = await fs.stat(lockPath)
+      if (Date.now() - stat.mtimeMs <= LOCK_STALE_MS) return false
+      await fs.unlink(lockPath)
+    } catch (statError) {
+      if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError
+    }
+  }
+  return false
+}
+
+const readSqliteHeader = async (file: string): Promise<string> => {
+  const handle = await fs.open(file, "r")
+  try {
+    const buffer = Buffer.alloc(SQLITE_HEADER.length)
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+    return buffer.subarray(0, bytesRead).toString("latin1")
+  } finally {
+    await handle.close()
+  }
+}
+
+/**
+ * One-time removal of the extension-global TODO database. Deletes only `twinny-state.sqlite` and its exact
+ * SQLite sidecar names, and only after verifying the main file is a regular SQLite database not held by another
+ * Twinny process (via the same `.lock` protocol the repository uses). Anything unexpected blocks the removal.
+ */
+export const retireLegacyTodoDatabase = async (globalStorageDir: string, activeDatabasePath: string): Promise<LegacyTodoRetirement> => {
+  const legacyPath = path.join(globalStorageDir, LEGACY_TODO_DATABASE_NAME)
+  if (path.resolve(legacyPath) === path.resolve(activeDatabasePath)) {
+    return { status: "blocked", legacyPath, reason: "the legacy path is the active project database" }
+  }
+  const lockPath = `${legacyPath}.lock`
+  if (!(await acquireLegacyLock(lockPath))) {
+    return { status: "blocked", legacyPath, reason: "another Twinny process holds the legacy database lock" }
+  }
+  try {
+    try {
+      if (!(await fs.lstat(legacyPath)).isFile()) {
+        return { status: "blocked", legacyPath, reason: "the legacy path is not a regular file" }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent", legacyPath }
+      throw error
+    }
+    if ((await readSqliteHeader(legacyPath)) !== SQLITE_HEADER) {
+      return { status: "blocked", legacyPath, reason: "the legacy path is not a SQLite database" }
+    }
+    const sidecars = (await fs.readdir(globalStorageDir))
+      .filter((name) => LEGACY_TODO_SIDECAR.test(name))
+      .map((name) => path.join(globalStorageDir, name))
+    for (const sidecar of sidecars) {
+      if (!(await fs.lstat(sidecar)).isFile()) {
+        return { status: "blocked", legacyPath, reason: `${sidecar} is not a regular file` }
+      }
+    }
+    const removed: string[] = []
+    for (const sidecar of sidecars) {
+      await fs.unlink(sidecar)
+      removed.push(sidecar)
+    }
+    await fs.unlink(legacyPath)
+    removed.push(legacyPath)
+    return { status: "removed", legacyPath, removed }
+  } finally {
+    await fs.unlink(lockPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error
+    })
   }
 }

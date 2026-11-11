@@ -12,7 +12,7 @@ import {
   redactEvidence
 } from "./evidence"
 import { validateIntentTaskPlan } from "./intent-plan"
-import { SqliteFile } from "./sqlite"
+import { SqliteFile, type SqliteLocation } from "./sqlite"
 import {
   type AcceptedFact,
   type AcceptedFactUsage,
@@ -688,7 +688,7 @@ export class TodoRepository {
   private readonly sqlite: SqliteFile
   private readonly evidenceLimits: EvidenceStorageLimits
 
-  constructor(databasePath: string, wasmPath: string, evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS) {
+  constructor(databasePath: SqliteLocation, wasmPath: string, evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS) {
     this.sqlite = new SqliteFile(databasePath, wasmPath)
     this.evidenceLimits = evidenceLimits
   }

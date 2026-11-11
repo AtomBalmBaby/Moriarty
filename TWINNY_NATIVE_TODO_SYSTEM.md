@@ -45,16 +45,22 @@ This is the first vertical slice of the larger intent, execution, feedback, and 
 
 ### 2.1 Recommended default
 
-**One `sql.js` SQLite WASM database per Twinny extension-host storage location**, placed under VS Code's `ExtensionContext.globalStorageUri`:
+**One `sql.js` SQLite WASM database per project**, stored inside the project being operated on:
 
 ```text
-ExtensionContext.globalStorageUri/
-  twinny-state.sqlite
+<project-root>/
+  .gitignore            (gains a ".twinny/" line, appended once)
+  .twinny/
+    evidence.sqlite
 ```
 
-These names are illustrative; resolve the actual location from the ExtensionContext at runtime. The directory may need to be created. Do not hardcode `~/.vscode-oss`, `.vscode`, or repository paths.
+The database is created on first use. Its schema is initialized from scratch; no historical evidence is imported. Conversations of the same project share one database, and projects with different roots get independent databases. Conversation and list IDs still scope TODO lists, while accepted evidence is project-wide.
 
-The database is **physically global to this extension host**, but **logically scoped** using stable project IDs, conversation IDs, and list IDs. Nothing appears in a project's source tree unless explicitly exported.
+Project resolution requires exactly one local workspace folder. With zero folders, several folders, or a non-`file` (for example remote) folder, TODO operations fail with an explicit error and no `.twinny/` directory is created.
+
+**Legacy database.** The earlier extension-global database `ExtensionContext.globalStorageUri/twinny-state.sqlite` (with its `-wal`, `-shm`, `-journal`, `.vN.bak`, and `.N.<uuid>.tmp` sidecars) is deleted once, on the first activation of this build after the project database initializes. Removal happens only when the legacy file is a regular SQLite database, no `<legacy>.lock` is held by another Twinny process, and every sidecar has an exact expected name. Otherwise nothing is deleted and the reason is logged. The completion is recorded in extension global state, so it does not repeat.
+
+**Manual reset.** Close Twinny, delete `<project-root>/.twinny/evidence.sqlite` and its sidecars, then reopen the project. No reset command, environment variable, or designation file exists.
 
 Why SQLite:
 
@@ -69,7 +75,7 @@ Do **not** put the full TODO database in `globalState` or `workspaceState` key/v
 
 ### 2.2 Remote-host behavior
 
-The store exists **where the extension host executes**. A local VSCodium instance and an SSH/remote extension host may have different physical `globalStorageUri` directories. The UI must not imply automatic synchronization. The first release is local-to-host only, with explicit portable export/import planned.
+The store lives in the project folder on the machine where the extension host executes. Remote workspaces are not yet supported for TODO storage. The UI must not imply automatic synchronization. The first release is local-to-host only, with explicit portable export/import planned.
 
 The implemented adapter is `sql.js` (SQLite WASM), with serialized writes, transactions and atomic database-file replacement. It does **not** use WAL. Do not add a second storage engine to satisfy obsolete compatibility needs.
 

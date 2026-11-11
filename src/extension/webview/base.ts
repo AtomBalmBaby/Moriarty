@@ -47,6 +47,7 @@ import type { TeamPlugins } from "../team/plugins-page"
 import { TeamShare } from "../team/share"
 import { TemplateProvider } from "../templates/provider"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../todos/repository"
+import { prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase } from "../todos/sqlite"
 import type { CreateTodoInput, TodoWriteRequest, UpdateTodoInput } from "../todos/types"
 import type { WorkspaceSearchProvider } from "../tools/workspace"
 import { getLanguage, getTerminal, getTextSelection, getTheme } from "../utils"
@@ -57,6 +58,15 @@ import { FileTreeProvider } from "./file-tree"
 
 /** Prefix under which a scoped context value lives in extension storage. */
 const storageKeyFor = (scope: string, key: string) => `${scope}-${key}`
+
+/** Set once the extension-global TODO database has been retired, so that removal never repeats. */
+const LEGACY_TODO_RETIRED_KEY = "twinny.legacyTodoDatabaseRetired"
+
+/** The TODO database belongs to the single open project; throws when the workspace has none or several. */
+const currentProjectTodoStorage = () =>
+  resolveProjectTodoStorage((vscode.workspace.workspaceFolders ?? []).map((folder) => ({ scheme: folder.uri.scheme, fsPath: folder.uri.fsPath })))
+
+let legacyTodoRetirement: Promise<void> | undefined
 
 export class BaseProvider {
   private _workspaceIndex: WorkspaceIndex | undefined
@@ -103,7 +113,7 @@ export class BaseProvider {
   ) {
     this.context = context
     this._todoRepository = new TodoRepository(
-      path.join(context.globalStorageUri.fsPath, "twinny-state.sqlite"),
+      async () => prepareProjectTodoStorage(currentProjectTodoStorage()),
       path.join(context.extensionPath, "out", "sql-wasm.wasm")
     )
     this._agentRegistry = new AgentRegistry(context)
@@ -117,6 +127,33 @@ export class BaseProvider {
     this._generations = generations
     this._templateDir = templateDir
     this._templateProvider = new TemplateProvider(templateDir)
+    void this.retireLegacyTodoDatabaseOnce()
+  }
+
+  /** Runs the one-time removal of the old extension-global TODO database after the project database initializes. */
+  private retireLegacyTodoDatabaseOnce(): Promise<void> {
+    if (this.context.globalState.get<boolean>(LEGACY_TODO_RETIRED_KEY)) return Promise.resolve()
+    legacyTodoRetirement ??= this.runLegacyTodoRetirement().finally(() => {
+      legacyTodoRetirement = undefined
+    })
+    return legacyTodoRetirement
+  }
+
+  private async runLegacyTodoRetirement(): Promise<void> {
+    try {
+      await this._todoRepository.initialize()
+      const storage = currentProjectTodoStorage()
+      const outcome = await retireLegacyTodoDatabase(this.context.globalStorageUri.fsPath, storage.databasePath)
+      logger.info(`Legacy TODO database ${outcome.legacyPath} -> project TODO database ${storage.databasePath}: ${outcome.status}`)
+      if (outcome.status === "blocked") {
+        logger.warn(`Legacy TODO database kept: ${outcome.reason}`)
+        return
+      }
+      if (outcome.status === "removed") logger.info(`Removed legacy TODO database files: ${outcome.removed.join(", ")}`)
+      await this.context.globalState.update(LEGACY_TODO_RETIRED_KEY, true)
+    } catch (error) {
+      logger.warn(`Legacy TODO database retirement deferred: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   public registerWebView(webView: vscode.Webview) {
