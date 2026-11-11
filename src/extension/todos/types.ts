@@ -153,6 +153,8 @@ export interface TodoToolObservationInput {
   failed: boolean
   exitCode?: number
   requestId: string
+  /** Set only by the host from its own execution state; never taken from model-provided arguments. */
+  executionId?: string
 }
 
 /** Stored tool output for one observation, with whatever the store still holds. */

@@ -12,7 +12,7 @@ import { continuationContext,ExecutionReconciliationController } from "../../ext
 import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, FeedbackPlanner, parseFeedbackPlanResponse, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
 import { checkDelivery, type DeliveryVerdict } from "../../extension/todos/delivery"
 import { commandDigest, compactArguments, compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
-import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
+import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { validateIntentTaskPlan } from "../../extension/todos/intent-plan"
 import { capabilityOf } from "../../extension/todos/verification-capabilities"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
@@ -556,7 +556,7 @@ test("a version-15 database keeps its alias rows as history, gains a nullable re
     await reopened.initialize()
     const check = new sql.Database(fs.readFileSync(state.databasePath))
     try {
-      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 16)
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
       assert.equal(check.exec("PRAGMA table_info(todo_accepted_evidence)")[0].values.some((row) => row[1] === "registered_tool"), true, "the migration adds registered_tool")
       assert.equal(check.exec("SELECT COUNT(*) FROM todo_symbol_aliases")[0].values[0][0], 1, "the legacy alias row is kept as history")
     } finally {
@@ -576,6 +576,49 @@ test("a version-15 database keeps its alias rows as history, gains a nullable re
   }
 })
 
+test("a version-16 database keeps its tool observations as history with no execution owner, and gains the execution index", async () => {
+  const state = await fixture([{
+    id: "historical-observation",
+    criteria: [semantic("historical-observation", "Read the workspace file")]
+  }], false)
+  try {
+    const item = state.items[0]
+    const historical = await state.repository.recordToolObservation(state.scope, {
+      itemId: item.id,
+      toolName: "read_file",
+      arguments: { path: "src/history.ts" },
+      output: "export const history = true",
+      failed: true,
+      requestId: "historical-read"
+    })
+
+    const sql = await initSqlJs({ locateFile: () => wasmPath })
+    const database = new sql.Database(fs.readFileSync(state.databasePath))
+    database.run("DROP INDEX IF EXISTS todo_tool_observations_execution; ALTER TABLE todo_tool_observations DROP COLUMN execution_id; PRAGMA user_version = 16")
+    fs.writeFileSync(state.databasePath, Buffer.from(database.export()))
+    database.close()
+
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    await reopened.initialize()
+    const check = new sql.Database(fs.readFileSync(state.databasePath))
+    try {
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
+      assert.equal(check.exec("PRAGMA table_info(todo_tool_observations)")[0].values.some((row) => row[1] === "execution_id"), true, "the migration adds execution_id")
+      assert.equal(check.exec("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'todo_tool_observations_execution'")[0]?.values.length, 1)
+      const [row] = check.exec(`SELECT output, failed, execution_id FROM todo_tool_observations WHERE id = '${historical.id}'`)[0].values
+      assert.deepEqual(row, ["export const history = true", 1, null], "the historical row keeps its output and failure, with no execution owner")
+    } finally {
+      check.close()
+    }
+
+    const [kept] = (await reopened.getReviewPackages(state.scope, { includeOpen: true })).flatMap((review) => review.observations).filter((observation) => observation.id === historical.id)
+    assert.equal(kept?.failed, true, "the historical failure is still readable through the repository")
+    assert.equal(kept?.executionId, undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("existing version-4 TODO databases gain child proposals and accepted evidence without losing tasks", async () => {
   const state = await fixture([{ id: "kept", criteria: [semantic("kept", "Kept task is inspected")] }])
   try {
@@ -587,7 +630,7 @@ test("existing version-4 TODO databases gain child proposals and accepted eviden
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
     const check = new sql.Database(fs.readFileSync(state.databasePath))
-    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 16)
+    assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0].values[0][0], 1)
     assert.equal(check.exec("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_symbol_aliases'")[0].values[0][0], 1)
     check.close()
@@ -742,13 +785,13 @@ test("the final report separates awaiting, review, and failed states from verifi
     const [registration, validation] = state.items
     await observeWorkspaceWindow(state, registration.id, "read-registration", 160, 181)
     await state.repository.recordToolObservation(state.scope, {
-      itemId: validation.id, toolName: "run_command", arguments: runCommandArguments("npx tsc --noEmit"), output: "tsc: 2 errors", failed: true, exitCode: 2, requestId: "failed-compile"
+      itemId: validation.id, toolName: "run_command", arguments: runCommandArguments("npx tsc --noEmit"), output: "tsc: 2 errors", failed: true, exitCode: 2, requestId: "failed-compile", executionId: "exec-report"
     })
     await state.repository.claimCompletion(state.scope, { itemId: registration.id, expectedVersion: registration.version, requestId: "claim-registration" })
     await state.repository.claimCompletion(state.scope, { itemId: validation.id, expectedVersion: validation.version, requestId: "claim-validation" })
 
     const outline = await state.repository.getPlanOutline(state.scope)
-    const report = authoritativeExecutionReport(outline!, await state.repository.failedToolOperations(state.scope))
+    const report = authoritativeExecutionReport(outline!, await state.repository.failedToolOperations(state.scope, "exec-report"))
     assert.match(report, /Verified complete \(0\)/)
     assert.match(report, /Awaiting Feedback review \(1\):\n- \S+ registration/)
     assert.match(report, /Awaiting dependencies \(1\):\n- \S+ validation \(waiting on registration\)/)
@@ -1007,6 +1050,75 @@ test("an early file read remains evaluator-visible across later tool calls and a
   }
 })
 
+test("the evaluator payload states what it omitted and keeps the newest and verifier-cited records", async () => {
+  const state = await fixture([{
+    id: "bounded-evidence",
+    criteria: [semantic("bounded-evidence", "Read the workspace files and summarize them")]
+  }], false)
+  try {
+    const item = state.items[0]
+    await state.repository.updateItem(state.scope, {
+      itemId: item.id,
+      expectedVersion: item.version,
+      patch: { status: "in_progress" },
+      actor: "model",
+      requestId: "bounded-start"
+    })
+    const records: string[] = []
+    for (let index = 0; index < 85; index += 1) {
+      const observation = await state.repository.recordToolObservation(state.scope, {
+        itemId: item.id,
+        toolName: "read_file",
+        arguments: { path: `src/file-${index}.ts` },
+        output: `contents ${index}`,
+        failed: false,
+        requestId: `bounded-read-${index}`
+      })
+      records.push(observation.id)
+    }
+    const version = (await state.repository.getList(state.scope)).items[0].version
+    await state.repository.updateItem(state.scope, {
+      itemId: item.id,
+      expectedVersion: version,
+      patch: { status: "in_review" },
+      actor: "model",
+      requestId: "bounded-review"
+    })
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    assert.equal(review.observations.length, 85)
+
+    const input = JSON.parse(todoReviewInput(review))
+    const shown = new Set(input.trustedTwinnyToolObservations.map((entry: { id: string }) => entry.id))
+    assert.equal(input.trustedTwinnyToolObservations.length, 80)
+    assert.equal(input.projectionOmissions.trustedTwinnyToolObservations, 5, "the payload states how many records it left out")
+    assert.equal(input.projectionOmissions.modelAuthoredEvidenceNotes, 0)
+    assert.equal(shown.has(records[84]), true, "the newest read in the category is kept")
+    assert.equal(shown.has(records[0]), false, "the oldest read in the category is the one left out")
+
+    // A record the verifier cites is shown even when it would otherwise be omitted, so the verdict can be checked against it.
+    const cited: TodoCriterionReconciliation = {
+      outcome: "semantic",
+      criterionId: review.criteria[0].id,
+      supportingObservationIds: [records[0]],
+      missing: [],
+      version: 1
+    }
+    const pinned = JSON.parse(todoReviewInput(review, undefined, undefined, [cited]))
+    assert.equal(pinned.trustedTwinnyToolObservations.some((entry: { id: string }) => entry.id === records[0]), true)
+    assert.equal(pinned.projectionOmissions.trustedTwinnyToolObservations, 5)
+
+    const accepted = parseTodoEvaluation(responseFor(review, { refs: [records[0]] }), review, "mock-reviewer", new Date().toISOString(), [cited])
+    assert.equal(accepted.criteria[0].evidenceRefs[0], records[0], "a shown, cited record is a valid citation")
+    assert.throws(
+      () => parseTodoEvaluation(responseFor(review, { refs: [records[1]] }), review, "mock-reviewer", new Date().toISOString(), [cited]),
+      (error: unknown) => error instanceof TodoEvaluationValidationError && error.field === "criteria[0].evidenceRefs",
+      "an omitted record cannot be cited"
+    )
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("a continuation names the next task and carries each unresolved criterion's established and missing facts", () => {
   const text = continuationContext({
     goal: "Investigate read_file",
@@ -1040,6 +1152,135 @@ test("an implementation cannot be accepted from prose without verified workspace
   }
 })
 
+
+test("evidence recorded while a claim is in review keeps the claim's version and stays reviewable", async () => {
+  const state = await fixture([{ id: "docs", criteria: [semantic("docs", "The docs describe the feature")] }], false)
+  try {
+    const item = state.items[0]
+    await state.repository.claimCompletion(state.scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-docs" })
+    const claimed = (await state.repository.getItem(state.scope, item.id)).item
+    assert.equal(claimed.status, "in_review")
+    await addObservation(state.repository, state.scope, item.id)
+    const after = (await state.repository.getItem(state.scope, item.id)).item
+    assert.equal(after.version, claimed.version, "unrelated evidence does not make an in-flight review stale")
+    assert.deepEqual(reviewCandidates(await state.repository.getReviewPackages(state.scope)).map((review) => review.task.id), [item.id])
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a task that needs evidence is reopened only by evidence recorded after its evaluation", async () => {
+  const state = await fixture([{ id: "edit", criteria: [{ id: "edit", description: "The component is updated in the workspace", verification: { kind: "workspace_mutation" } }] }], false)
+  try {
+    const item = state.items[0]
+    await state.repository.claimCompletion(state.scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-edit" })
+    const readOnly = await addObservation(state.repository, state.scope, item.id)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const first = await evaluateTodoReview(state.repository, state.scope, review,
+      async () => responseFor(review, { refs: [readOnly.id] }), "mock-reviewer",
+      { hasVerifiedFileChanges: taskHasVerifiedMutation(review) })
+    assert.equal(first.decision, "needs_evidence")
+    assert.deepEqual(reviewCandidates(await state.repository.getReviewPackages(state.scope)), [], "an unanswered wait is not re-sent to Feedback")
+
+    await addObservation(state.repository, state.scope, item.id, "edit_file")
+    const reopened = reviewCandidates(await state.repository.getReviewPackages(state.scope))
+    assert.deepEqual(reopened.map((candidate) => candidate.task.id), [item.id], "evidence after the evaluation reopens the review")
+    assert.equal(taskHasVerifiedMutation(reopened[0]), true)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a file change recorded for a sibling task, or a failed edit, cannot satisfy another task's workspace mutation", async () => {
+  const mutation = (id: string) => ({ id, criteria: [{ id, description: `${id} is updated in the workspace`, verification: { kind: "workspace_mutation" as const } }] })
+  const state = await fixture([mutation("writer"), mutation("other")], false)
+  try {
+    const [writer, other] = state.items
+    await addObservation(state.repository, state.scope, writer.id, "edit_file")
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: other.id,
+      toolName: "edit_file",
+      arguments: { path: "src/fixture.ts" },
+      output: "No match found for the requested text.",
+      failed: true,
+      requestId: "failed-edit-other"
+    })
+    await state.repository.claimCompletion(state.scope, { itemId: writer.id, expectedVersion: writer.version, requestId: "claim-writer" })
+    await state.repository.claimCompletion(state.scope, { itemId: other.id, expectedVersion: other.version, requestId: "claim-other" })
+    const reviews = await state.repository.getReviewPackages(state.scope)
+    const writerReview = reviews.find((review) => review.task.id === writer.id)
+    const otherReview = reviews.find((review) => review.task.id === other.id)
+    assert.ok(writerReview && otherReview)
+    assert.equal(taskHasVerifiedMutation(writerReview), true, "the task's own successful edit counts")
+    assert.equal(taskHasVerifiedMutation(otherReview), false, "a sibling's edit and a failed edit do not count")
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, otherReview,
+      async () => responseFor(otherReview, { refs: [] }), "mock-reviewer",
+      { hasVerifiedFileChanges: taskHasVerifiedMutation(otherReview) })
+    assert.equal(evaluation.decision, "needs_evidence")
+    assert.equal((await state.repository.getItem(state.scope, other.id)).item.status, "in_review")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a pending review and its claim survive reopening the repository", async () => {
+  const state = await fixture([{ id: "docs", criteria: [semantic("docs", "The docs describe the feature")] }], false)
+  try {
+    const item = state.items[0]
+    await state.repository.claimCompletion(state.scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-docs" })
+    const reopened = new TodoRepository(state.databasePath, wasmPath)
+    assert.equal((await reopened.getItem(state.scope, item.id)).item.status, "in_review")
+    assert.deepEqual(reviewCandidates(await reopened.getReviewPackages(state.scope)).map((review) => review.task.id), [item.id])
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a repeated completion claim is idempotent and leaves one reviewable claim", async () => {
+  const state = await fixture([{ id: "docs", criteria: [semantic("docs", "The docs describe the feature")] }], false)
+  try {
+    const item = state.items[0]
+    const first = await state.repository.claimCompletion(state.scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-docs" })
+    assert.equal(first.disposition, "accepted")
+    const afterFirst = (await state.repository.getItem(state.scope, item.id)).item
+
+    const replay = await state.repository.claimCompletion(state.scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-docs" })
+    assert.equal(replay.disposition, "accepted", "the same request replays its stored result")
+    assert.equal((await state.repository.getItem(state.scope, item.id)).item.version, afterFirst.version, "a replay does not advance the version")
+
+    const duplicate = await state.repository.claimCompletion(state.scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-docs-again" })
+    assert.equal(duplicate.disposition, "already_submitted", "a new claim while review is pending does not create a second review")
+    assert.equal((await state.repository.getItem(state.scope, item.id)).item.version, afterFirst.version)
+    assert.equal(reviewCandidates(await state.repository.getReviewPackages(state.scope)).length, 1)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a prerequisite's verification releases every branching dependent, and neither dependent is reviewed early", async () => {
+  const state = await fixture([
+    { id: "registration", criteria: [sourceLocation("registration", "`read_file` is registered in `src/extension/tools/workspace.ts`", "read_file", "registered_tool")] },
+    { id: "validation", criteria: [semantic("validation", "Validation rejects an empty path")], dependencies: ["registration"] },
+    { id: "docs", criteria: [semantic("docs", "The read_file tool is documented")], dependencies: ["registration"] }
+  ], false)
+  try {
+    const [registration, validation, docs] = state.items
+    const registrationRead = await observeWorkspaceWindow(state, registration.id, "read-registration", 160, 220)
+    await state.repository.claimCompletion(state.scope, { itemId: validation.id, expectedVersion: validation.version, requestId: "claim-validation" })
+    await state.repository.claimCompletion(state.scope, { itemId: docs.id, expectedVersion: docs.version, requestId: "claim-docs" })
+    await state.repository.claimCompletion(state.scope, { itemId: registration.id, expectedVersion: registration.version, requestId: "claim-registration" })
+    assert.deepEqual(reviewCandidates(await state.repository.getReviewPackages(state.scope)).map((review) => review.task.id), [registration.id], "dependents wait on the prerequisite")
+
+    const review = reviewCandidates(await state.repository.getReviewPackages(state.scope))[0]
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => responseFor(review, { refs: [registrationRead.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace })
+    assert.equal(evaluation.decision, "accept")
+
+    const released = reviewCandidates(await state.repository.getReviewPackages(state.scope)).map((candidate) => candidate.task.id).sort()
+    assert.deepEqual(released, [validation.id, docs.id].sort(), "both dependents become eligible exactly once")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
 
 test("evaluator fixtures validate schema, canonical plan IDs, and wrapped JSON independently", async () => {
   const state = await fixture([{ id: "task-1", criteria: [semantic("task-1", "Source paths are documented")] }])
@@ -4951,14 +5192,14 @@ test("a version-10 database with accepted evidence upgrades to version 11 with e
     await reopened.initialize()
     assert.deepEqual(await reopened.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "the accepted fact and its provenance survive the upgrade unchanged")
     const upgraded = inspect()
-    assert.equal(upgraded.version, 16)
+    assert.equal(upgraded.version, 17)
     assert.equal(upgraded.activationTable, 1, "the requirement activation table is added")
     assert.deepEqual(upgraded.observations, before.observations, "no observation row or list revision changes during the upgrade")
 
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual(await again.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "a second reopen is stable")
-    assert.equal(inspect().version, 16)
+    assert.equal(inspect().version, 17)
     assert.equal(calls.count, 0)
   } finally {
     removeAll(state.directory)
@@ -5051,7 +5292,7 @@ test("the v12 edit ledger rebuilds for optional task association, keeps its rows
   }
   try {
     const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
-    assert.deepEqual(inspect(state.databasePath), { version: 16, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
+    assert.deepEqual(inspect(state.databasePath), { version: 17, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
     assert.equal(fs.existsSync(backupPath), false, "a new database has no earlier version to back up")
 
     await state.repository.beginEditOperation(state.scope, { id: "v12-edit", itemId, target: "src/old.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
@@ -5086,7 +5327,7 @@ PRAGMA user_version = 12;`)
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     await reopened.initialize()
     const upgraded = inspect(state.databasePath)
-    assert.equal(upgraded.version, 16)
+    assert.equal(upgraded.version, 17)
     assert.equal(upgraded.itemNullable, true, "the task column becomes optional")
     assert.deepEqual(upgraded.statuses, [["v12-edit", "succeeded"]], "existing ledger rows keep their identity and settlement")
     assert.equal(upgraded.index, 1, "the target index is recreated")
@@ -5102,7 +5343,7 @@ PRAGMA user_version = 12;`)
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual(inspect(state.databasePath).ids, ["v12-edit", "v13-free"], "a second reopen is stable")
-    assert.equal(inspect(state.databasePath).version, 16)
+    assert.equal(inspect(state.databasePath).version, 17)
   } finally {
     removeAll(state.directory)
   }
@@ -5132,14 +5373,14 @@ test("the owner column is additive: legacy edit rows stay unowned and each reope
 
     const reopened = new TodoRepository(state.databasePath, wasmPath)
     await reopened.initialize()
-    assert.deepEqual(versionAndOwnerColumn(), { version: 16, ownerColumn: true }, "the upgrade adds the owner column")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 17, ownerColumn: true }, "the upgrade adds the owner column")
     assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined]], "a legacy row has no owner")
 
     await reopened.beginEditOperation(state.scope, { id: "2-owned-edit", ownerId: "host-b", target: "src/owned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
     const again = new TodoRepository(state.databasePath, wasmPath)
     await again.initialize()
     assert.deepEqual((await again.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined], ["2-owned-edit", "host-b"]], "owners survive a reopen")
-    assert.deepEqual(versionAndOwnerColumn(), { version: 16, ownerColumn: true }, "a second reopen is stable")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 17, ownerColumn: true }, "a second reopen is stable")
   } finally {
     removeAll(state.directory)
   }
@@ -5203,7 +5444,7 @@ test("the v11 TODO database gains the edit operation ledger while keeping the ac
 
     const check = new sql.Database(fs.readFileSync(state.databasePath))
     try {
-      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 16)
+      assert.equal(check.exec("PRAGMA user_version")[0].values[0][0], 17)
       assert.equal(check.exec("SELECT COUNT(*) FROM todo_edit_operations WHERE item_id = ?", [after!.task.id])[0].values[0][0], 1)
     } finally {
       check.close()

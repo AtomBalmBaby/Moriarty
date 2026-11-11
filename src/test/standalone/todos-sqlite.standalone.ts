@@ -466,8 +466,8 @@ test("failed tool operations report only the active plan's tasks across revision
       tasks: tasks.map((task) => ({ id: task.id, title: task.title, description: `${task.title} details`, criteria: [{ id: `${task.id}-done`, description: `${task.title} is done`, verification: { kind: "semantic_review" as const } }], dependencies: [] }))
     })
     const sync = (plan: ReturnType<typeof planWith>) => repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: plan.goal, plan })
-    const failure = (itemId: string, output: string) => repository.recordToolObservation(scope, {
-      itemId, toolName: "run_command", arguments: { command: "npm test" }, output, failed: true, exitCode: 1, requestId: `fail-${output}`
+    const failure = (itemId: string, output: string, executionId = "exec-a") => repository.recordToolObservation(scope, {
+      itemId, toolName: "run_command", arguments: { command: "npm test" }, output, failed: true, exitCode: 1, requestId: `fail-${output}`, executionId
     })
     const failureLine = (output: string) => `run_command {"command":"npm test"} (exit 1): ${output}`
     const idOf = (snapshot: { items: { id: string; title: string }[] }, title: string) => snapshot.items.find((item) => item.title === title)!.id
@@ -477,12 +477,12 @@ test("failed tool operations report only the active plan's tasks across revision
     const fixOld = idOf(first, "Fix parser")
     await failure(fixOld, "fix failed in revision one")
     await failure(inspectOld, "inspect failed in revision one")
-    assert.deepEqual(await repository.failedToolOperations(scope), [failureLine("fix failed in revision one"), failureLine("inspect failed in revision one")])
+    assert.deepEqual(await repository.failedToolOperations(scope, "exec-a"), [failureLine("fix failed in revision one"), failureLine("inspect failed in revision one")])
 
     const revised = await sync(planWith("plan-failures", 2, [{ id: "inspect", title: "Inspect parser" }, { id: "verify", title: "Verify parser" }]))
     const verifyNew = idOf(revised, "Verify parser")
     await failure(verifyNew, "verify failed in revision two")
-    assert.deepEqual(await repository.failedToolOperations(scope), [
+    assert.deepEqual(await repository.failedToolOperations(scope, "exec-a"), [
       failureLine("inspect failed in revision one"),
       failureLine("verify failed in revision two")
     ], "a task dropped by the revision leaves the report; the still-active task keeps its record")
@@ -492,9 +492,10 @@ test("failed tool operations report only the active plan's tasks across revision
       if (item.status !== "completed") await repository.completeByUser(scope, item.id, item.version, "Verified by user", `complete-${item.id}`, trustedTodoPanelApproval)
     }
     const replacement = await sync(planWith("plan-replacement", 3, [{ id: "inspect", title: "Inspect renderer" }]))
-    assert.deepEqual(await repository.failedToolOperations(scope), [], "a completed plan's failures do not leak into its replacement")
-    await failure(idOf(replacement, "Inspect renderer"), "renderer failed in replacement")
-    assert.deepEqual(await repository.failedToolOperations(scope), [failureLine("renderer failed in replacement")])
+    assert.deepEqual(await repository.failedToolOperations(scope, "exec-b"), [], "a completed plan's failures do not leak into its replacement")
+    await failure(idOf(replacement, "Inspect renderer"), "renderer failed in replacement", "exec-b")
+    assert.deepEqual(await repository.failedToolOperations(scope, "exec-b"), [failureLine("renderer failed in replacement")])
+    assert.deepEqual(await repository.failedToolOperations(scope, "exec-a"), [], "a different execution's failures are not reported for this one")
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }

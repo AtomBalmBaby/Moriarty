@@ -82,7 +82,26 @@ const exactKeys = (value: Record<string, unknown>, expected: string[], field: st
   if (unexpected) invalid("invalid_shape", `${field}.${unexpected} is not part of the evaluation schema`, expected, unexpected, `${field}.${unexpected}`)
 }
 
-const preserveObservationSet = (review: TodoReviewPackage) => {
+const citedObservationIds = (reconciliations: TodoCriterionReconciliation[]): Set<string> =>
+  new Set(reconciliations.flatMap((reconciliation) => reconciliation.supportingObservationIds))
+
+const MAX_TASK_OBSERVATIONS = 80
+
+/**
+ * The task's own observations shown to the evaluator. Records the deterministic verifier cited come first, so a
+ * verdict can always be checked against the records that decided it. Then records on files the criteria name, then the
+ * most relevant tool categories, newest first.
+ */
+const preserveObservationSet = (review: TodoReviewPackage, reconciliations: TodoCriterionReconciliation[] = []) => {
+  const cited = citedObservationIds(reconciliations)
+  const criterionStrings = review.criteria.flatMap((criterion) => [
+    criterion.description,
+    ...Object.values(criterion.verification).filter((value): value is string => typeof value === "string")
+  ])
+  const relevant = (observation: TodoReviewPackage["observations"][number]) =>
+    Object.values(observation.arguments).some((value) =>
+      typeof value === "string" && value.length >= 3 && /[./]/.test(value) && criterionStrings.some((text) => text.includes(value))
+    )
   const seen = new Set<string>()
   const unique = review.observations.filter((observation) => {
     if (seen.has(observation.id)) return false
@@ -100,11 +119,13 @@ const preserveObservationSet = (review: TodoReviewPackage) => {
     return category
   }
   return unique
-    .map((observation, index) => ({ observation, index, score: score(observation) }))
-    .sort((left, right) => right.score - left.score
-      || left.observation.createdAt.localeCompare(right.observation.createdAt)
+    .map((observation, index) => ({ observation, index, score: score(observation), cited: cited.has(observation.id), relevant: relevant(observation) }))
+    .sort((left, right) => Number(right.cited) - Number(left.cited)
+      || Number(right.relevant) - Number(left.relevant)
+      || right.score - left.score
+      || right.observation.createdAt.localeCompare(left.observation.createdAt)
       || right.index - left.index)
-    .slice(0, 80)
+    .slice(0, MAX_TASK_OBSERVATIONS)
     .map(({ observation }) => observation)
 }
 
@@ -114,11 +135,28 @@ const MAX_SHARED_OBSERVATIONS = 40
  * Observations from other tasks on the active plan that this review may cite. The payload and the
  * citation check both use this set, so a reference is valid only when the evaluator was shown that record.
  */
-const sharedObservationRecords = (review: TodoReviewPackage, visible: TodoReviewPackage["observations"]) =>
-  review.retainedEvidence
-    .filter((record) => record.itemId !== review.task.id && !visible.some((observation) => observation.id === record.observationId))
+const sharedCandidates = (review: TodoReviewPackage, visible: TodoReviewPackage["observations"]) =>
+  review.retainedEvidence.filter((record) => record.itemId !== review.task.id && !visible.some((observation) => observation.id === record.observationId))
+
+/** The evaluator's evidence for one review: what it is shown, and how many records were left out to fit the budget. */
+const evaluatorEvidence = (review: TodoReviewPackage, reconciliations: TodoCriterionReconciliation[] = []) => {
+  const visible = preserveObservationSet(review, reconciliations)
+  const candidates = sharedCandidates(review, visible)
+  const cited = citedObservationIds(reconciliations)
+  const shared = [...candidates]
+    .sort((left, right) => Number(cited.has(right.observationId)) - Number(cited.has(left.observationId)))
     .slice(0, MAX_SHARED_OBSERVATIONS)
     .map((record) => ({ id: record.observationId, taskId: record.itemId, toolName: record.toolName, arguments: record.arguments, failed: record.failed, exitCode: record.exitCode }))
+  const ownRecordIds = new Set(review.observations.map((observation) => observation.id))
+  return {
+    visible,
+    shared,
+    omitted: {
+      trustedTwinnyToolObservations: ownRecordIds.size - visible.length,
+      sharedTrustedObservations: candidates.length - shared.length
+    }
+  }
+}
 
 const FILE_CREATE_TOOLS = ["create_file"]
 const FILE_EDIT_TOOLS = ["edit_lines", "edit_file", "rename_symbol"]
@@ -994,9 +1032,9 @@ export const parseTodoEvaluation = (
     throw new TodoEvaluationValidationError("invalid_shape", "Evaluator must return exactly one result for each semantic criterion, identified by criterionId", [...semanticIds], Array.isArray(criteriaValue) ? criteriaValue.length : typeof criteriaValue, "criteria")
   }
   exactKeys(value, ["schemaVersion", "taskId", "decision", "criteria", "problems", "correctiveInstructions", "explanation", "scores"], "response")
-  const visibleObservations = preserveObservationSet(review)
+  const { visible: visibleObservations, shared: sharedRecords } = evaluatorEvidence(review, reconciliations)
   const visibleEvidence = review.evidence.slice(0, 8)
-  const trustedRecords = [...visibleObservations, ...sharedObservationRecords(review, visibleObservations)]
+  const trustedRecords = [...visibleObservations, ...sharedRecords]
   const knownRefs = new Set([...trustedRecords.map((observation) => observation.id), ...visibleEvidence.map((evidence) => evidence.id)])
   const judged = new Map<string, TodoEvaluationCriterion>()
   criteriaValue.forEach((entry, index) => {
@@ -1148,7 +1186,7 @@ export const todoReviewSystemPrompt = [
   "hostDecidedCriteria are objective predicates the host has already decided from trusted observations. Their outcome is final: proven means verified and disproven means refuted. Never change, restate, or downgrade them, and do not include them in your criteria. An unknown outcome is unresolved evidence, not failure; name its missing observation in needs_evidence.",
   "Host-recorded observations, such as the accepted-evidence lookup record, state what the host verified and are not tools. Never tell the implementer to call an observation's toolName; the only tools the implementer has are the ones it is given. A lookup with resolution none is a completed answer, not a failure.",
   "Criteria are fixed when the plan is made. Judge only the supplied criteria and never add a new condition, deliverable, or requirement to record, document, or report on the TODO list. Accepted host evidence is authoritative for narrow deterministic facts, so do not ask for a fresh observation of a fact the host has already verified unless its freshness check failed.",
-  "Never request or execute a command. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
+  "Never request or execute a command. projectionOmissions counts trusted records left out of this payload to fit its budget; an omitted record is unknown to you, not absent. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
   "Return exactly one JSON object and no other keys, following this structure: {\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"decision\":\"accept\",\"criteria\":[{\"criterionId\":\"<copy one semanticCriteria criterionId exactly>\",\"status\":\"passed\",\"evidenceRefs\":[\"<supplied observation ID>\"]}],\"problems\":[],\"correctiveInstructions\":[],\"explanation\":\"<non-empty string>\",\"scores\":{\"completion\":0,\"correctness\":0,\"alignment\":0}}. Every listed key is required. decision must be exactly one of accept, revise, needs_evidence, blocked. Each criteria entry has exactly criterionId (string), status (passed, failed, or unverified), and evidenceRefs (array of supplied IDs). criteria must contain exactly one entry per semanticCriteria item, identified by criterionId; never include hostDecidedCriteria. Each evidenceRefs entry must be an ID explicitly supplied in the input; never invent or infer IDs. problems and correctiveInstructions are arrays of strings and may be empty; explanation is a non-empty string; scores has exactly completion, correctness, and alignment, each an integer from -7 to +8. Do not use 'criterion' instead of 'criterionId', do not return correctiveInstructions as a string, and do not add fields."
 ].join("\n")
 
@@ -1189,7 +1227,7 @@ export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChange
   previouslyVerifiedCriteria: review.lastEvaluation?.criteria
     .filter((criterion) => criterion.status === "passed")
     .map((criterion) => ({ criterionId: criterion.criterionId, evidenceRefs: criterion.evidenceRefs.slice(0, 8) })),
-  trustedTwinnyToolObservations: preserveObservationSet(review).map((entry) => ({
+  trustedTwinnyToolObservations: evaluatorEvidence(review, reconciliations).visible.map((entry) => ({
     id: entry.id,
     toolName: entry.toolName,
     arguments: Object.fromEntries(Object.entries(entry.arguments).slice(0, 8).map(([key, value]) => [clip(key, 100), clip(value, 500)])),
@@ -1199,7 +1237,7 @@ export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChange
     failed: entry.failed,
     ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {})
   })),
-  sharedTrustedObservations: sharedObservationRecords(review, preserveObservationSet(review)).map((entry) => ({
+  sharedTrustedObservations: evaluatorEvidence(review, reconciliations).shared.map((entry) => ({
     id: entry.id,
     taskId: entry.taskId,
     toolName: entry.toolName,
@@ -1207,6 +1245,11 @@ export const todoReviewInput = (review: TodoReviewPackage, changes?: ReplyChange
     failed: entry.failed,
     ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {})
   })),
+  projectionOmissions: {
+    ...evaluatorEvidence(review, reconciliations).omitted,
+    modelAuthoredEvidenceNotes: Math.max(0, review.evidence.length - 8),
+    relevantFileChanges: Math.max(0, (changes?.files.length ?? 0) - 20)
+  },
   implementerFinalResponseUntrusted: finalResponse ? clip(finalResponse, 1200) : undefined
 })
 
@@ -1220,11 +1263,30 @@ const reviewsInFlight = new Map<string, Promise<TodoEvaluation>>()
 export const dependenciesComplete = (review: TodoReviewPackage): boolean =>
   review.dependencies.every((dependency) => dependency.status === "completed")
 
+/**
+ * Whether this task itself has a successful, host-recorded file mutation. Edits recorded for other tasks, and a
+ * request-level changes view, do not satisfy this task's workspace requirement.
+ */
+export const taskHasVerifiedMutation = (review: TodoReviewPackage): boolean =>
+  review.observations.some((record) => record.itemId === review.task.id && !record.failed && MUTATING_TOOLS.includes(record.toolName))
+
+/**
+ * A verdict that keeps the task in review (needs_evidence) bumps its version once, so the version alone looks like a
+ * wait. Evidence or observations recorded after that evaluation make the task reviewable again.
+ */
+const awaitingNewInput = (review: TodoReviewPackage): boolean => {
+  const evaluation = review.lastEvaluation
+  if (!evaluation || evaluation.metadata.taskVersion !== review.task.version - 1) return false
+  const since = evaluation.metadata.evaluatedAt
+  return !review.evidence.some((item) => item.createdAt > since) && !review.observations.some((record) => record.createdAt > since)
+}
+
 export const reviewCandidates = (reviews: TodoReviewPackage[], itemId?: string): TodoReviewPackage[] =>
   (itemId
     ? reviews.filter((review) => review.task.id === itemId)
-    : reviews.filter((review) => !review.lastEvaluation || review.lastEvaluation.metadata.taskVersion !== review.task.version - 1)
+    : reviews.filter((review) => !awaitingNewInput(review))
   ).filter(dependenciesComplete)
+
 
 /** Completes pending reviews whose every objective criterion is proven by trusted, current facts. Feedback is never consulted. */
 export const completeProvenReviews = async (

@@ -14,3 +14,22 @@ export const isStaleTodoSnapshot = (
   next: Pick<TodoListSnapshot, "id" | "conversationId" | "revision">
 ): boolean =>
   !!current && current.id === next.id && current.conversationId === next.conversationId && next.revision < current.revision
+
+/**
+ * Applies a snapshot delivered while `activeConversationId` is on screen. A response for any other conversation, late
+ * or from a superseded request, is ignored, and an older revision never replaces a newer one.
+ */
+export const applyTodoSnapshot = <T extends Pick<TodoListSnapshot, "id" | "conversationId" | "revision">>(
+  activeConversationId: string | undefined,
+  current: T | undefined,
+  next: T
+): T | undefined => {
+  if (next.conversationId !== activeConversationId) return current
+  return isStaleTodoSnapshot(current, next) ? current : next
+}
+
+/** The held snapshot only when it belongs to the conversation on screen; another conversation's list is never shown. */
+export const snapshotForConversation = <T extends Pick<TodoListSnapshot, "conversationId">>(
+  conversationId: string | undefined,
+  snapshot: T | undefined
+): T | undefined => (conversationId !== undefined && snapshot?.conversationId === conversationId ? snapshot : undefined)

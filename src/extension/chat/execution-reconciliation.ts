@@ -1,3 +1,5 @@
+import { randomUUID } from "crypto"
+
 import type { TodoToolObservation } from "../../common/types/todo"
 import { displayArguments } from "../todos/evidence"
 
@@ -41,7 +43,39 @@ export interface ObservedEvidence {
 const observationKey = (observation: { toolName: string; arguments: Record<string, string> }) =>
   observation.toolName + " " + JSON.stringify(Object.keys(observation.arguments).sort().map((key) => [key, observation.arguments[key]]))
 
+export type UnresolvedPlanState = "plan_complete" | "review_pending" | "blocked" | "dependency_waiting" | "no_actionable_work"
+
+/**
+ * Why no TODO is selectable while the plan has unresolved work. In-review work is pending review, not complete or
+ * permanently blocked, so it is reported separately from blocked tasks and from tasks waiting on prerequisites.
+ * A runnable task with every prerequisite met that is still not selected is a scheduling inconsistency, not a wait.
+ */
+export const classifyUnresolvedPlan = (tasks: readonly { status: string; dependenciesMet?: boolean }[]): UnresolvedPlanState => {
+  if (tasks.every((task) => task.status === "completed" || task.status === "cancelled")) return "plan_complete"
+  if (tasks.some((task) => task.status === "in_review")) return "review_pending"
+  if (tasks.some((task) => task.status === "blocked")) return "blocked"
+  if (tasks.some((task) => (task.status === "pending" || task.status === "in_progress") && task.dependenciesMet === false)) return "dependency_waiting"
+  return "no_actionable_work"
+}
+
+export const unresolvedPlanMessage = (state: UnresolvedPlanState, tasks: readonly { title: string; status: string; blockedReason?: string | null }[]): string => {
+  const names = tasks.filter((task) => task.status !== "completed" && task.status !== "cancelled").map((task) => `${task.title} (${task.status})`).slice(0, 5).join(", ")
+  switch (state) {
+    case "review_pending": return `Review is pending for ${names}; it needs new evidence before Feedback can evaluate it again.`
+    case "blocked": return `Blocked: ${tasks.filter((task) => task.status === "blocked").map((task) => task.blockedReason || task.title).slice(0, 3).join("; ")}.`
+    case "dependency_waiting": return `Waiting on unfinished prerequisites for ${names}.`
+    case "plan_complete": return "All plan tasks are complete."
+    default: return `No eligible task remains although these plan tasks have no unmet prerequisites: ${names}`
+  }
+}
+
 export class ExecutionReconciliationController {
+  /**
+   * Host-generated identity of one logical execution, the unit that owns tool observations and failure reports.
+   * Automatic continuations of the same user request reuse this controller and therefore this ID; a new user
+   * request constructs a new controller with a new ID. Model-supplied arguments never set it.
+   */
+  readonly executionId = randomUUID()
   private _state: ExecutionState = "executing"
   private _iterations = 0
   private _noProgress = 0

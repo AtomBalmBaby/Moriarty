@@ -887,12 +887,13 @@ export class TodoRepository {
         [current.id]
       )
       const retainedEvidence = retainedEvidenceFor(database, current.id, false, list.id)
-      const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
-        "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [current.id]
+      const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string; executionId: string | null }>(database,
+        "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt, execution_id AS executionId FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [current.id]
       ).map((observation) => ({
         id: observation.id, itemId: observation.itemId, toolName: observation.toolName,
         arguments: JSON.parse(observation.arguments_json) as Record<string, string>, output: observation.output,
         failed: observation.failed !== 0, exitCode: observation.exitCode ?? undefined, createdAt: observation.createdAt,
+        executionId: observation.executionId ?? undefined,
         evidence: evidenceStatus(retainedEvidence.find((entry) => entry.observationId === observation.id))
       }))
       const lastEvaluation = rows<{ evaluation_json: string }>(database,
@@ -971,7 +972,8 @@ export class TodoRepository {
    * Failed tool operations recorded against the active plan's tasks in this conversation, oldest first. Observations of
    * tasks a later plan revision or replacement dropped stay in storage but are not part of the current plan's report.
    */
-  failedToolOperations(request: TodoListRequest): Promise<string[]> {
+  /** Failed operations of one execution only. Failures recorded by other executions remain stored but are not reported here. */
+  failedToolOperations(request: TodoListRequest, executionId: string): Promise<string[]> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
       if (!project) return []
@@ -979,8 +981,8 @@ export class TodoRepository {
       if (!list) return []
       return rows<{ tool_name: string; arguments_json: string; exit_code: number | null; output: string }>(database,
         `SELECT tool_name, arguments_json, exit_code, output FROM todo_tool_observations
-         WHERE list_id = ? AND failed = 1 AND item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)
-         ORDER BY created_at ASC`, [list.id, list.id]
+         WHERE list_id = ? AND failed = 1 AND execution_id = ? AND item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)
+         ORDER BY created_at ASC`, [list.id, executionId, list.id]
       ).map((row) => {
         const args = displayArguments(JSON.parse(row.arguments_json) as Record<string, unknown>)
         const target = typeof args.path === "string" ? args.path : JSON.stringify(args).slice(0, 160)
@@ -1105,16 +1107,17 @@ export class TodoRepository {
         originalChars: preserved.originalChars,
         preservedChars: preserved.preservedChars
       }
-      const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence }
+      const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence, executionId: input.executionId }
       const listRevision = bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
-      database.run("INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision])
+      database.run("INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision, input.executionId ?? null])
       if (preserved) {
         database.run("INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
         enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
       }
-      if (row.status === "in_review") database.run("UPDATE todo_items SET version = version + 1, updated_at = ? WHERE id = ?", [observation.createdAt, row.id])
+      // Evidence does not change the task's content or status, so it does not bump its version: an unrelated observation
+      // made during review must not invalidate that review. The list revision above records it for review packages.
       logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
       return observation
     })
@@ -1786,11 +1789,9 @@ export class TodoRepository {
       const item = rows<{ id: string }>(database, "SELECT id FROM todo_items WHERE id = ? AND list_id = ?", [input.itemId, list.id])[0]
       if (!item) throw new Error("TODO item was not found in the active conversation")
       const evidence: TodoEvidence = { id: randomUUID(), itemId: input.itemId, kind, summary, result: input.result, createdAt: now() }
-      database.run(
-        "INSERT INTO todo_evidence(id, item_id, kind, summary, result, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      database.run("INSERT INTO todo_evidence(id, item_id, kind, summary, result, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         [evidence.id, evidence.itemId, evidence.kind, evidence.summary, evidence.result, evidence.createdAt]
       )
-      database.run("UPDATE todo_items SET version = version + 1, updated_at = ? WHERE id = ? AND status = 'in_review'", [evidence.createdAt, input.itemId])
       bumpList(database, list.id, input.itemId, "evidence_added", "model", input.requestId, { kind, result: input.result, summary })
       recordRequest(database, list.id, input.requestId, "evidence", evidence)
       return evidence

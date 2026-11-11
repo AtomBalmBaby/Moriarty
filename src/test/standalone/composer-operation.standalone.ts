@@ -5,7 +5,7 @@ import path from "node:path"
 import { test } from "node:test"
 
 import { EVENT_NAME, TODO_EVENT_NAME } from "../../common/constants/events"
-import { isStaleTodoSnapshot } from "../../common/guards"
+import { applyTodoSnapshot, isStaleTodoSnapshot, snapshotForConversation } from "../../common/guards"
 import type { TodoItem, TodoListSnapshot } from "../../common/types"
 import {
   composerIsBusy,
@@ -68,6 +68,9 @@ const outbound: { type: string; data?: unknown; id?: string }[] = []
 // `getList` answers from the lists the host holds for each conversation.
 const todoLists = new Map<string, TodoListSnapshot>()
 
+// While set, `getList` replies are queued instead of sent, so a test can release a slow host's answers in any order.
+let heldListReplies: { conversationId: string; reply: () => void }[] | undefined
+
 /** The host's answer to a webview request on mount, shaped as the webview expects each reply. */
 const hostReply = (type: string, request?: unknown): unknown => {
   if (type === EVENT_NAME.twinnyAgentRegistry) return []
@@ -119,13 +122,17 @@ const startWebview = async () => {
         outbound.push(message)
         // Requests the webview makes on mount need a reply, or their 30s timers outlive the test.
         if (message.id) {
-          queueMicrotask(() =>
+          const reply = () =>
             window.dispatchEvent(
               new window.MessageEvent("message", {
                 data: { type: message.type, id: message.id, data: hostReply(message.type, message.data) }
               })
             )
-          )
+          if (heldListReplies && message.type === TODO_EVENT_NAME.getList) {
+            heldListReplies.push({ conversationId: (message.data as { conversationId: string }).conversationId, reply })
+          } else {
+            queueMicrotask(reply)
+          }
         }
       },
       getState: () => undefined,
@@ -392,4 +399,72 @@ test("a snapshot is stale only when an older revision of the same list arrives",
   assert.equal(isStaleTodoSnapshot(list, { ...list, revision: 6 }), false)
   assert.equal(isStaleTodoSnapshot(list, { ...list, id: "list-b", revision: 1 }), false)
   assert.equal(isStaleTodoSnapshot(list, { ...list, conversationId: "conv-b", revision: 1 }), false)
+})
+
+test("a snapshot is applied only for the conversation on screen and never replaces a newer revision", () => {
+  const a2 = { id: "list-a", conversationId: "conv-a", revision: 2 }
+  const a1 = { ...a2, revision: 1 }
+  const b1 = { id: "list-b", conversationId: "conv-b", revision: 1 }
+  assert.equal(applyTodoSnapshot("conv-a", undefined, a1), a1)
+  assert.equal(applyTodoSnapshot("conv-a", a1, a2), a2)
+  assert.equal(applyTodoSnapshot("conv-a", a2, a1), a2, "an older revision of the same list is dropped")
+  assert.equal(applyTodoSnapshot("conv-a", a2, b1), a2, "another conversation's list is dropped while this one is on screen")
+  assert.equal(applyTodoSnapshot("conv-b", a2, b1), b1)
+  assert.equal(applyTodoSnapshot(undefined, undefined, a1), undefined)
+})
+
+test("a held snapshot is shown only for the conversation that owns it", () => {
+  const a = { conversationId: "conv-a", revision: 1 }
+  assert.equal(snapshotForConversation("conv-a", a), a)
+  assert.equal(snapshotForConversation("conv-b", a), undefined)
+  assert.equal(snapshotForConversation(undefined, a), undefined)
+  assert.equal(snapshotForConversation("conv-a", undefined), undefined)
+})
+
+/** Answers one held `getList` for the conversation, as a slow host would, inside the same act scope React uses. */
+const releaseListReply = async (conversationId: string): Promise<void> => {
+  const { act } = await loadWebview()
+  const pending = heldListReplies ?? []
+  const index = pending.findIndex((held) => held.conversationId === conversationId)
+  assert.notEqual(index, -1, `a list request for ${conversationId} should be waiting for the host`)
+  const [held] = pending.splice(index, 1)
+  await act(async () => held.reply())
+}
+
+test("rapid conversation switches clear the previous list at once and ignore late replies for it", async () => {
+  todoLists.set(TODO_CONVERSATION, todoSnapshot(TODO_CONVERSATION, 1, { first: "in_progress" }))
+  todoLists.set(OTHER_CONVERSATION, todoSnapshot(OTHER_CONVERSATION, 1, { other: "in_progress" }))
+  heldListReplies = []
+  const panel = await mountTodoPanel(TODO_CONVERSATION)
+  try {
+    await releaseListReply(TODO_CONVERSATION)
+    assert.equal(showsTask(panel.document, "first"), true)
+
+    // The first conversation's list is gone as soon as the switch renders, before the second list has loaded.
+    await panel.render(OTHER_CONVERSATION)
+    assert.equal(showsTask(panel.document, "first"), false)
+    assert.equal(showsTask(panel.document, "other"), false)
+
+    // Switch away and back while both requests are outstanding; the A reply is the one that matters.
+    await panel.render(TODO_CONVERSATION)
+    await releaseListReply(OTHER_CONVERSATION)
+    assert.equal(showsTask(panel.document, "other"), false, "B's late reply cannot appear while A is on screen")
+    assert.equal(showsTask(panel.document, "first"), false)
+
+    await releaseListReply(TODO_CONVERSATION)
+    assert.equal(showsTask(panel.document, "first"), true)
+    assert.equal(showsTask(panel.document, "other"), false)
+
+    // A server event for B while A is on screen must not replace A's list.
+    await sendHost(TODO_EVENT_NAME.changed, todoSnapshot(OTHER_CONVERSATION, 2, { other: "completed" }))
+    assert.equal(showsTask(panel.document, "first"), true)
+    assert.equal(showsTask(panel.document, "other"), false)
+  } finally {
+    const { act } = await loadWebview()
+    await act(async () => {
+      for (const held of heldListReplies ?? []) held.reply()
+    })
+    heldListReplies = undefined
+    await panel.unmount()
+  }
 })

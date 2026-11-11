@@ -2,7 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { useTranslation } from "react-i18next"
 
 import { TODO_EVENT_NAME } from "../common/constants"
-import { isStaleTodoSnapshot } from "../common/guards"
+import { applyTodoSnapshot, snapshotForConversation } from "../common/guards"
 import { TodoFeedbackStatus, TodoItem, TodoListSnapshot } from "../common/types"
 
 import { bridge, useServerEvent } from "./messaging"
@@ -23,7 +23,7 @@ interface TodoTreeRow {
 
 export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
   const { t } = useTranslation()
-  const [snapshot, setSnapshot] = useState<TodoListSnapshot>()
+  const [heldSnapshot, setHeldSnapshot] = useState<TodoListSnapshot>()
   const [feedbackStatus, setFeedbackStatus] = useState<TodoFeedbackStatus>()
   const [expandedMap, setExpandedMap] = useState<Record<string, boolean>>({})
   const [collapsedMap, setCollapsedMap] = useState<Record<string, boolean>>({})
@@ -36,18 +36,19 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
   const [editPriority, setEditPriority] = useState<TodoItem["priority"]>("normal")
   const conversationIdRef = useRef(conversationId)
   conversationIdRef.current = conversationId
+  const snapshot = snapshotForConversation(conversationId, heldSnapshot)
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
 
   const refresh = useCallback(async () => {
     if (!conversationId) {
-      setSnapshot(undefined)
+      setHeldSnapshot(undefined)
       return
     }
     try {
       const next = await bridge.request(TODO_EVENT_NAME.getList, { conversationId })
       if (conversationIdRef.current === conversationId) {
-        setSnapshot((current) => (isStaleTodoSnapshot(current, next) ? current : next))
+        setHeldSnapshot((current) => applyTodoSnapshot(conversationId, current, next))
         setError("")
       }
     } catch (reason) {
@@ -57,13 +58,16 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     }
   }, [conversationId])
 
+  // A switch drops the previous conversation's list and error before the new list loads.
   useEffect(() => {
+    setHeldSnapshot(undefined)
+    setError("")
     void refresh()
   }, [refresh])
 
   useServerEvent(TODO_EVENT_NAME.changed, (next) => {
     if (next.conversationId === conversationIdRef.current) {
-      setSnapshot((current) => (isStaleTodoSnapshot(current, next) ? current : next))
+      setHeldSnapshot((current) => applyTodoSnapshot(conversationIdRef.current, current, next))
       setError("")
     }
   })
@@ -123,7 +127,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     setError("")
     try {
       const next = await action()
-      setSnapshot((current) => (isStaleTodoSnapshot(current, next) ? current : next))
+      setHeldSnapshot((current) => applyTodoSnapshot(conversationIdRef.current, current, next))
       return true
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))

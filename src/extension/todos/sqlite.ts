@@ -237,7 +237,7 @@ export class SqliteFile {
       try {
         const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
         if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 16) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+        if (version > 17) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
         if (version === 0) {
           database.run(SCHEMA)
           await this.persist(database)
@@ -311,6 +311,9 @@ export class SqliteFile {
         if (version < 16) {
           await this.migrateAcceptedEvidenceToV16(database)
         }
+        if (version < 17) {
+          await this.migrateObservationExecutionToV17(database)
+        }
       } finally {
         database.close()
       }
@@ -375,6 +378,17 @@ CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(l
     const columns = database.exec("PRAGMA table_info(todo_accepted_evidence)")[0]?.values ?? []
     if (!columns.some((row) => row[1] === "registered_tool")) database.run("ALTER TABLE todo_accepted_evidence ADD COLUMN registered_tool TEXT")
     database.run("PRAGMA user_version = 16")
+    await this.persist(database)
+  }
+
+  // v17 records the host-generated execution that produced each tool observation, so failures can be reported for the
+  // execution that made them. Rows from earlier versions keep a NULL execution_id: they stay as history and are never
+  // attributed to a later execution. No rows are rewritten or deleted.
+  private async migrateObservationExecutionToV17(database: Database): Promise<void> {
+    const columns = database.exec("PRAGMA table_info(todo_tool_observations)")[0]?.values ?? []
+    if (!columns.some((row) => row[1] === "execution_id")) database.run("ALTER TABLE todo_tool_observations ADD COLUMN execution_id TEXT")
+    database.run("CREATE INDEX IF NOT EXISTS todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id)")
+    database.run("PRAGMA user_version = 17")
     await this.persist(database)
   }
 

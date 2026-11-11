@@ -3,9 +3,11 @@ import test from "node:test"
 
 import {
   allIntentTasksComplete,
+  classifyUnresolvedPlan,
   continuationContext,
   ExecutionReconciliationController,
-  forbiddenDeleteReason
+  forbiddenDeleteReason,
+  unresolvedPlanMessage
 } from "../../extension/chat/execution-reconciliation"
 import { ToolSteps } from "../../extension/chat/tool-steps"
 import { taskRequiresWorkspaceChanges } from "../../extension/todos/feedback"
@@ -152,4 +154,35 @@ test("overall goal completion requires every nonempty intent plan task to be com
   assert.equal(allIntentTasksComplete(["completed", "cancelled"]), false)
   assert.equal(allIntentTasksComplete(["completed", "completed"]), true)
   assert.equal(allIntentTasksComplete([]), false)
+})
+
+test("automatic continuations share one host-generated execution identity, and a new request gets its own", () => {
+  const controller = new ExecutionReconciliationController()
+  const executionId = controller.executionId
+  assert.match(executionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  controller.reconcile("revise", "no-edits:no-tool-success")
+  assert.equal(controller.claimContinuation(), true)
+  controller.continuationStarted()
+  controller.reconcile("revise", "no-edits:no-tool-success")
+  assert.equal(controller.executionId, executionId, "a continuation is the same logical execution")
+  assert.notEqual(new ExecutionReconciliationController().executionId, executionId, "a new request is a new execution")
+})
+
+test("no eligible task is classified by why the plan cannot advance", () => {
+  assert.equal(classifyUnresolvedPlan([{ status: "completed" }, { status: "cancelled" }]), "plan_complete")
+  assert.equal(classifyUnresolvedPlan([{ status: "completed" }, { status: "in_review" }]), "review_pending")
+  assert.equal(classifyUnresolvedPlan([{ status: "in_review" }, { status: "blocked" }]), "review_pending", "pending review outranks a blocked sibling")
+  assert.equal(classifyUnresolvedPlan([{ status: "blocked" }, { status: "pending", dependenciesMet: false }]), "blocked")
+  assert.equal(classifyUnresolvedPlan([{ status: "completed" }, { status: "pending", dependenciesMet: false }]), "dependency_waiting")
+  assert.equal(classifyUnresolvedPlan([{ status: "pending", dependenciesMet: true }]), "no_actionable_work", "a runnable task that is not selected is a scheduling inconsistency")
+  assert.equal(classifyUnresolvedPlan([{ status: "pending" }]), "no_actionable_work", "unknown dependency state is never treated as a wait")
+})
+
+test("the pause message names the reason and never claims review is a block", () => {
+  const review = unresolvedPlanMessage("review_pending", [{ title: "Edit panel", status: "in_review" }])
+  assert.match(review, /Review is pending for Edit panel \(in_review\)/)
+  assert.doesNotMatch(review, /Blocked/)
+  assert.match(unresolvedPlanMessage("dependency_waiting", [{ title: "Validate", status: "pending" }]), /prerequisites/)
+  assert.match(unresolvedPlanMessage("no_actionable_work", [{ title: "Validate", status: "pending" }]), /no unmet prerequisites/)
+  assert.equal(unresolvedPlanMessage("plan_complete", []), "All plan tasks are complete.")
 })

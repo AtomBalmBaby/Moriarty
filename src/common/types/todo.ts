@@ -127,6 +127,8 @@ export interface TodoToolObservation {
   exitCode?: number
   createdAt: string
   evidence?: TodoToolEvidenceStatus
+  /** Host-generated execution that produced this observation; absent for history recorded before execution identity. */
+  executionId?: string
 }
 
 export interface TodoListSnapshot {
