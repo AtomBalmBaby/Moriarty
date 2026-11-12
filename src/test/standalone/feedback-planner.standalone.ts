@@ -905,6 +905,36 @@ test("a failed initial plan does not start Mycroft", async () => {
   })
 })
 
+test("a plan revised by another writer during planning holds the turn with a concrete error", async () => {
+  await withRepository(async (repository) => {
+    await quietly(() => plannerWith(repository, scripted([validReply()])).start(scope, "Fix the parser."))
+    let raced = false
+    // The other writer lands after this planning read the stored plan and before it writes its own revision.
+    const racing: RoleInference = async () => {
+      if (!raced) {
+        raced = true
+        const stored = await repository.getIntentTaskPlan(scope)
+        assert.ok(stored)
+        await repository.synchronizeIntentPlan(scope, { ...stored, revision: stored.revision + 1 }, { source: "feedback", goal: stored.goal })
+      }
+      return validReply()
+    }
+    const planner = plannerWith(repository, racing)
+    const { gate, notices } = gated(planner)
+    let turns = 0
+    const { result } = await quietly(() =>
+      gate.admit(scope.conversationId, planner.start(scope, "Revise the parser."), async () => {
+        turns++
+        return "reply"
+      })
+    )
+    assert.equal(result, undefined)
+    assert.equal(turns, 0)
+    assert.equal(notices.length, 1, "the held turn must say why it did not start")
+    assert.match(notices[0], /did not start/)
+  })
+})
+
 test("a successful retry synchronizes the plan before Mycroft starts", async () => {
   await withRepository(async (repository) => {
     const order: string[] = []
@@ -920,6 +950,27 @@ test("a successful retry synchronizes the plan before Mycroft starts", async () 
     assert.equal(result.status, "planned")
     assert.deepEqual(order, ["sync", "dispatch"])
     assert.equal((await repository.getList(scope)).items.length, 2)
+  })
+})
+
+test("retrying a held turn never starts it unplanned when another conversation planned last", async () => {
+  await withRepository(async (repository) => {
+    const other = { ...scope, conversationId: "other" }
+    const planner = plannerWith(repository, scripted(["nope", "nope", "nope", validReply()]))
+    const { gate } = gated(planner)
+    let turns = 0
+    await quietly(() =>
+      gate.admit(scope.conversationId, planner.start(scope, "Fix the parser."), async () => {
+        turns++
+        return "reply"
+      })
+    )
+    assert.equal(turns, 0)
+    await quietly(() => planner.start(other, "Fix the other parser."))
+    const { result } = await quietly(() => gate.retry(scope.conversationId))
+    assert.equal(turns, 0, "the held turn must not start without a plan of its own")
+    assert.equal(result.status, "unavailable")
+    assert.equal((await repository.getList(scope)).items.length, 0)
   })
 })
 

@@ -637,7 +637,13 @@ export class FeedbackPlanner {
   /** Runs the last ordinary message's planning again, e.g. after a provider failure. */
   public retry(conversationId: string): Promise<FeedbackPlanOutcome> {
     const last = this._last
-    if (!last || last.scope.conversationId !== conversationId) return Promise.resolve({ status: "untracked" })
+    // "untracked" means the model judged the request needs no plan, so a missing
+    // message here must not read as permission to start the held turn unplanned.
+    if (!last || last.scope.conversationId !== conversationId) {
+      const error = "There is no message waiting to be planned for this conversation. Send the message again."
+      this.report(error)
+      return Promise.resolve({ status: "unavailable", error })
+    }
     // A retry while this conversation is already planning joins that planning rather than superseding it.
     const active = this._active
     if (active && !active.controller.signal.aborted && active.scope.conversationId === conversationId) return active.done
@@ -800,6 +806,12 @@ export class FeedbackPlanner {
         return { status: "untracked" }
       }
       const synced = await this.synchronize(repository, scope, parsed.plan, existing, active)
+      if (synced === "conflict") {
+        state = "failed"
+        const message = "Feedback could not plan TODOs: the TODO plan changed while this request was being planned. Retry planning to plan it against the current plan."
+        this.report(message)
+        return { status: "failed", error: message }
+      }
       if (!synced) {
         state = "stale"
         return { status: "stale" }
@@ -847,11 +859,11 @@ export class FeedbackPlanner {
     proposed: IntentTaskPlan,
     seen: IntentTaskPlan | undefined,
     active: ActivePlanning
-  ): Promise<{ snapshot: TodoListSnapshot; planId: string; replaced?: string } | undefined> {
+  ): Promise<{ snapshot: TodoListSnapshot; planId: string; replaced?: string } | "conflict" | undefined> {
     const stored = await untilAborted(repository.getIntentTaskPlan(scope), active.controller.signal)
-    // Someone else revised the plan while this one was being written.
-    if (stored && seen && stored.revision !== seen.revision) return undefined
     if (!this.isCurrent(active)) return undefined
+    // Someone else revised the plan while this one was being written: this request is not superseded, so it must fail visibly.
+    if (stored && seen && stored.revision !== seen.revision) return "conflict"
     const result = { source: "feedback", goal: proposed.goal }
     // A completed plan is replaced by the new work under its own planId; an open plan keeps its identity.
     const replacing = !!stored && await untilAborted(repository.intentPlanClosed(scope), active.controller.signal)
