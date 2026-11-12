@@ -119,11 +119,14 @@ test("read_file obeys the configured line cap and advertises it", async () => {
   const file = path.join(root, "src", "many-lines.ts")
   fs.writeFileSync(file, Array.from({ length: 250 }, (_, i) => `line ${i + 1}`).join("\n") + "\n")
   const tools = workspaceTools(root, [], { readFileMaxLines: 120 })
-  const read = await tools.run({ name: "read_file", args: { path: "src/many-lines.ts" } })
+  const refused = await tools.run({ name: "read_file", args: { path: "src/many-lines.ts" } })
+  assert.equal(refused.failed, true)
+  assert.match(refused.output, /contains 250 lines\.\nConfigured maximum: 120 lines\./)
+  const read = await tools.run({ name: "read_file", args: { path: "src/many-lines.ts", start_line: "1", end_line: "120" } })
   assert.match(read.output, /lines 1–120 of 250/)
   assert.strictEqual(read.summary, "read `src/many-lines.ts:1–120`")
   const desc = tools.tools.find((tool) => tool.name === "read_file")?.description
-  assert.match(desc ?? "", /at most 120 at a time/)
+  assert.match(desc ?? "", /longer than 120 lines is refused/)
 })
 
 test("grep tries the pattern as plain text when it matches nothing as a regex", async () => {

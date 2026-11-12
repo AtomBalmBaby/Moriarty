@@ -1,7 +1,7 @@
 import type { AnswerField, AnswerRequirement, CriterionVerification, CriterionVerificationKind, SourceIdentity, TypedCriterion } from "../../common/types"
 
 import type { IntentTaskDefinition, IntentTaskPlan } from "./types"
-import { VERIFICATION_CAPABILITIES, contradictoryCriteria } from "./verification-capabilities"
+import { contradictoryCriteria,VERIFICATION_CAPABILITIES } from "./verification-capabilities"
 
 export type IntentPlanValidation = { plan?: IntentTaskPlan; diagnostic?: string }
 
@@ -50,31 +50,39 @@ const verificationOf = (value: unknown, path: string): { verification?: Criterio
   if (unknownField) return { diagnostic: path + " has unsupported field " + unknownField + " for kind " + kind + "." }
   const symbolOf = (): string | undefined => typeof value.symbol === "string" && SYMBOL.test(value.symbol) ? value.symbol : undefined
   const identityOf = (): SourceIdentity | undefined => value.identity === "registered_tool" || value.identity === "implementation_symbol" ? value.identity : undefined
-  const identityDiagnostic = path + ".identity must be registered_tool or implementation_symbol; received " + received(value.identity) + "."
+  const identityDiagnostic = path + ".identity must be registered_tool or implementation_symbol when given; received " + received(value.identity) + "."
+  /** Identity is optional. Omitted, the symbol names the target and the verifier resolves it; given, it must be one of the two identities. */
+  const identityField = (): { identity?: SourceIdentity; diagnostic?: string } => {
+    if (value.identity === undefined) return {}
+    const identity = identityOf()
+    return identity ? { identity } : { diagnostic: identityDiagnostic }
+  }
   switch (kind) {
     case "evidence_lookup_completed":
     case "semantic_review":
       return { verification: { kind } as CriterionVerification }
     case "accepted_fact_exists": {
-      const identity = identityOf()
-      if (!identity) return { diagnostic: identityDiagnostic }
+      const { identity, diagnostic } = identityField()
+      if (diagnostic) return { diagnostic }
       const symbol = symbolOf()
       if (!symbol) return { diagnostic: path + ".symbol must be a source identifier." }
-      if (value.path === undefined) return { verification: { kind, identity, symbol } }
+      const identityPart = identity === undefined ? {} : { identity }
+      if (value.path === undefined) return { verification: { kind, ...identityPart, symbol } as CriterionVerification }
       const filePath = repositoryPath(value.path)
-      return filePath ? { verification: { kind, identity, symbol, path: filePath } } : { diagnostic: path + ".path must be a repository-relative path." }
+      return filePath ? { verification: { kind, ...identityPart, symbol, path: filePath } as CriterionVerification } : { diagnostic: path + ".path must be a repository-relative path." }
     }
     case "source_location":
     case "source_range":
     case "source_fingerprint": {
-      const identity = identityOf()
-      if (!identity) return { diagnostic: identityDiagnostic }
+      const { identity, diagnostic } = identityField()
+      if (diagnostic) return { diagnostic }
       const symbol = symbolOf()
       if (!symbol) return { diagnostic: path + ".symbol must be a source identifier." }
-      if (value.path === undefined) return { verification: { kind, identity, symbol } as CriterionVerification }
+      const identityPart = identity === undefined ? {} : { identity }
+      if (value.path === undefined) return { verification: { kind, ...identityPart, symbol } as CriterionVerification }
       const filePath = repositoryPath(value.path)
       if (!filePath) return { diagnostic: path + ".path must be a repository-relative path when present." }
-      return { verification: { kind, identity, symbol, path: filePath } as CriterionVerification }
+      return { verification: { kind, ...identityPart, symbol, path: filePath } as CriterionVerification }
     }
     case "execution_invariant":
       if (value.invariant !== "no_mutating_tool_calls") return { diagnostic: path + ".invariant must be no_mutating_tool_calls." }
@@ -130,7 +138,7 @@ const answerRequirementsOf = (value: unknown, tasks: IntentTaskDefinition[]): { 
     if (!isRecord(source)) return { diagnostic: at + ".source must be an object." }
     const unknownSource = hasOnlyKeys(source, ["identity", "symbol", "path"])
     if (unknownSource) return { diagnostic: at + ".source has unsupported field " + unknownSource + "." }
-    if (source.identity !== "registered_tool" && source.identity !== "implementation_symbol") return { diagnostic: at + ".source.identity must be registered_tool or implementation_symbol." }
+    if (source.identity !== undefined && source.identity !== "registered_tool" && source.identity !== "implementation_symbol") return { diagnostic: at + ".source.identity must be registered_tool or implementation_symbol when given." }
     if (typeof source.symbol !== "string" || !SYMBOL.test(source.symbol)) return { diagnostic: at + ".source.symbol must be an identifier of 1-128 characters." }
     if (source.path !== undefined && (typeof source.path !== "string" || !source.path.trim())) return { diagnostic: at + ".source.path must name a workspace file when given." }
     const sourcePath = typeof source.path === "string" ? source.path.trim() : undefined
@@ -138,14 +146,15 @@ const answerRequirementsOf = (value: unknown, tasks: IntentTaskDefinition[]): { 
     if (!Array.isArray(fields) || fields.length < 1 || new Set(fields).size !== fields.length || fields.some((field) => !fieldNames.includes(field))) {
       return { diagnostic: at + ".fields must be a non-empty list of unique values from " + fieldNames.join(", ") + "." }
     }
-    const identity = source.identity
+    const identity = source.identity as SourceIdentity | undefined
     const symbol = source.symbol
     for (const field of fields as AnswerField[]) {
       const kind = ANSWER_FIELD_KIND[field]
       const established = criteria.some((criterion) => {
         const verification = criterion.verification
-        return verification.kind === kind && "identity" in verification
-          && verification.identity === identity && verification.symbol === symbol && (sourcePath === undefined || verification.path === sourcePath)
+        if (verification.kind !== kind || !("symbol" in verification) || verification.symbol !== symbol) return false
+        if (sourcePath !== undefined && verification.path !== sourcePath) return false
+        return identity === undefined || verification.identity === identity
       })
       if (!established) return { diagnostic: at + ".fields includes " + field + ", but no " + kind + " criterion in the plan names " + symbol + (sourcePath === undefined ? "" : " in " + sourcePath) + "." }
     }

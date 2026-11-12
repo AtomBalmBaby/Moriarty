@@ -338,13 +338,20 @@ export class BaseProvider {
         return profiles
       },
       [EVENT_NAME.twinnyPromptInstructions]: (request) => this.promptInstructions(request),
-      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection, conversationId }) =>
-        void this.chat?.completion(messages, mentions, agentSelection, conversationId),
+      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection, conversationId }) => {
+        if (!this.chat) {
+          this.bridge?.emit(EVENT_NAME.twinnyNotification, "The chat is not ready. Reload the window and send again.")
+          this.bridge?.emit(EVENT_NAME.twinnyStopGeneration, { cancelled: true })
+          return
+        }
+        void this.chat.completion(messages, mentions, agentSelection, conversationId).catch((error: unknown) => {
+          logger.error(`[Chat] message failed conversation=${conversationId ?? "-"}: ${error instanceof Error ? error.message : String(error)}`)
+          this.bridge?.emit(EVENT_NAME.twinnyNotification, "The message could not be sent. See the Twinny output log for details.")
+        })
+      },
       [TODO_EVENT_NAME.getList]: async ({ conversationId }) => {
         if (this.activeConversationId() === conversationId) return this._todoRepository.getList(this.todoScope(conversationId))
-        const snapshot = await this._todoRepository.readList(this.todoReadScope(conversationId))
-        if (!snapshot) throw new Error("No TODO list exists for that conversation in this project")
-        return snapshot
+        return this._todoRepository.readList(this.todoReadScope(conversationId))
       },
       [TODO_EVENT_NAME.createItem]: async ({ conversationId, requestId, ...input }) => {
         await this._todoRepository.createItem(this.todoScope(conversationId), input as CreateTodoInput, requestId, "user")

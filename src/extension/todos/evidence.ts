@@ -107,7 +107,7 @@ export const compactToolEvidence = (input: ToolEvidenceInput): CompactToolEviden
     commandSha256: command === undefined ? undefined : commandDigest(command),
     failed: input.failed,
     exitCode: input.exitCode,
-    lineRange: start && end && end >= start ? { start, end } : start ? { start, end: start } : undefined,
+    lineRange: (input.name === "read_file" && !input.failed ? shownRange(text) : undefined) ?? (start && end && end >= start ? { start, end } : start ? { start, end: start } : undefined),
     fingerprints: unique([...text.matchAll(FINGERPRINT)].map((match) => match[0]), 8),
     resultIds: unique(resultIds, MAX_RESULT_IDS),
     summary
@@ -178,6 +178,16 @@ export interface PreservedEvidence {
   complete: boolean
   sources: EvidenceSource[]
   hits: EvidenceHit[]
+}
+
+/** The lines a successful read showed, from its header, so a clamped or cut read is not recorded as the requested range. */
+const shownRange = (text: string): { start: number; end: number } | undefined => {
+  const header = READ_HEADER.exec(text.split("\n", 1)[0] ?? "")
+  if (!header) return undefined
+  if (header[5] !== undefined) return { start: Number(header[5]), end: Number(header[5]) }
+  const start = Number(header[2])
+  const end = Number(header[3])
+  return start >= 1 && end >= start ? { start, end } : undefined
 }
 
 const parseSources = (text: string): EvidenceSource[] => {

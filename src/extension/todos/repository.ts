@@ -9,7 +9,8 @@ import {
   type EvidenceSource,
   MAX_EVIDENCE_TEXT,
   preserveEvidence,
-  redactEvidence
+  redactEvidence,
+  samePath
 } from "./evidence"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { SqliteFile, type SqliteLocation } from "./sqlite"
@@ -580,6 +581,25 @@ const symbolAliasesFor = (database: Database, projectId: string): SymbolAlias[] 
   }))
 
 /**
+ * Whether one read_file observation showed every line from startLine through endLine of the path. Coverage comes from the
+ * line range the tool reported in its own output header, not from the requested arguments: a read cut short or a request
+ * whose end_line the tool did not honor shows only what the header names.
+ */
+const observationShows = (
+  observation: { tool_name: string; evidence_metadata: string | null },
+  path: string,
+  startLine: number,
+  endLine: number
+): boolean => {
+  if (observation.tool_name !== "read_file" || !observation.evidence_metadata) return false
+  const metadata = JSON.parse(observation.evidence_metadata) as { sources?: EvidenceSource[] }
+  return (metadata.sources ?? []).some((source) =>
+    samePath(source.path, path) &&
+    source.startLine !== undefined && source.endLine !== undefined &&
+    source.startLine <= startLine && source.endLine >= endLine)
+}
+
+/**
  * Stores host-verified source facts from an accepted evaluation, in the reviewed conversation's list only.
  * A new fact supersedes earlier facts for the same symbol and path in that list. Project-wide currency is resolved on read.
  */
@@ -589,7 +609,7 @@ const recordAcceptedFacts = (
     plan: { plan_id: string; revision: number },
     itemId: string,
     evaluation: TodoEvaluation,
-    observations: Map<string, { tool_name: string; failed: number }>,
+    observations: Map<string, { tool_name: string; failed: number; evidence_metadata: string | null }>,
     acceptedAt: string
 ): void => {
     function refuse(index: number, reason: string): never {
@@ -604,6 +624,9 @@ const recordAcceptedFacts = (
     if (!fact.symbol.trim() || !fact.path.trim() || !fact.sourceHash.trim()) refuse(index, "fact is missing its symbol, path, or fingerprint")
     if (!Number.isInteger(fact.startLine) || !Number.isInteger(fact.endLine) || fact.startLine < 1 || fact.endLine < fact.startLine) {
       refuse(index, "fact has an invalid line range")
+    }
+    if (!observationShows(observation, fact.path, fact.startLine, fact.endLine)) {
+      refuse(index, "fact's line range is not fully shown by its cited observation")
     }
     if (fact.registeredTool !== undefined && !fact.registeredTool.trim()) refuse(index, "registered tool name is empty")
     const id = randomUUID()
@@ -1270,8 +1293,8 @@ export class TodoRepository {
       if (evaluation.criteria.length !== stored.length || evaluation.criteria.some((criterion, index) => criterion.criterionId !== stored[index].id)) {
         throw new Error("Evaluation criteria do not match the stored task criteria")
       }
-      const observations = rows<{ id: string; item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null }>(database,
-        "SELECT observations.id, observations.item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)", [list.id, list.id])
+      const observations = rows<{ id: string; item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; evidence_metadata: string | null }>(database,
+        "SELECT observations.id, observations.item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, evidence.metadata_json AS evidence_metadata FROM todo_tool_observations AS observations LEFT JOIN todo_tool_evidence AS evidence ON evidence.observation_id = observations.id WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)", [list.id, list.id])
       const evidenceIds = new Set(rows<{ id: string }>(database, "SELECT id FROM todo_evidence WHERE item_id = ?", [itemId]).map((entry) => entry.id))
       const observationIds = new Set(observations.map((observation) => observation.id))
       const acceptedObservationIds = new Set(acceptedFactsFor(database, list.project_id).map((fact) => fact.observationId))

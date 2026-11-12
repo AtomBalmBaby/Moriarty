@@ -11,6 +11,7 @@ import { replyParts } from "./reply-parts"
 import { getThinkingMessage, messageText } from "./text"
 import type {
   ChatCompletionMessage,
+  ExecutionDiagnostic,
   ReplyChangesView,
   ToolStepView
 } from "./types"
@@ -230,13 +231,37 @@ const renderChanges = (changes: ReplyChangesView | undefined): string => {
   return ["Files changed by this reply:", "", ...files].join("\n")
 }
 
+const EXECUTION_OUTCOME: Record<ExecutionDiagnostic["outcome"], string> = {
+  stalled: "Execution stalled before its task was verified complete.",
+  delivery_rejected: "Delivery rejected; the answer was withheld and not delivered.",
+  failed: "Execution failed; the answer was not delivered.",
+  cancelled: "Execution cancelled; the answer was not delivered."
+}
+
+const renderExecution = (execution: ExecutionDiagnostic): string => {
+  const rows = [
+    `- Conversation: \`${execution.conversationId}\``,
+    execution.planId ? `- Plan: \`${execution.planId}\`` : "",
+    execution.reconciliation ? `- Reconciliation: ${execution.reconciliation}` : "",
+    execution.verdict ? `- Delivery verdict: ${execution.verdict}${execution.verdictDetail ? `: ${execution.verdictDetail}` : ""}` : "",
+    execution.correction ? `- Corrective instruction: ${execution.correction}` : "",
+    `- Answer withheld: ${execution.answerWithheld ? "yes" : "no"}`,
+    `- Reason: ${execution.reason}`
+  ]
+  return ["Execution diagnostic:", "", ...rows.filter(Boolean)].join("\n")
+}
+
 const replyStatus = (
   message: ChatCompletionMessage,
-  inProgress: boolean
+  inProgress: boolean,
+  stalledAfter: boolean
 ): string => {
   if (inProgress)
     return "**Status:** in progress when exported; this is what had been written so far."
   const meta = message.meta
+  if (meta?.execution) return `**Status:** ${EXECUTION_OUTCOME[meta.execution.outcome]}`
+  if (stalledAfter)
+    return `**Status:** ${EXECUTION_OUTCOME.stalled} The task stayed unresolved after this reply; see the stop message that follows.`
   const steps = message.toolSteps ?? []
   const parts: string[] = []
   if (meta?.stopped) parts.push("Stopped by you before it finished.")
@@ -308,11 +333,25 @@ const renderText = (text: string, counter: Counter): string[] => {
   return out
 }
 
+/** A stall is recorded as its own message after the reply it ended, so the reply's status must look ahead. */
+const stalledBeforeNextUser = (
+  messages: ChatCompletionMessage[],
+  index: number
+): boolean => {
+  for (let next = index + 1; next < messages.length; next++) {
+    const message = messages[next]
+    if (message.role === USER) return false
+    if (message.meta?.execution?.outcome === "stalled") return true
+  }
+  return false
+}
+
 const renderAssistant = (
   message: ChatCompletionMessage,
   number: number,
   counter: Counter,
-  inProgress = false
+  inProgress = false,
+  stalledAfter = false
 ): string => {
   const { thinking, message: text } = getThinkingMessage(textOf(message))
   const model = message.meta?.model ? ` · \`${message.meta.model}\`` : ""
@@ -336,7 +375,8 @@ const renderAssistant = (
   if (changes) lines.push(changes, "")
   const withheld = renderWithheld(message)
   if (withheld) lines.push(withheld, "")
-  lines.push(replyStatus(message, inProgress))
+  if (message.meta?.execution) lines.push(renderExecution(message.meta.execution), "")
+  lines.push(replyStatus(message, inProgress, stalledAfter))
   return lines.join("\n")
 }
 
@@ -362,7 +402,13 @@ export const exportConversation = (
     sections.push(
       message.role === USER
         ? renderUser(message, number)
-        : renderAssistant(message, number, counter)
+        : renderAssistant(
+            message,
+            number,
+            counter,
+            false,
+            stalledBeforeNextUser(shown, index)
+          )
     )
   })
   if (inProgress)

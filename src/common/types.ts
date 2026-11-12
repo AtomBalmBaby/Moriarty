@@ -151,6 +151,29 @@ export interface ToolStepView {
 }
 
 /** What twinny knows about how one reply was produced. */
+/**
+ * Why an execution ended without delivering its answer, recorded on the message that reports it so the
+ * export and the transcript agree. Each field is bounded text or an identifier, never a withheld reply.
+ */
+export interface ExecutionDiagnostic {
+  /** `stalled`: the watchdog or budget ended it. `delivery_rejected`: the answer was withheld and not retried. `failed` and `cancelled` are the other outcomes. */
+  outcome: "stalled" | "delivery_rejected" | "failed" | "cancelled"
+  conversationId: string
+  /** The intent plan the execution belonged to, when there was one. */
+  planId?: string
+  /** The reconciliation state the workflow ended in. */
+  reconciliation?: string
+  /** The delivery verdict that rejected the answer, and its detail. */
+  verdict?: string
+  verdictDetail?: string
+  /** True when the generated answer was discarded rather than shown. */
+  answerWithheld?: boolean
+  /** The exact reason the execution stopped, including the corrective instruction. */
+  reason: string
+  /** The corrective instruction the delivery gate gave for the rejected answer. */
+  correction?: string
+}
+
 export interface ReplyMeta {
   model?: string
   /** The provider's label, or the teammate's machine for a team pool. */
@@ -169,6 +192,11 @@ export interface ReplyMeta {
   stopped?: boolean
   /** Agent mode used every tool step the reply had, so the work may be unfinished. */
   outOfSteps?: boolean
+  /**
+   * Why an execution ended without delivering its answer. Bounded: the reason and verdict
+   * text only, never a withheld model reply.
+   */
+  execution?: ExecutionDiagnostic
   /**
    * Credentials the secret shield replaced with placeholders before the
    * request left the machine: kinds and counts, never the values.

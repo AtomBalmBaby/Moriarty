@@ -341,6 +341,13 @@ const mountTodoPanel = async (conversationId: string) => {
   return {
     document: window.document,
     render,
+    click: async (selector: string) => {
+      const element = window.document.querySelector<HTMLElement>(selector)
+      assert.ok(element, `expected an element matching ${selector}`)
+      await act(async () => {
+        element.click()
+      })
+    },
     unmount: async () => {
       await act(async () => {
         root.unmount()
@@ -465,6 +472,50 @@ test("rapid conversation switches clear the previous list at once and ignore lat
       for (const held of heldListReplies ?? []) held.reply()
     })
     heldListReplies = undefined
+    await panel.unmount()
+  }
+})
+
+const EMPTY_CONVERSATION = "todo-empty-conversation"
+
+test("two completed TODOs both show after switching away and back once Show Completed is enabled", async () => {
+  todoLists.set(TODO_CONVERSATION, todoSnapshot(TODO_CONVERSATION, 5, { first: "completed", second: "completed" }))
+  todoLists.set(OTHER_CONVERSATION, todoSnapshot(OTHER_CONVERSATION, 1, { other: "in_progress" }))
+  const panel = await mountTodoPanel(TODO_CONVERSATION)
+  try {
+    // An all-completed list is retired, so its items stay hidden until Show Completed is pressed.
+    assert.equal(showsTask(panel.document, "first"), false)
+    assert.equal(showsTask(panel.document, "second"), false)
+    await panel.click("button[aria-pressed]")
+    assert.equal(showsTask(panel.document, "first"), true)
+    assert.equal(showsTask(panel.document, "second"), true)
+
+    await panel.render(OTHER_CONVERSATION)
+    assert.equal(showsTask(panel.document, "other"), true)
+    assert.equal(showsTask(panel.document, "first"), false)
+
+    await panel.render(TODO_CONVERSATION)
+    assert.equal(showsTask(panel.document, "first"), true, "the first completed TODO is restored on return")
+    assert.equal(showsTask(panel.document, "second"), true, "the second completed TODO is restored on return")
+    assert.equal(panel.document.querySelector("button[aria-pressed]")?.getAttribute("aria-pressed"), "true")
+  } finally {
+    await panel.unmount()
+  }
+})
+
+test("a conversation with no TODO list stays empty, with no fabricated items and no error", async () => {
+  todoLists.set(TODO_CONVERSATION, todoSnapshot(TODO_CONVERSATION, 2, { first: "in_progress" }))
+  const panel = await mountTodoPanel(TODO_CONVERSATION)
+  try {
+    assert.equal(showsTask(panel.document, "first"), true)
+    await panel.render(EMPTY_CONVERSATION)
+    assert.equal(showsTask(panel.document, "first"), false, "the previous conversation's TODO must not carry over")
+    assert.equal(inProgressCount(panel.document), 0)
+    assert.equal(panel.document.querySelector("button[aria-pressed]"), null, "no Show Completed control without completed TODOs")
+    assert.equal(panel.document.body.textContent?.includes("No TODO list"), false, "a missing list is not reported as an error")
+    await panel.render(TODO_CONVERSATION)
+    assert.equal(showsTask(panel.document, "first"), true)
+  } finally {
     await panel.unmount()
   }
 })

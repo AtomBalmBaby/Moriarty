@@ -435,7 +435,7 @@ test("native arguments with the slips small models make are mended, not refused"
   const steps: ToolStep[] = []
   await collect(withTools(client, workspaceTools(root), { mode: "native", onStep: (step) => steps.push(step) }).chat(ask("Read.")))
   assert.strictEqual(steps[0].parseError, undefined)
-  assert.strictEqual(steps[0].summary, "read `a.ts:1–1`")
+  assert.strictEqual(steps[0].summary, "read `a.ts` · whole file")
   const assistant = requests[1].messages[2] as unknown as { tool_calls: Array<{ function: { arguments: string } }> }
   assert.strictEqual(assistant.tool_calls[0].function.arguments, "{\"path\":\"a.ts\"}", "the conversation carries the mended arguments")
 })
@@ -861,7 +861,7 @@ test("a call repeated with nothing changed in between is answered with a pointer
   const counting: WorkspaceTools = { ...tools, run: (call, context) => (runs++, tools.run(call, context)) }
   await collect(withTools(client, counting, { mode: "native", onStep: (step) => steps.push(step) }).chat(ask("Read.")))
   assert.strictEqual(runs, 2, "the repeat never reached the tool")
-  assert.strictEqual(steps[1].summary, "read `a.ts:1–1` · repeated, not run again")
+  assert.strictEqual(steps[1].summary, "read `a.ts` · whole file · repeated, not run again")
   const repeat = requests[2].messages[requests[2].messages.length - 1]
   assert.match(String(repeat.content), /^You already called read_file with these same arguments in this reply/)
   assert.ok(requests[3].tools, "one repeat is not enough to stop the reply's tools")
@@ -963,7 +963,7 @@ test("a read after a change runs again, and so does one whose result was trimmed
   ])
   const steps: ToolStep[] = []
   await collect(withTools(client, workspaceTools(root, [], { edits }), { mode: "native", onStep: (step) => steps.push(step) }).chat(ask("Change.")))
-  assert.strictEqual(steps[2].summary, "read `a.ts:1–1`")
+  assert.strictEqual(steps[2].summary, "read `a.ts` · whole file")
   assert.match(steps[2].output, /1: two/)
 
   const body = Array.from({ length: 60 }, (_, i) => `const value${i} = "${"x".repeat(30)}"`).join("\n")

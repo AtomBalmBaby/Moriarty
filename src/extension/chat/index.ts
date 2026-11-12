@@ -39,6 +39,7 @@ import type { TodoListSnapshot } from "../../common/types"
 import {
   ChatCompletionMessage,
   Conversation,
+  ExecutionDiagnostic,
   MentionType,
   ReplyChangesView,
   TwinnyProvider
@@ -65,8 +66,8 @@ import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
-import { type AcceptedFactStatus, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
+import { type AcceptedFactStatus, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
@@ -78,7 +79,7 @@ import { type ToolCall, toolDefinition } from "../tools/protocol"
 import { type TodoToolOptions, todoTools, todoWorkspaceTools } from "../tools/todos"
 import { WorkspaceView } from "../tools/view"
 import type { ToolResult } from "../tools/workspace"
-import { ToolExtras, WorkspaceSearchProvider, WorkspaceTools, workspaceTools } from "../tools/workspace"
+import { readFileSettings, ToolExtras, WorkspaceSearchProvider, WorkspaceTools, workspaceTools } from "../tools/workspace"
 import { getLanguage } from "../utils"
 
 import { ChatContextBuilder } from "./context"
@@ -145,9 +146,6 @@ const PROVIDER_RESUME_DELAY_MS = 1000
 /** The steps an agent reply may take, as `twinny.chatToolsMaxSteps` may set them. */
 const MIN_STEPS_SETTING = 4
 const MAX_STEPS_SETTING = 100
-const DEFAULT_READ_LINES = 1000
-const MIN_READ_LINES = 100
-const MAX_READ_LINES = 5000
 const DEFAULT_RESULT_CHARS = 100_000
 const MIN_RESULT_CHARS = 10_000
 const MAX_RESULT_CHARS = 200_000
@@ -422,17 +420,20 @@ export class Chat extends Base {
     this._feedbackGate = new FeedbackGate({
       planner: this._feedbackPlanner,
       busy: () => this._generation.running || this._preparing,
-      notify: (message) => this._steps.said("feedback-blocked", message)
+      notify: (message) => this._steps.said("feedback-blocked", message),
+      operate: (body) => this.operate(body)
     })
 
     // Initialize generation and context
     this._generation = new ChatGeneration(bridge, generations)
     this._lifecycle = new OperationLifecycle(
       () => this._bridge.emit(EVENT_NAME.twinnyOnLoading, { continuation: 0 }),
-      () => this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {
-        cancelled: this._generation.cancelled,
+      (operationId, outcome) => this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {
+        operationId,
+        cancelled: outcome === "cancelled" || this._generation.cancelled,
         ...(this._generation.cancellationReason ? { cancellationReason: this._generation.cancellationReason } : {})
-      })
+      }),
+      (event, operationId, detail) => logger.debug(`[Operation] ${event} operation=${operationId} conversation=${this._activeConversationId ?? "-"}${detail ? " " + detail : ""}`)
     )
     this._context = new ChatContextBuilder(extensionContext, bridge, new TemplateProvider(templateDir), search)
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
@@ -447,6 +448,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     if (root) {
       // Build a minimal extras object that enables all native tools
       const extras: ToolExtras = {
+        ...readFileSettings((key, fallback) => this.config.get(key, fallback)),
         workspaceSearch: this._workspaceSearch,
         edits: {
           mode: "apply" as const,
@@ -513,6 +515,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     this._executionAbort?.abort()
     this._activeExecution?.cancel()
     this._generation.abort()
+    // Cancelling ends the open operation at once, even while its work is stalled. With no
+    // open operation the webview still gets a terminal, so a stale busy state is cleared.
+    if (!this._lifecycle.cancel("user")) this._bridge.emit(EVENT_NAME.twinnyStopGeneration, { cancelled: true })
   }
 
   /** Stop every chat request, including background titles and draft hints. */
@@ -801,8 +806,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     this._evidencePreflight = undefined
     this._evidencePreflightCheck = undefined
     const provider = this.start()
-    if (!provider) return undefined
-    return this.operate(() => this.completionReply(provider, messages, mentions, requestedSelection, conversationId))
+    // Run even without a provider, so the webview receives a terminal and the user sees why nothing ran.
+    return this.operate(async () => {
+      if (!provider) {
+        logger.warn(`[Chat] message not started: no chat provider conversation=${conversationId ?? "-"}`)
+        this._bridge.emit(EVENT_NAME.twinnyNotification, "No chat provider is configured. Choose one in Twinny settings, then send again.")
+        return undefined
+      }
+      return this.completionReply(provider, messages, mentions, requestedSelection, conversationId)
+    })
   }
 
   private async completionReply(
@@ -900,6 +912,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       if (!feedbackOn) logger.debug("[Feedback] planning not started: Feedback is off")
       const planning = feedbackOn ? this.startFeedbackPlanning(messages) : undefined
       const dispatch = async (): Promise<string | undefined> => {
+        // A turn whose operation was cancelled while it waited for planning must not start.
+        if (this._lifecycle.contextCancelled) return undefined
         this._replyText = this.latestUserText(messages) ?? ""
         this._evidencePreflight = await this.runEvidencePreflight(this.latestUserText(messages) ?? "")
         const scope = this.activeTodoScope()
@@ -940,6 +954,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         } finally {
           this._preparing = false
         }
+        if (this._lifecycle.contextCancelled) return undefined
+        logger.debug(`[Operation] inference dispatched operation=${this._lifecycle.operationId ?? "-"} conversation=${conversationId ?? "-"}`)
         return this.run(provider, "", view)
       }
       return await this._feedbackGate.admit(conversationId ?? "", planning, dispatch)
@@ -952,7 +968,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   public async templateCompletion(template: string, context?: string) {
     const provider = this.start()
     if (!provider) return ""
-    return this.operate(async () => {
+    return this.operateText(async () => {
       this._conversation = await this.buildTemplateConversation(template, context)
       return this.run(provider)
     })
@@ -970,7 +986,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   ): Promise<string> {
     const provider = this.start()
     if (!provider) return ""
-    return this.operate(async () => {
+    return this.operateText(async () => {
       const code = formatContextEntries(attached)
       const content = (code ? `${prompt}\n\nAttached code:\n\n${code}` : prompt).trim()
       this._bridge.emit(EVENT_NAME.twinnySetTab, WEBUI_TABS.chat)
@@ -1003,7 +1019,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   ): Promise<string> {
     const provider = this.start()
     if (!provider) return ""
-    return this.operate(() => {
+    return this.operateText(() => {
       this._conversation = messages
       return this.run(provider, prefix)
     })
@@ -1119,8 +1135,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * continuation, and reviews. The webview keeps Stop until the operation's
    * terminal `twinnyStopGeneration` is emitted.
    */
-  private operate<T>(body: () => Promise<T>): Promise<T> {
+  private operate<T>(body: () => Promise<T>): Promise<T | undefined> {
     return this._lifecycle.run(body)
+  }
+
+  /** As operate, for a body that yields text: a cancelled operation yields "". */
+  private async operateText(body: () => Promise<string>): Promise<string> {
+    return (await this.operate(body)) ?? ""
   }
 
   /** A reconnected webview has lost its composer state; re-announce an open operation. */
@@ -1540,7 +1561,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         }
         this._awaitingDelivery = undefined
         const reason = `The answer was not delivered. ${outcome.reason ?? ""}`.trim()
-        this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution stopped: ${reason}` })
+        this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
+          role: ASSISTANT,
+          content: `Execution stopped: ${reason}`,
+          meta: {
+            execution: {
+              outcome: "delivery_rejected",
+              conversationId: scope.conversationId,
+              planId: intent.planId,
+              reconciliation: outcome.state,
+              verdict: verdict.outcome,
+              verdictDetail: verdict.detail.slice(0, 800),
+              correction: verdict.correction.slice(0, 800),
+              answerWithheld: true,
+              reason: reason.slice(0, 800)
+            }
+          }
+        })
         logger.warn("[Execution] stopped: " + reason)
         return undefined
       }
@@ -1609,11 +1646,22 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       const reason = failure?.unrecordedTool
         ? "A tool ran but its result could not be recorded in the task ledger before the provider failed, so resuming could repeat its effect."
         : (outcome.reason ?? "The autonomous execution retry budget was exhausted.") + (open.length ? ` Unsatisfied: ${open.slice(0, 3).join("; ")}.` : "") + unresolved + detail
-      this._bridge.emit(EVENT_NAME.twinnyAddMessage, { role: ASSISTANT, content: `Execution stopped: ${reason}` })
+      const execution: ExecutionDiagnostic["outcome"] = failure ? "failed" : outcome.state === "cancelled" ? "cancelled" : "stalled"
+      this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
+        role: ASSISTANT,
+        content: `Execution stopped: ${reason}`,
+        meta: {
+          execution: {
+            outcome: execution,
+            conversationId: scope.conversationId,
+            planId: intent.planId,
+            reconciliation: outcome.state,
+            answerWithheld: false,
+            reason: reason.slice(0, 800)
+          }
+        }
+      })
       logger.warn("[Execution] stopped: " + reason)
-      return undefined
-    }
-    if (failure) {
       await pause(PROVIDER_RESUME_DELAY_MS, this._executionAbort?.signal).catch(() => undefined)
       if (this.cancelled || workflow.isCancelled()) {
         workflow.cancel()
@@ -1995,7 +2043,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           feedback: feedbackContext(active) || undefined
         }
       }
-      return "Active task from Twinny's native TODO plan (context only; preserve all other instructions):\n" + JSON.stringify(projection)
+      return "Active task from Twinny's native TODO plan (context only; preserve all other instructions; ids and revisions are TODO repository state, not workspace symbols):\n" + JSON.stringify(projection)
     } catch (error) {
       logger.warn(`[Intent] Could not load active task context: ${error instanceof Error ? error.message : String(error)}`)
       return ""
@@ -2347,12 +2395,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const approveChange = (detail: string, approval: "command" | "change") =>
       this._steps.approve(detail, approval)
     const search = this._search
-    const maxReadLines = clampNumericSetting(
-      this.config.get<number>("chatToolsMaxReadLines", DEFAULT_READ_LINES),
-      MIN_READ_LINES,
-      MAX_READ_LINES,
-      DEFAULT_READ_LINES
-    )
     const maxResultChars = clampNumericSetting(
       this.config.get<number>("chatToolsMaxResultChars", DEFAULT_RESULT_CHARS),
       MIN_RESULT_CHARS,
@@ -2368,7 +2410,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       workspaceSearch: this._workspaceSearch,
       edits: editorEdits(view, editMode, approveChange, changes, safety),
       editor: editorKnowledge(view, editMode, approveChange, changes, safety),
-      readFileMaxLines: maxReadLines,
+      ...readFileSettings((key, fallback) => this.config.get(key, fallback)),
       todos: this._todoRepository && todoScope ? {
         repository: this._todoRepository,
         scope: todoScope,

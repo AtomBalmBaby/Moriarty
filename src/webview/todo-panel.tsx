@@ -48,7 +48,8 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     try {
       const next = await bridge.request(TODO_EVENT_NAME.getList, { conversationId })
       if (conversationIdRef.current === conversationId) {
-        setHeldSnapshot((current) => applyTodoSnapshot(conversationId, current, next))
+        // A conversation with no list yet has no snapshot; the panel shows its empty state.
+        setHeldSnapshot((current) => (next ? applyTodoSnapshot(conversationId, current, next) : current))
         setError("")
       }
     } catch (reason) {

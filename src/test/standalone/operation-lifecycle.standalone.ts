@@ -2,8 +2,10 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import type { TwinnyProvider } from "../../common/types"
+import { FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository } from "../../extension/chat/feedback-planner"
 import { ChatGeneration } from "../../extension/chat/generation"
 import { OperationLifecycle } from "../../extension/chat/operation-lifecycle"
+import type { RoleResolution } from "../../extension/chat/role-inference"
 import { GenerationTracker } from "../../extension/generations"
 import type { ChatRequest, InferenceClient } from "../../extension/inference"
 import type { ExtensionBridge } from "../../extension/messaging/bridge"
@@ -113,4 +115,230 @@ test("stopping before a request is dispatched starts no model request", async ()
   assert.equal(await generation.generate(inference, chatRequest, provider), "")
   assert.equal(calls.started, 0)
   generation.dispose()
+})
+
+const settle = () => new Promise((resolve) => setImmediate(resolve))
+
+const scope = { projectFingerprint: "project", conversationId: "chat", writer: "chat" }
+
+/** A TODO store whose planning reads never answer, as a wedged database would not. */
+const stalledRepository = (overrides: Partial<FeedbackPlanRepository> = {}) => ({
+  getIntentTaskPlan: () => new Promise<never>(() => undefined),
+  intentPlanClosed: async () => false,
+  listAcceptedEvidence: async () => [],
+  synchronizeIntentPlan: async () => {
+    throw new Error("the planning under test must not write")
+  },
+  ...overrides
+}) as unknown as FeedbackPlanRepository
+
+const readyRepository = (overrides: Partial<FeedbackPlanRepository> = {}) =>
+  stalledRepository({ getIntentTaskPlan: async () => undefined, ...overrides })
+
+const untracked = JSON.stringify({ track: false, plan: null })
+
+/** Mirrors the chat host: a message runs Feedback planning and then the gate-held turn, inside one operation. */
+const chatHarness = (repository: () => FeedbackPlanRepository | undefined, reply: () => Promise<string> = async () => untracked) => {
+  const { events, lifecycle } = recorder()
+  const inference = { calls: 0 }
+  const planner = new FeedbackPlanner({
+    enabled: () => true,
+    repository,
+    resolve: () => ({
+      ok: true,
+      endpoint: {
+        infer: async () => {
+          inference.calls += 1
+          return reply()
+        },
+        provider: "scripted",
+        model: "feedback-model",
+        label: "Scripted"
+      }
+    }) as unknown as RoleResolution
+  })
+  const gate = new FeedbackGate({ planner, busy: () => false, notify: () => undefined })
+  const dispatches = { count: 0 }
+  const send = (prompt: string) => lifecycle.run(() => gate.admit("chat", planner.start(scope, prompt), async () => {
+    dispatches.count += 1
+    return "reply"
+  }))
+  return { events, lifecycle, planner, gate, inference, dispatches, send }
+}
+
+test("cancel ends an operation whose Feedback planning is stalled", async () => {
+  // Regression: a stalled planning read kept the webview busy and Cancel had no effect.
+  let repository: () => FeedbackPlanRepository = () => stalledRepository()
+  const chat = chatHarness(() => repository())
+  const pending = chat.send("Fix the parser.")
+  await settle()
+  assert.equal(chat.lifecycle.active, true)
+  const planning = chat.planner.pending()
+  // Host abort() cancels Feedback planning, then the operation.
+  chat.planner.cancel("user")
+  assert.equal(chat.lifecycle.cancel("user"), true)
+  assert.equal(await pending, undefined)
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+  assert.equal(chat.lifecycle.active, false)
+  assert.equal((await planning)?.status, "cancelled")
+  assert.equal(chat.inference.calls, 0)
+  assert.equal(chat.dispatches.count, 0)
+
+  repository = () => readyRepository()
+  assert.equal(await chat.send("well?"), "reply")
+  assert.deepEqual(chat.events, ["opened", "terminal", "opened", "terminal"])
+  assert.equal(chat.dispatches.count, 1)
+})
+
+test("a repeated cancel reports one terminal and an idle operation reports none", async () => {
+  const { events, lifecycle } = recorder()
+  assert.equal(lifecycle.cancel("user"), false)
+  const pending = lifecycle.run(() => new Promise<never>(() => undefined))
+  assert.equal(lifecycle.cancel("user"), true)
+  assert.equal(lifecycle.cancel("user"), false)
+  assert.equal(await pending, undefined)
+  assert.deepEqual(events, ["opened", "terminal"])
+})
+
+test("late results of a cancelled operation neither reopen it nor overwrite a newer one", async () => {
+  const { events, lifecycle } = recorder()
+  let release: () => void = () => undefined
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let continuationRan = false
+  const stale = lifecycle.run(async () => {
+    await gate
+    // A continuation of the cancelled turn must not join or reopen a newer operation.
+    await lifecycle.run(async () => { continuationRan = true })
+    return "late reply"
+  })
+  assert.equal(lifecycle.cancel("user"), true)
+  assert.equal(await stale, undefined)
+  const newer = lifecycle.run(async () => "newer reply")
+  release()
+  assert.equal(await newer, "newer reply")
+  assert.equal(continuationRan, false)
+  assert.deepEqual(events, ["opened", "terminal", "opened", "terminal"])
+  assert.equal(lifecycle.active, false)
+})
+
+test("a Feedback planner exception ends the operation, and the next message runs", async () => {
+  let broken = true
+  const chat = chatHarness(() => {
+    if (broken) throw new Error("TODO storage closed")
+    return readyRepository()
+  })
+  await assert.rejects(chat.send("Fix the parser."), /TODO storage closed/)
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+  assert.equal(chat.lifecycle.active, false)
+  broken = false
+  assert.equal(await chat.send("Fix the parser."), "reply")
+  assert.deepEqual(chat.events, ["opened", "terminal", "opened", "terminal"])
+})
+
+test("a rejected Feedback read fails the plan, holds the turn, and ends the operation", async () => {
+  const chat = chatHarness(() => readyRepository({
+    getIntentTaskPlan: async () => {
+      throw new Error("database is locked")
+    }
+  }))
+  assert.equal(await chat.send("Fix the parser."), undefined)
+  assert.equal(chat.dispatches.count, 0)
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+  assert.equal(chat.lifecycle.active, false)
+})
+
+test("an intent write exception stops the turn before the model is dispatched", async () => {
+  const chat = chatHarness(() => readyRepository({
+    synchronizeIntentPlan: async () => {
+      throw new Error("intent write failed")
+    }
+  }), async () => JSON.stringify({
+    track: true,
+    plan: {
+      planId: "plan-a",
+      version: 1,
+      revision: 1,
+      goal: "Fix the parser",
+      constraints: [],
+      tasks: [{ id: "inspect", title: "Inspect parser", description: "Find the bug", criteria: [{ id: "criterion-1", description: "Bug located", verification: { kind: "semantic_review" } }], dependencies: [] }]
+    }
+  }))
+  assert.equal(await chat.send("Fix the parser."), undefined)
+  assert.equal(chat.dispatches.count, 0)
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+})
+
+test("a conversation switch during pending planning does not dispatch the old turn", async () => {
+  let finishRead: () => void = () => undefined
+  const read = new Promise<undefined>((resolve) => { finishRead = () => resolve(undefined) })
+  const chat = chatHarness(() => readyRepository({ getIntentTaskPlan: () => read }))
+  const pending = chat.send("Fix the parser.")
+  await settle()
+  chat.gate.clear()
+  finishRead()
+  assert.equal(await pending, undefined)
+  assert.equal(chat.dispatches.count, 0)
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+})
+
+/** A plan whose criterion names a tool with the identity the validator rejects, as the Intent model returned it. */
+const invalidIdentity = JSON.stringify({
+  track: true,
+  plan: {
+    planId: "plan-a",
+    version: 1,
+    revision: 1,
+    goal: "Check twinny_todo_update.",
+    constraints: [],
+    tasks: [{
+      id: "lookup",
+      title: "Check twinny_todo_update",
+      description: "Consult accepted evidence.",
+      dependencies: [],
+      criteria: [
+        { id: "criterion-1", description: "The lookup completed.", verification: { kind: "evidence_lookup_completed" } },
+        { id: "criterion-2", description: "twinny_todo_update is described.", verification: { kind: "accepted_fact_exists", identity: "tool", symbol: "twinny_todo_update" } }
+      ]
+    }]
+  }
+})
+
+test("a repeated rejected plan ends its operation without dispatch, and the next message plans and runs", async () => {
+  let answer = invalidIdentity
+  const chat = chatHarness(() => readyRepository(), async () => answer)
+  assert.equal(await chat.send("Check twinny_todo_update."), undefined)
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+  assert.equal(chat.lifecycle.active, false)
+  assert.equal(chat.inference.calls, 2, "the identical correction is a repetition, so planning stops")
+  assert.equal(chat.dispatches.count, 0)
+
+  answer = untracked
+  assert.equal(await chat.send("well?"), "reply")
+  assert.deepEqual(chat.events, ["opened", "terminal", "opened", "terminal"])
+  assert.equal(chat.dispatches.count, 1)
+})
+
+test("cancel during a correction of a rejected plan ends the operation once, and a late correction revives nothing", async () => {
+  let calls = 0
+  let late: ((reply: string) => void) | undefined
+  const chat = chatHarness(() => readyRepository(), () => {
+    calls += 1
+    if (calls === 1) return Promise.resolve(invalidIdentity)
+    return new Promise<string>((resolve) => { late = resolve })
+  })
+  const pending = chat.send("Check twinny_todo_update.")
+  await settle()
+  assert.equal(chat.lifecycle.active, true)
+  assert.equal(calls, 2, "the correction is in flight")
+
+  chat.planner.cancel("user")
+  assert.equal(chat.lifecycle.cancel("user"), true)
+  assert.equal(await pending, undefined)
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+
+  late?.(untracked)
+  await settle()
+  assert.equal(chat.dispatches.count, 0, "a late correction cannot start the cancelled turn")
+  assert.deepEqual(chat.events, ["opened", "terminal"])
+  assert.equal(chat.lifecycle.active, false)
 })

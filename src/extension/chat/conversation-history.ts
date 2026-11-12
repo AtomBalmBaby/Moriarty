@@ -97,18 +97,19 @@ export class ConversationHistory extends Base {
     this.setActiveConversation(undefined)
   }
 
-  updateConversation(conversation: Conversation) {
-    if (!conversation.id) return
-
+  private storeConversation(id: string, conversation: Conversation): Conversation {
     const conversations = this.getConversations() || {}
-
     const stamped = { ...conversation, updatedAt: Date.now() }
     this.context?.globalState.update(CONVERSATION_STORAGE_KEY, {
       ...conversations,
-      [conversation.id]: stamped
+      [id]: stamped
     })
+    return stamped
+  }
 
-    this.setActiveConversation(stamped)
+  updateConversation(conversation: Conversation) {
+    if (!conversation.id) return
+    this.setActiveConversation(this.storeConversation(conversation.id, conversation))
   }
 
   /** A title the user typed sticks: the model is not asked again. */
@@ -183,13 +184,13 @@ export class ConversationHistory extends Base {
    * than paying for another request every time a message lands.
    */
   async saveConversation(conversation: Conversation) {
-    const activeConversation = this.getActiveConversation()
-    if (!activeConversation) return
+    if (!conversation.id) return
 
+    const stored = this.getConversations()?.[conversation.id]
     const isFirstExchange = conversation.messages.length === 2
-    let title = activeConversation.title
+    let title = stored?.title || conversation.title
 
-    if (isFirstExchange && !activeConversation.pinnedTitle) {
+    if (isFirstExchange && !stored?.pinnedTitle) {
       title =
         (await this._generateTitleWithLlm(conversation.messages)) || title
     }
@@ -197,11 +198,24 @@ export class ConversationHistory extends Base {
       title = this.getConversationTitle(conversation.messages)
     }
 
-    return this.updateConversation({
-      ...activeConversation,
+    // The title request is awaited, so a rename may have landed meanwhile.
+    const latest = this.getConversations()?.[conversation.id]
+    if (latest?.pinnedTitle) title = latest.title
+
+    const saved = this.storeConversation(conversation.id, {
+      ...(latest ?? stored ?? conversation),
+      id: conversation.id,
       messages: conversation.messages,
       title
     })
+
+    const active = this.context?.globalState.get<Conversation>(ACTIVE_CONVERSATION_STORAGE_KEY)
+    if (active?.id === saved.id) {
+      this.setActiveConversation(saved)
+    } else {
+      this.getAllConversations()
+    }
+    return saved
   }
 
   private async _generateTitleWithLlm(

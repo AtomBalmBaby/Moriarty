@@ -102,7 +102,7 @@ test("an administrative plan gets one corrective retry that names the offending 
     })
     const { result } = await quietly(() => planner.start(scope, "Locate read_file."))
     assert.equal(result.status, "failed")
-    assert.equal(calls, FEEDBACK_PLAN_ATTEMPTS, "the first reply and bounded corrections, then no further attempts")
+    assert.equal(calls, 2, "the first reply and one correction; an identical correction is a repetition, so planning stops")
     assert.equal(await repository.getIntentTaskPlan(scope), undefined, "an invalid plan is never written")
   })
 })
@@ -816,18 +816,18 @@ test("an invalid identity is corrected from the exact diagnostic and the correct
   await withRepository(async (repository) => {
     const requests: Sent[] = []
     const planner = plannerWith(repository, scripted([
-      lookupReply({ kind: "accepted_fact_exists", symbol: "read_file" }),
+      lookupReply({ kind: "accepted_fact_exists", identity: "tool", symbol: "read_file" }),
       lookupReply({ kind: "accepted_fact_exists", identity: "registered_tool", symbol: "read_file" })
     ], requests))
     const { result } = await quietly(() => planner.start(scope, "Check read_file."))
     assert.equal(result.status, "planned")
     assert.equal(requests.length, 2)
-    assert.match(requests[1].user, /Your previous reply was rejected: Invalid task plan: plan\.tasks\[0\]\.criteria\[1\]\.verification\.identity must be registered_tool or implementation_symbol; received nothing\./)
+    assert.match(requests[1].user, /Your previous reply was rejected: Invalid task plan: plan\.tasks\[0\]\.criteria\[1\]\.verification\.identity must be registered_tool or implementation_symbol when given; received "tool"\./)
     assert.ok(await repository.getIntentTaskPlan(scope))
   })
 })
 
-test("repeated invalid identities exhaust the planning budget with the exact unresolved diagnostic and write nothing", async () => {
+test("repeated identical invalid identities stop at the first repeated reply with the exact diagnostic and write nothing", async () => {
   await withRepository(async (repository) => {
     const invalid = lookupReply({ kind: "accepted_fact_exists", identity: "tool", symbol: "read_file" })
     const requests: Sent[] = []
@@ -835,8 +835,8 @@ test("repeated invalid identities exhaust the planning budget with the exact unr
     const planner = plannerWith(repository, scripted([invalid, invalid, invalid, invalid], requests), failures)
     const { result } = await quietly(() => planner.start(scope, "Check read_file."))
     assert.equal(result.status, "failed")
-    assert.equal(requests.length, 3)
-    assert.deepEqual(failures, ["Feedback could not plan TODOs: Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol; received \"tool\"."])
+    assert.equal(requests.length, 2)
+    assert.deepEqual(failures, ["Feedback could not plan TODOs: Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol when given; received \"tool\". The corrected reply repeated the rejected one, so planning stopped."])
     assert.equal(await repository.getIntentTaskPlan(scope), undefined)
   })
 })
@@ -865,13 +865,14 @@ test("each identity-bearing kind parses with its identity, with and without the 
   }
 })
 
-test("a source criterion with an unsupported identity is rejected, and a missing identity names the field", () => {
+test("a source criterion with an unsupported identity is rejected, and a missing identity is accepted as identity-free", () => {
   const unknown = parseFeedbackPlanResponse(lookupReply({ kind: "source_location", identity: "tool", symbol: "read_file" }), "Locate read_file.")
   assert.ok("error" in unknown)
-  assert.equal(unknown.error, "Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol; received \"tool\".")
+  assert.equal(unknown.error, "Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol when given; received \"tool\".")
   const missing = parseFeedbackPlanResponse(lookupReply({ kind: "source_fingerprint", symbol: "readFile", path: "src/tools.ts" }), "Locate readFile.")
-  assert.ok("error" in missing)
-  assert.equal(missing.error, "Invalid task plan: plan.tasks[0].criteria[1].verification.identity must be registered_tool or implementation_symbol; received nothing.")
+  assert.ok("plan" in missing, JSON.stringify(missing))
+  const verification = missing.plan.tasks[0].criteria[1].verification
+  assert.equal("identity" in verification ? verification.identity : undefined, undefined)
 })
 
 test("a reply stopped at the output limit is reported without a correction call", async () => {
@@ -1232,4 +1233,173 @@ test("the trusted-facts prompt block lists live facts with exact locations and i
   assert.match(block, /registered tool read_file implemented by readFile at src\/extension\/tools\/workspace\.ts lines 169-220/)
   const many = Array.from({ length: 30 }, (_, index) => acceptedFact({ id: `fact-${index}`, path: `src/file-${index}.ts`, registeredTool: undefined, symbol: `symbol${index}` }))
   assert.equal(trustedFactsBlock(many).split("\n").length, 21, "one heading plus at most twenty facts")
+})
+
+const twinnyRegistration = acceptedFact({
+  id: "fact-twinny",
+  criterion: "twinny_todo_update is registered",
+  toolName: "twinny_todo_update",
+  symbol: "updateTodos",
+  registeredTool: "twinny_todo_update",
+  path: "src/extension/todos/tool.ts",
+  startLine: 10,
+  endLine: 40
+})
+
+test("an implementation_symbol that names a registered tool is repaired to identity-free, keeping its kind and target, and the repair is reported", () => {
+  const invalid = lookupReply({ kind: "accepted_fact_exists", identity: "implementation_symbol", symbol: "twinny_todo_update" })
+  const parsed = parseFeedbackPlanResponse(invalid, "Locate twinny_todo_update.", [twinnyRegistration])
+  assert.ok("plan" in parsed, "the registration-named target is repaired, not rejected")
+  assert.deepEqual("repairs" in parsed ? parsed.repairs : undefined, ["lookup/criterion-2: implementation_symbol twinny_todo_update -> identity-free"])
+  assert.deepEqual(JSON.parse(JSON.stringify(parsed.plan.tasks[0].criteria[1].verification)), { kind: "accepted_fact_exists", symbol: "twinny_todo_update" })
+})
+
+test("a registered_tool that names a declaration is repaired to identity-free, and a correct identity is never changed", () => {
+  const declaration = parseFeedbackPlanResponse(lookupReply({ kind: "accepted_fact_exists", identity: "registered_tool", symbol: "updateTodos" }), "Locate updateTodos.", [twinnyRegistration])
+  assert.ok("plan" in declaration)
+  assert.deepEqual("repairs" in declaration ? declaration.repairs : undefined, ["lookup/criterion-2: registered_tool updateTodos -> identity-free"])
+  const correct = parseFeedbackPlanResponse(lookupReply({ kind: "accepted_fact_exists", identity: "registered_tool", symbol: "twinny_todo_update" }), "Locate twinny_todo_update.", [twinnyRegistration])
+  assert.ok("plan" in correct)
+  assert.equal("repairs" in correct, false, "a criterion that agrees with evidence is unchanged")
+  assert.equal(JSON.parse(JSON.stringify(correct.plan.tasks[0].criteria[1].verification)).identity, "registered_tool")
+})
+
+test("an implementation_symbol that no accepted evidence contradicts is left as written, never silently changed", () => {
+  const parsed = parseFeedbackPlanResponse(lookupReply({ kind: "accepted_fact_exists", identity: "implementation_symbol", symbol: "ghostTool" }), "Locate ghostTool.", [twinnyRegistration])
+  assert.ok("plan" in parsed)
+  assert.equal("repairs" in parsed, false)
+  assert.equal(JSON.parse(JSON.stringify(parsed.plan.tasks[0].criteria[1].verification)).identity, "implementation_symbol")
+})
+
+test("the twinny_todo_update scenario: accepted registration reaches the planner, the wrong identity is repaired without another call, and the plan is written", async () => {
+  await withRepository(async (repository) => {
+    const withEvidence: FeedbackPlanRepository = {
+      getIntentTaskPlan: (request) => repository.getIntentTaskPlan(request),
+      intentPlanClosed: (request) => repository.intentPlanClosed(request),
+      listAcceptedEvidence: async () => [twinnyRegistration],
+      synchronizeIntentPlan: (request, candidate, intentResult) => repository.synchronizeIntentPlan(request, candidate, intentResult)
+    }
+    const requests: Sent[] = []
+    const planner = plannerWith(withEvidence, scripted([
+      lookupReply({ kind: "accepted_fact_exists", identity: "implementation_symbol", symbol: "twinny_todo_update" })
+    ], requests))
+    const { result } = await quietly(() => planner.start(scope, "Locate twinny_todo_update."))
+    assert.equal(result.status, "planned")
+    assert.equal(requests.length, 1, "the repair needs no second planning call")
+    assert.match(requests[0].user, /registered tool twinny_todo_update implemented by updateTodos/)
+    const stored = await repository.getIntentTaskPlan(scope)
+    assert.ok(stored)
+    assert.deepEqual(JSON.parse(JSON.stringify(stored.tasks[0].criteria[1].verification)), { kind: "accepted_fact_exists", symbol: "twinny_todo_update" })
+  })
+})
+
+test("a correction carries the rejected reply and the exact diagnostic, and a revised valid criterion is accepted", async () => {
+  await withRepository(async (repository) => {
+    const rejected = lookupReply({ kind: "accepted_fact_exists", identity: "tool", symbol: "twinny_todo_update" })
+    const corrected = lookupReply({ kind: "accepted_fact_exists", identity: "registered_tool", symbol: "twinny_todo_update" })
+    const requests: Sent[] = []
+    const planner = plannerWith(repository, scripted([rejected, corrected], requests))
+    const { result } = await quietly(() => planner.start(scope, "Check twinny_todo_update."))
+    assert.equal(result.status, "planned")
+    assert.equal(requests.length, 2)
+    assert.match(requests[1].user, /Your previous reply was rejected: Invalid task plan: plan\.tasks\[0\]\.criteria\[1\]\.verification\.identity must be registered_tool or implementation_symbol when given; received "tool"\./)
+    assert.ok(requests[1].user.includes(JSON.stringify(rejected)), "the correction includes the rejected contract")
+    assert.ok(await repository.getIntentTaskPlan(scope))
+  })
+})
+
+test("a failed plan leaves no planning in flight, so the next message can plan", async () => {
+  await withRepository(async (repository) => {
+    const invalid = lookupReply({ kind: "accepted_fact_exists", identity: "tool", symbol: "twinny_todo_update" })
+    const planner = plannerWith(repository, scripted([invalid, invalid], []))
+    const { result } = await quietly(() => planner.start(scope, "Check twinny_todo_update."))
+    assert.equal(result.status, "failed")
+    assert.equal(planner.pending(), undefined, "a failed planning releases its operation")
+    const next = plannerWith(repository, scripted([validReply()]))
+    const followUp = await quietly(() => next.start(scope, "Try again."))
+    assert.equal(followUp.result.status, "planned")
+  })
+})
+
+const evidenceRepository = (repository: TodoRepository, facts: AcceptedFact[]): FeedbackPlanRepository => ({
+  getIntentTaskPlan: (request) => repository.getIntentTaskPlan(request),
+  intentPlanClosed: (request) => repository.intentPlanClosed(request),
+  listAcceptedEvidence: async () => facts,
+  synchronizeIntentPlan: (request, candidate, intentResult) => repository.synchronizeIntentPlan(request, candidate, intentResult)
+})
+
+const rangeTask = (verification: Record<string, unknown>) => ({
+  id: "lookup",
+  title: "Locate twinny_todo_update",
+  description: "Find the registered tool and its implementation range.",
+  dependencies: [],
+  criteria: [
+    { id: "criterion-1", description: "The project-wide accepted evidence lookup has completed.", verification: { kind: "evidence_lookup_completed" } },
+    { id: "criterion-2", description: "The twinny_todo_update implementation range is located.", verification }
+  ]
+})
+
+const rangeAnswer = (identity: string) => [{ id: "range", source: { identity, symbol: "twinny_todo_update" }, fields: ["range"] }]
+
+test("an answer range on a repaired implementation criterion stays consistent: the answer is repaired with it and the plan is written, not failed at persistence", async () => {
+  await withRepository(async (repository) => {
+    const reply = JSON.stringify({
+      track: true,
+      plan: plan({
+        tasks: [rangeTask({ kind: "source_range", identity: "implementation_symbol", symbol: "twinny_todo_update" })],
+        answer: rangeAnswer("implementation_symbol")
+      })
+    })
+    const requests: Sent[] = []
+    const planner = plannerWith(evidenceRepository(repository, [twinnyRegistration]), scripted([reply], requests))
+    const { result } = await quietly(() => planner.start(scope, "Locate twinny_todo_update."))
+    assert.equal(result.status, "planned", "error" in result ? result.error : undefined)
+    assert.equal(requests.length, 1, "the repair needs no second planning call")
+    const stored = await repository.getIntentTaskPlan(scope)
+    assert.ok(stored)
+    assert.deepEqual(JSON.parse(JSON.stringify(stored.tasks[0].criteria[1].verification)), { kind: "source_range", symbol: "twinny_todo_update" })
+    const context = await repository.getActiveIntentContext(scope)
+    assert.deepEqual(JSON.parse(JSON.stringify(context?.answer)), [{ id: "range", source: { symbol: "twinny_todo_update" }, fields: ["range"] }])
+  })
+})
+
+test("an answer that names an identity its criterion no longer has is returned to planning with the diagnostic, not thrown at persistence", async () => {
+  await withRepository(async (repository) => {
+    const rejected = JSON.stringify({
+      track: true,
+      plan: plan({
+        tasks: [rangeTask({ kind: "source_range", identity: "implementation_symbol", symbol: "twinny_todo_update" })],
+        answer: rangeAnswer("registered_tool")
+      })
+    })
+    const corrected = JSON.stringify({
+      track: true,
+      plan: plan({
+        tasks: [rangeTask({ kind: "source_range", identity: "registered_tool", symbol: "twinny_todo_update" })],
+        answer: rangeAnswer("registered_tool")
+      })
+    })
+    const requests: Sent[] = []
+    const planner = plannerWith(evidenceRepository(repository, [twinnyRegistration]), scripted([rejected, corrected], requests))
+    const { result } = await quietly(() => planner.start(scope, "Locate twinny_todo_update."))
+    assert.equal(result.status, "planned", "error" in result ? result.error : undefined)
+    assert.equal(requests.length, 2, "the mismatch is corrected by planning, not terminal")
+    assert.match(requests[1].user, /Your previous reply was rejected: Invalid task plan: plan\.answer\[0\]\.fields includes range, but no source_range criterion in the plan names twinny_todo_update\./)
+  })
+})
+
+test("a repaired answer identity is reported with the criterion repair", () => {
+  const reply = JSON.stringify({
+    track: true,
+    plan: plan({
+      tasks: [rangeTask({ kind: "source_range", identity: "implementation_symbol", symbol: "twinny_todo_update" })],
+      answer: rangeAnswer("implementation_symbol")
+    })
+  })
+  const parsed = parseFeedbackPlanResponse(reply, "Locate twinny_todo_update.", [twinnyRegistration])
+  assert.ok("plan" in parsed)
+  assert.deepEqual("repairs" in parsed ? parsed.repairs : undefined, [
+    "lookup/criterion-2: implementation_symbol twinny_todo_update -> identity-free",
+    "answer/range: implementation_symbol twinny_todo_update -> identity-free"
+  ])
 })

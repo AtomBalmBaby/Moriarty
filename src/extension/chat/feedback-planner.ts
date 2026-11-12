@@ -30,22 +30,24 @@ export const FEEDBACK_PLAN_PROTOCOL =
   "You maintain the task plan Twinny uses to track progress on the user's request. " +
   "Return exactly one valid JSON object, with no prose or Markdown fences, with keys track (boolean) and plan. " +
   "Use {\"track\": false, \"plan\": null} when the message needs no tracked work (a question, greeting, or a follow-up that the existing plan already covers). " +
-  "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, criteria: [{id: stable string, description: string, verification: object}], dependencies: string[]}], answer?: [{id: stable string, source: {identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string}, fields: subset of [\"path\", \"range\", \"fingerprint\"]}]}. " +
-  "answer lists the objective values the final reply must state for a source; omit it when the reply needs none. Each field is proven only by a source criterion of the same plan that names the same identity and symbol, and the same path when the answer gives one: path by source_location, range by source_range, fingerprint by source_fingerprint. " +
+  "Otherwise plan must be {planId: string, version: 1, revision: positive integer, goal: string, constraints: string[], tasks: [{id: stable string, title: string, description: string, criteria: [{id: stable string, description: string, verification: object}], dependencies: string[]}], answer?: [{id: stable string, source: {identity?: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string}, fields: subset of [\"path\", \"range\", \"fingerprint\"]}]}. " +
+  "answer lists the objective values the final reply must state for a source; omit it when the reply needs none. Each field is proven only by a source criterion of the same plan that names the same symbol, with the same identity when the answer gives one, and the same path when the answer gives one: path by source_location, range by source_range, fingerprint by source_fingerprint. " +
   "Each criterion's verification is a typed descriptor chosen by what must be proven, never by its wording. Allowed verification objects: " +
   "{kind: \"evidence_lookup_completed\"} proves only that a project-scoped evidence lookup succeeded, whether or not facts matched; " +
-  "{kind: \"accepted_fact_exists\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires a current accepted fact about the symbol; " +
-  "{kind: \"source_location\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the declaration's start line; " +
-  "{kind: \"source_range\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the declaration's complete start-to-closing range; " +
-  "{kind: \"source_fingerprint\", identity: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the authoritative content fingerprint of the declaration; " +
+  "{kind: \"accepted_fact_exists\", identity?: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires a current accepted fact about the symbol; " +
+  "{kind: \"source_location\", identity?: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the declaration's start line; " +
+  "{kind: \"source_range\", identity?: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the declaration's complete start-to-closing range; " +
+  "{kind: \"source_fingerprint\", identity?: \"registered_tool\"|\"implementation_symbol\", symbol: string, path?: string} requires the authoritative content fingerprint of the declaration; " +
   "{kind: \"execution_invariant\", invariant: \"no_mutating_tool_calls\"} requires that no mutating tool ran in this conversation; " +
   "{kind: \"workspace_mutation\", operation?: \"create\"|\"edit\"|\"delete\"} requires that a successful file create, edit, or delete ran during this task (narrowed to one operation when given), and is the only way to require a workspace change; " +
   "{kind: \"command_exit_status\", command: string, exitCode: number, scope?: \"current\"|\"historical\", execution?: \"recorded\"|\"after_activation\"} requires the latest Twinny run of that exact command to exit with exitCode, with no later successful workspace mutation; scope \"historical\" states a diagnostic about an earlier revision and ignores later mutations; execution \"after_activation\" also requires that run to come after the task's requirement activation, which is how a criterion demands a run made now (for example, \"is run again\"); " +
   "{kind: \"semantic_review\"} is only for a criterion that genuinely needs judgment. " +
-  "identity is required on every accepted_fact_exists and source_* descriptor and says what symbol names, and the two identities are never interchangeable: \"registered_tool\" when symbol is the exact name Twinny registers, underscores included (for example read_file), and \"implementation_symbol\" when symbol is the TypeScript declaration that the source actually declares. " +
-  "Never derive one from the other: a registered name is not converted to a camelCase or other declaration name, and a declaration name is not treated as a tool name. Locating a registered tool and locating its implementation declaration are separate facts, each proven by its own read; when the request needs both, give each its own criterion with its own identity. An inline run method has no declared name of its own, so a tool implemented inline is proven by its registered_tool criterion, and no implementation_symbol is invented for it. " +
+  "identity is optional on accepted_fact_exists and source_* descriptors. Omit it for an ordinary request to locate, read, or fingerprint a named target such as run_command: symbol is then the name the user gave, and Twinny resolves it through the registration or declaration the source actually contains. The implementing function, method, lambda, or callback is not known until the source is read, so never name it in a criterion. " +
+  "Give identity only when the request itself distinguishes the two names: \"registered_tool\" when symbol is the exact name Twinny registers, underscores included (for example read_file), and \"implementation_symbol\" when symbol is a declaration the source actually declares. The two are never interchangeable: a registered name is not converted to a declaration name, and a declaration name is not a tool name. A criterion whose identity the source contradicts is a plan error, and Twinny returns it for correction. " +
+    "Never derive one from the other: a registered name is not converted to a camelCase or other declaration name, and a declaration name is not treated as a tool name. Locating a registered tool and locating its implementation declaration are separate facts, each proven by its own read; when the request needs both, give each its own criterion with its own identity. An inline run method has no declared name of its own, so a tool implemented inline is proven by its registered_tool criterion, and no implementation_symbol is invented for it. " +
+
   "Use only the fields listed for each kind, with the listed values. Omit path when the request does not name the file; Twinny then uses the single file it observes declaring the symbol. Include path only when the request names it. " +
-  "Accepted facts listed with the request are authoritative: a path the request does not name must agree with them, and a path they contradict is rejected, so omit path rather than guess it. " +
+  "Accepted facts listed with the request are authoritative: a path the request does not name must agree with them, and a path or identity they contradict is rejected, so omit path or identity rather than guess it. " +
   "symbol is a bare identifier, and path, when present, is repository-relative. Each criterion description must match its descriptor exactly and must not weaken the user's requirement. " +
   "Include 1-100 ordered tasks with stable IDs and no unknown or cyclic dependencies. Ground every task in the user's request; do not invent requirements. " +
   "Keep the plan as small as the objective allows: one task per distinct piece of user work, with factual, specific, measurable acceptance criteria proportional to that task. " +
@@ -65,7 +67,7 @@ export type FeedbackPlanFailure = JsonFailure | "output-limit" | "schema" | "adm
 
 export type FeedbackPlanParse =
   | { track: false }
-  | { track: true; plan: IntentTaskPlan }
+  | { track: true; plan: IntentTaskPlan; repairs?: string[] }
   | { error: string; failure: FeedbackPlanFailure; offset?: number }
 
 const OUTPUT_LIMIT_MESSAGE = "The provider stopped at its output limit before the plan was complete."
@@ -204,6 +206,74 @@ export const pathContradiction = (plan: IntentTaskPlan, request: string, trusted
   return undefined
 }
 
+/**
+ * An explicit identity must agree with the trusted accepted facts for its symbol. Naming a declaration as a registered tool,
+ * or a registered tool as a declaration, is a planning-contract error that re-reading cannot repair, so it is returned to
+ * planning before any implementer continuation is spent on it.
+ */
+export const identityContradiction = (plan: IntentTaskPlan, trusted: AcceptedFact[]): string | undefined => {
+  const live = trusted.filter((fact) => !fact.supersededBy)
+  for (const task of plan.tasks) {
+    for (const criterion of task.criteria) {
+      const verification = criterion.verification
+      if (!("identity" in verification) || verification.identity === undefined) continue
+      const { identity, symbol } = verification
+      if (live.some((fact) => factNamedBy(identity, symbol, fact))) continue
+      const other = identity === "registered_tool" ? "implementation_symbol" : "registered_tool"
+      const alternative = live.find((fact) => factNamedBy(other, symbol, fact))
+      if (!alternative) continue
+      const prefix = `Criterion "${criterion.id}" in task "${task.id}" names ${symbol} as ${identity}`
+      if (identity === "implementation_symbol") {
+        const implemented = alternative.registeredTool === undefined ? "" : `, implemented by ${alternative.symbol}`
+        return `${prefix}, but accepted evidence registers ${symbol} as a tool${implemented}. Use identity registered_tool for the tool name, or omit identity so Twinny resolves it.`
+      }
+      return `${prefix}, but accepted evidence shows ${symbol} is the declaration implementing tool ${alternative.registeredTool}. Use identity implementation_symbol for the declaration, or omit identity so Twinny resolves it.`
+    }
+  }
+  return undefined
+}
+
+/**
+ * Repairs an identity that contradicts accepted evidence and has a verifiable alternative: an implementation_symbol that names a
+ * registered tool, or a registered_tool that names a declaration. The criterion becomes identity-free, which the verifier resolves
+ * through the registration to its implementation, or to the declaration. That keeps the implementation requirement and never
+ * swaps it for a registration-only one. Criteria without an identity, or whose identity agrees with evidence, are unchanged.
+ */
+export const repairIdentityContradictions = (plan: IntentTaskPlan, trusted: AcceptedFact[]): { plan: IntentTaskPlan; repairs: string[] } => {
+  const live = trusted.filter((fact) => !fact.supersededBy)
+  const repairs: string[] = []
+  const repaired: Array<{ identity: string; symbol: string; path?: string }> = []
+  const tasks = plan.tasks.map((task) => ({
+    ...task,
+    criteria: task.criteria.map((criterion) => {
+      const verification = criterion.verification
+      if (!("identity" in verification) || verification.identity === undefined) return criterion
+      const { identity, symbol } = verification
+      if (live.some((fact) => factNamedBy(identity, symbol, fact))) return criterion
+      const other = identity === "registered_tool" ? "implementation_symbol" : "registered_tool"
+      if (!live.some((fact) => factNamedBy(other, symbol, fact))) return criterion
+      repairs.push(`${task.id}/${criterion.id}: ${identity} ${symbol} -> identity-free`)
+      repaired.push({ identity, symbol, path: "path" in verification ? verification.path : undefined })
+      const identityFree: typeof verification = { ...verification }
+      delete identityFree.identity
+      return { ...criterion, verification: identityFree }
+    })
+  }))
+  // An answer requirement names the same identity as the criterion that proves it, so it follows a repaired criterion.
+  // Otherwise the repaired criterion would no longer satisfy it at persistence.
+  const answer = plan.answer?.map((requirement) => {
+    const { identity, symbol, path } = requirement.source
+    const follows = identity !== undefined && repaired.some((item) =>
+      item.identity === identity && item.symbol === symbol && (path === undefined || item.path === path))
+    if (!follows) return requirement
+    repairs.push(`answer/${requirement.id}: ${identity} ${symbol} -> identity-free`)
+    const source = { ...requirement.source }
+    delete source.identity
+    return { ...requirement, source }
+  })
+  return repairs.length ? { plan: { ...plan, tasks, answer }, repairs } : { plan, repairs }
+}
+
 const TRUSTED_FACT_LIMIT = 20
 
 /** The live accepted facts shown to the planner, bounded so a long project history cannot dominate the prompt. */
@@ -235,9 +305,13 @@ const parseFeedbackPlanBody = (reply: string | RoleReply | undefined, objective:
   if (!validation.plan) {
     return { error: "Invalid task plan: " + (validation.diagnostic ?? "validation failed"), failure: "schema" }
   }
-  const contradiction = pathContradiction(validation.plan, objective, trusted)
+  const repair = repairIdentityContradictions(validation.plan, trusted)
+  // A repair must leave a plan that validates as a whole, so a residual answer mismatch is corrected by planning here.
+  const checked = repair.repairs.length ? validateIntentTaskPlan(repair.plan) : validation
+  if (!checked.plan) return { error: "Invalid task plan: " + (checked.diagnostic ?? "validation failed"), failure: "schema" }
+  const contradiction = pathContradiction(checked.plan, objective, trusted) ?? identityContradiction(checked.plan, trusted)
   if (contradiction) return { error: "Invalid task plan: " + contradiction, failure: "schema" }
-  return { track: true, plan: validation.plan }
+  return repair.repairs.length ? { track: true, plan: checked.plan, repairs: repair.repairs } : { track: true, plan: checked.plan }
 }
 
 export interface AdministrativeRepair {
@@ -433,7 +507,7 @@ export class ChildTodoReviewer {
       if (signal?.aborted) return cancelled
       let parsed = parseChildTodoDecision(reply, context)
       if (!parsed.ok) {
-        reply = await ask(correctionPrompt(user, parsed.error))
+        reply = await ask(correctionPrompt(user, parsed.error, replyText(reply)))
         if (signal?.aborted) return cancelled
         parsed = parseChildTodoDecision(reply, context)
       }
@@ -451,8 +525,16 @@ export class ChildTodoReviewer {
   }
 }
 
-const correctionPrompt = (user: string, error: string) =>
-  `${user}\n\nYour previous reply was rejected: ${error} Return only one corrected JSON object that matches the schema, with no other text.`
+const REJECTED_REPLY_LIMIT = 1500
+
+/**
+ * The correction names the exact validator diagnostic and includes a bounded excerpt of the rejected reply, so the model
+ * corrects the contract it actually returned instead of starting a new one.
+ */
+const correctionPrompt = (user: string, error: string, rejected: string) =>
+  `${user}\n\nYour previous reply was rejected: ${error} ` +
+  `The rejected reply began: ${JSON.stringify(rejected.slice(0, REJECTED_REPLY_LIMIT))}. ` +
+  "Return only one corrected JSON object that matches the schema, with no other text. Change only what the diagnostic names and keep the requirements the rejected reply expressed."
 
 /** Logs what the provider reported, with a bounded excerpt only at debug level (which redacts). */
 const diagnose = (
@@ -481,6 +563,13 @@ const diagnose = (
     failed ? "warn" : "debug"
   )
   if (text) logger.debug(`[Feedback] ${attempt} response excerpt: ${JSON.stringify(text.slice(0, EXCERPT_CHARS))}`)
+}
+
+/** Records each identity repaired at the contract boundary, so a changed criterion is visible in the log. */
+const logRepairs = (parsed: FeedbackPlanParse) => {
+  if ("track" in parsed && parsed.track && parsed.repairs?.length) {
+    logger.info(`[Feedback] Repaired identity contradictions in the plan: ${parsed.repairs.join("; ")}.`)
+  }
 }
 
 export interface FeedbackPlanRepository {
@@ -573,16 +662,26 @@ export class FeedbackPlanner {
     })
     const active = { sequence, scope, controller, trace } as ActivePlanning
     this._last = { scope, prompt: request }
-    active.done = this.plan(active, scope, request, repository).then((outcome) => {
-      if (this._active === active) this.reportStatus(scope.conversationId, outcome)
-      return outcome
-    })
+    active.done = this.plan(active, scope, request, repository)
+      .catch((error: unknown) => this.unexpectedFailure(active, error))
+      .then((outcome) => {
+        if (this._active === active) this.reportStatus(scope.conversationId, outcome)
+        return outcome
+      })
     this._active = active
     this._deps.onStatus?.({ conversationId: scope.conversationId, state: "planning" })
     void active.done.finally(() => {
       if (this._active === active) this._active = undefined
     })
     return active.done
+  }
+
+  /** Planning settles with an outcome even when something unforeseen throws; a cancelled run is not a failure. */
+  private unexpectedFailure(active: ActivePlanning, error: unknown): FeedbackPlanOutcome {
+    if (active.controller.signal.aborted) return { status: "cancelled" }
+    const message = "Feedback provider failed: " + redact(error instanceof Error ? error.message : String(error))
+    this.report(message)
+    return { status: "failed", error: message }
   }
 
   /** Only the newest planning reports; superseded and cancelled runs stay silent. */
@@ -616,34 +715,37 @@ export class FeedbackPlanner {
     repository: FeedbackPlanRepository
   ): Promise<FeedbackPlanOutcome> {
     const { controller, trace } = active
-    const resolution = await Promise.resolve(this._deps.resolve()).catch((error): { ok: false; error: string } => ({
-      ok: false,
-      error: error instanceof Error ? error.message : String(error)
-    }))
-    if (!resolution.ok) {
-      if (this.isCurrent(active)) this.report(resolution.error)
-      return { status: "unavailable", error: resolution.error }
-    }
-    const { endpoint } = resolution
-    trace.provider = endpoint.provider
-    inferenceEvent("feedback.started", { operation_id: trace.operationId, parent_operation_id: trace.parentRequestId, conversation_id: scope.conversationId, provider: endpoint.provider })
-    inferenceEvent("operation.started", {
-      operation_id: trace.operationId,
-      kind: "feedback",
-      phase: "plan",
-      parent_operation_id: trace.parentRequestId,
-      provider: endpoint.provider,
-      model: endpoint.model,
-      conversation_id: scope.conversationId
-    })
     const timeoutMs = this._deps.timeoutMs ?? DEFAULT_FEEDBACK_PLAN_TIMEOUT_MS
     const clear = abortAfter(controller, timeoutMs, `Feedback planning timed out after ${Math.round(timeoutMs / 1000)} seconds.`)
+    // Cancel or timeout abandons any wait on the endpoint or a TODO read; a wedged read must not hold planning open.
+    const abortable = <T>(work: PromiseLike<T>) => untilAborted(work, controller.signal)
     let state = "completed"
     try {
-      const existing = await repository.getIntentTaskPlan(scope)
-      const trusted = await repository.listAcceptedEvidence(scope)
+      const resolution = await abortable(Promise.resolve(this._deps.resolve()).catch((error): { ok: false; error: string } => ({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      })))
+      if (!resolution.ok) {
+        state = "unavailable"
+        if (this.isCurrent(active)) this.report(resolution.error)
+        return { status: "unavailable", error: resolution.error }
+      }
+      const { endpoint } = resolution
+      trace.provider = endpoint.provider
+      inferenceEvent("feedback.started", { operation_id: trace.operationId, parent_operation_id: trace.parentRequestId, conversation_id: scope.conversationId, provider: endpoint.provider })
+      inferenceEvent("operation.started", {
+        operation_id: trace.operationId,
+        kind: "feedback",
+        phase: "plan",
+        parent_operation_id: trace.parentRequestId,
+        provider: endpoint.provider,
+        model: endpoint.model,
+        conversation_id: scope.conversationId
+      })
+      const existing = await abortable(repository.getIntentTaskPlan(scope))
+      const trusted = await abortable(repository.listAcceptedEvidence(scope))
       // A finished plan is not offered for revision: the request gets its own planning decision.
-      const closed = !!existing && await repository.intentPlanClosed(scope)
+      const closed = !!existing && await abortable(repository.intentPlanClosed(scope))
       const base = !existing
         ? request
         : closed
@@ -662,11 +764,15 @@ export class FeedbackPlanner {
       }
       let parsed = parseFeedbackPlanResponse(reply, request, trusted)
       diagnose(trace, endpoint, "initial", reply, parsed)
-      // Bounded recovery: each correction re-asks with the same provider and request plus the exact validator diagnostic,
-      // within FEEDBACK_PLAN_ATTEMPTS planning calls in total. Output-limit stops are not retried.
+      logRepairs(parsed)
+      // Bounded recovery: each correction re-asks with the same provider and request plus the exact validator diagnostic and the
+      // rejected reply, within FEEDBACK_PLAN_ATTEMPTS planning calls in total. Output-limit stops are not retried. A correction that
+      // returns the rejected reply unchanged cannot succeed, so planning stops at once.
+      let repeated = false
       for (let attempt = 2; "error" in parsed && parsed.failure !== "output-limit" && attempt <= FEEDBACK_PLAN_ATTEMPTS; attempt++) {
+        const rejected = replyText(reply)
         this._deps.onStatus?.({ conversationId: scope.conversationId, state: "retrying" })
-        reply = await ask(correctionPrompt(user, parsed.error))
+        reply = await ask(correctionPrompt(user, parsed.error, rejected))
         if (controller.signal.reason instanceof RoleTimeoutError) throw controller.signal.reason
         if (!this.isCurrent(active)) {
           state = "stale"
@@ -675,10 +781,16 @@ export class FeedbackPlanner {
         }
         parsed = parseFeedbackPlanResponse(reply, request, trusted)
         diagnose(trace, endpoint, "correction", reply, parsed)
+        logRepairs(parsed)
+        if ("error" in parsed && replyText(reply).trim() === rejected.trim()) {
+          repeated = true
+          logger.warn(`[Feedback] correction ${attempt} repeated the rejected reply; planning stopped`)
+          break
+        }
       }
       if ("error" in parsed) {
         state = "invalid-response"
-        const message = "Feedback could not plan TODOs: " + parsed.error
+        const message = "Feedback could not plan TODOs: " + parsed.error + (repeated ? " The corrected reply repeated the rejected one, so planning stopped." : "")
         this.report(message)
         return { status: "failed", error: message }
       }
@@ -736,13 +848,13 @@ export class FeedbackPlanner {
     seen: IntentTaskPlan | undefined,
     active: ActivePlanning
   ): Promise<{ snapshot: TodoListSnapshot; planId: string; replaced?: string } | undefined> {
-    const stored = await repository.getIntentTaskPlan(scope)
+    const stored = await untilAborted(repository.getIntentTaskPlan(scope), active.controller.signal)
     // Someone else revised the plan while this one was being written.
     if (stored && seen && stored.revision !== seen.revision) return undefined
     if (!this.isCurrent(active)) return undefined
     const result = { source: "feedback", goal: proposed.goal }
     // A completed plan is replaced by the new work under its own planId; an open plan keeps its identity.
-    const replacing = !!stored && await repository.intentPlanClosed(scope)
+    const replacing = !!stored && await untilAborted(repository.intentPlanClosed(scope), active.controller.signal)
     const plan = !stored
       ? proposed
       : replacing
@@ -768,6 +880,8 @@ export interface FeedbackGateDeps {
   busy: () => boolean
   /** Explains, in the main conversation, why a message did not start. */
   notify: (message: string) => void
+  /** Runs a held turn as part of an operation, so its terminal is announced like any other turn. */
+  operate?: <T>(body: () => Promise<T>) => Promise<T | undefined>
 }
 
 interface HeldTurn {
@@ -804,11 +918,12 @@ export class FeedbackGate {
     const outcome = await planning
     // A superseded message is owned by the newer message's own planning.
     if (outcome.status === "stale") return undefined
+    // The conversation was reset while planning: the old turn must not start, nor be held.
+    if (epoch !== this._epoch) return undefined
     if (PROCEED.includes(outcome.status)) {
       this._held = undefined
       return dispatch()
     }
-    if (epoch !== this._epoch) return undefined
     this._held = { conversationId, dispatch }
     if (outcome.status !== "cancelled") this._deps.notify(blockedMessage(outcome))
     return undefined
@@ -832,7 +947,8 @@ export class FeedbackGate {
     if (!PROCEED.includes(outcome.status) || !held || held.conversationId !== conversationId) return outcome
     if (this._deps.busy()) return { status: "busy" }
     this._held = undefined
-    void held.dispatch().catch((error: unknown) => {
+    const dispatch = () => (this._deps.operate ? this._deps.operate(held.dispatch) : held.dispatch())
+    void dispatch().catch((error: unknown) => {
       logger.error("[Feedback] held turn could not start: " + (error instanceof Error ? error.message : String(error)))
     })
     return outcome

@@ -426,7 +426,7 @@ export type PromptCompileResult =
 /* -------------------------------------------------------------------------- */
 
 export interface ClientEvents {
-  [TODO_EVENT_NAME.getList]: Channel<{ conversationId: string }, TodoListSnapshot>
+  [TODO_EVENT_NAME.getList]: Channel<{ conversationId: string }, TodoListSnapshot | undefined>
   [TODO_EVENT_NAME.createItem]: Channel<TodoCreateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.updateItem]: Channel<TodoUpdateRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.completeItem]: Channel<TodoCompleteRequest, TodoListSnapshot>
@@ -617,7 +617,7 @@ export interface ServerEvents {
   [EVENT_NAME.twinnySessionContext]: ContextValue
   [EVENT_NAME.twinnySetLocale]: string
   [EVENT_NAME.twinnySetTab]: string
-  [EVENT_NAME.twinnyStopGeneration]: { cancelled?: boolean; cancellationReason?: "user" | "host" }
+  [EVENT_NAME.twinnyStopGeneration]: { operationId?: string; cancelled?: boolean; cancellationReason?: "user" | "host" }
   [EVENT_NAME.twinnyTextSelection]: string
   [EVENT_NAME.twinnyUpdateContextItems]: AnyContextItem[]
   [EVENT_NAME.twinnyWorkspaceSearch]: WorkspaceSearchReport

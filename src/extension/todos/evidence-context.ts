@@ -1,4 +1,5 @@
 import type { SourceIdentity, TodoToolObservation, TypedCriterion } from "../../common/types"
+
 import { codeIdentifiers } from "./evidence"
 import { type AcceptedFactStatus, assessAcceptedFacts, type CurrentSourceReader, factMatchesSymbol, factNamedBy } from "./feedback"
 import { acceptedFactEntry } from "./plan-context"
@@ -22,7 +23,7 @@ const ENTRY_LIMIT = 600
 const PROMOTION_BATCH = 12
 
 export interface EvidenceRequirement {
-  identity: SourceIdentity
+  identity?: SourceIdentity
   symbol: string
   path?: string
 }

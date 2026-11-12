@@ -156,13 +156,17 @@ export type CriterionVerification =
   /** Proven by a successful project-scoped accepted-evidence lookup, whether it found facts or none. */
   | { kind: "evidence_lookup_completed" }
   /** Proven by a live accepted fact that matches the symbol under `identity` and the path, or disproven only by a complete project-wide lookup that found none. */
-  | { kind: "accepted_fact_exists"; identity: SourceIdentity; symbol: string; path?: string }
-  /** Proven by an authoritative read or accepted fact that locates the symbol's declaration, in `path` or in the single file the host observed declaring it. */
-  | { kind: "source_location"; identity: SourceIdentity; symbol: string; path?: string }
-  /** Proven by an authoritative read that shows the declaration through its closing boundary at the current source, in `path` or the single declaring file. */
-  | { kind: "source_range"; identity: SourceIdentity; symbol: string; path?: string }
-  /** Proven when the declaration's fingerprint at the authoritative read matches the current source, in `path` or the single declaring file. */
-  | { kind: "source_fingerprint"; identity: SourceIdentity; symbol: string; path?: string }
+  | { kind: "accepted_fact_exists"; identity?: SourceIdentity; symbol: string; path?: string }
+  /**
+   * Proven by an authoritative read or accepted fact that locates the target, in `path` or in the single file the host observed
+   * containing it. Omitting `identity` names the target only: the verifier resolves a registered tool to its implementation,
+   * or a declaration to itself, and never requires the planner to know the implementing name.
+   */
+  | { kind: "source_location"; identity?: SourceIdentity; symbol: string; path?: string }
+  /** Proven by an authoritative read that shows the target's implementation through its closing boundary at the current source, in `path` or the single file containing it. */
+  | { kind: "source_range"; identity?: SourceIdentity; symbol: string; path?: string }
+  /** Proven when the implementation's fingerprint at the authoritative read matches the current source, in `path` or the single file containing it. */
+  | { kind: "source_fingerprint"; identity?: SourceIdentity; symbol: string; path?: string }
   /** Proven by the host's record of tool operations. Covers only tool calls the host recorded, not shell writes. */
   | { kind: "execution_invariant"; invariant: "no_mutating_tool_calls" }
   /** Proven when a successful host-recorded file create, edit, or delete ran during this task. A required change, not a prohibition. `operation` narrows it to one kind of mutation. */
@@ -214,6 +218,6 @@ export type AnswerField = "path" | "range" | "fingerprint"
  */
 export interface AnswerRequirement {
   id: string
-  source: { identity: SourceIdentity; symbol: string; path?: string }
+  source: { identity?: SourceIdentity; symbol: string; path?: string }
   fields: AnswerField[]
 }

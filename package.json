@@ -1123,7 +1123,14 @@
           "default": 1000,
           "minimum": 100,
           "maximum": 5000,
-          "markdownDescription": "The maximum number of lines any single `read_file` call may return. Lower values keep tool results smaller; higher values let the agent read wider ranges in one pass.",
+          "markdownDescription": "The maximum number of lines any single `read_file` call may return. Lower values keep tool results smaller; higher values let the agent read wider ranges in one pass. A read longer than this is refused with suggested ranges rather than cut short.",
+          "scope": "machine"
+        },
+        "twinny.chatToolsAllowFullFileReadsBeyondMaxReadLines": {
+          "order": 21,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Allow a whole-file `read_file` (one given only a path, or with `full_file` set to `true`) to return more lines than `twinny.chatToolsMaxReadLines`. Off by default. Ranges stay bounded by `twinny.chatToolsMaxReadLines`. A whole file this large uses much more of the model's context.",
           "scope": "machine"
         },
         "twinny.chatToolsMaxResultChars": {

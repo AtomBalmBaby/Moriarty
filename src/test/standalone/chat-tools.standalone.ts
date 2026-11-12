@@ -640,7 +640,7 @@ test("the text protocol lists tools without the parentheses that invite function
   const { client, requests } = scripted(["Hi."])
   await collect(withTools(client, workspaceTools(makeWorkspace())).chat({ model: "m", messages: [{ role: "user", content: "Hi" }] }))
   const system = requests[0].messages[0].content as string
-  assert.match(system, /\n- read_file \{path, start_line\?, end_line\?, full_line\?\}: /)
+  assert.match(system, /\n- read_file \{path, full_file\?, start_line\?, end_line\?\}: /)
   assert.doesNotMatch(system, /\n- \w+\(/)
 })
 

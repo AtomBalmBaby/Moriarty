@@ -102,6 +102,75 @@ test("an empty inProgress reply says nothing was written yet", () => {
   assert.match(text, /_nothing written yet_/)
 })
 
+test("a reply withheld by delivery rejection is not exported as Completed, and keeps its reason", () => {
+  const text = exportOf([
+    user("where is run_command defined?"),
+    assistant("", {
+      meta: {
+        execution: {
+          outcome: "delivery_rejected",
+          conversationId: "conv-1",
+          planId: "plan-1",
+          reconciliation: "stopped",
+          verdict: "rejected",
+          verdictDetail: "answer cites no source",
+          correction: "read the declaration before answering",
+          answerWithheld: true,
+          reason: "delivery gate rejected the reply"
+        }
+      }
+    } as Partial<ChatCompletionMessage>)
+  ])
+  assert.doesNotMatch(text, /Status:\*\* Completed/)
+  assert.match(text, /Delivery rejected; the answer was withheld/)
+  assert.match(text, /Conversation: `conv-1`/)
+  assert.match(text, /Plan: `plan-1`/)
+  assert.match(text, /Delivery verdict: rejected: answer cites no source/)
+  assert.match(text, /Corrective instruction: read the declaration before answering/)
+  assert.match(text, /Answer withheld: yes/)
+  assert.match(text, /Reason: delivery gate rejected the reply/)
+})
+
+test("a stalled execution is exported as stalled, not as Completed", () => {
+  const text = exportOf([
+    user("where is run_command defined?"),
+    assistant("partial", {
+      meta: {
+        execution: {
+          outcome: "stalled",
+          conversationId: "conv-1",
+          answerWithheld: false,
+          reason: "watchdog: 2 consecutive turns without progress"
+        }
+      }
+    } as Partial<ChatCompletionMessage>)
+  ])
+  assert.doesNotMatch(text, /Status:\*\* Completed/)
+  assert.match(text, /Execution stalled/)
+  assert.match(text, /Answer withheld: no/)
+  assert.match(text, /watchdog: 2 consecutive turns/)
+})
+
+test("a reply followed by a stall message is exported as stalled, not as Completed", () => {
+  const text = exportOf([
+    user("add the TODO"),
+    assistant("I updated the plan."),
+    assistant("Execution stopped: unresolved, Feedback-rejected.", {
+      meta: {
+        execution: {
+          outcome: "stalled",
+          conversationId: "conv-1",
+          answerWithheld: false,
+          reason: "watchdog: 2 consecutive turns without progress"
+        }
+      }
+    } as Partial<ChatCompletionMessage>)
+  ])
+  const replies = text.split("## 2. twinny")[1]?.split("## 3.")[0] ?? ""
+  assert.match(replies, /Status:\*\* Execution stalled/)
+  assert.doesNotMatch(text, /Status:\*\* Completed/)
+})
+
 test("an empty chat exports only its header", () => {
   const text = exportOf([])
   assert.match(text, /^# Twinny chat/)

@@ -1,5 +1,4 @@
 import { extname } from "node:path"
-
 import ts from "typescript"
 
 /** A named declaration the verifier can locate. Lines are 1-based and inclusive in the analysed document. */

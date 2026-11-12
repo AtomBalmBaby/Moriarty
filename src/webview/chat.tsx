@@ -406,7 +406,9 @@ export const Chat = (props: ChatProps): JSX.Element => {
     setCelebration(undefined)
     const conversationId = conversation?.id
     if (!conversationId) return
-    void bridge.request(TODO_EVENT_NAME.getList, { conversationId }).then(acceptTodoSnapshot).catch(() => undefined)
+    void bridge.request(TODO_EVENT_NAME.getList, { conversationId }).then((next) => {
+      if (next) acceptTodoSnapshot(next)
+    }).catch(() => undefined)
   }, [conversation?.id])
 
   useServerEvent(TODO_EVENT_NAME.changed, acceptTodoSnapshot)

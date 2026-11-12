@@ -101,11 +101,9 @@ test("read_file counts lines as an editor does and never shows a byte-order mark
   assert.strictEqual((await read({ path: "crlf.ts" })).output, "crlf.ts (lines 1–2 of 2)\n1: a\n2: b")
   assert.strictEqual((await read({ path: "bom.ts" })).output, "bom.ts (lines 1–1 of 1)\n1: const a = 1")
   assert.strictEqual((await read({ path: "empty.ts" })).output, "empty.ts (lines 0–0 of 0)")
-  assert.strictEqual(
-    (await read({ path: "three.ts", start_line: "2", end_line: "1" })).output,
-    "three.ts (lines 2–2 of 3)\n2: b",
-    "an end before the start reads the start line"
-  )
+  const backwards = await read({ path: "three.ts", start_line: "2", end_line: "1" })
+  assert.strictEqual(backwards.failed, true, "an end before the start is contradictory, not a single line")
+  assert.match(backwards.output, /end_line 1 is before start_line 2/)
   assert.match((await read({ path: "three.ts", start_line: "9" })).output, /has only 3 lines/)
   // The edit planner sees the same text: line 1 of a file with a mark is still found.
   const edited: string[] = []

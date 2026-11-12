@@ -90,7 +90,7 @@ const restoreCutLines = (replace: string, original: string[]): string | undefine
 }
 
 const CUT_LINE_REFUSAL =
-  "replace has a line cut short with … that is not in find; read that line with read_file full_line=true, or leave it out of find and replace"
+  "replace has a line cut short with … that is not in find; read that line with read_file, start_line and end_line both set to its number, or leave it out of find and replace"
 
 const NOT_FOUND = "find is not in the file; read the lines again and copy them exactly, without the line numbers"
 

@@ -166,54 +166,116 @@ const clampReadLines = (limit: number | undefined) => {
   return Math.min(MAX_READ_LINES, Math.max(MIN_READ_LINES, value))
 }
 
-const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink): Tool => {
+/** A line number argument: blank is absent; a whole number from 1 (a trailing ".0" is tolerated) is accepted; anything else is rejected rather than guessed. */
+const lineArgument = (rel: string, name: string, raw: string | undefined) => {
+  const text = raw === undefined ? "" : String(raw).trim()
+  if (text === "") return undefined
+  const value = /^\d+(\.0+)?$/.test(text) ? Number(text) : 0
+  if (value < 1) throw new ToolInputError(`${rel}: ${name} must be a line number from 1, got "${text}".`)
+  return value
+}
+
+/** A true/false argument in any letter case; blank counts as false. */
+const flagArgument = (rel: string, name: string, raw: string | undefined) => {
+  const text = raw === undefined ? "" : String(raw).trim().toLowerCase()
+  if (text === "" || text === "false") return false
+  if (text === "true") return true
+  throw new ToolInputError(`${rel}: ${name} must be true or false, got "${raw}".`)
+}
+
+/** The read settings, read through the host's configuration reader, so the mapping from settings to the tool is testable without VS Code. */
+export const readFileSettings = (get: <T>(key: string, fallback: T) => T) => ({
+  readFileMaxLines: clampReadLines(get("chatToolsMaxReadLines", DEFAULT_READ_LINES)),
+  readFileAllowFullFile: get<boolean>("chatToolsAllowFullFileReadsBeyondMaxReadLines", false) === true
+})
+
+/** Most read calls named in an over-limit error; a longer file gets a count of the rest. */
+const MAX_SUGGESTED_READS = 5
+
+/** The read calls covering lines from..last, at most `limit` each and at most MAX_SUGGESTED_READS named. */
+const suggestedReads = (from: number, last: number, limit: number) => {
+  const shown: string[] = []
+  let next = from
+  while (next <= last && shown.length < MAX_SUGGESTED_READS) {
+    shown.push(`  start_line=${next}, end_line=${Math.min(last, next + limit - 1)}`)
+    next += limit
+  }
+  const rest = last - next + 1
+  if (rest > 0) shown.push(`  … ${plural(Math.ceil(rest / limit), "more read")} of up to ${limit} lines, through line ${last}`)
+  return shown.join("\n")
+}
+
+const overLimitMessage = (rel: string, from: number, last: number, total: number, limit: number, wholeFile: boolean) => {
+  const subject = wholeFile
+    ? `${rel} contains ${plural(total, "line")}.`
+    : `${rel} lines ${from}–${last} are ${plural(last - from + 1, "line")}.`
+  const remedy = wholeFile
+    ? "Or enable the full-file limit override in Twinny settings: \"Allow Full-File Reads Beyond Maximum Lines\" (twinny.chatToolsAllowFullFileReadsBeyondMaxReadLines)."
+    : "The full-file override does not apply to ranges; ranges stay within the maximum."
+  return `read_file: ${subject}\nConfigured maximum: ${plural(limit, "line")}.\n\nUse multiple read_file calls:\n${suggestedReads(from, last, limit)}\n\n${remedy}`
+}
+
+const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink, allowFullFile = false): Tool => {
   const limit = clampReadLines(maxLines)
   return {
     name: "read_file",
     readOnly: true,
-    description: `A file's lines, numbered; at most ${limit} at a time. Read a range with start_line and end_line, or a single line with full_line. Source lines are complete. Includes the content fingerprint of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
+    description: `A file's lines, numbered. Pass only path, or full_file set to true, to read the whole file; a whole file longer than ${limit} lines is refused with suggested ranges, unless the user has allowed longer full-file reads. Read a range with start_line and end_line (start_line alone reads to the end of the file); a single line is start_line and end_line set to the same number. A range longer than ${limit} lines is refused, not cut short. Source lines are complete. Includes the content fingerprint of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
+    // full_line is still accepted for earlier calls but is not advertised: start_line and end_line set to the same number already read one line.
     parameters: [
       { name: "path", description: "The file." },
-      { name: "start_line", description: "First line to read, from 1. For a range, pass start_line with end_line; for full_line, pass the one line.", optional: true, type: "integer" },
-      { name: "end_line", description: "Last line of a range to read. Omit it with full_line, which returns only start_line.", optional: true, type: "integer" },
-      { name: "full_line", description: "Set to true only for a one-line read: returns the exact text of the line at start_line. Do not combine with end_line or a multiline range; use start_line and end_line for ranges.", optional: true, type: "boolean" }
+      { name: "full_file", description: "true to read the whole file. Cannot be combined with start_line, end_line or full_line.", optional: true, type: "boolean" },
+      { name: "start_line", description: "First line to read, from 1. Omit to start at the top of the file.", optional: true, type: "integer" },
+      { name: "end_line", description: "Last line to read, inclusive. Omit to read to the end of the file. Must not be before start_line.", optional: true, type: "integer" }
     ],
-    async run({ path: file, start_line, end_line, full_line }) {
+    async run({ path: file, start_line, end_line, full_line, full_file }) {
       if (!file) throw new ToolInputError("read_file needs a path.")
       const absolute = view.resolve(file, "file")
       const rel = view.relative(absolute)
       const text = (await sink?.read?.(absolute)) ?? await view.text(absolute)
       if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
+      const single = flagArgument(rel, "full_line", full_line)
+      const fullFile = flagArgument(rel, "full_file", full_file)
+      const start = lineArgument(rel, "start_line", start_line)
+      const end = lineArgument(rel, "end_line", end_line)
+      if (fullFile && (single || start !== undefined || end !== undefined)) {
+        throw new ToolInputError(`${rel}: full_file reads the whole file, so it cannot be combined with start_line, end_line or full_line. Pass full_file alone for the whole file, or drop full_file and pass start_line and end_line for a range.`)
+      }
       const lines = linesOf(text)
       const metadata = `content_hash: ${await contentHash(text)}; total_lines: ${lines.length}`
       if (!lines.length) return { output: `${rel} (lines 0–0 of 0)\n${metadata}`, summary: `read \`${rel}\` · empty` }
-      if (full_line === "true") {
-        const lineNumber = Number.parseInt(start_line ?? "", 10)
-        if (!Number.isInteger(lineNumber) || lineNumber < 1 || lineNumber > lines.length) {
-          throw new ToolInputError(`${rel}: full_line needs start_line set to one line from 1 to ${lines.length}. Retry with that start_line and no end_line.`)
+      if (single) {
+        if (start === undefined) {
+          throw new ToolInputError(`${rel}: full_line needs start_line, the one line to read. full_line does not choose a line; pass start_line, or drop full_line to read a range.`)
         }
-        if (end_line && Number.parseInt(end_line, 10) !== lineNumber) {
-          throw new ToolInputError(`${rel}: full_line returns exactly one line, but end_line ${end_line} differs from start_line ${lineNumber}. For a range, drop full_line and pass start_line and end_line. For one line, drop end_line.`)
+        if (start > lines.length) {
+          throw new ToolInputError(`${rel}: full_line start_line ${start} is past the last line, ${lines.length}. Pass a start_line from 1 to ${lines.length}.`)
         }
-        const line = lines[lineNumber - 1]
-        return { output: `${rel} (full line ${lineNumber})\n${metadata}\n${lineNumber}: ${line}`, summary: `read \`${rel}:${lineNumber}\` · full line` }
+        if (end !== undefined && end !== start) {
+          throw new ToolInputError(`${rel}: full_line returns exactly one line, but end_line ${end} differs from start_line ${start}. For a range, drop full_line and pass start_line and end_line. For one line, drop end_line.`)
+        }
+        const line = lines[start - 1]
+        return { output: `${rel} (full line ${start})\n${metadata}\n${start}: ${line}`, summary: `read \`${rel}:${start}\` · full line` }
       }
-      const start = Math.max(1, Number.parseInt(start_line ?? "", 10) || 1)
-      if (start > lines.length) {
+      const from = start ?? 1
+      if (from > lines.length) {
         throw new ToolInputError(`${rel} has only ${plural(lines.length, "line")}.`)
       }
-      const asked = Math.max(start, Number.parseInt(end_line ?? "", 10) || lines.length)
-      const end = Math.min(lines.length, asked, start + limit - 1)
+      if (end !== undefined && end < from) {
+        throw new ToolInputError(`${rel}: end_line ${end} is before start_line ${from}. Pass an end_line from ${from} onward, or drop end_line to read from start_line.`)
+      }
+      const last = Math.min(end ?? lines.length, lines.length)
+      const wholeFile = fullFile || (start === undefined && end === undefined)
+      if (last - from + 1 > limit && !(wholeFile && allowFullFile)) {
+        throw new ToolInputError(overLimitMessage(rel, from, last, lines.length, limit, wholeFile))
+      }
       const body = lines
-        .slice(start - 1, end)
-        .map((line, i) => `${start + i}: ${line}`)
+        .slice(from - 1, last)
+        .map((line, i) => `${from + i}: ${line}`)
         .join("\n")
-      const cut = end < Math.min(asked, lines.length)
-        ? `\n… stopped at line ${end} of ${lines.length}; read on with start_line ${end + 1}`
-        : ""
       return {
-        output: `${rel} (lines ${start}–${end} of ${lines.length})\n${metadata}\n${body}${cut}`,
-        summary: `read \`${rel}:${start}–${end}\``
+        output: `${rel} (lines ${from}–${last} of ${lines.length})\n${metadata}\n${body}`,
+        summary: wholeFile ? `read \`${rel}\` · whole file` : `read \`${rel}:${from}–${last}\``
       }
     }
   }
@@ -746,6 +808,8 @@ export interface ToolExtras {
   editor?: EditorSink
   /** The maximum number of lines a single `read_file` result may show. */
   readFileMaxLines?: number
+  /** Whether a whole-file `read_file` may return more lines than `readFileMaxLines`; off by default. */
+  readFileAllowFullFile?: boolean
   /** Whether `git` is offered when the root is in a repository; on by default. */
   git?: boolean
   /** Whether the project's `AGENTS.md` files are read; on by default. */
@@ -785,7 +849,7 @@ export const workspaceTools = (
   ignoredGlobs: string[] = [],
   extras: ToolExtras = {}
 ): WorkspaceTools => {
-  const { edits, commands, codeSearch, workspaceSearch, editor, readFileMaxLines } = extras
+  const { edits, commands, codeSearch, workspaceSearch, editor, readFileMaxLines, readFileAllowFullFile } = extras
   const view =
     typeof root === "string" ? new WorkspaceView(root, ignoredGlobs, edits?.read?.bind(edits)) : root
   const tools = [
@@ -794,7 +858,7 @@ export const workspaceTools = (
     listDir(view),
     findFiles(view, workspaceSearch),
     ...(workspaceSearch ? [searchWorkspace(view, workspaceSearch)] : []),
-    readFile(view, readFileMaxLines, edits),
+    readFile(view, readFileMaxLines, edits, readFileAllowFullFile),
     grep(view),
     findSymbol(view),
     ...(editor ? [goToDefinition(view, editor), findReferences(view, editor), diagnostics(view, editor)] : []),

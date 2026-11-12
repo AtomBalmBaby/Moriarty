@@ -26,6 +26,14 @@ test("tool steps are emitted when each call starts, before it finishes, and a re
   assert.equal(steps.steps.length, 2, "the review entry is replaced, not duplicated")
 })
 
+test("the no-progress reason reports the number of no-progress turns actually counted", () => {
+  const controller = new ExecutionReconciliationController()
+  assert.equal(controller.reconcile("revise", "same-failure").continue, true)
+  const blocked = controller.reconcile("revise", "same-failure")
+  assert.equal(blocked.continue, false)
+  assert.match(blocked.reason ?? "", /for 2 consecutive turns/)
+})
+
 test("an incomplete implementation turn is independently continued once", () => {
   const controller = new ExecutionReconciliationController()
   const decision = controller.reconcile("revise", "no-edits:no-tool-success")
@@ -103,7 +111,7 @@ test("a repeated runtime inventory snapshot is progress once per controller and 
   assert.equal(controller.reconcile("revise", "task", "none").continue, true)
   const stopped = controller.reconcile("revise", "task", "none")
   assert.equal(stopped.continue, false)
-  assert.match(stopped.reason ?? "", /no measurable progress for 3 consecutive turns/)
+  assert.match(stopped.reason ?? "", /no measurable progress for 2 consecutive turns/)
 })
 
 test("a provider failure resumes only while it keeps producing evidence, and stops on repetition", () => {

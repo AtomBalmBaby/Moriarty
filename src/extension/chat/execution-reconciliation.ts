@@ -179,7 +179,7 @@ export class ExecutionReconciliationController {
       return { state: this._state = "blocked", continue: false, reason: `Execution exceeded ${this._limits.maxIterations} reconciliation iterations.` }
     }
     if (this._noProgress >= this._limits.maxNoProgress) {
-      return { state: this._state = "blocked", continue: false, reason: `Execution made no measurable progress for ${this._noProgress + 1} consecutive turns.` }
+      return { state: this._state = "blocked", continue: false, reason: `Execution made no measurable progress for ${this._noProgress} consecutive turns.` }
     }
     const evidenceLimit = this._limits.maxEvidenceOnlyTurns ?? DEFAULT_RECONCILIATION_LIMITS.maxEvidenceOnlyTurns ?? 0
     if (this._evidenceOnly > evidenceLimit) {
