@@ -19,10 +19,12 @@ import {
   parsableToolArguments
 } from "../../extension/inference/adapters/fluency"
 import {
-  assumedContextWindow,
-  contextWindowOf,
+  contextCapacityOf,
   forgetContextWindows,
-  knownContextWindow
+  knownContextCapacity,
+  parseContextSetting,
+  resolveFallback,
+  setContextClock
 } from "../../extension/inference/context-window"
 import { ChatChunk } from "../../extension/inference/types"
 
@@ -261,63 +263,250 @@ const fakeServer = async (routes: Record<string, (body: unknown) => unknown>) =>
   return { hits, port, close: () => server.close() }
 }
 
-test("Ollama says what a loaded model holds; before it is loaded, what its Modelfile sets", async () => {
-  forgetContextWindows()
-  let loaded = false
-  const server = await fakeServer({
-    "/api/ps": () => ({
-      models: loaded
-        ? [
-            { name: "qwen3-coder:30b", model: "qwen3-coder:30b", context_length: 32768 },
-            { name: "llama3:latest", model: "llama3:latest", context_length: 4096 }
-          ]
-        : []
-    }),
-    "/api/show": (body) =>
-      (body as { model: string }).model === "tuned" ? { parameters: "temperature 0.7\nnum_ctx                        16384" } : { parameters: "temperature 0.7" }
-  })
-  try {
-    const at = { apiHostname: "127.0.0.1", apiPort: server.port, apiProtocol: "http", apiPath: "/v1" }
-    const qwen = provider("ollama", { ...at, modelName: "qwen3-coder:30b" })
-    assert.strictEqual(await contextWindowOf(qwen), undefined, "Ollama decides when it loads the model")
-    assert.strictEqual(knownContextWindow(qwen), undefined)
-    assert.strictEqual(assumedContextWindow(qwen), 32_768)
-    assert.strictEqual(await contextWindowOf(provider("ollama", { ...at, modelName: "tuned" })), 16_384)
+const auto = { setting: "Auto", fallback: 32_768 }
+const at = (port: number): Partial<TwinnyProvider> => ({
+  apiHostname: "127.0.0.1",
+  apiPort: port,
+  apiProtocol: "http",
+  apiPath: "/v1"
+})
 
-    loaded = true
+let now = 0
+
+/** Each discovery test starts with no answers and a clock it controls. */
+const discovery = async (run: () => Promise<void>) => {
+  forgetContextWindows()
+  now = 0
+  setContextClock(() => now)
+  try {
+    await run()
+  } finally {
+    setContextClock(() => Date.now())
     forgetContextWindows()
-    assert.strictEqual(await contextWindowOf(qwen), 32_768)
-    assert.strictEqual(knownContextWindow(qwen), 32_768)
-    const asked = server.hits.length
-    assert.strictEqual(await contextWindowOf(qwen), 32_768)
-    assert.strictEqual(server.hits.length, asked, "an answer is kept for a while, not asked for on every request")
-    assert.strictEqual(
-      await contextWindowOf(provider("ollama", { ...at, modelName: "llama3" })),
-      4096,
-      "`llama3` and `llama3:latest` are one model"
-    )
-    assert.strictEqual(await contextWindowOf(provider("ollama", { ...at, modelName: "not-loaded" })), undefined)
-  } finally {
-    server.close()
   }
+}
+
+test("the chat setting is Auto, a whole number of tokens, or invalid; the fallback is a positive whole number", () => {
+  assert.deepStrictEqual(parseContextSetting("Auto"), { mode: "auto" })
+  assert.deepStrictEqual(parseContextSetting(undefined), { mode: "auto" })
+  assert.deepStrictEqual(parseContextSetting(4096), { mode: "override", tokens: 4_096 })
+  assert.deepStrictEqual(parseContextSetting(" 65536 "), { mode: "override", tokens: 65_536 })
+  for (const bad of ["8k", "0", "-1", 1.5, 0]) {
+    assert.strictEqual(parseContextSetting(bad).mode, "invalid", String(bad))
+  }
+  assert.strictEqual(resolveFallback(undefined), 32_768)
+  assert.strictEqual(resolveFallback(0), 32_768)
+  assert.strictEqual(resolveFallback(65_536), 65_536)
 })
 
-test("llama.cpp says in its properties; a hosted API is not asked and is taken to be large", async () => {
-  forgetContextWindows()
-  const server = await fakeServer({
-    "/props?model=m&autoload=false": () => ({ default_generation_settings: { n_ctx: 8192 } })
-  })
-  try {
-    const llama = provider("llamacpp", { apiHostname: "127.0.0.1", apiPort: server.port, apiProtocol: "http" })
-    assert.strictEqual(await contextWindowOf(llama), 8192)
-    const hosted = provider("anthropic")
-    assert.strictEqual(await contextWindowOf(hosted), undefined)
-    assert.strictEqual(assumedContextWindow(hosted), 128_000)
-    assert.deepStrictEqual(server.hits, ["GET /props?model=m&autoload=false"], "a router-mode server is told the model and not to load it")
-  } finally {
-    server.close()
-  }
-})
+test("Ollama: a loaded model's runtime context is confirmed, an unloaded model's Modelfile num_ctx is configured, and nothing is guessed", () =>
+  discovery(async () => {
+    let loaded = false
+    const server = await fakeServer({
+      "/api/ps": () => ({
+        models: loaded
+          ? [
+              { name: "qwen3-coder:30b", model: "qwen3-coder:30b", context_length: 32768 },
+              { name: "llama3:latest", model: "llama3:latest", context_length: 4096 }
+            ]
+          : []
+      }),
+      "/api/show": (body) => {
+        const model = (body as { model: string }).model
+        if (model === "tuned") return { parameters: "temperature 0.7\nnum_ctx                        16384" }
+        if (model === "qwen3-coder:30b") {
+          return { parameters: "temperature 0.7", model_info: { "qwen3moe.context_length": 262144 } }
+        }
+        return { parameters: "temperature 0.7" }
+      }
+    })
+    try {
+      const qwen = provider("ollama", { ...at(server.port), modelName: "qwen3-coder:30b" })
+      const unloaded = await contextCapacityOf(qwen, auto)
+      assert.deepStrictEqual([unloaded.tokens, unloaded.source, unloaded.confirmed], [32_768, "fallback", false])
+      assert.strictEqual(unloaded.advertised, 262_144, "the model's maximum is advertised, not confirmed")
+      assert.match(unloaded.warning ?? "", /planning for 32768 tokens/)
+      assert.strictEqual(knownContextCapacity(qwen, auto)?.source, "fallback")
+
+      const tuned = await contextCapacityOf(provider("ollama", { ...at(server.port), modelName: "tuned" }), auto)
+      assert.deepStrictEqual([tuned.tokens, tuned.source, tuned.confirmed], [16_384, "configured", true])
+      assert.match(tuned.warning ?? "", /below the 65536-token minimum/)
+
+      loaded = true
+      now = 3_000
+      const runtime = await contextCapacityOf(qwen, auto)
+      assert.deepStrictEqual([runtime.tokens, runtime.source, runtime.confirmed], [32_768, "runtime", true])
+      assert.strictEqual(runtime.advertised, 262_144)
+
+      const llama3 = await contextCapacityOf(provider("ollama", { ...at(server.port), modelName: "llama3" }), auto)
+      assert.deepStrictEqual([llama3.tokens, llama3.source], [4_096, "runtime"], "`llama3` and `llama3:latest` are one model")
+
+      const idle = await contextCapacityOf(provider("ollama", { ...at(server.port), modelName: "not-loaded" }), auto)
+      assert.strictEqual(idle.source, "fallback")
+
+      const before = server.hits.length
+      now = 32_999
+      await contextCapacityOf(qwen, auto)
+      assert.strictEqual(server.hits.length, before, "a confirmed answer is kept for 30 seconds")
+      assert.ok(
+        server.hits.every((hit) => / \/api\/(ps|show)$/.test(hit)),
+        "only the model listing and its metadata are asked, never a generation request"
+      )
+    } finally {
+      server.close()
+    }
+  }))
+
+test("llama.cpp: the per-slot context is confirmed with its slot count, and a router-mode server is named and not made to load", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/props?model=m&autoload=false": () => ({ default_generation_settings: { n_ctx: 8192 }, total_slots: 4 })
+    })
+    try {
+      const capacity = await contextCapacityOf(provider("llamacpp", at(server.port)), auto)
+      assert.deepStrictEqual(
+        [capacity.tokens, capacity.source, capacity.confirmed, capacity.slots],
+        [8_192, "runtime", true, 4]
+      )
+      assert.deepStrictEqual(server.hits, ["GET /props?model=m&autoload=false"])
+    } finally {
+      server.close()
+    }
+  }))
+
+test("LM Studio: the loaded context is confirmed; the model's maximum is advertised only", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/api/v0/models": () => ({
+        data: [
+          { id: "loaded", loaded_context_length: 16384, max_context_length: 131072 },
+          { id: "idle", max_context_length: 131072 }
+        ]
+      })
+    })
+    try {
+      const loaded = await contextCapacityOf(provider("lmstudio", { ...at(server.port), modelName: "loaded" }), auto)
+      assert.deepStrictEqual(
+        [loaded.tokens, loaded.source, loaded.confirmed, loaded.advertised],
+        [16_384, "runtime", true, 131_072]
+      )
+      const idle = await contextCapacityOf(provider("lmstudio", { ...at(server.port), modelName: "idle" }), auto)
+      assert.deepStrictEqual(
+        [idle.tokens, idle.source, idle.confirmed, idle.advertised],
+        [32_768, "fallback", false, 131_072]
+      )
+    } finally {
+      server.close()
+    }
+  }))
+
+test("an OpenAI-compatible server: the smallest confirmed size wins; advertised maxima and malformed values confirm nothing", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/v1/models": () => ({
+        data: [
+          { id: "both", loaded_context_length: 131072, max_model_len: 65536 },
+          { id: "maximum", context_length: 262144 },
+          { id: "plain" },
+          { id: "malformed", loaded_context_length: "8192", max_model_len: -1, context_window: 1.5, max_context_length: 1e12 }
+        ]
+      })
+    })
+    try {
+      const both = await contextCapacityOf(provider("openai-compatible", { ...at(server.port), modelName: "both" }), auto)
+      assert.deepStrictEqual([both.tokens, both.source, both.confirmed], [65_536, "configured", true])
+      assert.strictEqual(both.considered.length, 2)
+      assert.strictEqual(both.warning, undefined)
+
+      const maximum = await contextCapacityOf(provider("openai-compatible", { ...at(server.port), modelName: "maximum" }), auto)
+      assert.deepStrictEqual([maximum.tokens, maximum.source, maximum.confirmed, maximum.advertised], [32_768, "fallback", false, 262_144])
+
+      const plain = await contextCapacityOf(provider("openai-compatible", { ...at(server.port), modelName: "plain" }), auto)
+      assert.deepStrictEqual([plain.source, plain.advertised], ["fallback", undefined])
+
+      const malformed = await contextCapacityOf(provider("openai-compatible", { ...at(server.port), modelName: "malformed" }), auto)
+      assert.deepStrictEqual([malformed.source, malformed.advertised], ["fallback", undefined])
+    } finally {
+      server.close()
+    }
+  }))
+
+test("a user's figure wins over the server; a figure that disagrees with the server or sits below 64K is reported", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/props?model=m&autoload=false": () => ({ default_generation_settings: { n_ctx: 65536 } })
+    })
+    try {
+      const llama = provider("llamacpp", at(server.port))
+      const above = await contextCapacityOf(llama, { setting: 131_072, fallback: 32_768 })
+      assert.deepStrictEqual([above.tokens, above.source], [131_072, "override"])
+      assert.match(above.warning ?? "", /the server confirmed 65536/)
+
+      const small = await contextCapacityOf(llama, { setting: 4_096, fallback: 32_768 })
+      assert.strictEqual(small.tokens, 4_096)
+      assert.match(small.warning ?? "", /below the 65536-token minimum/)
+
+      const same = await contextCapacityOf(llama, { setting: "65536", fallback: 32_768 })
+      assert.deepStrictEqual([same.tokens, same.source, same.warning], [65_536, "override", undefined])
+    } finally {
+      server.close()
+    }
+  }))
+
+test("a hosted API is not asked and is never assumed to hold 64K; an invalid setting is reported and planned as Auto", () =>
+  discovery(async () => {
+    for (const kind of ["anthropic", "openai"]) {
+      const capacity = await contextCapacityOf(provider(kind), auto)
+      assert.deepStrictEqual([capacity.tokens, capacity.source, capacity.confirmed], [32_768, "fallback", false], kind)
+    }
+    const invalid = await contextCapacityOf(provider("anthropic"), { setting: "8k", fallback: 8_192 })
+    assert.deepStrictEqual([invalid.tokens, invalid.source], [8_192, "fallback"])
+    assert.match(invalid.warning ?? "", /"8k" is not a token count/)
+    assert.match(invalid.warning ?? "", /planning for 8192 tokens/)
+  }))
+
+test("answers are kept while fresh, asked again once stale, kept per model, and forgotten on a configuration change", () =>
+  discovery(async () => {
+    let loaded = false
+    const server = await fakeServer({
+      "/api/ps": () => ({
+        models: loaded ? [{ name: "qwen3-coder:30b", model: "qwen3-coder:30b", context_length: 32768 }] : []
+      }),
+      "/api/show": () => ({ parameters: "temperature 0.7" })
+    })
+    try {
+      const qwen = provider("ollama", { ...at(server.port), modelName: "qwen3-coder:30b" })
+      const tuned = provider("ollama", { ...at(server.port), modelName: "tuned" })
+
+      await contextCapacityOf(qwen, auto)
+      const first = server.hits.length
+      now = 2_999
+      await contextCapacityOf(qwen, auto)
+      assert.strictEqual(server.hits.length, first, "an unconfirmed answer is kept for 3 seconds")
+
+      now = 3_000
+      loaded = true
+      const reloaded = await contextCapacityOf(qwen, auto)
+      assert.strictEqual(reloaded.source, "runtime", "a stale unconfirmed answer is asked again")
+      assert.strictEqual(server.hits.length, first + 2)
+
+      now = 33_000
+      await contextCapacityOf(qwen, auto)
+      assert.strictEqual(server.hits.length, first + 4, "a confirmed answer is asked again after 30 seconds")
+
+      const other = await contextCapacityOf(tuned, auto)
+      assert.strictEqual(server.hits.length, first + 6, "another model is asked for its own answer")
+      assert.strictEqual(other.source, "fallback", "tuned has no num_ctx and is not loaded here")
+
+      forgetContextWindows()
+      assert.strictEqual(knownContextCapacity(qwen, auto), undefined)
+      await contextCapacityOf(qwen, auto)
+      assert.strictEqual(server.hits.length, first + 8, "a configuration change forgets every answer")
+    } finally {
+      server.close()
+    }
+  }))
+
 
 test("a step cut off by a stop says so, and what is kept of a step is held to a size", () => {
   const sent: string[][] = []

@@ -34,7 +34,7 @@ import { hostedTakesTools } from "../inference/adapters/fluency"
 import { isRetryableProviderFailure } from "../inference/errors"
 import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
-import { ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
+import { ContextCapacity, ContextDiagnostics, ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
 import { buildBreakdown, RequestBreakdown, RowChars } from "./context-breakdown"
 import { instructionsSection } from "./instructions"
 import {
@@ -57,6 +57,8 @@ export const DEFAULT_MAX_STEPS = DEFAULT_AGENT_STEPS
 const MAX_CALLS_PER_REPLY = 8
 /** A result keeps at least this much of its output, whatever comes ahead of it. */
 const MIN_RESULT_CHARS = 1000
+/** The least of a fresh result kept when the context is tight; less is left out, with a notice saying so. */
+const MIN_FRESH_CHARS = 400
 /** Calls repeated in one reply, or requests in a row of calls that cannot be read, before the model is asked to answer. */
 const MAX_REPEATED_CALLS = 3
 const MAX_UNREADABLE_IN_A_ROW = 3
@@ -219,11 +221,11 @@ export interface ToolLoopOptions {
   /** Upper ceiling for one tool result kept in the model's context, after scaling by the context window. */
   maxResultChars?: number
   /**
-   * Tokens the model's context holds, asked before each request: a local
-   * server knows only once the model is loaded. Unknown leaves the
-   * conversation untrimmed.
+   * The capacity the model's requests may use, asked before each request: a
+   * local server knows only once the model is loaded. A bare number is taken
+   * as given. Unknown leaves the conversation untrimmed.
    */
-  contextWindow?(): Promise<number | undefined> | number | undefined
+  contextWindow?(): Promise<number | ContextCapacity | undefined> | number | ContextCapacity | undefined
   /**
    * Whether the reply text carries a `> summary` line per call. On by
    * default; a host that shows the steps itself turns it off.
@@ -259,6 +261,10 @@ export interface ToolLoopOptions {
   onFallback?(reason: string, what: "tools" | "reasoning-effort"): void
   /** Called when old results were trimmed so the next request fits. */
   onTrim?(results: number, estimatedTokens: number): void
+  /** What became of a tool result's text on its way into the conversation, and into the next request. */
+  onBudget?(entry: ResultBudget): void
+  /** What one inference request was budgeted with, as counts and tokens; no content. */
+  onContext?(entry: ContextDiagnostics): void
   /** Wait before re-sending a provider request that failed; tests shorten it. */
   providerRetryDelayMs?: number
   /**
@@ -509,16 +515,56 @@ interface PendingCall {
   written?: string
 }
 
+/** One tool result's sizes and fate, in characters; no content. */
+export interface ResultBudget {
+  /** The call's invocation ID, as in the step stream: `${step}.${index}`. */
+  id: string
+  name: string
+  /** What the tool returned. */
+  original?: number
+  /** What was sent into the conversation after the per-result cap. */
+  serialized?: number
+  /** What the conversation holds for it once the context was budgeted. */
+  budgeted: number
+  reason: "kept whole" | "per-result cap" | "older result trimmed" | "cut to remaining room" | "omitted: no room"
+  /** Tokens left under the window's limit when the request was budgeted; negative when over. */
+  remainingTokens?: number
+  /** Whether the result's text is in the next request, rather than a notice in its place. */
+  retained?: boolean
+}
+
+export const describeResultBudget = (entry: ResultBudget) =>
+  [
+    `Tool result ${entry.id} ${entry.name} · ${entry.reason}`,
+    entry.original === undefined ? undefined : `original ${entry.original} chars`,
+    entry.serialized === undefined ? undefined : `serialized ${entry.serialized}`,
+    `budgeted ${entry.budgeted}`,
+    entry.remainingTokens === undefined ? undefined : `remaining ${entry.remainingTokens} tokens`,
+    entry.retained === undefined ? undefined : entry.retained ? "retained in next request" : "not retained"
+  ]
+    .filter(Boolean)
+    .join(" · ")
+
 /** A result in the conversation, so it can be trimmed later. */
 interface ResultSlot {
+  id: string
   message: number
   step: number
   name: string
   trimmed: boolean
+  /** Left out of the conversation for lack of room, with a notice in its place. */
+  omitted?: boolean
   /** A folder's instructions ahead of the output: kept when the output is trimmed. */
   preface?: string
   /** What follows the result in its message (the user's words mid-reply, in text mode): kept when it is trimmed. */
   after?: string
+}
+
+const toCapacity = (raw: number | ContextCapacity | undefined): ContextCapacity | undefined => {
+  if (typeof raw === "number") {
+    return raw > 0 ? { tokens: raw, source: "unspecified", confirmed: false, considered: [] } : undefined
+  }
+  return raw && raw.tokens > 0 ? raw : undefined
 }
 
 class ToolLoop {
@@ -655,7 +701,7 @@ class ToolLoop {
       const closing = last && !settled
 
       const context = await this._options.requestContext?.()
-      await this.fit((tools ? definitionChars : 0) + (closing ? FINAL_ANSWER_PROMPT.length : 0) + (context?.length ?? 0))
+      await this.fit((tools ? definitionChars : 0) + (closing ? FINAL_ANSWER_PROMPT.length : 0) + (context?.length ?? 0), step)
       if (outer?.aborted) {
         inferenceEvent("request.cancelled_before_dispatch", {
           operation_id: operationId,
@@ -681,7 +727,11 @@ class ToolLoop {
 
       const limits = this._options.generationLimits?.() ?? NO_GENERATION_LIMITS
       const monitor = new GenerationMonitor(limits)
-      const maxOutputTokens = limits.maxOutputTokens > 0 ? limits.maxOutputTokens : undefined
+      const configuredOutput = limits.maxOutputTokens > 0 ? limits.maxOutputTokens : undefined
+      // The reply may not take more than the plan kept room for; the window cannot hold more.
+      const maxOutputTokens = configuredOutput && this._plan
+        ? Math.min(configuredOutput, Math.max(1, this._plan.reserved))
+        : configuredOutput
       const reply = { text: "", shown: 0, toolCalls: undefined as ChatToolCall[] | undefined, reasoning: "" }
       let found: FoundCall | undefined
       let finishReason: ChatFinishReason | undefined
@@ -899,8 +949,9 @@ class ToolLoop {
         // Anything that may change the workspace makes every earlier read stale.
         if (pending.call && !key) this._answered.clear()
         const earlier = key ? this._answered.get(key) : undefined
-        // A result trimmed out of the context is gone from the model's view, and is run again.
-        const repeated = earlier && !earlier.slot?.trimmed ? earlier : undefined
+        // A result trimmed out of the context is gone from the model's view, and is run again;
+        // one left out for lack of room is refused, since running it again would give the same answer.
+        const repeated = earlier && (!earlier.slot?.trimmed || earlier.slot.omitted) ? earlier : undefined
         if (repeated) this._repeats++
         const stopped = this._options.shouldStop?.() === true
         const ran: ToolResult = stopped
@@ -911,7 +962,14 @@ class ToolLoop {
               summary: `tool call not understood · ${pending.error}`,
               failed: true
             }
+          : repeated?.slot?.omitted
+          ? {
+              output: `${name} was not run again: its result for these same arguments did not fit in the model's context, so it was left out. Ask for a smaller part, such as a narrower line range, or try something different.`,
+              summary: `${repeated.summary} · repeated, left out for lack of room`,
+              failed: true
+            }
           : repeated
+
             ? {
                 output:
                   `You already called ${name} with these same arguments in this reply, and nothing in the workspace has changed since, ` +
@@ -934,10 +992,20 @@ class ToolLoop {
         const room = this._plan
           ? Math.max(MIN_RESULT_CHARS, Math.floor(this._plan.resultChars / calls.length) - (preface?.length ?? 0))
           : undefined
+        const fitted = room ? fitResult(ran.output, room) : ran.output
         const result: ToolResult = {
           ...ran,
-          output: (room ? fitResult(ran.output, room) : ran.output) + note || "(no output)"
+          output: fitted + note || "(no output)"
         }
+        this._options.onBudget?.({
+          id,
+          name,
+          original: ran.output.length,
+          serialized: result.output.length,
+          budgeted: result.output.length,
+          reason: fitted.length < ran.output.length ? "per-result cap" : "kept whole"
+        })
+
         // A folder's instructions go ahead of the output, where a cut to
         // fit the context does not reach them; the step shows the output.
         const sent = preface ? { ...result, output: `${preface}\n\n${result.output}` } : result
@@ -1056,58 +1124,151 @@ class ToolLoop {
   }
 
   /**
-   * Before a request: if it would not fit the model's context, trim tool
-   * results out of the conversation, oldest first and the newest step's
-   * last, until it is comfortably inside.
+   * Before a request: if it would not fit the model's context, trim the older
+   * tool results out of the conversation, oldest first, until it is comfortably
+   * inside. The newest step's results are the evidence for the next turn, so
+   * they are cut to the room left, never to a preview; a result with too little
+   * room left is replaced by a notice saying it was left out.
    */
-  private async fit(extraChars: number) {
-    let window: number | undefined
+  private async fit(extraChars: number, step: number) {
+    let raw: number | ContextCapacity | undefined
     try {
-      window = await this._options.contextWindow?.()
+      raw = await this._options.contextWindow?.()
     } catch {
-      window = undefined
+      raw = undefined
     }
-    this._plan = window && window > 0 ? planContext(window, this._options.maxResultChars) : undefined
+    const capacity = toCapacity(raw)
+    const limits = this._options.generationLimits?.() ?? NO_GENERATION_LIMITS
+    this._plan = capacity ? planContext(capacity.tokens, this._options.maxResultChars, limits.maxOutputTokens) : undefined
     const plan = this._plan
-    if (!plan) return
+    if (!capacity || !plan) return
     const estimate = () => this._estimator.tokens(charsOf(this._messages) + extraChars)
-    if (estimate() <= plan.limit) return
+    const sizeOf = (slot: ResultSlot) => textOf(this._messages[slot.message]?.content).length
     const newest = this._results.length ? this._results[this._results.length - 1].step : 0
-    const passes: Array<(slot: ResultSlot) => boolean> = [
-      (slot) => slot.step < newest - 1,
-      (slot) => slot.step < newest,
-      () => true
-    ]
-    let trimmed = 0
-    for (const eligible of passes) {
-      for (const slot of this._results) {
-        if (slot.trimmed || !eligible(slot)) continue
-        if (estimate() <= plan.target) break
-        this.trim(slot)
-        trimmed++
+    const before = new Map<ResultSlot, number>(this._results.map((slot) => [slot, sizeOf(slot)]))
+    const changed = new Map<ResultSlot, ResultBudget["reason"]>()
+    if (estimate() > plan.limit) {
+      const passes: Array<(slot: ResultSlot) => boolean> = [(slot) => slot.step < newest - 1, (slot) => slot.step < newest]
+      let trimmed = 0
+      for (const eligible of passes) {
+        for (const slot of this._results) {
+          if (slot.trimmed || !eligible(slot)) continue
+          if (estimate() <= plan.target) break
+          this.trim(slot)
+          changed.set(slot, "older result trimmed")
+          trimmed++
+        }
+        if (estimate() <= plan.limit) break
       }
-      if (estimate() <= plan.limit) break
+      if (trimmed) this._options.onTrim?.(trimmed, estimate())
+      for (const slot of this._results) {
+        if (slot.trimmed || slot.step !== newest) continue
+        const over = estimate() - plan.limit
+        if (over <= 0) break
+        changed.set(slot, this.cut(slot, over * this._estimator.charsPerToken))
+      }
     }
-    if (trimmed) this._options.onTrim?.(trimmed, estimate())
+    for (const slot of this._results) {
+      if (slot.step !== newest && !changed.has(slot)) continue
+      const message = this._messages[slot.message]
+      this._options.onBudget?.({
+        id: slot.id,
+        name: slot.name,
+        budgeted: textOf(message?.content).length,
+        reason: changed.get(slot) ?? (slot.omitted ? "omitted: no room" : "kept whole"),
+        remainingTokens: plan.limit - estimate(),
+        retained: !slot.omitted
+      })
+    }
+    const used = estimate()
+    const freshSlots = this._results.filter((slot) => slot.step === newest)
+    const removedFrom = (reasons: ResultBudget["reason"][]) => {
+      const slots = [...changed].filter(([, reason]) => reasons.includes(reason)).map(([slot]) => slot)
+      const chars = slots.reduce((sum, slot) => sum + (before.get(slot) ?? 0) - sizeOf(slot), 0)
+      return { results: slots.length, chars, tokens: this._estimator.tokens(chars) }
+    }
+    const olderResults = removedFrom(["older result trimmed"])
+    const freshResults = removedFrom(["cut to remaining room", "omitted: no room"])
+    const cut = freshSlots.filter((slot) => changed.get(slot) === "cut to remaining room").length
+    const omitted = freshSlots.length - freshSlots.filter((slot) => !slot.omitted).length
+    const exhausted = used > plan.limit
+    const reasons = [
+      olderResults.results ? `${olderResults.results} older result(s) trimmed` : undefined,
+      cut ? `${cut} fresh result(s) cut` : undefined,
+      omitted ? `${omitted} fresh result(s) omitted` : undefined,
+      exhausted ? "still over budget after trimming" : undefined
+    ].filter((reason): reason is string => reason !== undefined)
+    this._options.onContext?.({
+      request: step + 1,
+      capacity: {
+        tokens: capacity.tokens,
+        source: capacity.source,
+        confirmed: capacity.confirmed,
+        advertised: capacity.advertised,
+        slots: capacity.slots
+      },
+      reserved: plan.reserved,
+      margin: plan.margin,
+      promptBudget: plan.limit,
+      estimatedPromptTokens: used,
+      remainingTokens: plan.limit - used,
+      utilizationPercent: Math.round((used / capacity.tokens) * 1000) / 10,
+      fresh: { total: freshSlots.length, retained: freshSlots.length - omitted, cut, omitted },
+      removed: { olderResults, freshResults },
+      reason: reasons.length ? reasons.join("; ") : "none",
+      exhausted
+    })
   }
 
-  private trim(slot: ResultSlot) {
+  /** A result's output as the conversation holds it, apart from the folder's instructions and any text after it. */
+  private split(slot: ResultSlot) {
     const message = this._messages[slot.message]
-    if (!message) return
+    if (!message) return undefined
     const whole = textOf(message.content)
     const after = slot.after && whole.endsWith(slot.after) ? slot.after : ""
     const text = whole.slice(0, whole.length - after.length)
-    const output = message.role === "tool" ? text : text.replace(/^<tool_result[^>]*>\n/, "").replace(/\n<\/tool_result>$/, "")
+    const body = message.role === "tool" ? text : text.replace(/^<tool_result[^>]*>\n/, "").replace(/\n<\/tool_result>$/, "")
     // Instructions hold for the whole reply, so they outlast the output they came with.
-    const { preface } = slot
-    const kept =
-      preface && output.startsWith(preface)
-        ? `${preface}\n\n${trimmedResult(output.slice(preface.length).trimStart())}`
-        : trimmedResult(output)
+    const preface = slot.preface && body.startsWith(slot.preface) ? slot.preface : ""
+    return { message, after, preface, output: preface ? body.slice(preface.length).trimStart() : body }
+  }
+
+  private rewrite(slot: ResultSlot, output: string) {
+    const parts = this.split(slot)
+    if (!parts) return
+    const kept = parts.preface ? `${parts.preface}\n\n${output}` : output
+    const { message, after } = parts
     this._messages[slot.message] = (
       message.role === "tool" ? { ...message, content: kept } : { ...message, content: toolResultMessage(slot.name, kept) + after }
     ) as ChatMessage
     slot.trimmed = true
+  }
+
+  private trim(slot: ResultSlot) {
+    const parts = this.split(slot)
+    if (parts) this.rewrite(slot, trimmedResult(parts.output))
+  }
+
+  /**
+   * Cuts a fresh result by `excess` characters, or leaves it out with a notice
+   * when too little of it would remain to be worth the model's attention.
+   */
+  private cut(slot: ResultSlot, excess: number): ResultBudget["reason"] {
+    const parts = this.split(slot)
+    if (!parts) return "kept whole"
+    // A short result costs little, and is often a notice the model needs, such as a refused repeat.
+    if (parts.output.length <= MIN_FRESH_CHARS) return "kept whole"
+    const room = parts.output.length - Math.ceil(excess)
+    if (room >= MIN_FRESH_CHARS) {
+      this.rewrite(slot, fitResult(parts.output, room))
+      return "cut to remaining room"
+    }
+    this.rewrite(
+      slot,
+      `[Not included: this result (${parts.output.length} characters) did not fit in the model's context. Ask for a smaller part, such as a narrower line range.]`
+    )
+    slot.omitted = true
+    return "omitted: no room"
   }
 
   /** The calls made and what they returned, cut to a size worth carrying into the next turn. */
@@ -1176,7 +1337,8 @@ class ToolLoop {
     step: number,
     reasoning?: string
   ): ResultSlot[] {
-    const slot = (name: string, preface?: string): ResultSlot => ({
+    const slot = (name: string, preface: string | undefined, id: string): ResultSlot => ({
+      id,
       message: this._messages.length,
       step,
       name,
@@ -1199,7 +1361,7 @@ class ToolLoop {
       if (reasoning) assistant.reasoning = reasoning
       this._messages.push(assistant)
       calls.forEach(({ raw }, i) => {
-        slots.push(slot(raw!.name, results[i].preface))
+        slots.push(slot(raw!.name, results[i].preface, `${step}.${i}`))
         this._messages.push({ role: "tool", tool_call_id: raw!.id, content: results[i].output } as ChatMessage)
       })
       this._results.push(...slots)
@@ -1208,7 +1370,7 @@ class ToolLoop {
     const name = calls[0].call?.name ?? "error"
     // A call read before its closing marker arrived is recorded closed.
     this._messages.push({ role: ASSISTANT, content: found?.unclosed ? `${text.trimEnd()}\n${found.unclosed}` : text })
-    slots.push(slot(name, results[0].preface))
+    slots.push(slot(name, results[0].preface, `${step}.0`))
     this._results.push(...slots)
     this._messages.push({ role: USER, content: toolResultMessage(name, results[0].output) })
     return slots

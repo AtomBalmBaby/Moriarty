@@ -1081,6 +1081,21 @@
           "scope": "machine",
           "markdownDescription": "Automatically approve every tool call from enabled MCP servers. Applies across conversations and restarts. Does not enable disabled servers or override external system permissions. This includes destructive actions offered by enabled servers."
         },
+        "twinny.chatContextFallback": {
+          "order": 19,
+          "type": "number",
+          "default": 32768,
+          "minimum": 1,
+          "markdownDescription": "The context size, in tokens, to plan chat requests for when no server confirms the model's context (with `#twinny.chatContextWindow#` on Auto). It is an assumption, not a confirmed capacity, and the chat says so with a warning.",
+          "scope": "machine"
+        },
+        "twinny.chatContextWindow": {
+          "order": 19,
+          "type": ["string", "number"],
+          "default": "Auto",
+          "markdownDescription": "The context size, in tokens, for chat requests. `Auto` asks the provider's server for the model's context, and uses the smallest size it confirms. A number sets the size yourself and is used as given, which is useful for testing small windows. Agent work needs 65536 tokens; a smaller size is reported with a warning.",
+          "scope": "machine"
+        },
         "twinny.chatToolsMaxSteps": {
           "order": 20,
           "type": "number",

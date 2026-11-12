@@ -53,9 +53,9 @@ import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
 import { isCancelled, isRetryableProviderFailure, readReply, readText, resolveInferenceProvider } from "../inference"
 import {
-  assumedContextWindow,
-  contextWindowOf,
-  knownContextWindow
+  contextCapacityOf,
+  forgetContextWindows,
+  knownContextCapacity
 } from "../inference/context-window"
 import { ExtensionBridge } from "../messaging/bridge"
 import { PromptInstructionResolver } from "../prompts/instructions"
@@ -71,9 +71,9 @@ import { type AcceptedFactStatus, completeProvenReviews, type CurrentSourceReade
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
-import { SMALL_CONTEXT_TOKENS } from "../tools/budget"
+import { type ContextCapacity, type ContextDiagnostics,FALLBACK_CONTEXT_TOKENS } from "../tools/budget"
 import { formatCountedTokens, formatRequestBreakdown } from "../tools/context-breakdown"
-import { DEFAULT_MAX_STEPS, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
+import { DEFAULT_MAX_STEPS, describeResultBudget, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import { type ToolCall, toolDefinition } from "../tools/protocol"
 import { type TodoToolOptions, todoTools, todoWorkspaceTools } from "../tools/todos"
@@ -327,6 +327,7 @@ export class Chat extends Base {
   private _missingMcpCapabilities: string[] = []
   private _agentToolDiagnostic?: string
   private readonly _runtimeInventorySignatures = new Map<string, string>()
+  private readonly _warnedCapacity = new Set<string>()
   private readonly _steps: ToolSteps
   private readonly _stopSubscription: { dispose(): void }
   /** What agent replies changed, kept so each can be compared or undone from the chat. */
@@ -1263,6 +1264,46 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   }
 
   /** Records the outgoing tool definitions as a trusted host observation, only when they change for the active TODO. */
+  public updateConfig() {
+    super.updateConfig()
+    forgetContextWindows()
+    this._warnedCapacity.clear()
+  }
+
+  private contextOptions() {
+    return {
+      setting: this.config.get("chatContextWindow", "Auto"),
+      fallback: this.config.get("chatContextFallback", FALLBACK_CONTEXT_TOKENS)
+    }
+  }
+
+  private async contextCapacity(provider: TwinnyProvider): Promise<ContextCapacity> {
+    const capacity = await contextCapacityOf(provider, this.contextOptions())
+    const key = `${provider.modelName}|${capacity.warning ?? ""}`
+    if (capacity.warning && !this._warnedCapacity.has(key)) {
+      this._warnedCapacity.add(key)
+      logger.warn(`Chat context · ${provider.modelName}: ${capacity.warning}`)
+    }
+    return capacity
+  }
+
+  /** Counts only; no prompt or tool content is logged. */
+  private logContext(provider: TwinnyProvider, entry: ContextDiagnostics) {
+    const { capacity, fresh, removed } = entry
+    logger.debug(
+      `[Context] request=${entry.request} model=${provider.modelName} ` +
+        `capacity=${capacity.tokens} source=${capacity.source}${capacity.confirmed ? "" : " (unconfirmed)"}` +
+        `${capacity.advertised === undefined ? "" : ` advertised=${capacity.advertised}`}` +
+        `${capacity.slots === undefined ? "" : ` slots=${capacity.slots}`} ` +
+        `promptBudget=${entry.promptBudget} reserved=${entry.reserved} margin=${entry.margin} ` +
+        `estimatedPrompt=${entry.estimatedPromptTokens} remaining=${entry.remainingTokens} ` +
+        `utilization=${entry.utilizationPercent}% ` +
+        `fresh=${fresh.retained}/${fresh.total} cut=${fresh.cut} omitted=${fresh.omitted} ` +
+        `removedOlder=${removed.olderResults.results} removedFresh=${removed.freshResults.results} ` +
+        `exhausted=${entry.exhausted} reason=${entry.reason}`
+    )
+  }
+
   private generationOptions() {
     return {
       generationLimits: () => generationLimitsFrom({
@@ -2077,7 +2118,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     let outOfSteps = false
     const providerFailures: unknown[] = []
     // Asked now, so the reply can say how much of the context it used.
-    void contextWindowOf(provider)
+    void this.contextCapacity(provider)
     this._steering = []
     this._steerable = !!view
     // Every model turn, including an automatic continuation after Feedback,
@@ -2214,13 +2255,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           providerFailures.push(error)
         },
         meta: () => {
-          const contextWindow = knownContextWindow(provider)
+          const capacity = knownContextCapacity(provider, this.contextOptions())
           const instructions = instructionFiles()
           return {
             ...(instructions.length ? { instructions } : {}),
             ...(usage.promptTokens ? { promptTokens: usage.promptTokens } : {}),
             ...(usage.completionTokens ? { completionTokens: usage.completionTokens } : {}),
-            ...(contextWindow ? { contextWindow } : {}),
+            ...(capacity ? { contextWindow: capacity.tokens } : {}),
             ...(outOfSteps ? { outOfSteps: true } : {})
           }
         }
@@ -2318,21 +2359,14 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       MAX_RESULT_CHARS,
       DEFAULT_RESULT_CHARS
     )
-    let warned = false
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
       ...this.generationOptions(),
       maxResultChars,
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
-      contextWindow: async () => {
-        const told = await contextWindowOf(provider)
-        if (told && told < SMALL_CONTEXT_TOKENS && !warned) {
-          warned = true
-          logger.warn(`Chat tools · ${provider.modelName} is loaded with a ${formatCount(told)}-token context. Tools need about 8k to work well.`)
-        }
-        return told ?? assumedContextWindow(provider)
-      },
+      contextWindow: () => this.contextCapacity(provider),
+      onContext: (entry) => this.logContext(provider, entry),
       stepLines: false,
       steering: () => this.takeSteering(),
       requestContext: () => this.planRequestContext(),
@@ -2351,6 +2385,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.debug(`Chat TODO tools · ${step.summary}`)
       },
       onTrim: (results, tokens) => logger.debug(`Chat TODO tools · trimmed ${results} older result${results === 1 ? "" : "s"} (now about ${formatCount(tokens)} tokens)`),
+      onBudget: (entry) => logger.debug(`Chat TODO tools · ${describeResultBudget(entry)}`),
       onFallback: (reason) => logger.warn(`Chat TODO tools · provider fell back to text tool calls: ${reason}`),
       onEnd: () => this._steps.settle()
     })
@@ -2520,7 +2555,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
     hooks.onTools(available)
 
-    let warned = false
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
@@ -2529,17 +2563,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       // OpenAI's reasoning models think silently on the chat route; at their
       // default effort one tool step can take minutes.
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
-      contextWindow: async () => {
-        const told = await contextWindowOf(provider)
-        if (told && told < SMALL_CONTEXT_TOKENS && !warned) {
-          warned = true
-          logger.warn(
-            `Chat tools · ${provider.modelName} is loaded with a ${formatCount(told)}-token context. ` +
-              "Tools need about 8k to work well; older results will be trimmed often. Raise the server's context length if you can."
-          )
-        }
-        return told ?? assumedContextWindow(provider)
-      },
+      contextWindow: () => this.contextCapacity(provider),
+      onContext: (entry) => this.logContext(provider, entry),
       stepLines: false,
       steering: () => this.takeSteering(),
       requestContext: () => this.planRequestContext(),
@@ -2562,6 +2587,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.debug(
           `Chat tools · trimmed ${results} older tool result${results === 1 ? "" : "s"} to fit the context (now about ${formatCount(tokens)} tokens)`
         ),
+      onBudget: (entry) => logger.debug(`Chat tools · ${describeResultBudget(entry)}`),
       onFallback: (reason, what) =>
         logger.warn(
           what === "tools"

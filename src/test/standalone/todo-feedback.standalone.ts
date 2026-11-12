@@ -6560,6 +6560,18 @@ test("an implementation_symbol that names a registered tool is rejected by the v
   }
 })
 
+test("an implementation_symbol that no read declaration matches is disproven by the verifier, whatever the request says", async () => {
+  const judged = await judgeSource({ file: TS_REGISTERED_FILE, text: TS_REGISTERED, criteria: [locate("ChatStopMessage", TS_REGISTERED_FILE, "implementation_symbol")] })
+  try {
+    assert.notEqual(judged.evaluation.decision, "accept")
+    assert.equal(judged.evaluation.criteria[0].reconciliation?.outcome, "disproven")
+    assert.equal(judged.evaluation.criteria[0].reconciliation?.failureReason, "contradicted_evidence")
+    assert.match(judged.evaluation.criteria[0].reconciliation?.missing[0] ?? "", /does not declare ChatStopMessage/)
+  } finally {
+    fs.rmSync(judged.state.directory, { recursive: true, force: true })
+  }
+})
+
 test("completing a source-location task releases the task that depends on it", async () => {
   const state = await evidenceFixtureFor([
     { id: "locate", criteria: [identityFree("located", "run_command", TS_REGISTERED_FILE)] },

@@ -16,6 +16,8 @@ import { buildChatTurn } from "../../extension/chat/turn"
 import { ChatChunk, ChatRequest, InferenceClient, InferenceError, InferenceErrorKind, InferenceOptions, isCancelled, isInferenceError } from "../../extension/inference"
 import { abortable } from "../../extension/inference/stream"
 import {
+  ContextDiagnostics,
+  DEFAULT_CHARS_PER_TOKEN,
   fitResult,
   planContext,
   SMALL_CONTEXT_TOKENS,
@@ -29,6 +31,7 @@ import {
   generationLimitsFrom,
   GenerationMonitor,
   NO_GENERATION_LIMITS,
+  ResultBudget,
   ToolLoopUsage,
   ToolStep,
   withTools
@@ -99,8 +102,11 @@ test("a context is shared out by its size", () => {
   const small = planContext(4096)
   const local = planContext(32_768)
   const hosted = planContext(200_000)
-  assert.deepStrictEqual([small.limit, small.target, small.resultChars, small.notesChars], [2867, 1863, 2703, 1200])
-  assert.deepStrictEqual([local.limit, local.resultChars, local.notesChars], [27_443, 21_626, 6000])
+  assert.deepStrictEqual([small.limit, small.target, small.resultChars, small.notesChars], [2868, 1864, 2703, 1200])
+  assert.deepStrictEqual([local.limit, local.resultChars, local.notesChars], [27_444, 21_626, 6000])
+  for (const plan of [small, local, hosted]) {
+    assert.strictEqual(plan.limit + plan.reserved + plan.margin, plan.window, "the prompt budget, reply reserve and margin fill the window exactly")
+  }
   assert.deepStrictEqual([hosted.resultChars, hosted.notesChars], [100_000, 6000], "the default cap is large enough to keep a whole result in context")
   assert.ok(small.window < SMALL_CONTEXT_TOKENS && local.window > SMALL_CONTEXT_TOKENS)
 
@@ -164,6 +170,219 @@ test("old results are trimmed, oldest first, when the next request would not fit
   await collect(withTools(untrimmed.client, workspaceTools(root), { mode: "native" }).chat(ask("Read two.")))
   assert.ok(results(untrimmed.requests[2]).every((content) => content.includes("const value59")))
 })
+
+/** Earlier turns long enough that the conversation itself, not the tool results, fills most of the window. */
+const longHistory = (turns: number): ChatRequest["messages"] =>
+  Array.from({ length: turns }, (_, i) => [
+    { role: "user" as const, content: `Earlier question ${i}: ${"detail ".repeat(40)}` },
+    { role: "assistant" as const, content: `Earlier answer ${i}: ${"reply ".repeat(40)}` }
+  ]).flat()
+
+test("a fresh read stays readable when an older read must be trimmed to fit", async () => {
+  const body = Array.from({ length: 60 }, (_, i) => `const value${i} = "${"x".repeat(30)}"`).join("\n")
+  const root = workspace({ "a.ts": body, "b.ts": body })
+  const { client, requests } = scripted([{ calls: [read("1", "a.ts")] }, { calls: [read("2", "b.ts")] }, "Done."])
+  await collect(
+    withTools(client, workspaceTools(root), { mode: "native", contextWindow: () => 4096 }).chat({
+      model: "m",
+      messages: [...longHistory(6), { role: "user", content: "Read both." }]
+    })
+  )
+  const fresh = requests[2].messages.filter((m) => m.role === "tool").map((m) => String(m.content)).pop() ?? ""
+  assert.ok(fresh.includes("const value20"), `the fresh read is shown beyond its first line:\n${fresh}`)
+})
+
+test("a fresh read that cannot fit is left out with a notice, and running it again is refused rather than looping", async () => {
+  const body = Array.from({ length: 60 }, (_, i) => `const value${i} = "${"x".repeat(30)}"`).join("\n")
+  const root = workspace({ "a.ts": body })
+  const { client, requests } = scripted([
+    { calls: [read("1", "a.ts")] },
+    { calls: [read("2", "a.ts")] },
+    { calls: [read("3", "a.ts")] },
+    { calls: [read("4", "a.ts")] },
+    "Stopped for lack of room."
+  ])
+  const budgets: ResultBudget[] = []
+  const reply = await collect(
+    withTools(client, workspaceTools(root), {
+      mode: "native",
+      contextWindow: () => 4096,
+      onBudget: (entry) => budgets.push(entry)
+    }).chat({ model: "m", messages: [...longHistory(40), { role: "user", content: "Read it." }] })
+  )
+  assert.ok(requests.length <= 5, `the loop stops by itself, after ${requests.length} requests`)
+  assert.strictEqual(reply.text.includes("Stopped for lack of room."), true)
+  const tools = requests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content))
+  assert.match(tools[0], /^\[Not included: this result \(\d+ characters\) did not fit in the model's context/, "a fresh result that cannot fit is named as left out")
+  const repeated = requests.flatMap((request) => request.messages.filter((m) => m.role === "tool").map((m) => String(m.content)))
+  assert.ok(repeated.some((content) => content.includes("was not run again")), "a repeat of the left-out read is refused, not run again")
+  assert.ok(
+    budgets.some((entry) => entry.name === "read_file" && entry.reason === "omitted: no room" && entry.retained === false),
+    "the diagnostics say the result was omitted and not retained"
+  )
+  assert.ok(budgets.every((entry) => !("content" in entry)), "diagnostics carry sizes and ids, never the content")
+})
+
+test("a small fresh read is kept whole beside a large conversation", async () => {
+  const root = workspace({ "one.ts": "export const one = 1\n" })
+  const { client, requests } = scripted([{ calls: [read("1", "one.ts")] }, "Read."])
+  await collect(
+    withTools(client, workspaceTools(root), { mode: "native", contextWindow: () => 4096 }).chat({
+      model: "m",
+      messages: [...longHistory(6), { role: "user", content: "Read it." }]
+    })
+  )
+  const fresh = requests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content)).pop() ?? ""
+  assert.match(fresh, /1: export const one = 1/, "the one-line read keeps its line")
+})
+
+test("a fresh read cut to the room left keeps its beginning and says so", async () => {
+  const body = Array.from({ length: 60 }, (_, i) => `const value${i} = "${"x".repeat(30)}"`).join("\n")
+  const root = workspace({ "a.ts": body })
+  const { client, requests } = scripted([{ calls: [read("1", "a.ts")] }, "Read."])
+  const budgets: ResultBudget[] = []
+  await collect(
+    withTools(client, workspaceTools(root), {
+      mode: "native",
+      contextWindow: () => 4096,
+      onBudget: (entry) => budgets.push(entry)
+    }).chat({ model: "m", messages: [...longHistory(8), { role: "user", content: "Read it." }] })
+  )
+  const fresh = requests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content)).pop() ?? ""
+  assert.ok(fresh.includes("const value0") && fresh.includes("cut to fit the model's context"), "the cut keeps the start and names the cut")
+  assert.ok(budgets.some((entry) => entry.id === "0.0" && entry.reason === "cut to remaining room" && entry.retained === true))
+})
+
+const CAPACITIES = [4_096, 16_384, 65_536, 131_072, 262_144]
+const SAMPLE = Array.from({ length: 60 }, (_, i) => `const value${i} = "${"x".repeat(30)}"`).join("\n")
+
+/** Conversation sized to a share of the window's prompt budget, so fresh results have to fit beside it. */
+const historyFilling = (window: number, share: number): ChatRequest["messages"] => {
+  const perTurn = longHistory(1).reduce((chars, message) => chars + String(message.content).length, 0)
+  return longHistory(Math.ceil((planContext(window).limit * DEFAULT_CHARS_PER_TOKEN * share) / perTurn))
+}
+
+const toolOutputs = (request: ChatRequest) => request.messages.filter((m) => m.role === "tool").map((m) => String(m.content))
+
+test("each context capacity splits into a prompt budget, reply reserve and margin that fill it exactly", () => {
+  const plans = CAPACITIES.map((window) => planContext(window))
+  for (const plan of plans) {
+    assert.strictEqual(plan.limit + plan.reserved + plan.margin, plan.window, `${plan.window}: nothing is over-committed`)
+    assert.ok(plan.reserved > 0 && plan.reserved <= 2048, `${plan.window}: the reply keeps room within its cap`)
+    assert.ok(plan.target > 0 && plan.target <= plan.limit, `${plan.window}: the target sits inside the prompt budget`)
+    assert.ok(plan.resultChars >= 2000 && plan.resultChars <= 100_000, `${plan.window}: a result's share stays within its bounds`)
+  }
+  assert.ok(plans.every((plan, i) => i === 0 || plan.limit > plans[i - 1].limit), "more capacity means more prompt budget")
+  assert.ok(planContext(131_072).limit > planContext(65_536).limit * 1.9, "128K is budgeted from its own capacity, not a 64K-sized one")
+  assert.ok(planContext(262_144).limit > 200_000, "256K is represented in full")
+})
+
+test("every inference request reports its capacity, budget and removals at each context size", async () => {
+  for (const window of CAPACITIES) {
+    const plan = planContext(window)
+    const root = workspace({ "a.ts": SAMPLE, "b.ts": SAMPLE })
+    const { client, requests } = scripted([{ calls: [read("1", "a.ts")] }, { calls: [read("2", "b.ts")] }, "Done."])
+    const diagnostics: ContextDiagnostics[] = []
+    await collect(
+      withTools(client, workspaceTools(root), {
+        mode: "native",
+        contextWindow: () => window,
+        onContext: (entry) => diagnostics.push(entry)
+      }).chat({ model: "m", messages: [...historyFilling(window, 0.4), { role: "user", content: "Read both." }] })
+    )
+    assert.strictEqual(diagnostics.length, requests.length, `${window}: one diagnostic per request`)
+    for (const entry of diagnostics) {
+      assert.strictEqual(entry.capacity.tokens, window, `${window}: the request reports the capacity it was planned for`)
+      assert.strictEqual(entry.promptBudget, plan.limit, `${window}: the budget is the plan's`)
+      assert.strictEqual(entry.reserved + entry.margin + entry.promptBudget, window, `${window}: budget, reserve and margin fill the window`)
+      assert.ok(entry.exhausted || entry.estimatedPromptTokens <= entry.promptBudget, `${window}: an unexhausted request fits its budget`)
+      assert.ok(entry.exhausted || entry.utilizationPercent <= 100, `${window}: utilization stays within capacity`)
+      assert.ok(entry.removed.olderResults.results === 0 || entry.reason.includes("older result"), `${window}: every trim is named in the reason`)
+    }
+    const fresh = toolOutputs(requests[2]).pop() ?? ""
+    assert.ok(
+      window < 16_384 ? fresh.includes("const value0") || fresh.includes("[Not included:") : fresh.includes("const value0"),
+      `${window}: the fresh read is shown, or at the deliberate 4K limit named as left out, never dropped silently`
+    )
+    if (window >= 16_384) assert.ok(fresh.includes("const value59"), `${window}: a small fresh read is kept whole`)
+  }
+})
+
+test("switching the model mid-task recalculates the capacity and keeps the task's results", async () => {
+  let window = 131_072
+  const root = workspace({ "a.ts": SAMPLE, "b.ts": SAMPLE })
+  const { client, requests } = scripted([{ calls: [read("1", "a.ts")] }, { calls: [read("2", "b.ts")] }, "Done."])
+  const diagnostics: ContextDiagnostics[] = []
+  await collect(
+    withTools(client, workspaceTools(root), {
+      mode: "native",
+      contextWindow: () => window,
+      onContext: (entry) => {
+        diagnostics.push(entry)
+        if (entry.request === 1) window = 4096
+      }
+    }).chat({ model: "large", messages: [{ role: "user", content: "Read both." }] })
+  )
+  assert.deepStrictEqual(diagnostics.map((entry) => entry.capacity.tokens), [131_072, 4096, 4096])
+  assert.strictEqual(diagnostics[1].promptBudget, planContext(4096).limit, "the smaller model's budget replaces the larger one")
+  assert.strictEqual(toolOutputs(requests[2]).length, 2, "both results are still in the conversation after the switch")
+  assert.ok(requests[2].messages.some((m) => String(m.content) === "Read both."), "the task itself is kept")
+})
+
+test("a conversation too large for its window is reported as exhausted, and the reply still ends", async () => {
+  const { client } = scripted(["Stopped for lack of room."])
+  const diagnostics: ContextDiagnostics[] = []
+  const reply = await collect(
+    withTools(client, workspaceTools(workspace({})), {
+      mode: "native",
+      contextWindow: () => 4096,
+      onContext: (entry) => diagnostics.push(entry)
+    }).chat({ model: "m", messages: [...historyFilling(4096, 3), { role: "user", content: "Continue." }] })
+  )
+  assert.ok(diagnostics.some((entry) => entry.exhausted && entry.reason.includes("still over budget")), "the overflow is observable")
+  assert.strictEqual(reply.text, "Stopped for lack of room.", "the reply still completes")
+})
+
+for (const window of [65_536, 131_072]) {
+  test(`a sustained ${window}-token session keeps fresh observations, TODO and evidence across a new instruction`, async () => {
+    const todo = "TODO\n- [x] read a.ts\n- [ ] edit b.ts"
+    const root = workspace({ "a.ts": SAMPLE, "b.ts": SAMPLE })
+    const { client, requests } = scripted([
+      { calls: [read("1", "a.ts")] },
+      { calls: [{ id: "2", name: "grep", arguments: JSON.stringify({ pattern: "value5 " }) }] },
+      { calls: [read("3", "b.ts")] },
+      "Read both; value5 is in both files.",
+      "Noted: the next change goes in b.ts."
+    ])
+    const diagnostics: ContextDiagnostics[] = []
+    const onContext = (entry: ContextDiagnostics) => diagnostics.push(entry)
+    const history = historyFilling(window, 0.4)
+    const first = await collect(
+      withTools(client, workspaceTools(root), { mode: "native", contextWindow: () => window, requestContext: () => todo, onContext }).chat({
+        model: "m",
+        messages: [...history, { role: "user", content: "Read both and find value5." }]
+      })
+    )
+    const turn = [...history, { role: "user" as const, content: "Read both and find value5." }, { role: "assistant" as const, content: first.text }]
+    await collect(
+      withTools(client, workspaceTools(root), { mode: "native", contextWindow: () => window, requestContext: () => todo, onContext }).chat({
+        model: "m",
+        messages: [...turn, { role: "user", content: "Now note the next change." }]
+      })
+    )
+
+    assert.strictEqual(diagnostics.length, 5, "every request, across both turns, is reported")
+    assert.ok(diagnostics.every((entry) => entry.capacity.tokens === window && entry.promptBudget === planContext(window).limit))
+    assert.ok(diagnostics.slice(0, 4).every((entry) => entry.fresh.omitted === 0 && entry.fresh.cut === 0), "no fresh result is cut or omitted")
+    assert.ok(requests.slice(0, 4).every((request) => JSON.stringify(request.messages).includes("edit b.ts")), "the TODO is in every request of the turn")
+
+    const finalOutputs = toolOutputs(requests[3])
+    assert.ok(finalOutputs.at(-1)?.includes("const value59") && finalOutputs.at(-1)?.includes("content_hash: xxh64:"), "the fresh read is whole and carries its fingerprint")
+    assert.ok(finalOutputs.some((output) => output.includes("value5")), "the search output survives")
+    assert.strictEqual(finalOutputs.join("\n").split("const value0 = ").length - 1, 2, "each file's first line is kept once per result, not duplicated")
+    assert.ok(String(requests[4].messages.at(-1)?.content).includes("Now note the next change."), "the new instruction is in the continued request")
+  })
+}
 
 /** A client that sends its first chunks, then goes quiet until the host aborts the request. */
 const stalled = (chunks: ChatChunk[], requests: ChatRequest[]) =>

@@ -17,12 +17,56 @@ export const DEFAULT_CHARS_PER_TOKEN = 3.3
 /** Under this, tool use is cramped whatever is trimmed: the tools' own description takes a quarter of it. */
 export const SMALL_CONTEXT_TOKENS = 8192
 
+export const SUPPORTED_CONTEXT_TOKENS = 65_536
+
+/** Planned for when no server confirms a model's context and the user has not set one. */
+export const FALLBACK_CONTEXT_TOKENS = 32_768
+
+export type CapacitySource = "override" | "runtime" | "configured" | "listing" | "fallback" | "unspecified"
+
+export interface ConfirmedCapacity {
+  source: "runtime" | "configured" | "listing"
+  tokens: number
+}
+
+export interface ContextCapacity {
+  tokens: number
+  source: CapacitySource
+  confirmed: boolean
+  advertised?: number
+  slots?: number
+  considered: ConfirmedCapacity[]
+  warning?: string
+}
+
+export interface ContextDiagnostics {
+  request: number
+  capacity: { tokens: number; source: CapacitySource; confirmed: boolean; advertised?: number; slots?: number }
+  reserved: number
+  margin: number
+  promptBudget: number
+  estimatedPromptTokens: number
+  remainingTokens: number
+  utilizationPercent: number
+  fresh: { total: number; retained: number; cut: number; omitted: number }
+  removed: {
+    olderResults: { results: number; chars: number; tokens: number }
+    freshResults: { results: number; chars: number; tokens: number }
+  }
+  reason: string
+  exhausted: boolean
+}
+
 const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value))
 
 export interface ContextPlan {
   /** Tokens the model's context holds. */
   window: number
-  /** Tokens a request may be estimated at before old results are trimmed. */
+  /** Tokens kept for the reply, at least the output cap; capped so `limit` keeps 512 tokens when the window allows. */
+  reserved: number
+  /** Tokens held back from the window against estimate error. */
+  margin: number
+  /** Tokens an estimated prompt may take before old results are trimmed. */
   limit: number
   /** Where trimming stops, well under the limit, so it is not needed again a step later. */
   target: number
@@ -32,14 +76,17 @@ export interface ContextPlan {
   notesChars: number
 }
 
-/** How a context of `window` tokens is shared out. */
-export const planContext = (window: number, maxResultChars = 100_000): ContextPlan => {
-  // Room for the reply itself: the answer, or the next call's arguments.
-  const reply = Math.min(2048, Math.floor(window * 0.2))
-  const limit = Math.max(512, Math.floor(window * 0.9) - reply)
+/** How a context of `window` tokens is shared out, given the output cap each request sends. */
+export const planContext = (window: number, maxResultChars = 100_000, outputTokens = 0): ContextPlan => {
+  const margin = Math.floor(window * 0.1)
+  const reply = Math.max(Math.min(2048, Math.floor(window * 0.2)), outputTokens)
+  const reserved = Math.max(0, Math.min(reply, window - margin - 512))
+  const limit = window - reserved - margin
   const ceiling = Number.isFinite(maxResultChars) ? Math.max(2000, Math.min(200_000, Math.round(maxResultChars))) : 100_000
   return {
     window,
+    reserved,
+    margin,
     limit,
     target: Math.floor(limit * 0.65),
     resultChars: clamp(Math.floor(window * DEFAULT_CHARS_PER_TOKEN * 0.2), 2000, ceiling),
