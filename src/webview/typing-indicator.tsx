@@ -4,6 +4,8 @@ import { TWINNY } from "../common/constants"
 import { WorkspaceSearchReport } from "../common/messaging/protocol"
 import { ToolStepView } from "../common/types"
 
+import ReasoningBlock from "./reasoning-block"
+import type { ReasoningView } from "./reasoning-rounds"
 import ToolSteps from "./tool-steps"
 import WorkspaceContext from "./workspace-context"
 
@@ -11,8 +13,8 @@ import styles from "./styles/typing-indicator.module.css"
 
 /** What the chat knows about the turn in progress; nothing here is inferred from text. */
 export interface TypingActivity {
-  /** Reasoning the provider streamed for this turn; empty when it exposes none. */
-  reasoning: string
+  /** Reasoning the provider streamed for this turn; no rounds when it exposes none. */
+  reasoning: ReasoningView
   /** Automatic turns after the first in this request. */
   continuation: number
   /** The TODO item marked in progress, when there is one. */
@@ -39,7 +41,7 @@ const phaseOf = (steps: ToolStepView[] | undefined, activity: TypingActivity | u
   const running = steps?.find((step) => step.status === "running")
   if (running) return `Running ${running.name}`
   if (activity?.feedbackPlanning) return "Feedback is reviewing the plan"
-  return activity?.reasoning ? "Thinking" : "Generating"
+  return activity?.reasoning.activeId ? "Thinking" : "Generating"
 }
 
 const TypingIndicator = ({ context, steps, activity }: TypingIndicatorProps) => {
@@ -65,12 +67,7 @@ const TypingIndicator = ({ context, steps, activity }: TypingIndicatorProps) => 
         {activity?.activeTask && <span>task: {activity.activeTask}</span>}
         {!!activity?.verified?.total && <span>verified {activity.verified.done}/{activity.verified.total}</span>}
       </div>
-      {!!activity?.reasoning && (
-        <details className={styles.reasoning}>
-          <summary>Reasoning</summary>
-          <pre>{activity.reasoning}</pre>
-        </details>
-      )}
+      {activity && <ReasoningBlock reasoning={activity.reasoning} />}
       {context && (
         <div className={styles.context}>
           <WorkspaceContext report={context} />

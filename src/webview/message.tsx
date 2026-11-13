@@ -26,6 +26,8 @@ import CodeBlock from "./code-block"
 import { createCustomImageExtension } from "./image-extension"
 import { MentionExtension } from "./mention-extention"
 import { emit } from "./messaging"
+import ReasoningBlock from "./reasoning-block"
+import type { ReasoningView } from "./reasoning-rounds"
 import { ReplyChanges } from "./reply-changes"
 import { useToast } from "./toast"
 import ToolSteps from "./tool-steps"
@@ -59,6 +61,8 @@ interface MessageProps {
   onDeleteImage?: (id: string) => void
   /** A reply whose task the user paused: it reads paused and offers Continue or Stop. */
   paused?: boolean
+  /** Reasoning streamed for a reply still in progress; a saved reply carries its own. */
+  reasoning?: ReasoningView
   /** Continue a paused or out-of-steps reply. Only the last reply offers it. */
   onContinue?: () => void
   /** End a paused reply's task for good. Any paused reply offers it. */
@@ -330,6 +334,7 @@ export const Message: React.FC<MessageProps> = ({
   onContinue,
   onStopTask,
   paused,
+  reasoning,
   onChangesUpdate
 }) => {
   const { t } = useTranslation()
@@ -612,7 +617,9 @@ export const Message: React.FC<MessageProps> = ({
 
   // A reply can be all steps and no text: its tools ran, then it was stopped.
   if (!message) return null
-  if (!message.content && !message.toolSteps?.length && !steps?.length) return null
+  const reasoningView = reasoning ?? { rounds: message.reasoningRounds ?? [] }
+  const hasReasoning = reasoningView.rounds.length > 0
+  if (!message.content && !message.toolSteps?.length && !steps?.length && !hasReasoning) return null
 
   const { thinking, message: messageContent } = getThinkingMessage(
     message.content as string
@@ -719,6 +726,9 @@ export const Message: React.FC<MessageProps> = ({
         </span>
         {!footerActions && options}
       </div>
+      {message.role === ASSISTANT && (
+        <ReasoningBlock reasoning={reasoningView} interrupted={paused ? "paused" : "stopped"} />
+      )}
       {message.role === ASSISTANT && (
         <>
           <WorkspaceContext report={message.context ?? context} />

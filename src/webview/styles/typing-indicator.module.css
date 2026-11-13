@@ -30,25 +30,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-.reasoning {
-  margin-top: 6px;
-  color: var(--tw-fg-faint);
-  font-size: var(--tw-fs-xs);
-  user-select: text;
-}
-
-.reasoning summary {
-  cursor: pointer;
-}
-
-.reasoning pre {
-  max-height: 180px;
-  overflow: auto;
-  margin: 4px 0 0;
-  white-space: pre-wrap;
-  font-family: inherit;
-}
-
 /* A blinking block cursor: the terminal's own "working" signal. */
 .cursor {
   width: 7px;

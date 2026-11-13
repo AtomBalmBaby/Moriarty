@@ -149,6 +149,10 @@
   opacity: 0;
 }
 
+.reasoningText {
+  white-space: pre-wrap;
+}
+
 /* Markdown rendered inside a message. */
 .message p {
   margin: 0 0 0.9em;

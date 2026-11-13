@@ -108,6 +108,7 @@ const MessageItem = memo(
             message={completion}
             context={context}
             steps={steps}
+            reasoning={activity?.reasoning}
             index={index}
             isLoading={isLoading}
             messages={messages}

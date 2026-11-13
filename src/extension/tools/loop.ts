@@ -772,7 +772,7 @@ class ToolLoop {
           if (typeof chunk.reasoning === "string" && chunk.reasoning) {
             reply.reasoning += chunk.reasoning
             // Passed on as it arrives, so the chat can show the thinking while it happens.
-            yield { content: "", reasoning: chunk.reasoning }
+            yield { content: "", reasoning: chunk.reasoning, reasoningStep: step }
           }
           if (chunk.toolCalls) reply.toolCalls = [...(reply.toolCalls ?? []), ...chunk.toolCalls]
           if (chunk.usage?.promptTokens) promptTokens = chunk.usage.promptTokens

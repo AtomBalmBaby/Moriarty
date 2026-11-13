@@ -874,3 +874,149 @@ test("a conversation with no TODO list stays empty, with no fabricated items and
     await panel.unmount()
   }
 })
+
+// Reasoning arrives as deltas that the webview batches, so each assertion waits past the flush interval.
+const settleReasoning = async (): Promise<void> => {
+  const { act } = await loadWebview()
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  })
+}
+
+const reasoningSections = (document: Document): Element[] => [...document.querySelectorAll("[data-reasoning-state]")]
+
+const clickElement = async (element: HTMLElement): Promise<void> => {
+  const { act, window } = await loadWebview()
+  await act(async () => {
+    element.dispatchEvent(new window.MouseEvent("click", { bubbles: true }))
+  })
+}
+
+const reasoningHeader = (document: Document, label: string): HTMLElement | undefined =>
+  [...document.querySelectorAll<HTMLElement>("[role=\"button\"]")].find((item) => item.textContent?.includes(label))
+
+test("streamed reasoning opens while thinking and collapses when the answer begins", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Think it through" })
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-r1" })
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r1:0", text: "Weighing options" })
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r1:0", text: " carefully" })
+    await settleReasoning()
+
+    assert.ok(hasText(chat.document, "Weighing options carefully"), "the active reasoning is visible while streaming")
+    assert.equal(reasoningSections(chat.document)[0]?.getAttribute("data-reasoning-state"), "active")
+    assert.ok(reasoningHeader(chat.document, "Thinking"), "the active block is labelled Thinking")
+
+    await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: "The answer" })
+    assert.equal(hasText(chat.document, "Weighing options carefully"), false, "completed reasoning collapses")
+    assert.ok(reasoningHeader(chat.document, "Thought"), "the completed block shows a compact header")
+    assert.ok(hasText(chat.document, "The answer"))
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("a new reasoning round starts its own block and closes the previous one", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Two rounds" })
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-r4" })
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r4:0", text: "First round" })
+    await settleReasoning()
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r4:1", text: "Second round" })
+    await settleReasoning()
+
+    assert.equal(hasText(chat.document, "First round"), false, "the earlier round is collapsed")
+    assert.ok(hasText(chat.document, "Second round"), "the new round is open")
+    assert.equal(reasoningSections(chat.document).length, 2)
+    assert.equal(reasoningSections(chat.document).filter((item) => item.getAttribute("data-reasoning-state") === "active").length, 1)
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("a reply without reasoning shows no reasoning block", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Plain question" })
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-r5" })
+    await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: "Plain answer" })
+    assert.equal(reasoningSections(chat.document).length, 0, "no empty reasoning block")
+    assert.ok(hasText(chat.document, "Plain answer"))
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("a saved reply's reasoning reloads collapsed and can be expanded", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Think" })
+    await sendHost(EVENT_NAME.twinnyAddMessage, {
+      role: "assistant",
+      content: "Final",
+      reasoningRounds: [{ id: "old:0", text: "Remembered thinking", complete: true, durationMs: 4000 }]
+    })
+    assert.equal(hasText(chat.document, "Remembered thinking"), false, "saved reasoning starts collapsed")
+    const header = reasoningHeader(chat.document, "Thought for")
+    assert.ok(header, "the saved block shows how long it thought")
+
+    await clickElement(header)
+    assert.ok(hasText(chat.document, "Remembered thinking"), "the reader can expand a completed block")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Pause keeps the reasoning received so far, labelled paused rather than complete", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Pause me" })
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-r6" })
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r6:0", text: "Half a thought" })
+    await settleReasoning()
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-r6", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, {
+      role: "assistant",
+      content: "Partial",
+      meta: { stopped: true, durationMs: 1000, task: { operationId: "op-r6", state: "paused" } }
+    })
+
+    const header = reasoningHeader(chat.document, "Thinking paused")
+    assert.ok(header, "an unfinished round reads paused")
+    assert.equal(hasText(chat.document, "Thought for"), false, "an interrupted round never claims a duration")
+    await clickElement(header)
+    assert.ok(hasText(chat.document, "Half a thought"), "the received reasoning is preserved")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Stop finalises the open reasoning as stopped and keeps it out of the active state", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Stop me" })
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-r7" })
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r7:0", text: "Abandoned" })
+    await settleReasoning()
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-r7", cancelled: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, {
+      role: "assistant",
+      content: "Cut short",
+      meta: { stopped: true, task: { operationId: "op-r7", state: "stopped" } }
+    })
+
+    assert.equal(reasoningSections(chat.document).filter((item) => item.getAttribute("data-reasoning-state") === "active").length, 0)
+    assert.ok(reasoningHeader(chat.document, "Thinking stopped"), "the open round reads stopped")
+  } finally {
+    await chat.unmount()
+  }
+})

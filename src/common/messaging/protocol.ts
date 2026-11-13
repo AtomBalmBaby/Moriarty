@@ -611,8 +611,8 @@ export interface ServerEvents {
   [EVENT_NAME.twinnyOnCompletion]: ChatCompletionMessage
   /** `continuation` counts the automatic turns after the first in one request; `operationId` names the operation. */
   [EVENT_NAME.twinnyOnLoading]: { continuation?: number; operationId?: string } | void
-  /** Reasoning streamed for the turn in progress, as it arrives; reset when the turn starts. */
-  [EVENT_NAME.twinnyOnReasoning]: string
+  /** Reasoning streamed for the turn in progress, as it arrives. `round` names the thinking round the text belongs to. */
+  [EVENT_NAME.twinnyOnReasoning]: { round: string; text: string }
   [EVENT_NAME.twinnySendLanguage]: LanguageType
   [EVENT_NAME.twinnySendLoader]: string
   [EVENT_NAME.twinnySendTheme]: ThemeType

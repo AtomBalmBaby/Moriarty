@@ -37,9 +37,11 @@ import { useAutosizeTextArea } from "./hooks/useAutosizeTextArea"
 import { useComposerSuggestions } from "./hooks/useComposerSuggestions"
 import { useConversationHistory } from "./hooks/useConversationHistory"
 import { useProviders } from "./hooks/useProviders"
+import { useReasoningRounds } from "./hooks/useReasoningRounds"
 import { useSelection } from "./hooks/useSelection"
 import { useSuggestion } from "./hooks/useSuggestion"
 import { useToolSteps } from "./hooks/useToolSteps"
+import { useViewportAnchor } from "./hooks/useViewportAnchor"
 import { useWorkspaceContext } from "./hooks/useWorkspaceContext"
 import { useWorkspaceSearch } from "./hooks/useWorkspaceSearch"
 import { ProviderSelect } from "./providers/provider-select"
@@ -65,6 +67,7 @@ import {
   sendButtonAction,
   textToComposerHtml
 } from "./prompt-compiler-draft"
+import { activeReasoningId, mergeReasoningRounds, ReasoningView, toReasoningViews } from "./reasoning-rounds"
 import { Shortcuts } from "./shortcuts"
 import { Suggestions } from "./suggestions"
 import { TodoPanel } from "./todo-panel"
@@ -83,8 +86,6 @@ const COMPOSER_MIN_HEIGHT = 44
 const COMPOSER_HEIGHT_KEY = "twinny.composerHeight"
 const PROMPT_HISTORY_KEY = "twinny.promptHistory"
 const PROMPT_HISTORY_LIMIT = 50
-const REASONING_LIMIT = 20_000
-const REASONING_FLUSH_MS = 200
 const CELEBRATION_MS = 3000
 /** Two presses of Esc this close together clear the draft. */
 const DOUBLE_ESCAPE_MS = 800
@@ -179,7 +180,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const { steps: toolSteps, clear: clearToolSteps, take: takeToolSteps } = useToolSteps(
     () => getThinkingMessage(String(completionRef.current?.content ?? "")).message
   )
-  const [isBottom, setIsBottom] = useState(false)
+  const viewport = useViewportAnchor(virtuosoRef, messages.length)
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([])
   const { conversation, conversationLoaded, saveLastConversation, setActiveConversation } = useConversationHistory()
   const [agentProfilesSettled, setAgentProfilesSettled] = useState(false)
@@ -365,37 +366,22 @@ export const Chat = (props: ChatProps): JSX.Element => {
     return stored > 0 ? stored : null
   })
 
-  const [reasoning, setReasoning] = useState("")
   const [continuation, setContinuation] = useState(0)
   const [todoSnapshot, setTodoSnapshot] = useState<TodoListSnapshot>()
   const [feedbackState, setFeedbackState] = useState<TodoFeedbackStatus>()
   const [celebration, setCelebration] = useState<"milestone" | "complete">()
-  const reasoningRef = useRef("")
-  const reasoningTimerRef = useRef<ReturnType<typeof setTimeout>>()
   const celebrationTimerRef = useRef<ReturnType<typeof setTimeout>>()
   const progressRef = useRef<Pick<TodoListSnapshot, "id" | "conversationId" | "revision"> & { verified: number }>()
 
   useEffect(() => () => {
-    clearTimeout(reasoningTimerRef.current)
     clearTimeout(celebrationTimerRef.current)
   }, [])
 
-  // Reasoning streams token by token; the view is updated at most every REASONING_FLUSH_MS.
-  const resetReasoning = () => {
-    clearTimeout(reasoningTimerRef.current)
-    reasoningTimerRef.current = undefined
-    reasoningRef.current = ""
-    setReasoning("")
-  }
-
-  useServerEvent(EVENT_NAME.twinnyOnReasoning, (delta) => {
-    reasoningRef.current = (reasoningRef.current + delta).slice(-REASONING_LIMIT)
-    if (reasoningTimerRef.current !== undefined) return
-    reasoningTimerRef.current = setTimeout(() => {
-      reasoningTimerRef.current = undefined
-      setReasoning(reasoningRef.current)
-    }, REASONING_FLUSH_MS)
-  })
+  const reasoningRounds = useReasoningRounds()
+  const reasoning = useMemo<ReasoningView>(
+    () => ({ rounds: toReasoningViews(reasoningRounds.rounds), activeId: activeReasoningId(reasoningRounds.rounds) }),
+    [reasoningRounds.rounds]
+  )
 
   const acceptTodoSnapshot = (next: TodoListSnapshot) => {
     if (next.conversationId !== conversationIdRef.current) return
@@ -442,7 +428,15 @@ export const Chat = (props: ChatProps): JSX.Element => {
     if (added.role === ASSISTANT) {
       const context = takeSearchReport()
       const steps = takeToolSteps()
-      incoming = { ...added, ...(context ? { context } : {}), ...(steps ? { toolSteps: steps } : {}) }
+      // A reply the user paused or stopped keeps the rounds it streamed; an unfinished round stays unfinished.
+      const interrupted = added.meta?.stopped === true || added.meta?.task?.state === "paused" || added.meta?.task?.state === "stopped"
+      const rounds = reasoningRounds.take(!interrupted)
+      incoming = {
+        ...added,
+        ...(context ? { context } : {}),
+        ...(steps ? { toolSteps: steps } : {}),
+        ...(rounds ? { reasoningRounds: rounds } : {})
+      }
     } else {
       clearSearchReport()
       clearToolSteps()
@@ -454,7 +448,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
         if (existingIndex !== -1) {
           const updatedMessages = [...(prev || [])]
-          updatedMessages[existingIndex || 0] = incoming
+          const existing = updatedMessages[existingIndex || 0]
+          updatedMessages[existingIndex || 0] = {
+            ...incoming,
+            reasoningRounds: mergeReasoningRounds(existing?.reasoningRounds, incoming.reasoningRounds)
+          }
 
           saveLastConversation({
             ...conversation,
@@ -478,7 +476,6 @@ export const Chat = (props: ChatProps): JSX.Element => {
     }, 200)
 
     setCompletion(null)
-    resetReasoning()
   }
 
   useServerEvent(EVENT_NAME.twinnyAddMessage, (incoming) => {
@@ -487,14 +484,19 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
   useServerEvent(EVENT_NAME.twinnyOnCompletion, (incoming) => {
     completionRef.current = incoming
+    // Text that is not only whitespace means the reasoning round has ended.
+    if (typeof incoming?.content === "string" && incoming.content.trim()) reasoningRounds.close(true)
     setCompletion(incoming)
   })
 
   useServerEvent(EVENT_NAME.twinnyOnLoading, (turn) => {
     if (typeof turn === "object" && turn.operationId && closedOperationsRef.current.has(turn.operationId)) return
-    resetReasoning()
+    const operationId = typeof turn === "object" ? turn.operationId : undefined
+    // A continuation of the same operation keeps its reasoning; a new operation starts with none.
+    if (operationId === undefined || operationId !== activeOperationIdRef.current) reasoningRounds.clear()
     setContinuation(typeof turn === "object" ? turn.continuation ?? 0 : 0)
-    activeOperationIdRef.current = typeof turn === "object" ? turn.operationId : undefined
+    activeOperationIdRef.current = operationId
+    if (operationId) viewport.anchorOperation(operationId)
     dispatchOperation({ type: "started" })
   })
 
@@ -502,6 +504,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
     updateQueue([])
     setMessages([])
     setCompletion(null)
+    viewport.reset()
     clearSearchReport()
     clearToolSteps()
     setActiveConversation({
@@ -521,6 +524,8 @@ export const Chat = (props: ChatProps): JSX.Element => {
     if (stop?.operationId && activeOperationIdRef.current && stop.operationId !== activeOperationIdRef.current) return
     activeOperationIdRef.current = undefined
     dispatchOperation({ type: "terminal", paused: stop?.paused === true })
+    // Reasoning that was cut short by a pause or cancel is not finished, and says so.
+    reasoningRounds.close(!(stop?.paused === true || stop?.cancelled === true))
     setCompletion(null)
     stopRef.current = false
     const stoppedByUser = userStoppedRef.current
@@ -549,6 +554,8 @@ export const Chat = (props: ChatProps): JSX.Element => {
   // waiting. Taken as the steps arrive, ahead of the reply's end, which
   // sends what is still queued.
   useServerEvent(EVENT_NAME.twinnyToolSteps, (incoming) => {
+    // Tool calls begin only after the reasoning that asked for them has ended.
+    if (incoming?.length) reasoningRounds.close(true)
     const read = new Set((incoming ?? []).filter((step) => step.said).map((step) => step.id))
     if (!read.size) return
     const left = queuedRef.current.filter((message) => !read.has(`said.${message.id}`))
@@ -820,11 +827,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
   }, [setShortcuts])
 
   const scrollTranscript = useCallback((direction: -1 | 1) => {
+    if (direction < 0) viewport.scrolledAway()
     virtuosoRef.current?.scrollBy({
       top: direction * window.innerHeight * 0.6
     })
     return true
-  }, [])
+  }, [viewport.scrolledAway])
 
   useEffect(() => () => clearTimeout(hintTimerRef.current), [])
 
@@ -832,6 +840,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const sendMessage = (message: QueuedMessage) => {
     // A new message is independent work: a paused task stays paused for its own Continue or Stop.
     dispatchOperation({ type: "submitted" })
+    viewport.resume()
     clearSearchReport()
     clearToolSteps()
 
@@ -1237,6 +1246,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   useEffect(() => {
     if (conversation?.id) setMessages(conversation.messages || [])
     if (queuedRef.current.length) updateQueue([])
+    viewport.reset()
   }, [conversation?.id])
 
   const { suggestion, filePaths } = useSuggestion()
@@ -1489,12 +1499,6 @@ export const Chat = (props: ChatProps): JSX.Element => {
     []
   )
 
-  const scrollToBottom = useCallback(() => {
-    virtuosoRef.current?.scrollTo({
-      top: Infinity,
-      behavior: "auto"
-    })
-  }, [])
 
   const renderContextItem = useCallback(
     (item: AnyContextItem) => {
@@ -1638,16 +1642,14 @@ export const Chat = (props: ChatProps): JSX.Element => {
             <EmptyChat />
           ) : (
             <Virtuoso
-              followOutput
               style={{ height: "100%" }}
               ref={virtuosoRef}
               data={messages}
               initialTopMostItemIndex={messages?.length}
               defaultItemHeight={800}
               itemContent={itemContent}
-              atBottomThreshold={20}
-              atBottomStateChange={(bottom) => setIsBottom(bottom)}
-              alignToBottom
+              components={viewport.components}
+              scrollerRef={viewport.scrollerRef}
             />
           )}
         </div>
@@ -1656,11 +1658,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
         )}
         <div className={styles.chatOptions}>
           <div>
-            {!isBottom && messages.length > 0 && (
+            {!viewport.following && messages.length > 0 && (
               <VSCodeButton
                 appearance="icon"
                 className={styles.scrollDown}
-                onClick={scrollToBottom}
+                onClick={viewport.jumpToLatest}
                 title={t("scroll-to-bottom")}
               >
                 <i className="codicon codicon-arrow-down" />

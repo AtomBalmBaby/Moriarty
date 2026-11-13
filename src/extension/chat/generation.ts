@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto"
+
 import { ASSISTANT, EVENT_NAME } from "../../common/constants"
 import { formatCount, logger } from "../../common/logger"
 import { ChatCompletionMessage, ReplyChangesView, ReplyMeta, TwinnyProvider } from "../../common/types"
@@ -156,6 +158,8 @@ export class ChatGeneration {
       kind: "chat"
     })
     let text = prefix
+    // Round ids are unique per request, so a continuation never reuses an earlier round.
+    const reasoningRun = randomUUID()
     let streamChunks = 0
     let streamedContentChars = 0
     let reasoningChars = 0
@@ -188,7 +192,12 @@ export class ChatGeneration {
           streamChunks++
           streamedContentChars += chunk.content.length
           reasoningChars += chunk.reasoning?.length ?? 0
-          if (chunk.reasoning && !holding) this._bridge.emit(EVENT_NAME.twinnyOnReasoning, redactEvidence(chunk.reasoning))
+          if (chunk.reasoning && !holding) {
+            this._bridge.emit(EVENT_NAME.twinnyOnReasoning, {
+              round: `${reasoningRun}:${chunk.reasoningStep ?? 0}`,
+              text: redactEvidence(chunk.reasoning)
+            })
+          }
           if (chunk.finishReason) finishReason = chunk.finishReason
           if (chunk.usage?.completionTokens) {
             meta.completionTokens = chunk.usage.completionTokens

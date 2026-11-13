@@ -166,6 +166,8 @@ export interface ChatChunk {
   usage?: InferenceUsage
   /** A reasoning model's thinking, when the backend streams it apart from the answer. */
   reasoning?: string
+  /** The tool-loop request a reasoning chunk came from; each request is a separate round of thinking. */
+  reasoningStep?: number
   /** On the last chunk, from backends that say why they stopped. */
   finishReason?: ChatFinishReason
   /** The model's tool calls, whole, once the reply that made them has ended. */

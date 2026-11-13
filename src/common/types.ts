@@ -80,6 +80,8 @@ export type ChatCompletionMessage = ChatCompletionMessageParam & {
   meta?: ReplyMeta
   /** The tools the model used for this reply, shown above it; never sent to the model. */
   toolSteps?: ToolStepView[]
+  /** The reasoning the provider streamed for this reply, one entry per round; shown, never sent back. */
+  reasoningRounds?: ReasoningRoundView[]
   /**
    * What those tools were asked and returned, cut to size. Not shown; the
    * next turn sends it along with the user's question, so a follow-up
@@ -91,6 +93,16 @@ export type ChatCompletionMessage = ChatCompletionMessageParam & {
    * takes to undo them; shown under it, never sent to the model.
    */
   changes?: ReplyChangesView
+}
+
+/** One round of provider reasoning, as a reply keeps it. */
+export interface ReasoningRoundView {
+  id: string
+  text: string
+  /** Finished normally; an interrupted round has no completed duration. */
+  complete: boolean
+  /** Only when both ends of the round were seen. */
+  durationMs?: number
 }
 
 /** A file agent mode changed during a reply, as the chat lists it. */
