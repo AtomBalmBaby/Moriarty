@@ -485,9 +485,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
   })
 
   useServerEvent(EVENT_NAME.twinnyOnCompletion, (incoming) => {
+    const previous = String(completionRef.current?.content ?? "").trim()
     completionRef.current = incoming
-    // Text that is not only whitespace means the reasoning round has ended.
-    if (typeof incoming?.content === "string" && incoming.content.trim()) reasoningRounds.close(true)
+    // The content is the whole reply so far, repeated on every reasoning delta. Only visible
+    // text that is new ends the reasoning round; repeats must not, or each later round closes on its first token.
+    const visible = typeof incoming?.content === "string" ? incoming.content.trim() : ""
+    if (visible && visible !== previous) reasoningRounds.close(true)
     setCompletion(incoming)
   })
 

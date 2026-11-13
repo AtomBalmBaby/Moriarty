@@ -262,7 +262,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
                     <span className={styles.count}>{pendingCount} {t("todo-of")} {(snapshot?.items.length ?? 0)} {t("todo-open")}</span>
                   </button>
         {!!completedCount && <span className={styles.completedCount}>{completedCount} {t("todo-completed-count")}</span>}
-        {retired && (
+        {!!completedCount && (
           <VSCodeButton
             appearance="icon"
             aria-pressed={showCompleted}
@@ -270,7 +270,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
             aria-label={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
             onClick={() => setShowCompleted((value) => !value)}
           >
-            <i className={`codicon codicon-${showCompleted ? "eye-closed" : "eye"}`} />
+            <i className={`codicon codicon-${showCompleted ? "eye" : "eye-closed"}`} />
           </VSCodeButton>
         )}
       </div>
@@ -293,17 +293,6 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
                 </div>
               )}
               {treeRows.length ? <ul className={styles.list}>{treeRows.map(renderItem)}</ul> : !retired && <p className={styles.empty}>{planning ? t("todo-planning-empty") : t("todo-empty")}</p>}
-              {!!completedCount && !retired && (
-                <VSCodeButton
-                  appearance="icon"
-                  className={styles.showCompleted}
-                  title={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
-                  aria-label={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
-                  onClick={() => setShowCompleted((value) => !value)}
-                >
-                  <i className={`codicon codicon-${showCompleted ? "eye-closed" : "eye"}`} />
-                </VSCodeButton>
-              )}
             </>
           )}
         </div>

@@ -897,6 +897,24 @@ test("rapid conversation switches clear the previous list at once and ignore lat
 
 const EMPTY_CONVERSATION = "todo-empty-conversation"
 
+test("the Show Completed toggle is one header control whenever some TODOs are completed", async () => {
+  todoLists.set(TODO_CONVERSATION, todoSnapshot(TODO_CONVERSATION, 3, { first: "completed", second: "in_progress" }))
+  const panel = await mountTodoPanel(TODO_CONVERSATION)
+  try {
+    const toggles = panel.document.querySelectorAll("[aria-pressed]")
+    assert.equal(toggles.length, 1, "exactly one Show Completed control")
+    assert.equal(toggles[0].getAttribute("aria-pressed"), "false")
+    const header = toggles[0].parentElement
+    assert.ok(header?.querySelector("strong")?.textContent?.length, "the control sits in the panel header beside the title")
+    assert.equal(showsTask(panel.document, "first"), false)
+    await panel.click("[aria-pressed]")
+    assert.equal(showsTask(panel.document, "first"), true)
+    assert.equal(panel.document.querySelector("[aria-pressed]")?.getAttribute("aria-pressed"), "true")
+  } finally {
+    await panel.unmount()
+  }
+})
+
 test("two completed TODOs both show after switching away and back once Show Completed is enabled", async () => {
   todoLists.set(TODO_CONVERSATION, todoSnapshot(TODO_CONVERSATION, 5, { first: "completed", second: "completed" }))
   todoLists.set(OTHER_CONVERSATION, todoSnapshot(OTHER_CONVERSATION, 1, { other: "in_progress" }))
@@ -905,7 +923,7 @@ test("two completed TODOs both show after switching away and back once Show Comp
     // An all-completed list is retired, so its items stay hidden until Show Completed is pressed.
     assert.equal(showsTask(panel.document, "first"), false)
     assert.equal(showsTask(panel.document, "second"), false)
-    await panel.click("button[aria-pressed]")
+    await panel.click("[aria-pressed]")
     assert.equal(showsTask(panel.document, "first"), true)
     assert.equal(showsTask(panel.document, "second"), true)
 
@@ -916,7 +934,7 @@ test("two completed TODOs both show after switching away and back once Show Comp
     await panel.render(TODO_CONVERSATION)
     assert.equal(showsTask(panel.document, "first"), true, "the first completed TODO is restored on return")
     assert.equal(showsTask(panel.document, "second"), true, "the second completed TODO is restored on return")
-    assert.equal(panel.document.querySelector("button[aria-pressed]")?.getAttribute("aria-pressed"), "true")
+    assert.equal(panel.document.querySelector("[aria-pressed]")?.getAttribute("aria-pressed"), "true")
   } finally {
     await panel.unmount()
   }
@@ -930,7 +948,7 @@ test("a conversation with no TODO list stays empty, with no fabricated items and
     await panel.render(EMPTY_CONVERSATION)
     assert.equal(showsTask(panel.document, "first"), false, "the previous conversation's TODO must not carry over")
     assert.equal(inProgressCount(panel.document), 0)
-    assert.equal(panel.document.querySelector("button[aria-pressed]"), null, "no Show Completed control without completed TODOs")
+    assert.equal(panel.document.querySelector("[aria-pressed]"), null, "no Show Completed control without completed TODOs")
     assert.equal(panel.document.body.textContent?.includes("No TODO list"), false, "a missing list is not reported as an error")
     await panel.render(TODO_CONVERSATION)
     assert.equal(showsTask(panel.document, "first"), true)
@@ -997,6 +1015,31 @@ test("a new reasoning round starts its own block and closes the previous one", a
     assert.ok(hasText(chat.document, "Second round"), "the new round is open")
     assert.equal(reasoningSections(chat.document).length, 2)
     assert.equal(reasoningSections(chat.document).filter((item) => item.getAttribute("data-reasoning-state") === "active").length, 1)
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("a later reasoning round keeps every streamed delta after the reply already has visible text", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    const visible = "I'll look at the code."
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Find it" })
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-late" })
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r12:0", text: "Let me look" })
+    await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: visible })
+    await sendHost(EVENT_NAME.twinnyToolSteps, [{ id: "t-r12", name: "read_file", summary: "read a.ts", status: "done" }])
+    // Every delta of the second round arrives with the reply's cumulative content, as the extension sends it.
+    for (const delta of ["The user", " wants the", " panel fixed."]) {
+      await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r12:1", text: delta })
+      await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: visible })
+    }
+    await settleReasoning()
+
+    assert.ok(hasText(chat.document, "The user wants the panel fixed."), "the whole round is shown while it streams")
+    const active = reasoningSections(chat.document).filter((item) => item.getAttribute("data-reasoning-state") === "active")
+    assert.equal(active.length, 1, "the second round is the one still streaming")
   } finally {
     await chat.unmount()
   }
