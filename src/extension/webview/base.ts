@@ -458,6 +458,7 @@ export class BaseProvider {
         this.chat?.announceOperation()
       },
       [EVENT_NAME.twinnyStopGeneration]: () => this.destroyStream(),
+      [EVENT_NAME.twinnyPauseGeneration]: ({ operationId }) => this.chat?.pause(operationId),
       [EVENT_NAME.twinnyToolApproval]: ({ id, run, always }) => this.chat?.answerToolApproval(id, run, always),
       [EVENT_NAME.twinnyToolStop]: ({ id }) => this.chat?.stopToolStep(id),
       [EVENT_NAME.twinnySteer]: ({ id, text }) => this.chat?.steer(id, text),

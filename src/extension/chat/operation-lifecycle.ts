@@ -41,6 +41,11 @@ export class OperationLifecycle {
     return owner.getStore()?.controller.signal.aborted ?? false
   }
 
+  /** The operation the current work belongs to, even once that operation has been cancelled. */
+  get contextOperationId(): string | undefined {
+    return owner.getStore()?.id
+  }
+
   /**
    * Runs `body` as part of the open operation, or of a new one. Resolves to
    * undefined if the operation is cancelled first, and never to a late result.
@@ -86,7 +91,8 @@ export class OperationLifecycle {
 
   private open(): Operation {
     operationCount += 1
-    const operation: Operation = { id: `op-${operationCount}`, controller: new AbortController(), depth: 0, ended: false }
+    // The start time keeps ids unique across reloads, so a persisted task never matches a new operation.
+    const operation: Operation = { id: `op-${Date.now().toString(36)}-${operationCount}`, controller: new AbortController(), depth: 0, ended: false }
     this.current = operation
     this.trace("operation.opened", operation.id)
     return operation

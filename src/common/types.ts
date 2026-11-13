@@ -174,6 +174,13 @@ export interface ExecutionDiagnostic {
   correction?: string
 }
 
+/** A reply's task after the user paused it (continuable) or stopped it (closed). */
+export interface ReplyTask {
+  /** Absent on a legacy reply that was stopped before tasks were recorded. */
+  operationId?: string
+  state: "paused" | "stopped"
+}
+
 export interface ReplyMeta {
   model?: string
   /** The provider's label, or the teammate's machine for a team pool. */
@@ -190,6 +197,11 @@ export interface ReplyMeta {
   contextWindow?: number
   /** The user stopped it before the model finished. */
   stopped?: boolean
+  /**
+   * The task the reply belongs to, once the user has paused or stopped it. A paused task can be
+   * continued; a stopped one is closed for good. Replies without it are plain stops.
+   */
+  task?: ReplyTask
   /** Agent mode used every tool step the reply had, so the work may be unfinished. */
   outOfSteps?: boolean
   /**

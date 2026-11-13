@@ -264,7 +264,9 @@ const replyStatus = (
     return `**Status:** ${EXECUTION_OUTCOME.stalled} The task stayed unresolved after this reply; see the stop message that follows.`
   const steps = message.toolSteps ?? []
   const parts: string[] = []
-  if (meta?.stopped) parts.push("Stopped by you before it finished.")
+  if (meta?.task?.state === "paused")
+    parts.push("Paused by you before it finished; it has not been continued.")
+  else if (meta?.stopped) parts.push("Stopped by you before it finished.")
   if (meta?.outOfSteps)
     parts.push("Stopped at the tool-step limit; the work may be unfinished.")
   if (

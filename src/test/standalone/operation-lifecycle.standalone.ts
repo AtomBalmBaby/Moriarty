@@ -221,6 +221,47 @@ test("late results of a cancelled operation neither reopen it nor overwrite a ne
   assert.equal(lifecycle.active, false)
 })
 
+test("each operation has its own id, and the work inside it reports that id, even after cancel", async () => {
+  const terminals: string[] = []
+  const lifecycle = new OperationLifecycle(() => undefined, (operationId) => terminals.push(operationId))
+  let inside: string | undefined
+  await lifecycle.run(async () => {
+    inside = lifecycle.contextOperationId
+  })
+  assert.equal(inside, terminals[0])
+
+  let release: () => void = () => undefined
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let abandoned: string | undefined
+  let abandonedCancelled = false
+  const pending = lifecycle.run(async () => {
+    await gate
+    abandoned = lifecycle.contextOperationId
+    abandonedCancelled = lifecycle.contextCancelled
+  })
+  const cancelled = lifecycle.operationId
+  lifecycle.cancel("user")
+  await pending
+  release()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.notEqual(cancelled, terminals[0])
+  assert.equal(terminals[1], cancelled)
+  assert.equal(abandoned, cancelled)
+  assert.equal(abandonedCancelled, true)
+  assert.equal(lifecycle.contextCancelled, false)
+  assert.notEqual(terminals[0], terminals[1])
+})
+
+test("operation ids stay unique across sequential operations, so a persisted task never matches a new one", async () => {
+  const terminals: string[] = []
+  const lifecycle = new OperationLifecycle(() => undefined, (operationId) => terminals.push(operationId))
+  for (let index = 0; index < 5; index += 1) {
+    await lifecycle.run(async () => undefined)
+  }
+  assert.equal(new Set(terminals).size, 5)
+})
+
 test("a Feedback planner exception ends the operation, and the next message runs", async () => {
   let broken = true
   const chat = chatHarness(() => {

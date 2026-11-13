@@ -119,7 +119,7 @@
   "selection-chars": "выделено символов: {{chars}}",
   "send": "Отправить",
   "status": "Статус",
-  "stop-generation": "Остановить генерацию",
+  "pause-generation": "Приостановить генерацию",
   "success": "Успех",
   "template-settings": "Настройки шаблонов",
   "template-settings-description": "Выберите шаблоны, которые вы хотите использовать в интерфейсе чата.",

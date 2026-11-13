@@ -1,17 +1,21 @@
+import { createElement, Fragment, type ReactNode } from "react"
 import { JSDOM } from "jsdom"
 import assert from "node:assert/strict"
 import Module from "node:module"
 import path from "node:path"
 import { test } from "node:test"
 
-import { EVENT_NAME, TODO_EVENT_NAME } from "../../common/constants/events"
+import { CONVERSATION_EVENT_NAME, EVENT_NAME, TODO_EVENT_NAME } from "../../common/constants/events"
 import { applyTodoSnapshot, isStaleTodoSnapshot, snapshotForConversation } from "../../common/guards"
-import type { TodoItem, TodoListSnapshot } from "../../common/types"
+import type { ChatCompletionMessage, TodoItem, TodoListSnapshot } from "../../common/types"
 import {
   composerIsBusy,
   ComposerOperationEvent,
   ComposerOperationPhase,
-  reduceComposerOperation
+  isPausedReply,
+  reduceComposerOperation,
+  resumePausedReply,
+  stopPausedReply
 } from "../../webview/composer-operation"
 
 /** The composer's button for each host event, in the order the host sends them. */
@@ -23,7 +27,7 @@ const replay = (events: ComposerOperationEvent[]) => {
   })
 }
 
-test("Stop stays through Feedback, replies, and continuations until the terminal event", () => {
+test("Pause stays through Feedback, replies, and continuations until the terminal event", () => {
   const trace = replay([
     { type: "started" },
     { type: "started" },
@@ -34,23 +38,42 @@ test("Stop stays through Feedback, replies, and continuations until the terminal
   assert.equal(composerIsBusy(done), false)
 })
 
-test("a stop request shows the stopping state and keeps Stop until the terminal event", () => {
+test("a pause request interrupts a running task, which then leaves the composer usable", () => {
   const trace = replay([
     { type: "started" },
-    { type: "stop-requested" },
-    { type: "started" },
-    { type: "terminal" }
+    { type: "pause-requested" },
+    { type: "terminal", paused: true }
   ])
-  assert.deepEqual(trace.map((step) => step.phase), ["running", "stopping", "stopping", "idle"])
-  assert.deepEqual(trace.map((step) => step.stop), [true, true, true, false])
+  assert.deepEqual(trace.map((step) => step.phase), ["running", "paused", "paused"])
+  assert.deepEqual(trace.map((step) => step.stop), [true, false, false])
 })
 
-test("a late start cannot undo a stop already requested", () => {
-  const phase = reduceComposerOperation("stopping", { type: "started" })
-  assert.equal(phase, "stopping")
+test("a late start cannot undo a pause, and only Continue resumes it", () => {
+  assert.equal(reduceComposerOperation("paused", { type: "started" }), "paused")
+  assert.equal(reduceComposerOperation("paused", { type: "continue-requested" }), "running")
+  assert.equal(reduceComposerOperation("running", { type: "continue-requested" }), "running")
 })
 
-test("a stop request while idle does nothing", () => {
+test("duplicate pause and continue requests are no-ops", () => {
+  const paused = reduceComposerOperation("running", { type: "pause-requested" })
+  assert.equal(reduceComposerOperation(paused, { type: "pause-requested" }), "paused")
+  const running = reduceComposerOperation(paused, { type: "continue-requested" })
+  assert.equal(reduceComposerOperation(running, { type: "continue-requested" }), "running")
+})
+
+test("Stop from a paused task ends it at once; while running it waits for the host", () => {
+  assert.equal(reduceComposerOperation("paused", { type: "stop-requested" }), "idle")
+  assert.equal(reduceComposerOperation("running", { type: "stop-requested" }), "running")
+})
+
+test("a paused terminal stays paused, but a plain terminal returns the composer to idle", () => {
+  assert.equal(reduceComposerOperation("running", { type: "terminal", paused: true }), "paused")
+  assert.equal(reduceComposerOperation("paused", { type: "terminal" }), "idle")
+  assert.equal(reduceComposerOperation("running", { type: "terminal" }), "idle")
+})
+
+test("pause and stop requests while idle do nothing", () => {
+  assert.equal(reduceComposerOperation("idle", { type: "pause-requested" }), "idle")
   assert.equal(reduceComposerOperation("idle", { type: "stop-requested" }), "idle")
 })
 
@@ -58,6 +81,56 @@ test("a reply message alone never returns the composer to Send", () => {
   // Per-request replies are not operation events, so they cannot change the phase.
   const phase = reduceComposerOperation("running", { type: "started" })
   assert.equal(composerIsBusy(phase), true)
+})
+
+const pausedReply = (): ChatCompletionMessage[] => [
+  { role: "user", content: "Write it" },
+  { role: "assistant", content: "Partial", meta: { stopped: true, durationMs: 4200, task: { operationId: "op-1", state: "paused" } } }
+]
+
+test("a new message starts work from any phase, so it never needs a Stop first", () => {
+  assert.equal(reduceComposerOperation("paused", { type: "submitted" }), "running")
+  assert.equal(reduceComposerOperation("idle", { type: "submitted" }), "running")
+  assert.equal(reduceComposerOperation("running", { type: "submitted" }), "running")
+})
+
+test("a paused reply is stoppable and continuable; a legacy stopped reply is paused only while last", () => {
+  const paused = pausedReply()
+  assert.equal(isPausedReply(paused, 1), true)
+  const withNext: ChatCompletionMessage[] = [...paused, { role: "user", content: "Next" }]
+  assert.equal(isPausedReply(withNext, 1), true)
+  const legacy: ChatCompletionMessage[] = [{ role: "assistant", content: "Cut", meta: { stopped: true } }]
+  assert.equal(isPausedReply(legacy, 0), true)
+  const legacyEarlier: ChatCompletionMessage[] = [...legacy, { role: "user", content: "Next" }]
+  assert.equal(isPausedReply(legacyEarlier, 0), false)
+  assert.equal(isPausedReply([{ role: "assistant", content: "Done", meta: { durationMs: 1 } }], 0), false)
+})
+
+test("stopPausedReply ends a paused task for good, once, and keeps its content", () => {
+  const stopped = stopPausedReply(pausedReply(), 1)
+  assert.deepEqual(stopped.at(-1)?.meta, { stopped: true, durationMs: 4200, task: { operationId: "op-1", state: "stopped" } })
+  assert.equal(stopped.at(-1)?.content, "Partial")
+  assert.equal(isPausedReply(stopped, 1), false)
+  assert.equal(stopPausedReply(stopped, 1), stopped)
+})
+
+test("stopPausedReply closes a legacy stopped reply without inventing an operation", () => {
+  const legacy: ChatCompletionMessage[] = [{ role: "assistant", content: "Cut", meta: { stopped: true } }]
+  assert.deepEqual(stopPausedReply(legacy, 0).at(-1)?.meta, { stopped: true, task: { state: "stopped" } })
+})
+
+test("resumePausedReply hands the last paused reply to Continue without the paused or stopped marks", () => {
+  const resumed = resumePausedReply(pausedReply())
+  assert.deepEqual(resumed.at(-1)?.meta, { durationMs: 4200 })
+  assert.deepEqual(resumed.map((message) => message.content), ["Write it", "Partial"])
+})
+
+test("stop and resume leave replies that are not paused alone", () => {
+  const plain: ChatCompletionMessage[] = [{ role: "assistant", content: "Done", meta: { stopped: true, task: { operationId: "op-2", state: "stopped" } } }]
+  assert.equal(stopPausedReply(plain, 0), plain)
+  assert.equal(resumePausedReply(plain), plain)
+  const earlier = [...pausedReply(), { role: "user" as const, content: "Later" }]
+  assert.equal(resumePausedReply(earlier), earlier)
 })
 
 // The tests below drive the real `Chat` component under jsdom. Host events
@@ -85,7 +158,18 @@ class InertObserver {
   disconnect(): void {}
 }
 
-/** CSS modules resolve each class to its own name, so `styles.stopping` is "stopping". */
+/** Renders each transcript row in place, the way Virtuoso would once it had measured them. */
+const VirtuosoStub = (props: {
+  data?: unknown[]
+  itemContent: (index: number, item: unknown) => unknown
+}) =>
+  createElement(
+    "div",
+    null,
+    (props.data ?? []).map((item, index) => createElement(Fragment, { key: index }, props.itemContent(index, item) as ReactNode))
+  )
+
+/** CSS modules resolve each class to its own name, so `styles.replyStopped` is "replyStopped". */
 const classNames = new Proxy({}, { get: (_target, key) => (typeof key === "string" ? key : undefined) })
 
 const startWebview = async () => {
@@ -160,6 +244,9 @@ const startWebview = async () => {
   ])
   loader._load = function (request: string, parent: unknown, isMain: boolean) {
     if (request.endsWith(".css")) return { __esModule: true, default: classNames }
+    // Virtuoso sizes its rows from layout, which jsdom does not have, so it would render no transcript.
+    // The stub renders every row in order instead; the scroll handle is unused under test.
+    if (request === "react-virtuoso") return { __esModule: true, Virtuoso: VirtuosoStub }
     const target = esEntries.get(request) ?? request.replace("react-syntax-highlighter/dist/esm/", "react-syntax-highlighter/dist/cjs/")
     return loadModule.call(this, target, parent, isMain)
   }
@@ -204,88 +291,106 @@ const sendHost = async (type: string, data?: unknown): Promise<void> => {
 }
 
 // Accessible names as rendered from the English locale.
-const STOP_LABEL = "Stop generation"
+const PAUSE_LABEL = "Pause generation"
 const SEND_LABEL = "Send"
 
-const clickStop = async (document: Document): Promise<void> => {
+const clickPause = async (document: Document): Promise<void> => {
   const { act, window } = await loadWebview()
-  const stop = document.querySelector<HTMLElement>(`[aria-label="${STOP_LABEL}"]`)
-  assert.ok(stop, "the Stop button should be rendered before it is clicked")
+  const pause = document.querySelector<HTMLElement>(`[aria-label="${PAUSE_LABEL}"]`)
+  assert.ok(pause, "the Pause button should be rendered before it is clicked")
   await act(async () => {
-    stop.dispatchEvent(new window.MouseEvent("click", { bubbles: true }))
+    pause.dispatchEvent(new window.MouseEvent("click", { bubbles: true }))
   })
 }
 
-/** The composer button the user can see: Stop while busy, otherwise Send. */
-const visibleButton = (document: Document): "stop" | "send" | "none" => {
-  if (document.querySelector(`[aria-label="${STOP_LABEL}"]`)) return "stop"
+/** Clicks a footer control on the paused or stopped reply, by its visible label. */
+const footerButton = (document: Document, label: string): HTMLButtonElement | undefined =>
+  [...document.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent?.trim() === label)
+
+const clickFooterButton = async (document: Document, label: string): Promise<void> => {
+  const { act, window } = await loadWebview()
+  const button = footerButton(document, label)
+  assert.ok(button, `the "${label}" control should be rendered`)
+  await act(async () => {
+    button.dispatchEvent(new window.MouseEvent("click", { bubbles: true }))
+  })
+}
+
+/** The composer button the user can see: Pause while running, otherwise Send. */
+const visibleButton = (document: Document): "pause" | "send" | "none" => {
+  if (document.querySelector(`[aria-label="${PAUSE_LABEL}"]`)) return "pause"
   if (document.querySelector(`[aria-label="${SEND_LABEL}"]`)) return "send"
   return "none"
 }
 
-const stopIsBusy = (document: Document): boolean =>
-  document.querySelector(`[aria-label="${STOP_LABEL}"]`)?.getAttribute("aria-busy") === "true"
+const postedPauses = (): { type: string; data?: unknown; id?: string }[] =>
+  outbound.filter((message) => message.type === EVENT_NAME.twinnyPauseGeneration)
 
 const postedStops = (): { type: string; data?: unknown; id?: string }[] =>
   outbound.filter((message) => message.type === EVENT_NAME.twinnyStopGeneration)
 
-test("the Stop button stays visible through Feedback review and automatic continuation", async () => {
+const postedChats = (): { type: string; data?: unknown; id?: string }[] =>
+  outbound.filter((message) => message.type === EVENT_NAME.twinnyChatMessage)
+
+const hasText = (document: Document, text: string): boolean => document.body.textContent?.includes(text) ?? false
+
+test("the Pause button stays visible through Feedback review and automatic continuation", async () => {
   outbound.length = 0
   const chat = await mountChat()
   try {
     assert.equal(visibleButton(chat.document), "send")
 
     await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0 })
-    assert.equal(visibleButton(chat.document), "stop")
+    assert.equal(visibleButton(chat.document), "pause")
 
     // The first request has replied; the host is still working (Feedback review, then the next request).
     await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: "First request" })
-    assert.equal(visibleButton(chat.document), "stop")
+    assert.equal(visibleButton(chat.document), "pause")
 
     // The gap before the continuation is dispatched carries no host event.
-    assert.equal(visibleButton(chat.document), "stop")
+    assert.equal(visibleButton(chat.document), "pause")
 
     await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 1 })
-    assert.equal(visibleButton(chat.document), "stop")
+    assert.equal(visibleButton(chat.document), "pause")
 
     await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: "Continuation" })
-    assert.equal(visibleButton(chat.document), "stop")
+    assert.equal(visibleButton(chat.document), "pause")
+    assert.equal(postedPauses().length, 0)
     assert.equal(postedStops().length, 0)
   } finally {
     await chat.unmount()
   }
 })
 
-test("clicking Stop posts the stop message and keeps Stop until the host is terminal", async () => {
+test("Pause interrupts the task, leaves the composer usable, and ignores late events", async () => {
   outbound.length = 0
   const chat = await mountChat()
   try {
     await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0 })
-    await clickStop(chat.document)
+    await clickPause(chat.document)
 
-    assert.deepEqual(postedStops(), [{ type: EVENT_NAME.twinnyStopGeneration, data: {} }])
-    assert.equal(visibleButton(chat.document), "stop")
-    assert.equal(stopIsBusy(chat.document), true)
+    assert.equal(postedPauses().length, 1)
+    assert.equal(postedStops().length, 0)
+    assert.equal(visibleButton(chat.document), "send")
 
-    // Late events from the cancelled operation must not restore Send.
+    // Late events from the paused operation must not make the composer busy again.
     await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 1 })
     await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: "Late reply" })
-    assert.equal(visibleButton(chat.document), "stop")
-    assert.equal(stopIsBusy(chat.document), true)
-    assert.equal(postedStops().length, 1)
+    assert.equal(visibleButton(chat.document), "send")
+    assert.equal(postedPauses().length, 1)
 
-    await sendHost(EVENT_NAME.twinnyStopGeneration, { cancelled: true })
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { cancelled: true, paused: true })
     assert.equal(visibleButton(chat.document), "send")
   } finally {
     await chat.unmount()
   }
 })
 
-test("a webview reconnect during an operation restores Stop once the host re-announces it", async () => {
+test("a webview reconnect during an operation restores Pause once the host re-announces it", async () => {
   outbound.length = 0
   const first = await mountChat()
   await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 1 })
-  assert.equal(visibleButton(first.document), "stop")
+  assert.equal(visibleButton(first.document), "pause")
   await first.unmount()
 
   outbound.length = 0
@@ -297,16 +402,266 @@ test("a webview reconnect during an operation restores Stop once the host re-ann
     )
     // The host answers the announcement by re-sending the active operation.
     await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 1 })
-    assert.equal(visibleButton(second.document), "stop")
+    assert.equal(visibleButton(second.document), "pause")
 
-    await clickStop(second.document)
-    assert.equal(postedStops().length, 1)
-    assert.equal(stopIsBusy(second.document), true)
+    await clickPause(second.document)
+    assert.equal(postedPauses().length, 1)
+    assert.equal(visibleButton(second.document), "send")
 
-    await sendHost(EVENT_NAME.twinnyStopGeneration, { cancelled: true })
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { cancelled: true, paused: true })
     assert.equal(visibleButton(second.document), "send")
   } finally {
     await second.unmount()
+  }
+})
+
+const PAUSED_REPLY: ChatCompletionMessage = {
+  role: "assistant",
+  content: "Partial answer",
+  meta: { stopped: true, durationMs: 4200, task: { operationId: "op-7", state: "paused" } }
+}
+
+test("a paused reply shows its duration, paused, and Continue and Stop controls", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+
+    assert.ok(hasText(chat.document, "paused"), "the footer should say paused")
+    assert.ok(!hasText(chat.document, "stopped"), "a paused reply is not shown as stopped")
+    assert.ok(hasText(chat.document, "Continue"))
+    assert.ok(hasText(chat.document, "Stop"))
+    assert.equal(visibleButton(chat.document), "send")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Continue resumes a paused task once: the control is replaced at once, so a second press finds nothing", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+
+    await clickFooterButton(chat.document, "Continue")
+
+    assert.equal(postedChats().length, 1)
+    assert.equal(footerButton(chat.document, "Continue"), undefined)
+    assert.equal(visibleButton(chat.document), "pause")
+    assert.ok(!hasText(chat.document, "paused"), "a resumed reply no longer reads paused")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Stop ends a paused task for good: no controls remain and nothing is sent to the host", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+
+    await clickFooterButton(chat.document, "Stop")
+
+    assert.ok(hasText(chat.document, "stopped"))
+    assert.ok(!hasText(chat.document, "Continue"))
+    assert.equal(postedStops().length, 0)
+    assert.equal(postedChats().length, 0)
+    assert.equal(visibleButton(chat.document), "send")
+
+    // A late terminal for the paused operation changes nothing.
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    assert.ok(hasText(chat.document, "stopped"))
+    assert.ok(!hasText(chat.document, "Continue"))
+  } finally {
+    await chat.unmount()
+  }
+})
+
+const postedSaves = () =>
+  outbound.filter((message) => message.type === CONVERSATION_EVENT_NAME.saveConversation) as { data?: { messages: ChatCompletionMessage[] } }[]
+
+/** Types into the composer through the editor's DOM and presses Send, as the user does. */
+const sendComposerText = async (document: Document, text: string): Promise<void> => {
+  const { act, window } = await loadWebview()
+  const editor = document.querySelector<HTMLElement>(".ProseMirror")
+  assert.ok(editor, "the composer editor should be rendered")
+  await act(async () => {
+    editor.innerHTML = `<p>${text}</p>`
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+  })
+  const send = document.querySelector<HTMLElement>(`[aria-label="${SEND_LABEL}"]`)
+  assert.ok(send, "the Send button should be rendered")
+  await act(async () => {
+    send.dispatchEvent(new window.MouseEvent("click", { bubbles: true }))
+  })
+}
+
+const setConversation = async (id: string, messages: ChatCompletionMessage[]): Promise<void> =>
+  sendHost(CONVERSATION_EVENT_NAME.setActiveConversation, { id, title: id, messages })
+
+test("a new message while paused is independent work and does not stop the paused task", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+
+    await sendComposerText(chat.document, "A different question")
+
+    assert.equal(postedChats().length, 1, "the new message is sent as a new request")
+    assert.equal(postedStops().length, 0, "sending a message never stops the paused task")
+    assert.equal(visibleButton(chat.document), "pause", "the new request is running")
+    assert.ok(footerButton(chat.document, "Stop"), "the paused reply keeps its Stop control")
+    assert.equal(footerButton(chat.document, "Continue"), undefined, "Continue moves with the last reply only")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Stop on a paused reply does not touch a newer request that is running", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+    await sendComposerText(chat.document, "A different question")
+
+    await clickFooterButton(chat.document, "Stop")
+
+    assert.ok(hasText(chat.document, "stopped"))
+    assert.equal(postedStops().length, 0)
+    assert.equal(visibleButton(chat.document), "pause", "the newer request keeps running")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("late events for a stopped task cannot revive it or change a newer running task", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+    await clickFooterButton(chat.document, "Stop")
+
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 1, operationId: "op-7" })
+    assert.equal(visibleButton(chat.document), "send", "a late event does not revive the stopped task")
+    assert.equal(footerButton(chat.document, "Continue"), undefined)
+
+    await sendComposerText(chat.document, "A different question")
+    assert.equal(visibleButton(chat.document), "pause")
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    assert.equal(visibleButton(chat.document), "pause", "a late terminal for the stopped task leaves the newer request running")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("legacy stopped replies: the last one is paused and continuable, an earlier one is plain stopped history", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Write it" })
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "assistant", content: "Cut", meta: { stopped: true, durationMs: 1000 } })
+    assert.ok(hasText(chat.document, "paused"), "the last legacy stopped reply reads paused")
+    assert.ok(footerButton(chat.document, "Continue"), "the last legacy stopped reply stays continuable")
+
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Later" })
+    assert.equal(footerButton(chat.document, "Continue"), undefined)
+    assert.ok(hasText(chat.document, "stopped"), "an earlier legacy reply reads stopped")
+    assert.ok(!hasText(chat.document, "paused"))
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Escape and Ctrl+C pause a running reply and never stop a paused task", async () => {
+  const { act, window } = await loadWebview()
+  const press = async (document: Document, init: KeyboardEventInit) => {
+    await act(async () => {
+      document.body.dispatchEvent(new window.KeyboardEvent("keydown", { ...init, bubbles: true }))
+    })
+  }
+
+  outbound.length = 0
+  const escape = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await press(escape.document, { key: "Escape" })
+    assert.equal(postedPauses().length, 1)
+    assert.equal(postedStops().length, 0)
+    assert.equal(visibleButton(escape.document), "send")
+  } finally {
+    await escape.unmount()
+  }
+
+  outbound.length = 0
+  const ctrlC = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-8" })
+    await press(ctrlC.document, { key: "c", ctrlKey: true })
+    assert.equal(postedPauses().length, 1)
+    assert.equal(postedStops().length, 0)
+    assert.equal(visibleButton(ctrlC.document), "send")
+  } finally {
+    await ctrlC.unmount()
+  }
+})
+
+test("a paused task survives a reload and a conversation switch, and Stop persists as terminal", async () => {
+  outbound.length = 0
+  const first = await mountChat()
+  await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+  await clickPause(first.document)
+  await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+  await setConversation("conv-a", [{ role: "user", content: "Write it" }, PAUSED_REPLY])
+  assert.ok(footerButton(first.document, "Continue"), "the paused reply is continuable on screen")
+  await first.unmount()
+
+  // Reload: a fresh webview receives the same saved conversation.
+  const reloaded = await mountChat()
+  try {
+    await setConversation("conv-a", [{ role: "user", content: "Write it" }, PAUSED_REPLY])
+    assert.ok(footerButton(reloaded.document, "Continue"), "Continue survives a reload")
+    assert.ok(hasText(reloaded.document, "paused"))
+
+    await setConversation("conv-b", [{ role: "user", content: "Unrelated" }])
+    assert.equal(footerButton(reloaded.document, "Continue"), undefined, "the other conversation has no paused reply")
+    await setConversation("conv-a", [{ role: "user", content: "Write it" }, PAUSED_REPLY])
+    assert.ok(footerButton(reloaded.document, "Continue"), "switching back restores the paused reply")
+
+    await clickFooterButton(reloaded.document, "Stop")
+    const saved = postedSaves().at(-1)?.data?.messages
+    assert.equal(saved?.[1]?.meta?.task?.state, "stopped", "the saved reply records the terminal state")
+  } finally {
+    await reloaded.unmount()
+  }
+
+  // Reload again: the saved terminal state is shown, with no controls.
+  const restored = await mountChat()
+  try {
+    const saved = postedSaves().at(-1)?.data?.messages ?? []
+    await setConversation("conv-a", saved)
+    assert.ok(hasText(restored.document, "stopped"))
+    assert.equal(footerButton(restored.document, "Continue"), undefined)
+    assert.equal(footerButton(restored.document, "Stop"), undefined)
+  } finally {
+    await restored.unmount()
   }
 })
 

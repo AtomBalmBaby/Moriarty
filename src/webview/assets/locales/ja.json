@@ -119,7 +119,7 @@
   "selection-chars": "{{chars}} 文字を選択中",
   "send": "送信",
   "status": "状態",
-  "stop-generation": "生成を停止",
+  "pause-generation": "生成を一時停止",
   "success": "成功",
   "template-settings": "テンプレート設定",
   "template-settings-description": "チャットインターフェースで使用するテンプレートを選択してください。",

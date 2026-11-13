@@ -119,7 +119,7 @@
   "selection-chars": "{{chars}} Zeichen ausgewählt",
   "send": "Senden",
   "status": "Status",
-  "stop-generation": "Generierung stoppen",
+  "pause-generation": "Generierung pausieren",
   "success": "Erfolg",
   "template-settings": "Vorlagen-Einstellungen",
   "template-settings-description": "Wählen Sie die Vorlagen, die Sie in der Chat-Oberfläche verwenden möchten.",

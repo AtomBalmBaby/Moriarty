@@ -119,7 +119,7 @@
   "selection-chars": "{{chars}} caratteri selezionati",
   "send": "Invia",
   "status": "Stato",
-  "stop-generation": "Ferma generazione",
+  "pause-generation": "Metti in pausa la generazione",
   "success": "Successo",
   "template-settings": "Impostazioni template",
   "template-settings-description": "Seleziona i template che vuoi usare nell'interfaccia chat.",

@@ -57,8 +57,12 @@ interface MessageProps {
   ) => void
   onHeightChange?: () => void
   onDeleteImage?: (id: string) => void
-  /** Ask for the rest of a reply the user stopped. Only the last reply offers it. */
+  /** A reply whose task the user paused: it reads paused and offers Continue or Stop. */
+  paused?: boolean
+  /** Continue a paused or out-of-steps reply. Only the last reply offers it. */
   onContinue?: () => void
+  /** End a paused reply's task for good. Any paused reply offers it. */
+  onStopTask?: () => void
   /** Keep a reply's changed files as they stand after an undo. */
   onChangesUpdate?: (index: number, changes: ReplyChangesView) => void
 }
@@ -156,11 +160,17 @@ const CONTEXT_NEARLY_FULL = 0.8
  */
 const ReplyFooter = ({
   meta,
+  paused,
   onContinue,
+  onStopTask,
   actions
 }: {
   meta: ReplyMeta
+  /** The reply's task is paused: it is not stopped, and Continue or Stop can act on it. */
+  paused?: boolean
   onContinue?: () => void
+  /** Ends a paused task for good. */
+  onStopTask?: () => void
   /** The reply's copy and regenerate, at the line's end. */
   actions?: React.ReactNode
 }) => {
@@ -204,7 +214,8 @@ const ReplyFooter = ({
             : t("reply-context", { used: compactCount(used) })}
         </span>
       )}
-      {meta.stopped && <span className={styles.replyStopped}>{t("reply-stopped")}</span>}
+      {paused && <span className={styles.replyStopped}>{t("reply-paused")}</span>}
+      {meta.stopped && !paused && <span className={styles.replyStopped}>{t("reply-stopped")}</span>}
       {meta.outOfSteps && !meta.stopped && <span className={styles.replyStopped}>{t("reply-out-of-steps")}</span>}
       {!!meta.withheld?.length && <WithheldBadge withheld={meta.withheld} />}
       {!!meta.instructions?.length && <InstructionsBadge files={meta.instructions} />}
@@ -217,6 +228,12 @@ const ReplyFooter = ({
         >
           <span className="codicon codicon-debug-continue" aria-hidden="true" />
           {t("reply-continue")}
+        </button>
+      )}
+      {onStopTask && (
+        <button type="button" className={styles.replyContinue} onClick={onStopTask} title={t("reply-stop-task-title")}>
+          <span className="codicon codicon-debug-stop" aria-hidden="true" />
+          {t("reply-stop-task")}
         </button>
       )}
       {actions && <span className={styles.replyActions}>{actions}</span>}
@@ -311,6 +328,8 @@ export const Message: React.FC<MessageProps> = ({
   messages,
   onDeleteImage,
   onContinue,
+  onStopTask,
+  paused,
   onChangesUpdate
 }) => {
   const { t } = useTranslation()
@@ -727,7 +746,15 @@ export const Message: React.FC<MessageProps> = ({
               onError={showToast}
             />
           )}
-          {message.meta && <ReplyFooter meta={message.meta} onContinue={onContinue} actions={footerActions ? options : undefined} />}
+          {message.meta && (
+            <ReplyFooter
+              meta={message.meta}
+              paused={paused}
+              onContinue={onContinue}
+              onStopTask={onStopTask}
+              actions={footerActions ? options : undefined}
+            />
+          )}
         </>
       ) : (
         <Collapsible>

@@ -3,6 +3,7 @@ import React, { memo } from "react"
 import { WorkspaceSearchReport } from "../common/messaging/protocol"
 import { ChatCompletionMessage, MentionType, ReplyChangesView, ToolStepView } from "../common/types"
 
+import { isPausedReply } from "./composer-operation"
 import Message from "./message"
 import TypingIndicator, { TypingActivity } from "./typing-indicator"
 
@@ -31,6 +32,7 @@ interface MessageListProps {
   ) => void
   handleDeleteImage?: (id: string) => void
   handleContinue?: () => void
+  handleStopPausedTask?: (index: number) => void
   handleChangesUpdate?: (index: number, changes: ReplyChangesView) => void
 }
 
@@ -49,15 +51,20 @@ const MessageItem = memo(
     handleRegenerateMessage,
     handleDeleteImage,
     handleContinue,
+    handleStopPausedTask,
     handleChangesUpdate
   }: MessageListProps) => {
     const isUserMessage = message?.role === "user"
     const isAgentMessage = message?.role === "assistant"
     const isLastMessage = index === messages?.length - 1
     const messageKey = `${message?.role}-0`
-    // A reply the user stopped, or one that used every tool step it had.
-    const canContinue =
-      isAgentMessage && isLastMessage && !isLoading && !!(message.meta?.stopped || message.meta?.outOfSteps)
+    const task = message?.meta?.task
+    const paused = isAgentMessage && isPausedReply(messages, index)
+    // The last reply that is not still running. Continue picks up a paused reply, or an out-of-steps one.
+    const isLastReply = isAgentMessage && isLastMessage && !isLoading
+    const canContinue = isLastReply && (paused || (!task && !!message.meta?.outOfSteps))
+    // A paused task stays stoppable wherever its reply sits, even when a later message follows it.
+    const canStopTask = paused
     // Shown while a step runs even between turns, such as during a Feedback review.
     const stepActive = !!steps?.some((step) => step.status === "running" || step.status === "waiting")
 
@@ -87,8 +94,10 @@ const MessageItem = memo(
             onEdit={handleEditMessage}
             onRegenerate={handleRegenerateMessage}
             isAssistant
+            paused={paused}
             onDeleteImage={handleDeleteImage}
             onContinue={canContinue ? handleContinue : undefined}
+            onStopTask={canStopTask ? () => handleStopPausedTask?.(index) : undefined}
             onChangesUpdate={handleChangesUpdate}
           />
         )}

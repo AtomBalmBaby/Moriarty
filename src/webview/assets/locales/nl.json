@@ -119,7 +119,7 @@
   "selection-chars": "{{chars}} tekens geselecteerd",
   "send": "Verzenden",
   "status": "Status",
-  "stop-generation": "Generatie stoppen",
+  "pause-generation": "Generatie pauzeren",
   "success": "Succes",
   "template-settings": "Sjabloon instellingen",
   "template-settings-description": "Selecteer de sjablonen die je wilt gebruiken in de chat interface.",

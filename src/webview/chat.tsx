@@ -44,7 +44,15 @@ import { useWorkspaceContext } from "./hooks/useWorkspaceContext"
 import { useWorkspaceSearch } from "./hooks/useWorkspaceSearch"
 import { ProviderSelect } from "./providers/provider-select"
 import AgentSettings from "./agent-settings"
-import { composerIsBusy, ComposerOperationEvent, ComposerOperationPhase, reduceComposerOperation } from "./composer-operation"
+import {
+  composerIsBusy,
+  ComposerOperationEvent,
+  ComposerOperationPhase,
+  isPausedReply,
+  reduceComposerOperation,
+  resumePausedReply,
+  stopPausedReply
+} from "./composer-operation"
 import { EmptyChat } from "./empty-chat"
 import { GhostText } from "./ghost-text"
 import { createCustomImageExtension } from "./image-extension"
@@ -138,6 +146,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const { t } = useTranslation()
   const [operationPhase, setOperationPhase] = useState<ComposerOperationPhase>("idle")
   const operationPhaseRef = useRef<ComposerOperationPhase>("idle")
+  /** The operation the host is running now; events from any other operation are stale. */
+  const activeOperationIdRef = useRef<string | undefined>(undefined)
+  /** Operations whose paused task was stopped for good: their late events change nothing. */
+  const closedOperationsRef = useRef(new Set<string>())
   const isLoading = composerIsBusy(operationPhase)
   /** Stop and Send follow the host's operation events only; the ref keeps callbacks in step. */
   const dispatchOperation = useCallback((event: ComposerOperationEvent) => {
@@ -479,8 +491,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
   })
 
   useServerEvent(EVENT_NAME.twinnyOnLoading, (turn) => {
+    if (typeof turn === "object" && turn.operationId && closedOperationsRef.current.has(turn.operationId)) return
     resetReasoning()
     setContinuation(typeof turn === "object" ? turn.continuation ?? 0 : 0)
+    activeOperationIdRef.current = typeof turn === "object" ? turn.operationId : undefined
     dispatchOperation({ type: "started" })
   })
 
@@ -502,11 +516,17 @@ export const Chat = (props: ChatProps): JSX.Element => {
   })
 
   useServerEvent(EVENT_NAME.twinnyStopGeneration, (stop) => {
-    dispatchOperation({ type: "terminal" })
+    // A terminal from an operation the webview is no longer tracking, or one whose task was stopped, changes nothing.
+    if (stop?.operationId && closedOperationsRef.current.has(stop.operationId)) return
+    if (stop?.operationId && activeOperationIdRef.current && stop.operationId !== activeOperationIdRef.current) return
+    activeOperationIdRef.current = undefined
+    dispatchOperation({ type: "terminal", paused: stop?.paused === true })
     setCompletion(null)
     stopRef.current = false
     const stoppedByUser = userStoppedRef.current
     userStoppedRef.current = false
+    // A paused task keeps its queue: Continue resumes it, Stop returns the queue to the composer.
+    if (stop?.paused) return
     const [next, ...rest] = queuedRef.current
     if (next && shouldResumeQueuedChat(stoppedByUser, stop?.cancelled === true)) {
       updateQueue(rest)
@@ -547,17 +567,40 @@ export const Chat = (props: ChatProps): JSX.Element => {
     editor.commands.focus("end")
   }
 
-  const handleStopGeneration = useCallback(() => {
-    userStoppedRef.current = true
+  /**
+   * Ends the paused task of the reply at `index` for good: it reads stopped and loses Continue. The
+   * host has nothing running for it, so no event is sent. A newer running operation is left alone,
+   * and so is its queue; the queue returns to the composer only when nothing is running.
+   */
+  const stopPausedTask = (index: number) => {
+    if (!isPausedReply(messages, index)) return
+    const operationId = messages[index].meta?.task?.operationId
+    if (operationId) closedOperationsRef.current.add(operationId)
     dispatchOperation({ type: "stop-requested" })
-    emit(EVENT_NAME.twinnyStopGeneration, {})
+    setMessages((prev) => {
+      const updatedMessages = stopPausedReply(prev || [], index)
+      saveLastConversation({ ...conversation, messages: updatedMessages })
+      return updatedMessages
+    })
+    if (!generatingRef.current) restoreQueue()
+  }
+  const stopPausedTaskRef = useRef(stopPausedTask)
+  stopPausedTaskRef.current = stopPausedTask
+  const handleStopPausedTask = useCallback((index: number) => stopPausedTaskRef.current(index), [])
+
+  /** Pauses the running operation: its work is interrupted and its reply stays continuable. */
+  const pauseIfGenerating = useCallback(() => {
+    if (!generatingRef.current) return false
+    dispatchOperation({ type: "pause-requested" })
+    emit(EVENT_NAME.twinnyPauseGeneration, { operationId: activeOperationIdRef.current })
+    return true
   }, [dispatchOperation])
 
   const handleRegenerateMessage = (
     index: number,
     mentions: MentionType[] | undefined
   ): void => {
-    dispatchOperation({ type: "started" })
+    dispatchOperation({ type: "submitted" })
     clearSearchReport()
     clearToolSteps()
     setMessages((prev) => {
@@ -612,7 +655,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
     mentions: MentionType[] | undefined,
     images?: ImageAttachment[]
   ): void => {
-    dispatchOperation({ type: "started" })
+    dispatchOperation({ type: "submitted" })
     clearSearchReport()
     clearToolSteps()
     setMessages((prev) => {
@@ -749,7 +792,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
       return true
     }
     if (approveWaiting("skip")) return true
-    if (stopIfGenerating()) return true
+    if (pauseIfGenerating()) return true
     const editor = editorRef.current
     if (!editor || editor.isEmpty) return false
 
@@ -763,13 +806,13 @@ export const Chat = (props: ChatProps): JSX.Element => {
     setHint(t("shortcuts-esc-again"))
     hintTimerRef.current = setTimeout(() => setHint(null), DOUBLE_ESCAPE_MS)
     return true
-  }, [approveWaiting, clearDraft, setShortcuts, stopIfGenerating, t])
+  }, [approveWaiting, clearDraft, setShortcuts, pauseIfGenerating, t])
 
   /* Ctrl+C with nothing selected; with a selection it is still a copy. */
   const handleInterrupt = useCallback(() => {
     if (!window.getSelection()?.isCollapsed) return false
-    return stopIfGenerating() || clearDraft()
-  }, [clearDraft, stopIfGenerating])
+    return pauseIfGenerating() || clearDraft()
+  }, [clearDraft, pauseIfGenerating])
 
   const toggleShortcuts = useCallback(() => {
     setShortcuts(!showShortcutsRef.current)
@@ -787,7 +830,8 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
   /** One message to the model: into the transcript and out to the extension. */
   const sendMessage = (message: QueuedMessage) => {
-    dispatchOperation({ type: "started" })
+    // A new message is independent work: a paused task stays paused for its own Continue or Stop.
+    dispatchOperation({ type: "submitted" })
     clearSearchReport()
     clearToolSteps()
 
@@ -1031,14 +1075,16 @@ export const Chat = (props: ChatProps): JSX.Element => {
    */
   const handleContinue = useCallback(() => {
     if (generatingRef.current || chatDisabled) return
+    dispatchOperation({ type: "continue-requested" })
     dispatchOperation({ type: "started" })
     clearSearchReport()
     clearToolSteps()
     setMessages((prev) => {
       const last = prev?.[prev.length - 1]
+      // Read before resuming: resuming clears the stopped mark this check depends on.
       const outOfSteps = !!last?.meta?.outOfSteps && !last.meta.stopped
       const updatedMessages: ChatCompletionMessage[] = [
-        ...(prev || []),
+        ...resumePausedReply(prev || []),
         {
           role: USER,
           content: t("reply-continue"),
@@ -1534,6 +1580,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         handleEditMessage={handleEditMessage}
         handleRegenerateMessage={handleRegenerateMessage}
         handleContinue={handleContinue}
+        handleStopPausedTask={handleStopPausedTask}
         handleChangesUpdate={handleChangesUpdate}
         index={index}
         isLoading={isLoading}
@@ -1546,6 +1593,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
       handleEditMessage,
       handleRegenerateMessage,
       handleContinue,
+      handleStopPausedTask,
       handleChangesUpdate,
       isLoading,
       messages,
@@ -1851,13 +1899,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
                   <VSCodeButton
                     appearance="icon"
                     role="button"
-                    className={cx(styles.stopButton, { [styles.stopping]: operationPhase === "stopping" })}
-                    aria-busy={operationPhase === "stopping"}
-                    onClick={handleStopGeneration}
-                    title={t("stop-generation-esc")}
-                    aria-label={t("stop-generation")}
+                    className={styles.stopButton}
+                    onClick={pauseIfGenerating}
+                    title={t("pause-generation-esc")}
+                    aria-label={t("pause-generation")}
                   >
-                    <span className="codicon codicon-debug-stop"></span>
+                    <span className="codicon codicon-debug-pause"></span>
                   </VSCodeButton>
                 ) : (
                   <VSCodeButton

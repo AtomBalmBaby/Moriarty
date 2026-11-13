@@ -42,6 +42,7 @@ import {
   ExecutionDiagnostic,
   MentionType,
   ReplyChangesView,
+  ReplyTask,
   TwinnyProvider
 } from "../../common/types"
 import { composeAgentPrompt } from "../agents/prompt"
@@ -348,6 +349,8 @@ export class Chat extends Base {
   private _evidencePreflightCheck: string | undefined
   /** Open operations (planning, replies, reviews, continuations); Stop stays available while any is open. */
   private readonly _lifecycle: OperationLifecycle
+  /** The last operation the user paused; its reply carries that as a continuable task. */
+  private _interrupted?: string
   /**
    * Messages the user queued while an agent reply works, offered for the
    * model to read at its next step. Only taken while that reply runs: one
@@ -428,11 +431,12 @@ export class Chat extends Base {
     // Initialize generation and context
     this._generation = new ChatGeneration(bridge, generations)
     this._lifecycle = new OperationLifecycle(
-      () => this._bridge.emit(EVENT_NAME.twinnyOnLoading, { continuation: 0 }),
+      () => this._bridge.emit(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: this._lifecycle.operationId }),
       (operationId, outcome) => this._bridge.emit(EVENT_NAME.twinnyStopGeneration, {
         operationId,
         cancelled: outcome === "cancelled" || this._generation.cancelled,
-        ...(this._generation.cancellationReason ? { cancellationReason: this._generation.cancellationReason } : {})
+        ...(this._generation.cancellationReason ? { cancellationReason: this._generation.cancellationReason } : {}),
+        ...(operationId !== undefined && this._interrupted === operationId ? { paused: true } : {})
       }),
       (event, operationId, detail) => logger.debug(`[Operation] ${event} operation=${operationId} conversation=${this._activeConversationId ?? "-"}${detail ? " " + detail : ""}`)
     )
@@ -506,11 +510,27 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   
   
   
+  /** Cancelled for this work: the generation was stopped, or this work belongs to an operation already cancelled. */
   public get cancelled(): boolean {
-    return this._generation.cancelled
+    return this._generation.cancelled || this._lifecycle.contextCancelled
   }
   
-  public abort = () => {
+  /** Interrupts the open operation as a pause: its reply stays continuable. */
+  public abort = () => this.interrupt()
+
+  /**
+   * Pauses the open operation. Its work is interrupted and its reply is kept as a paused task
+   * that only Continue resumes. Ignored unless `operationId` is the operation running now.
+   */
+  public pause = (operationId?: string) => {
+    const current = this._lifecycle.operationId
+    if (!current || (operationId !== undefined && operationId !== current)) return
+    this.interrupt()
+  }
+
+  private interrupt() {
+    const operationId = this._lifecycle.operationId
+    if (operationId) this._interrupted = operationId
     this._steps.cancelWaiting()
     this._feedbackPlanner.cancel("user")
     this._executionAbort?.abort()
@@ -1121,6 +1141,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       new Promise<void>((resolve) => (timer = setTimeout(resolve, POLICY_REFRESH_WAIT_MS)))
     ])
     clearTimeout(timer)
+  }
+
+  /** The task this reply belongs to, once the user has paused or stopped its operation. */
+  private replyTask(): ReplyTask | undefined {
+    const operationId = this._lifecycle.contextOperationId
+    if (!operationId || this._interrupted !== operationId) return undefined
+    return { operationId, state: "paused" }
   }
 
   /** Common preamble: clear the stop flag, tell the webview the language. */
@@ -2123,7 +2150,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     this._steerable = !!view
     // Every model turn, including an automatic continuation after Feedback,
     // is generating from here on; the chat shows its tool steps while it does.
-    this._bridge.emit(EVENT_NAME.twinnyOnLoading, { continuation: execution.continuations })
+    this._bridge.emit(EVENT_NAME.twinnyOnLoading, {
+      continuation: execution.continuations,
+      operationId: this._lifecycle.contextOperationId ?? this._lifecycle.operationId
+    })
     const hooks = {
       onNotes: (notes: string | undefined) => (toolNotes = notes),
       onUsage: (counted: ToolLoopUsage) => Object.assign(usage, counted),
@@ -2235,7 +2265,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       prefix,
       {
         toolNotes: () => toolNotes,
-        keepEmpty: () => (!!view || todoOnly) && this._steps.steps.length > 0,
+        keepEmpty: () => ((!!view || todoOnly) && this._steps.steps.length > 0) || this.replyTask()?.state === "paused",
         // A reply that must state verified values is held until the delivery gate has checked it.
         hold: () => !!todoScope && isFeedbackEnabled(workspace.getConfiguration("twinny")) && !!(intentAtStart ?? this.awaitingDeliveryIntent(execution))?.answer?.length,
         // What the reply changed, read once it is over and kept for undo.
@@ -2256,13 +2286,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         },
         meta: () => {
           const capacity = knownContextCapacity(provider, this.contextOptions())
+          const task = this.replyTask()
           const instructions = instructionFiles()
           return {
             ...(instructions.length ? { instructions } : {}),
             ...(usage.promptTokens ? { promptTokens: usage.promptTokens } : {}),
             ...(usage.completionTokens ? { completionTokens: usage.completionTokens } : {}),
             ...(capacity ? { contextWindow: capacity.tokens } : {}),
-            ...(outOfSteps ? { outOfSteps: true } : {})
+            ...(outOfSteps ? { outOfSteps: true } : {}),
+            ...(task ? { task } : {})
           }
         }
       }

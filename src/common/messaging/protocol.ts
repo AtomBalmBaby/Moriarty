@@ -474,6 +474,8 @@ export interface ClientEvents {
   [EVENT_NAME.twinnySetSessionContext]: Channel<ContextValue>
   [EVENT_NAME.twinnySetWorkspaceContext]: Channel<ContextValue>
   [EVENT_NAME.twinnySidebarReady]: Channel
+  /** Interrupts the open operation without ending its task; `operationId` must be the one it is running. */
+  [EVENT_NAME.twinnyPauseGeneration]: Channel<{ operationId?: string }>
   [EVENT_NAME.twinnyStopGeneration]: Channel<{ cancelled?: boolean; cancellationReason?: "user" | "host" }>
   [EVENT_NAME.twinnySymbolSearch]: Channel<{ query: string }, ContextItem[]>
   [EVENT_NAME.twinnyTextSelection]: Channel<void, string>
@@ -607,8 +609,8 @@ export interface ServerEvents {
   [EVENT_NAME.twinnyReplySteps]: ToolStepView[]
   [EVENT_NAME.twinnyShowShortcuts]: void
   [EVENT_NAME.twinnyOnCompletion]: ChatCompletionMessage
-  /** `continuation` counts the automatic turns after the first in one request. */
-  [EVENT_NAME.twinnyOnLoading]: { continuation?: number } | void
+  /** `continuation` counts the automatic turns after the first in one request; `operationId` names the operation. */
+  [EVENT_NAME.twinnyOnLoading]: { continuation?: number; operationId?: string } | void
   /** Reasoning streamed for the turn in progress, as it arrives; reset when the turn starts. */
   [EVENT_NAME.twinnyOnReasoning]: string
   [EVENT_NAME.twinnySendLanguage]: LanguageType
@@ -617,7 +619,8 @@ export interface ServerEvents {
   [EVENT_NAME.twinnySessionContext]: ContextValue
   [EVENT_NAME.twinnySetLocale]: string
   [EVENT_NAME.twinnySetTab]: string
-  [EVENT_NAME.twinnyStopGeneration]: { operationId?: string; cancelled?: boolean; cancellationReason?: "user" | "host" }
+  /** `paused` ends the operation as a pause: its task can still be continued. */
+  [EVENT_NAME.twinnyStopGeneration]: { operationId?: string; cancelled?: boolean; cancellationReason?: "user" | "host"; paused?: boolean }
   [EVENT_NAME.twinnyTextSelection]: string
   [EVENT_NAME.twinnyUpdateContextItems]: AnyContextItem[]
   [EVENT_NAME.twinnyWorkspaceSearch]: WorkspaceSearchReport

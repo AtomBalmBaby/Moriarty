@@ -508,12 +508,6 @@
   color: var(--vscode-errorForeground);
 }
 
-/* Stop was pressed; the operation is still winding down. */
-.stopping {
-  opacity: 0.6;
-  cursor: progress;
-}
-
 /* Lined up with the input above it. */
 .footer {
   display: flex;

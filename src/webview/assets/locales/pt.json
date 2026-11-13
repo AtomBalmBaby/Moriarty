@@ -119,7 +119,7 @@
   "selection-chars": "{{chars}} caracteres selecionados",
   "send": "Enviar",
   "status": "Status",
-  "stop-generation": "Parar geração",
+  "pause-generation": "Pausar geração",
   "success": "Sucesso",
   "template-settings": "Configurações de modelo",
   "template-settings-description": "Selecione os modelos que você deseja usar na interface de chat.",
