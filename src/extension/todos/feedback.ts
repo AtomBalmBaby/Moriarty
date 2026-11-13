@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 
 import { logger, redact } from "../../common/logger"
 import type { CriterionFailureReason, ReplyChangesView, SourceIdentity, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TypedCriterion, WorkspaceMutationOperation } from "../../common/types"
@@ -378,17 +378,21 @@ export const evidencePreflight = async (
 }
 
 const PREFLIGHT_GUIDANCE: Record<EvidencePreflightStatus, string> = {
-  fresh: "Answer from these verified facts and cite their observation_id. Do not search or read this source again.",
+  fresh: "These accepted facts appear to satisfy the request, but the task is not finished until you submit. Cite their observation_id values in your completion claim, or challenge them with the reason and do the remaining work. Do not re-read this source unless you challenge the facts.",
   stale: "The accepted source changed. Read only the listed lines again before claiming them.",
   ambiguous: "Several accepted locations match. Do not choose one silently; state the ambiguity or resolve it from the request.",
   missing: "No accepted fact exists yet. Search and read as needed, then complete the task with observation IDs.",
   unverifiable: "The source could not be read, so freshness is unknown. Do not describe these facts as current."
 }
 
-/** The preflight as compact structured context for the implementer. */
+/**
+ * The preflight as compact structured context for the implementer. itemId and conversationId identify where each fact
+ * was recorded; they are provenance, not TODOs in the active conversation.
+ */
 export const renderEvidencePreflight = (preflight: EvidencePreflight): string => [
   "Host evidence preflight (deterministic, from persisted accepted facts; the host ran it before your first request):",
   JSON.stringify({ status: preflight.status, reason: preflight.reason, subjects: preflight.subjects, facts: preflight.facts }),
+  "Provenance: each fact's itemId and conversationId name the TODO that originally recorded it. Do not pass them to twinny_todo_get or twinny_todo_update.",
   PREFLIGHT_GUIDANCE[preflight.status]
 ].join("\n")
 
@@ -1358,54 +1362,9 @@ export const reviewCandidates = (reviews: TodoReviewPackage[], itemId?: string):
   ).filter(dependenciesComplete)
 
 
-/** Completes pending reviews whose every objective criterion is proven by trusted, current facts. Feedback is never consulted. */
-export const completeProvenReviews = async (
-  repository: import("./repository").TodoRepository,
-  scope: import("./types").TodoWriteRequest,
-  readCurrentSource?: CurrentSourceReader,
-  options: { isCancelled?: () => boolean } = {}
-): Promise<string[]> => {
-  const completed: string[] = []
-  for (const review of await repository.getReviewPackages(scope, { includeOpen: true })) {
-    if (options.isCancelled?.()) break
-    if (review.task.status !== "pending" && review.task.status !== "in_progress") continue
-    if (!dependenciesComplete(review) || taskRequiresWorkspaceChanges(review.criteria)) continue
-    if (!(await provenTodoEvaluation(review, readCurrentSource))) continue
-    if (options.isCancelled?.()) break
-    const claimed = await repository.updateItem(scope, {
-      itemId: review.task.id,
-      expectedVersion: review.task.version,
-      patch: { status: "in_review" },
-      actor: "model",
-      requestId: randomUUID()
-    })
-    const fresh = (await repository.getReviewPackages(scope)).find((candidate) => candidate.task.id === review.task.id)
-
-    const verdict = fresh ? await provenTodoEvaluation(fresh, readCurrentSource) : undefined
-    if (!fresh || !verdict) {
-      logger.warn(`[Evidence] lazy completion of ${review.planTaskId} was not reproduced on re-check; the turn-end review will decide`)
-      continue
-    }
-    if (options.isCancelled?.()) {
-      // A claim made before cancellation is released so the task is not left in review without a verdict.
-      await repository.updateItem(scope, {
-        itemId: claimed.id,
-        expectedVersion: claimed.version,
-        patch: { status: "in_progress" },
-        actor: "model",
-        requestId: randomUUID()
-      })
-      break
-    }
-    await repository.applyEvaluation(scope, fresh.task.id, fresh.task.version, verdict, evaluationRequestId(fresh))
-    logger.info(`[Evidence] completed ${review.planTaskId} from trusted facts without Feedback or implementer investigation (criteria=${review.criteria.length}, claimedVersion=${claimed.version})`)
-    completed.push(review.planTaskId)
-  }
-  return completed
-}
-
 /**
- * Host-only proof: a verdict exists only when every criterion is proven by trusted, current facts. Never consults Feedback.
+ * Host-only proof: a verdict exists only when every criterion is proven by trusted, current facts. Never consults Feedback
+ * and never writes status; it only answers whether the evidence appears sufficient.
  * Partial or unproven work returns undefined, so the normal review path investigates only what is still missing.
  */
 export const provenTodoEvaluation = async (
@@ -1415,6 +1374,27 @@ export const provenTodoEvaluation = async (
   const reconciliations = await reviewReconciliations(review, readCurrentSource)
   const evaluation = deterministicTodoEvaluation(review, reconciliations)
   return evaluation?.decision === "accept" ? evaluation : undefined
+}
+
+/**
+ * The host's non-binding assessment that existing accepted evidence appears to satisfy a pending task. It is presented to
+ * the implementer, who must still submit; it never changes the task's status.
+ */
+export interface EvidenceAssessment {
+  state: "appears_satisfied"
+  evidenceRefs: string[]
+  requiresImplementerReview: true
+}
+
+export const assessProvenTodo = async (
+  review: TodoReviewPackage,
+  readCurrentSource?: CurrentSourceReader
+): Promise<EvidenceAssessment | undefined> => {
+  if (!dependenciesComplete(review) || taskRequiresWorkspaceChanges(review.criteria)) return undefined
+  const evaluation = await provenTodoEvaluation(review, readCurrentSource)
+  if (!evaluation) return undefined
+  const evidenceRefs = [...new Set(evaluation.criteria.flatMap((criterion) => criterion.evidenceRefs))].slice(0, 20)
+  return { state: "appears_satisfied", evidenceRefs, requiresImplementerReview: true }
 }
 
 /**

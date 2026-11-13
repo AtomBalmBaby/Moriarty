@@ -13,7 +13,7 @@ import { v4 as uuidv4 } from "uuid"
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
 import { AGENT_GLYPHS, agentGlyphState, nextAgentSelection, withAgentSelection } from "../common/agents"
 import { ASSISTANT, EVENT_NAME, TODO_EVENT_NAME, USER } from "../common/constants"
-import { exportConversation } from "../common/conversation-export"
+import { exportEntireChat } from "../common/conversation-export"
 import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
 import { isStaleTodoSnapshot } from "../common/guards"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
@@ -1142,13 +1142,15 @@ export const Chat = (props: ChatProps): JSX.Element => {
    */
   const handleEntireChatExport = (action: EntireChatAction) => {
     const streaming = completionRef.current
-    const streamingSteps = toolSteps.length ? toolSteps : streaming?.toolSteps
-    const inProgress: ChatCompletionMessage | null = streaming || streamingSteps?.length
-      ? { role: ASSISTANT, content: messageText(streaming), toolSteps: streamingSteps }
-      : null
-    const markdown = messages.length || inProgress
-      ? exportConversation(messages, { title: conversation?.title, inProgress })
-      : ""
+    const markdown = exportEntireChat(
+      messages,
+      {
+        text: messageText(streaming),
+        toolSteps: toolSteps.length ? toolSteps : streaming?.toolSteps,
+        reasoningRounds: reasoningRounds.snapshot()
+      },
+      { title: conversation?.title }
+    )
     emit(EVENT_NAME.twinnyEntireChatExport, { action, markdown })
   }
 

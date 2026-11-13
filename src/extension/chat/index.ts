@@ -68,7 +68,7 @@ import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
-import { type AcceptedFactStatus, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
@@ -937,8 +937,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         if (this._lifecycle.contextCancelled) return undefined
         this._replyText = this.latestUserText(messages) ?? ""
         this._evidencePreflight = await this.runEvidencePreflight(this.latestUserText(messages) ?? "")
-        const scope = this.activeTodoScope()
-        if (scope && !this.cancelled) await this.completeProvenTodos(scope, { isCancelled: () => this.cancelled })
         this._preparing = true
         try {
           this._conversation = await buildChatTurn(messages, {
@@ -1570,8 +1568,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }
 
-    // Facts established by this turn's trusted observations complete their TODOs before the continuation decision.
-    if (!this.cancelled && !workflow.isCancelled()) await this.completeProvenTodos(scope, { isCancelled: () => this.cancelled || workflow.isCancelled() })
     const after = await this._todoRepository.getList({ ...scope, includeCompleted: true })
     current = after.items.find((item) => item.id === intent.task.id)
     if (reviewFailure && current?.status === "in_review") {
@@ -2031,22 +2027,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
-  /**
-   * Completes pending TODOs whose every objective criterion is proven by trusted, current facts. Feedback is never
-   * consulted here; a TODO with any unproven or semantic criterion is left for the implementer or Feedback.
-   */
-  private async completeProvenTodos(scope: TodoWriteRequest, options: { isCancelled?: () => boolean } = {}): Promise<void> {
-    if (!this._todoRepository) return
-    try {
-      await this.repairAdministrativePlan(scope)
-      await completeProvenReviews(this._todoRepository, scope, this.currentSourceReader(), options)
-    } catch (error) {
-      logger.warn(`[Evidence] lazy completion skipped: ${redact(error instanceof Error ? error.message : String(error))}`)
-    } finally {
-      await this.publishTodoSnapshot(scope)
-    }
-  }
-
   /** Pushes the persisted list to the panel after a TODO transition, so the active view does not wait for a conversation switch. */
   private async publishTodoSnapshot(scope: TodoWriteRequest): Promise<void> {
     if (!this._todoRepository) return
@@ -2083,6 +2063,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     try {
       const active = await this._todoRepository.getActiveIntentContext(scope)
       if (!active) return ""
+      const assessment = await this.taskEvidenceAssessment(scope, active.task.id)
       const clip = (value: string, limit: number) => value.length > limit ? value.slice(0, limit - 1) + "…" : value
       const projection = {
         type: "twinny_active_intent_task",
@@ -2108,7 +2089,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             result: evidence.result,
             summary: clip(evidence.summary, 220)
           })),
-          feedback: feedbackContext(active) || undefined
+          feedback: feedbackContext(active) || undefined,
+          evidenceAssessment: assessment ? {
+            state: assessment.state,
+            evidenceRefs: assessment.evidenceRefs,
+            note: "Existing accepted evidence appears to satisfy this task. It is not complete: submit a completion claim that cites these refs for review, or challenge the assessment with the reason and do the remaining work."
+          } : undefined
         }
       }
       return "Active task from Twinny's native TODO plan (context only; preserve all other instructions; ids and revisions are TODO repository state, not workspace symbols):\n" + JSON.stringify(projection)
@@ -2116,6 +2102,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       logger.warn(`[Intent] Could not load active task context: ${error instanceof Error ? error.message : String(error)}`)
       return ""
     }
+  }
+
+  /**
+   * The host's assessment of an open task against existing accepted evidence. It is presented to the implementer and
+   * never changes status; a submitted or completed task has no assessment to present.
+   */
+  private async taskEvidenceAssessment(scope: TodoWriteRequest, itemId: string): Promise<EvidenceAssessment | undefined> {
+    if (!this._todoRepository) return undefined
+    const review = (await this._todoRepository.getReviewPackages(scope, { includeOpen: true })).find((candidate) => candidate.task.id === itemId)
+    if (!review || (review.task.status !== "pending" && review.task.status !== "in_progress")) return undefined
+    return assessProvenTodo(review, this.currentSourceReader())
   }
 
   /**

@@ -52,6 +52,9 @@ export const useReasoningRounds = (replyText: () => string = () => "") => {
 
   const clear = useCallback(() => commit([]), [commit])
 
+  /** The rounds as they stand now, including deltas not yet published. */
+  const snapshot = useCallback((): ReasoningRoundView[] => toReasoningViews(roundsRef.current), [])
+
   /** Closes what is still streaming and returns the rounds for the reply that keeps them. */
   const take = useCallback((complete: boolean): ReasoningRoundView[] | undefined => {
     const views = toReasoningViews(closeReasoning(roundsRef.current, complete, Date.now()))
@@ -59,5 +62,5 @@ export const useReasoningRounds = (replyText: () => string = () => "") => {
     return views.length ? views : undefined
   }, [commit])
 
-  return { rounds, close, clear, take }
+  return { rounds, close, clear, take, snapshot }
 }

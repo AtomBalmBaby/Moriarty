@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -13,7 +14,7 @@ import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, Feedbac
 import { checkDelivery, type DeliveryVerdict } from "../../extension/todos/delivery"
 import { commandDigest, compactArguments, compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, preserveEvidence } from "../../extension/todos/evidence"
 import { EVIDENCE_BUDGET, type EvidenceBudget, projectEvidence, rankPromotionCandidates, renderRecentObservations, renderRequiredEvidence } from "../../extension/todos/evidence-context"
-import { assessAcceptedFacts, completeProvenReviews, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
+import { assessAcceptedFacts, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { validateIntentTaskPlan } from "../../extension/todos/intent-plan"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
 import { editDigest, TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
@@ -3389,6 +3390,29 @@ const claimTask = (state: FeedbackFixture, title: string, requestId: string) => 
 const reviewOf = async (state: FeedbackFixture, itemId: string) =>
   (await state.repository.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === itemId)!
 const statusOf = async (state: FeedbackFixture, title: string) => (await state.repository.getItem(state.scope, itemTitled(state, title).id)).item.status
+/** Host assessment of open TODOs against accepted evidence. It writes nothing; it names the plan tasks whose criteria all appear proven. */
+const assessedTasks = async (repository: TodoRepository, scope: TodoWriteRequest, readCurrentSource?: CurrentSourceReader): Promise<string[]> => {
+  const assessed: string[] = []
+  for (const review of await repository.getReviewPackages(scope, { includeOpen: true })) {
+    if (review.task.status !== "pending" && review.task.status !== "in_progress") continue
+    if (await assessProvenTodo(review, readCurrentSource)) assessed.push(review.planTaskId)
+  }
+  return assessed
+}
+/** The only completion path: the implementer claims the assessed task, then the host reconciles that claim. */
+const submitAndReconcile = async (repository: TodoRepository, scope: TodoWriteRequest, readCurrentSource?: CurrentSourceReader): Promise<string[]> => {
+  const completed: string[] = []
+  for (const planTaskId of await assessedTasks(repository, scope, readCurrentSource)) {
+    const open = (await repository.getReviewPackages(scope, { includeOpen: true })).find((review) => review.planTaskId === planTaskId)!
+    await repository.updateItem(scope, { itemId: open.task.id, expectedVersion: open.task.version, patch: { status: "in_review" }, actor: "model", requestId: randomUUID() })
+    const claimed = (await repository.getReviewPackages(scope)).find((review) => review.task.id === open.task.id)!
+    await evaluateTodoReview(repository, scope, claimed, async () => {
+      throw new Error("the deterministic host decision must not need Feedback")
+    }, "deterministic", { readCurrentSource })
+    if ((await repository.getItem(scope, open.task.id)).item.status === "completed") completed.push(planTaskId)
+  }
+  return completed
+}
 /** One real read of the registration, then the host's deterministic verdict on the locate TODO. Feedback must never be asked. */
 const establishFact = async (state: FeedbackFixture, workspace: string, reads: { count: number }) => {
   await claimTask(state, "locate", "locate-claim")
@@ -3423,11 +3447,13 @@ test("Scenario A: one trusted read_file observation establishes the locate fact 
     assert.equal(fact.sourceHash, await fingerprintContent(realWorkspaceSource), "the fingerprint is the one read_file reported")
     assert.ok(fact.startLine >= READ_FILE_START && fact.endLine <= READ_FILE_END, `fact lies within the requested read: ${fact.startLine}-${fact.endLine}`)
 
-    const completed = await completeProvenReviews(state.repository, state.scope, sourceReader(workspace))
-    assert.deepEqual(completed, ["read"])
-    assert.equal(await statusOf(state, "read"), "completed")
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), ["read"], "the trusted fact appears to satisfy the overlapping read TODO")
+    assert.equal(await statusOf(state, "read"), "pending", "an assessment is not a completion")
     assert.equal(reads.count, 1, "the overlapping TODO needs no second read")
-    assert.ok(logs.some((line) => line.includes("[Evidence] completed read")), "completion is attributed to trusted facts")
+    assert.deepEqual(await submitAndReconcile(state.repository, state.scope, sourceReader(workspace)), ["read"], "the implementer's submission is reconciled by the host")
+    assert.equal(await statusOf(state, "read"), "completed")
+    assert.equal(reads.count, 1, "reconciling the submission issues no read")
+    assert.ok(logs.some((line) => line.includes("source=deterministic")), "the submission is judged by the host")
   } finally {
     logger.info = originalInfo
     removeAll(state.directory, workspace)
@@ -3452,8 +3478,7 @@ test("Scenario B: a reopened repository in a new conversation resolves the persi
     assert.equal(fact.conversationId, first.scope.conversationId)
     assert.ok(renderEvidencePreflight(preflight).includes(fact.sourceHash), "the injected preflight carries the fingerprint")
 
-    const completed = await completeProvenReviews(reopened, scope, sourceReader(workspace))
-    assert.deepEqual(completed.sort(), ["locate", "read"])
+    assert.deepEqual((await assessedTasks(reopened, scope, sourceReader(workspace))).sort(), ["locate", "read"])
     assert.equal(reads.count, 1, "the new conversation issues no read")
   } finally {
     removeAll(first.directory, workspace)
@@ -3508,7 +3533,7 @@ test("live regression: planner criteria are resolved by the host from one author
     assert.equal(fact.sourceHash, await fingerprintContent(realWorkspaceSource))
     assert.equal(await statusOf(state, LIVE_TASK), "completed")
 
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [], "nothing remains to complete, so no continuation is needed")
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [], "nothing remains to assess, so no continuation is needed")
     assert.equal(evaluatorCalls, 0)
     assert.equal(reads.count, 1, "one authoritative read establishes every source fact")
 
@@ -4010,7 +4035,7 @@ test("negative: a changed source makes the fact stale and leaves the overlapping
     fs.writeFileSync(path.join(workspace, READ_FILE_SOURCE), realWorkspaceSource.replace("name: \"read_file\",", "name: \"read_file_renamed\","))
     const preflight = await evidencePreflight(EVIDENCE_REQUEST, await state.repository.listAcceptedEvidence(state.scope), sourceReader(workspace))
     assert.equal(preflight.status, "stale")
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [])
     assert.equal(await statusOf(state, "read"), "pending")
   } finally {
     removeAll(state.directory, workspace)
@@ -4026,7 +4051,7 @@ test("negative: an unavailable source is unverifiable, never fresh", async () =>
     fs.rmSync(path.join(workspace, READ_FILE_SOURCE))
     const preflight = await evidencePreflight(EVIDENCE_REQUEST, await state.repository.listAcceptedEvidence(state.scope), sourceReader(workspace))
     assert.equal(preflight.status, "unverifiable")
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [])
     assert.equal(await statusOf(state, "read"), "pending")
   } finally {
     removeAll(state.directory, workspace)
@@ -4051,7 +4076,7 @@ test("negative: a failed or out-of-range read never becomes accepted evidence", 
     const review = await reviewOf(state, itemTitled(state, "locate").id)
     assert.equal(await provenTodoEvaluation(review, sourceReader(workspace)), undefined)
     assert.deepEqual(await state.repository.listAcceptedEvidence(state.scope), [])
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [])
   } finally {
     removeAll(state.directory, workspace)
   }
@@ -4067,7 +4092,7 @@ test("negative: a valid fact never certifies a criterion it does not prove, nor 
   ], false, EVIDENCE_REQUEST)
   try {
     await establishFact(state, workspace, reads)
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), ["read"])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), ["read"])
     assert.equal(await statusOf(state, "other"), "pending")
     assert.equal(await statusOf(state, "semantic"), "pending")
     assert.equal(reads.count, 1)
@@ -4093,7 +4118,7 @@ test("negative: ambiguous symbol resolution is reported and another project's fa
     const foreignFacts = await foreign.listAcceptedEvidence(foreignScope)
     assert.deepEqual(foreignFacts, [])
     assert.equal((await evidencePreflight(EVIDENCE_REQUEST, foreignFacts, sourceReader(workspace))).status, "missing")
-    assert.deepEqual(await completeProvenReviews(foreign, foreignScope, sourceReader(workspace)), [])
+    assert.deepEqual(await assessedTasks(foreign, foreignScope, sourceReader(workspace)), [])
   } finally {
     removeAll(state.directory, workspace)
   }
@@ -4115,7 +4140,7 @@ test("information reuse: a modification TODO receives the established fact with 
     assert.ok(context.includes(status.fact.sourceHash), "the fingerprint travels with the fact")
     assert.ok(context.includes(`observation ${status.fact.observationId}`), "original provenance is preserved")
 
-    await completeProvenReviews(state.repository, state.scope, sourceReader(workspace))
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [])
     assert.equal(await statusOf(state, "modify"), "pending", "a change task is never completed from read-only facts")
     assert.equal(await statusOf(state, "locate"), "completed")
     assert.equal(reads.count, 1, "reuse issues no further read")
@@ -4141,7 +4166,7 @@ test("partial reuse: a TODO with one proven and one unproven criterion keeps the
     assert.notEqual(unproven.outcome, "proven", "the unrelated criterion is not carried by the fact")
     assert.equal(await provenTodoEvaluation(review, sourceReader(workspace)), undefined, "a partly proven TODO is not completed")
 
-    await completeProvenReviews(state.repository, state.scope, sourceReader(workspace))
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [])
     assert.equal(await statusOf(state, "read"), "pending")
     assert.equal(reads.count, 1)
   } finally {
@@ -4161,8 +4186,8 @@ test("stale evidence stays visible as historical context with its status, never 
     assert.equal(status.freshness, "historical")
     const context = renderPlanContext((await state.repository.getPlanOutline(state.scope))!, facts)
     assert.ok(context.includes(`${status.fact.id} [historical]`), "the historical fact keeps its ID and status")
-    assert.ok(context.includes("re-read them before relying on them"))
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.equal(await statusOf(state, "read"), "pending")
     assert.equal(await statusOf(state, "read"), "pending")
   } finally {
     removeAll(state.directory, workspace)
@@ -4181,7 +4206,7 @@ test("negative: a historical read never proves a criterion that adds, changes, o
     const state = await fixture([{ id: "mutate", criteria: [{ id: "mutate", description: acceptance, verification: { kind: "workspace_mutation" } }] }], false, EVIDENCE_REQUEST)
     try {
       await recordRead(state, itemTitled(state, "mutate").id, "mutate-read", await runReadFile(workspace, reads))
-      assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [], acceptance)
+      assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [], acceptance)
       assert.equal(await statusOf(state, "mutate"), "pending", acceptance)
     } finally {
       removeAll(state.directory)
@@ -4210,7 +4235,7 @@ test("negative: a passing run that predates a later successful edit does not pro
       failed: false,
       requestId: "verify-edit"
     })
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), [])
     assert.equal(await statusOf(state, "verify"), "pending")
   } finally {
     removeAll(state.directory)
@@ -4229,7 +4254,7 @@ test("negative: a criterion that asks for a new run is never proven by an earlie
       exitCode: 0,
       requestId: "again-run"
     })
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), [])
     assert.equal(await statusOf(state, "again"), "pending")
   } finally {
     removeAll(state.directory)
@@ -4263,14 +4288,14 @@ test("negative: a run stays unproven when the clock stored a later edit earlier 
     fs.writeFileSync(state.databasePath, Buffer.from(database.export()))
     database.close()
     const reopened = new TodoRepository(state.databasePath, wasmPath)
-    assert.deepEqual(await completeProvenReviews(reopened, state.scope), [])
+    assert.deepEqual(await assessedTasks(reopened, state.scope), [])
     assert.equal((await reopened.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.id === itemId)?.status, "pending")
   } finally {
     removeAll(state.directory)
   }
 })
 
-test("cancellation: a stopped reply completes no TODO even when its evidence proves the criterion", async () => {
+test("assessment: a proven criterion records an assessment and leaves the TODO and its version untouched", async () => {
   const state = await fixture([{ id: "verify", criteria: [{ id: "tests-pass", description: "`npm test` exits 0", verification: { kind: "command_exit_status", command: "npm test", exitCode: 0 } }] }], false, EVIDENCE_REQUEST)
   try {
     await state.repository.recordToolObservation(state.scope, {
@@ -4282,14 +4307,17 @@ test("cancellation: a stopped reply completes no TODO even when its evidence pro
       exitCode: 0,
       requestId: "verify-run"
     })
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined, { isCancelled: () => true }), [])
-    assert.equal(await statusOf(state, "verify"), "pending")
+    const before = (await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.title === "verify")
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), ["verify"])
+    const after = (await state.repository.getList({ ...state.scope, includeCompleted: true })).items.find((item) => item.title === "verify")
+    assert.equal(after?.status, "pending")
+    assert.equal(after?.version, before?.version, "reading an assessment writes nothing")
   } finally {
     removeAll(state.directory)
   }
 })
 
-test("cancellation: a stop after the claim releases it to in_progress and completes nothing", async () => {
+test("duplicate events: a repeated reconciliation or a late claim cannot complete or reopen a TODO", async () => {
   const state = await fixture([{ id: "verify", criteria: [{ id: "tests-pass", description: "`npm test` exits 0", verification: { kind: "command_exit_status", command: "npm test", exitCode: 0 } }] }], false, EVIDENCE_REQUEST)
   try {
     await state.repository.recordToolObservation(state.scope, {
@@ -4301,11 +4329,17 @@ test("cancellation: a stop after the claim releases it to in_progress and comple
       exitCode: 0,
       requestId: "verify-run"
     })
-    // Checks run before the scan, before the claim, and before the apply: the third check stops after the claim.
-    let checks = 0
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined, { isCancelled: () => ++checks >= 3 }), [])
-    assert.equal(checks, 3)
-    assert.equal(await statusOf(state, "verify"), "in_progress")
+    const itemId = itemTitled(state, "verify").id
+    const assessedVersion = (await state.repository.getItem(state.scope, itemId)).item.version
+    assert.deepEqual(await submitAndReconcile(state.repository, state.scope), ["verify"])
+    assert.equal(await statusOf(state, "verify"), "completed")
+    assert.deepEqual(await submitAndReconcile(state.repository, state.scope), [], "a repeated reconciliation finds nothing open")
+    await assert.rejects(
+      state.repository.updateItem(state.scope, { itemId, expectedVersion: assessedVersion, patch: { status: "in_review" }, actor: "model", requestId: "late-claim" }),
+      TodoConflictError,
+      "a late claim against the superseded version is refused"
+    )
+    assert.equal(await statusOf(state, "verify"), "completed", "the completed TODO is not reopened")
   } finally {
     removeAll(state.directory)
   }
@@ -4322,7 +4356,7 @@ test("approval: a failed or declined edit never satisfies a criterion that requi
       failed: true,
       requestId: "declined-edit"
     })
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), [])
     assert.equal(await statusOf(state, "modify"), "pending")
   } finally {
     removeAll(state.directory)
@@ -4341,7 +4375,7 @@ test("approval: a run recorded as failed never proves a passing run criterion", 
       exitCode: 0,
       requestId: "declined-run"
     })
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), [])
     assert.equal(await statusOf(state, "verify"), "pending")
   } finally {
     removeAll(state.directory)
@@ -4358,7 +4392,7 @@ test("prerequisite only: a proven location leaves the broader modification task 
     const [location, modification] = await reviewCriteria(review.criteria, review.retainedEvidence, sourceReader(workspace), review.acceptedEvidence, review.symbolAliases)
     assert.equal(location.outcome, "proven", "the trusted read proves the location prerequisite")
     assert.notEqual(modification.outcome, "proven", "the location never proves the change")
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, sourceReader(workspace)), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope, sourceReader(workspace)), [])
     assert.equal(await statusOf(state, "locate"), "pending")
   } finally {
     removeAll(workspace, state.directory)
@@ -4378,12 +4412,14 @@ test("fresh demand: a re-run after the reply started proves a re-run criterion, 
       requestId
     })
     await runNpmTest("again-earlier")
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), [])
     // The reply start activates the requirement; this test performs that host step explicitly.
     await state.repository.activateRequirement(state.scope, itemTitled(state, "again").id, "again-reply-start")
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined), [])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), [])
     await runNpmTest("again-fresh")
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope, undefined), ["again"])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), ["again"])
+    assert.equal(await statusOf(state, "again"), "pending", "a fresh run is an assessment, not a completion")
+    assert.deepEqual(await submitAndReconcile(state.repository, state.scope), ["again"])
     assert.equal(await statusOf(state, "again"), "completed")
   } finally {
     removeAll(state.directory)
@@ -4421,7 +4457,9 @@ test("historical scope: a run that predates a later edit still proves a criterio
       failed: false,
       requestId: "diagnose-edit"
     })
-    assert.deepEqual(await completeProvenReviews(state.repository, state.scope), ["diagnose"])
+    assert.deepEqual(await assessedTasks(state.repository, state.scope), ["diagnose"])
+    assert.equal(await statusOf(state, "diagnose"), "pending", "a historical run is an assessment until the implementer submits")
+    assert.deepEqual(await submitAndReconcile(state.repository, state.scope), ["diagnose"])
     assert.equal(await statusOf(state, "diagnose"), "completed")
   } finally {
     removeAll(state.directory)
@@ -4690,7 +4728,7 @@ test("Scenario C: a location fact accepted in one conversation guides a modifica
     const context = renderPlanContext((await repositoryB.getPlanOutline(scopeB))!, selection.selected, selection.omitted)
     assert.ok(context.includes(`observation ${locateObservation.id}`), "the implementer receives the accepted location as compact context")
 
-    assert.deepEqual(await completeProvenReviews(repositoryB, scopeB, sourceReader(workspace)), [], "knowing the location does not complete the modification")
+    assert.deepEqual(await assessedTasks(repositoryB, scopeB, sourceReader(workspace)), [], "knowing the location does not complete the modification")
     assert.equal((await repositoryB.getItem(scopeB, modify.id)).item.status, "pending")
 
     await setStatus(repositoryB, scopeB, modify.id, "in_progress", "modify-claim")

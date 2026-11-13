@@ -1458,7 +1458,7 @@ suite("Read-file acceptance, production controller", function () {
     autoRunCommands?: boolean
     editCommands?: EditCommandRunner
     editOwnerId?: string
-    hold?: () => void
+    hold?: () => Promise<void> | void
     onChat?: (chat: ChatIn) => void
     onRepository?: (repository: TodoRepository) => void
     onWaiting?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
@@ -1527,6 +1527,25 @@ suite("Read-file acceptance, production controller", function () {
   }
 
   type Turn = Awaited<ReturnType<typeof runTurn>>
+
+  /** Samples a task's status when the implementer's first request begins, before any submission can exist. */
+  const sampleImplementerStart = (workspace: Workspace, conversationId: string, title: string) => {
+    const statuses: (string | undefined)[] = []
+    let repository: TodoRepository | undefined
+    const scope = { projectFingerprint: workspace.projectFingerprint, conversationId, writer: conversationId }
+    return {
+      statuses,
+      onRepository: (value: TodoRepository) => {
+        repository = value
+      },
+      hold: async () => {
+        if (statuses.length || !repository) return
+        const { items } = await repository.getList({ ...scope, includeCompleted: true })
+        statuses.push(items.find((item) => item.title === title)?.status)
+      }
+    }
+  }
+
 
   const statusOf = async (turn: Turn, title: string) => {
     const { items } = await turn.repository.getList({ ...turn.scope, includeCompleted: true })
@@ -1695,25 +1714,27 @@ suite("Read-file acceptance, production controller", function () {
     return JSON.stringify(body)
   }
 
-  test("a planner path that contradicts current accepted evidence is repaired before the implementer runs, and the trusted fact completes the task", async () => {
+  test("a planner path that contradicts current accepted evidence is repaired before the implementer runs, and the trusted fact is assessed without completing the task", async () => {
     const file = "src/extension/tools/workspace.ts"
     const guessed = "tools/read_file.ts"
     const { source } = repositoryDeclaration(file)
     await withWorkspace(async (workspace) => {
       const seed = await seedImplementationFact(workspace, file, "contradiction-seed")
       const observedBefore = await observationCounts(workspace)
+      const sample = sampleImplementerStart(workspace, "contradiction-guess", investigateTitle)
       const turn = await runTurn(workspace, {
         conversationId: "contradiction-guess",
         planReply: [readFilePlanReply("contradiction-plan-guessed", "source", guessed), readFilePlanReply("contradiction-plan-repaired", "accepted_fact", file)],
-        replies: [`read_file is implemented in ${file}, lines ${seed.start} to ${seed.end}, fingerprint ${seed.fingerprint}.`]
+        replies: [`read_file is implemented in ${file}, lines ${seed.start} to ${seed.end}, fingerprint ${seed.fingerprint}.`],
+        onRepository: sample.onRepository,
+        hold: sample.hold
       })
 
       const planning = planningRequests(turn.evaluator)
       assert.equal(planning.length, 2, "one contradicted plan, then one repaired plan")
       const correction = JSON.stringify(planning[1].messages)
       assert.ok(correction.includes(guessed) && correction.includes(file), "the repair names the guessed path and the trusted path")
-      assert.equal(turn.agent.requests.length, 1, "the implementer runs only once, against the repaired plan")
-      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      assert.deepEqual(sample.statuses, ["pending"], "the implementer starts with the task unfinished; the trusted fact is an assessment, not a completion")
       const facts = await turn.repository.listAcceptedEvidence(turn.scope)
       assert.ok(facts.every((fact) => fact.path === file), "no fact is recorded for the guessed path")
       assert.equal((await observationCounts(workspace)).read_file ?? 0, observedBefore.read_file ?? 0, "no file is re-read for the repaired plan")
@@ -1722,24 +1743,50 @@ suite("Read-file acceptance, production controller", function () {
 
   test("a fresh accepted fact that satisfies the request is delivered with its exact values, without another source read", async () => {
     const file = "src/extension/tools/workspace.ts"
+    const lookupTitle = "Check accepted evidence for read_file"
     const { source } = repositoryDeclaration(file)
     await withWorkspace(async (workspace) => {
       const seed = await seedImplementationFact(workspace, file, "fresh-fact-seed")
       const observedBefore = await observationCounts(workspace)
+      const conversationId = "fresh-fact-answer"
+      const scope = { projectFingerprint: workspace.projectFingerprint, conversationId, writer: conversationId }
+      const sample = sampleImplementerStart(workspace, conversationId, investigateTitle)
+      // Item IDs exist only after planning, so the submission replies are filled in from the repository on the first request.
+      // Feedback reconciles the lookup at turn end, which unblocks the investigation, so the answer comes after a second submission.
+      const replies: Array<string | Error> = ["", "The lookup is submitted; the investigation continues.", "", `read_file is implemented in ${file}, lines ${seed.start} to ${seed.end}, fingerprint ${seed.fingerprint}.`]
+      let repository: TodoRepository | undefined
+      let submitted = false
       const turn = await runTurn(workspace, {
-        conversationId: "fresh-fact-answer",
+        conversationId,
         message: mycroftRequest,
         planReply: readFilePlanReply("fresh-fact-plan", "accepted_fact", file),
-        replies: [`read_file is implemented in ${file}, lines ${seed.start} to ${seed.end}, fingerprint ${seed.fingerprint}.`]
+        replies,
+        onRepository: (value) => {
+          repository = value
+          sample.onRepository(value)
+        },
+        hold: async () => {
+          await sample.hold()
+          if (submitted || !repository) return
+          submitted = true
+          const items = (await repository.getList({ ...scope, includeCompleted: true })).items
+          const lookup = items.find((item) => item.title === lookupTitle)
+          const investigation = items.find((item) => item.title === investigateTitle)
+          if (!lookup || !investigation) return
+          replies[0] = call("twinny_todo_update", { item_id: lookup.id, expected_version: String(lookup.version), status: "completed", request_id: "fresh-lookup-submit" })
+          replies[2] = call("twinny_todo_update", { item_id: investigation.id, expected_version: String(investigation.version), status: "completed", request_id: "fresh-investigate-submit" })
+        }
       })
 
-      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      assert.deepEqual(sample.statuses, ["pending"], "accepted evidence alone never completes a newly created TODO before the implementer submits")
       assert.equal(sawSourceText(turn), false, "the trusted fact is used without re-reading the source")
       const observedAfter = await observationCounts(workspace)
       for (const tool of ["read_file", "twinny_evidence_lookup"]) {
         assert.equal(observedAfter[tool] ?? 0, observedBefore[tool] ?? 0, `${tool} must not execute again`)
       }
-      assert.equal(turn.agent.requests.length, 1, "no redundant continuation runs")
+      assert.equal(turn.agent.requests.length, 4, "lookup submission, answer that ends the first pass, investigation submission, final answer")
+      assert.equal(await statusOf(turn, lookupTitle), "completed", "the submitted lookup is reconciled by Feedback")
+      assert.equal(await statusOf(turn, investigateTitle), "completed", "the investigation is reconciled once its dependency is complete")
       const reply = turn.reply ?? ""
       assert.ok(reply.includes(file) && reply.includes(`lines ${seed.start} to ${seed.end}`) && reply.includes(seed.fingerprint), "the delivered answer carries the exact current values")
     }, { [file]: source })

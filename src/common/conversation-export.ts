@@ -7,11 +7,12 @@
 import * as cheerio from "cheerio"
 
 import { ASSISTANT, CONTINUATION_PREFIX, TWINNY, USER, YOU } from "./constants"
-import { replyParts } from "./reply-parts"
+import { closes, Fence, opens, replyParts } from "./reply-parts"
 import { getThinkingMessage, messageText } from "./text"
 import type {
   ChatCompletionMessage,
   ExecutionDiagnostic,
+  ReasoningRoundView,
   ReplyChangesView,
   ToolStepView
 } from "./types"
@@ -145,6 +146,197 @@ const quoted = (label: string, text: string) =>
     .split("\n")
     .map((line) => (line ? `> ${line}` : ">"))
     .join("\n")}`
+
+const isSpace = (ch: string | undefined) => ch === undefined || /\s/.test(ch)
+const isPunct = (ch: string | undefined) =>
+  ch !== undefined && /[\p{P}\p{S}]/u.test(ch)
+
+interface Delimiter {
+  char: string
+  start: number
+  end: number
+  size: number
+  /** Characters closed at the front of the run, and opened at its back. */
+  front: number
+  back: number
+  canOpen: boolean
+  canClose: boolean
+}
+
+const remaining = (run: Delimiter) => run.size - run.front - run.back
+
+const backtickRun = (text: string, from: number) => {
+  let end = from
+  while (text[end] === "`") end++
+  return end - from
+}
+
+/** Where the next backtick run of exactly `size` starts at or after `from`, or -1. */
+const closingBacktickRun = (text: string, from: number, size: number) => {
+  let at = from
+  while (at < text.length) {
+    if (text[at] !== "`") {
+      at++
+      continue
+    }
+    const run = backtickRun(text, at)
+    if (run === size) return at
+    at += run
+  }
+  return -1
+}
+
+/**
+ * Escapes the inline delimiters of one paragraph that have no partner in it,
+ * so each reads as the character it was. Matched pairs, code spans and
+ * existing escapes stay as written. Emphasis is matched the way CommonMark
+ * matches it, minus the rule of three.
+ */
+const escapeUnpairedDelimiters = (text: string): string => {
+  const literal = new Array<boolean>(text.length).fill(false)
+  // Link targets and bare URLs are not prose: their underscores and asterisks are part of the address.
+  for (const match of text.matchAll(/\]\([^)\s]*\)|<[^>\s]+>|https?:\/\/\S+/g)) {
+    literal.fill(true, match.index ?? 0, (match.index ?? 0) + match[0].length)
+  }
+  for (let at = 0; at < text.length; ) {
+    if (text[at] === "\\") {
+      literal[at] = true
+      if (at + 1 < text.length) literal[at + 1] = true
+      at += 2
+    } else if (text[at] === "`") {
+      const size = backtickRun(text, at)
+      const close = closingBacktickRun(text, at + size, size)
+      if (close === -1) {
+        at += size
+      } else {
+        literal.fill(true, at, close + size)
+        at = close + size
+      }
+    } else {
+      at++
+    }
+  }
+
+  const runs: Delimiter[] = []
+  const stray: Array<[number, number]> = []
+  for (let at = 0; at < text.length; ) {
+    const char = text[at]
+    if (literal[at] || !"*_~`".includes(char)) {
+      at++
+      continue
+    }
+    let end = at
+    while (end < text.length && text[end] === char && !literal[end]) end++
+    if (char === "`") {
+      stray.push([at, end])
+    } else {
+      const before = text[at - 1]
+      const after = text[end]
+      const leftFlanking =
+        !isSpace(after) && (!isPunct(after) || isSpace(before) || isPunct(before))
+      const rightFlanking =
+        !isSpace(before) && (!isPunct(before) || isSpace(after) || isPunct(after))
+      runs.push({
+        char,
+        start: at,
+        end,
+        size: end - at,
+        front: 0,
+        back: 0,
+        canOpen: char === "_" ? leftFlanking && (!rightFlanking || isPunct(before)) : leftFlanking,
+        canClose: char === "_" ? rightFlanking && (!leftFlanking || isPunct(after)) : rightFlanking
+      })
+    }
+    at = end
+  }
+
+  const openers: Delimiter[] = []
+  for (const run of runs) {
+    if (run.canClose) {
+      while (remaining(run) > 0) {
+        let k = openers.length - 1
+        while (
+          k >= 0 &&
+          !(
+            openers[k].char === run.char &&
+            remaining(openers[k]) > 0 &&
+            (run.char !== "~" || openers[k].size === run.size)
+          )
+        )
+          k--
+        if (k < 0) break
+        const opener = openers[k]
+        const used = Math.min(2, remaining(opener), remaining(run))
+        opener.back += used
+        run.front += used
+        openers.length = k + 1
+        if (remaining(opener) === 0) openers.pop()
+      }
+    }
+    if (run.canOpen && remaining(run) > 0) openers.push(run)
+  }
+
+  const escape = new Array<boolean>(text.length).fill(false)
+  for (const run of runs) {
+    if (!run.canOpen && !run.canClose) continue
+    for (let at = run.start + run.front; at < run.end - run.back; at++) escape[at] = true
+  }
+  for (const [start, end] of stray) {
+    for (let at = start; at < end; at++) escape[at] = true
+  }
+  return Array.from(text, (char, at) => (escape[at] ? `\\${char}` : char)).join("")
+}
+
+/**
+ * Model text is cut at tool calls and reasoning rounds, so emphasis, code
+ * spans and fences opened before a cut may have no close in their own piece,
+ * and would run into what follows. Each piece is balanced on its own: unpaired
+ * delimiters are escaped and a fence still open at the end is closed. Nothing
+ * else is changed.
+ */
+const balanceMarkup = (text: string): string => {
+  const out: string[] = []
+  let paragraph: string[] = []
+  let fence: Fence | undefined
+  const endParagraph = () => {
+    if (!paragraph.length) return
+    out.push(escapeUnpairedDelimiters(paragraph.join("\n")))
+    paragraph = []
+  }
+  for (const line of text.split("\n")) {
+    if (fence) {
+      out.push(line)
+      if (closes(line, fence)) fence = undefined
+      continue
+    }
+    const opening = opens(line)
+    if (opening) {
+      endParagraph()
+      fence = opening
+      out.push(line)
+    } else if (line.trim()) {
+      paragraph.push(line)
+    } else {
+      endParagraph()
+      out.push(line)
+    }
+  }
+  endParagraph()
+  if (fence) out.push(fence.char.repeat(fence.size))
+  return out.join("\n")
+}
+
+const formatSeconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`
+
+const renderRound = (round: ReasoningRoundView, inProgress: boolean): string => {
+  const timing = round.durationMs !== undefined ? `, ${formatSeconds(round.durationMs)}` : ""
+  const state = round.complete
+    ? ""
+    : inProgress
+      ? ", in progress when exported"
+      : ", interrupted"
+  return quoted(`Reasoning${timing}${state}`, balanceMarkup(round.text.trim()))
+}
 
 const renderFeedback = (step: ToolStepView): string => {
   const verdict =
@@ -333,7 +525,7 @@ const renderText = (text: string, counter: Counter): string[] => {
         ""
       )
     }
-    const body = piece.replace(/^\n+/, "").replace(/\s+$/, "")
+    const body = balanceMarkup(piece.replace(/^\n+/, "").replace(/\s+$/, ""))
     if (body) out.push(body, "")
   })
   return out
@@ -362,15 +554,19 @@ const renderAssistant = (
   const { thinking, message: text } = getThinkingMessage(textOf(message))
   const model = message.meta?.model ? ` · \`${message.meta.model}\`` : ""
   const lines = [`## ${number}. ${TWINNY}${model}`, ""]
-  if (thinking) lines.push(quoted("Reasoning", thinking), "")
+  // Thinking written into the text itself, from before rounds were kept, has no place among the activity: it opens the reply.
+  if (thinking) lines.push(quoted("Reasoning", balanceMarkup(thinking)), "")
   const steps = message.toolSteps ?? []
+  const rounds = message.reasoningRounds ?? []
   let wrote = false
-  for (const part of replyParts(text, steps)) {
+  for (const part of replyParts(text, steps, rounds)) {
     if ("text" in part) {
       const rendered = renderText(part.text, counter)
       wrote ||= rendered.some(Boolean)
       lines.push(...rendered)
-    } else if ("steps" in part) {
+    } else if ("round" in part) {
+      lines.push(renderRound(part.round, inProgress), "")
+    } else {
       wrote = true
       for (const step of part.steps) lines.push(renderStep(step), "")
     }
@@ -429,4 +625,33 @@ export const exportConversation = (
     )
   ]
   return `${header.join("\n")}\n\n${sections.join("\n\n---\n\n")}\n`
+}
+
+/** The reply still streaming when the chat is copied, as the chat holds it right now. */
+export interface LiveReply {
+  text: string
+  toolSteps?: ToolStepView[]
+  reasoningRounds?: ReasoningRoundView[]
+}
+
+/**
+ * Copy All: every saved message and the reply still streaming, in the order
+ * they happened. Empty when the chat has nothing to copy.
+ */
+export const exportEntireChat = (
+  messages: ChatCompletionMessage[],
+  live: LiveReply,
+  options: Omit<ConversationExportOptions, "inProgress"> = {}
+): string => {
+  const hasLive = !!live.text || !!live.toolSteps?.length || !!live.reasoningRounds?.length
+  if (!messages.length && !hasLive) return ""
+  const inProgress: ChatCompletionMessage | null = hasLive
+    ? {
+        role: ASSISTANT,
+        content: live.text,
+        ...(live.toolSteps?.length ? { toolSteps: live.toolSteps } : {}),
+        ...(live.reasoningRounds?.length ? { reasoningRounds: live.reasoningRounds } : {})
+      }
+    : null
+  return exportConversation(messages, { ...options, inProgress })
 }

@@ -10,10 +10,15 @@ import { test } from "node:test"
 import { CONTINUATION_PREFIX } from "../../common/constants"
 import {
   exportConversation,
+  exportEntireChat,
   htmlToMarkdown
 } from "../../common/conversation-export"
 import { attachLateSteps } from "../../common/reply-steps"
-import type { ChatCompletionMessage, ToolStepView } from "../../common/types"
+import type {
+  ChatCompletionMessage,
+  ReasoningRoundView,
+  ToolStepView
+} from "../../common/types"
 import {
   deliverEntireChat,
   EMPTY_CHAT_MESSAGE,
@@ -667,4 +672,150 @@ test("an HTML message from before Markdown composing exports as Markdown, as it 
   assert.ok(text.includes("Use **bold** *now*"), "inline formatting is converted")
   assert.ok(text.includes("- a"), "the list is converted")
   assert.ok(!text.includes("<p>"), "no HTML tags are left in the body")
+})
+
+const round = (id: string, text: string, extra: Partial<ReasoningRoundView> = {}): ReasoningRoundView => ({
+  id,
+  text,
+  complete: true,
+  ...extra
+})
+
+const assertInOrder = (text: string, needles: string[]) => {
+  let cursor = 0
+  for (const needle of needles) {
+    const at = text.indexOf(needle, cursor)
+    assert.ok(at >= 0, `"${needle}" must appear after the previous activity`)
+    assert.strictEqual(text.split(needle).length - 1, 1, `"${needle}" must appear exactly once`)
+    cursor = at + needle.length
+  }
+}
+
+const interleaved = (): ChatCompletionMessage =>
+  assistant("Part one. Part two. Part three.", {
+    reasoningRounds: [
+      round("r1", "Plan: list the tools first.", { at: 0, order: 1, durationMs: 1200 }),
+      round("r2", "Now search for the function.", { at: 10, order: 3, durationMs: 800 }),
+      round("r3", "Confirm the result.", { at: 20, order: 5, durationMs: 400 })
+    ],
+    toolSteps: [
+      step({ id: "t1", name: "twinny_todo_list", summary: "twinny_todo_list ran", at: 0, order: 2 }),
+      step({ id: "t2", name: "twinny_evidence_lookup", summary: "twinny_evidence_lookup ran", at: 10, order: 4 })
+    ]
+  })
+
+test("multiple reasoning rounds interleaved with tools export in the order they happened", () => {
+  const text = exportOf([user("find run_command"), interleaved()])
+  assertInOrder(text, [
+    "Plan: list the tools first.",
+    "twinny_todo_list ran",
+    "Part one.",
+    "Now search for the function.",
+    "twinny_evidence_lookup ran",
+    "Part two.",
+    "Confirm the result.",
+    "Part three."
+  ])
+})
+
+test("a failed tool call and the reasoning after it export in order, with the failure visible", () => {
+  const reply = assistant("Recovered answer.", {
+    reasoningRounds: [
+      round("r1", "Look up the task first.", { at: 0, order: 1 }),
+      round("r2", "The lookup failed, so try the evidence instead.", { at: 0, order: 3 })
+    ],
+    toolSteps: [
+      step({ id: "t1", name: "twinny_todo_get", summary: "twinny_todo_get failed", status: "failed", at: 0, order: 2 })
+    ]
+  })
+  const text = exportOf([user("q"), reply])
+  assertInOrder(text, [
+    "Look up the task first.",
+    "twinny_todo_get failed",
+    "The lookup failed, so try the evidence instead.",
+    "Recovered answer."
+  ])
+})
+
+test("reasoning after an automatic continuation exports after the continuation boundary", () => {
+  const content = `first half${CONTINUATION_PREFIX}second half`
+  const text = exportOf([
+    user("long job"),
+    assistant(content, {
+      reasoningRounds: [
+        round("r1", "Before the continuation.", { at: 0, order: 1 }),
+        round("r2", "After the continuation.", { at: content.indexOf("second"), order: 2 })
+      ]
+    })
+  ])
+  assertInOrder(text, [
+    "Before the continuation.",
+    "first half",
+    "### Automatic continuation 1",
+    "After the continuation.",
+    "second half"
+  ])
+})
+
+test("an interrupted saved round is labelled interrupted, not completed", () => {
+  const text = exportOf([
+    user("q"),
+    assistant("partial", { reasoningRounds: [round("r1", "Cut off mid thought.", { complete: false, at: 0, order: 1 })] })
+  ])
+  assert.match(text, /Reasoning, interrupted/)
+  assert.ok(text.includes("Cut off mid thought."))
+})
+
+test("a reasoning round still streaming in Copy All is exported as in progress, after the saved messages", () => {
+  const saved = assistant("Earlier answer.", {
+    reasoningRounds: [round("r0", "Earlier thinking.", { at: 0, order: 1, durationMs: 500 })]
+  })
+  const text = exportEntireChat(
+    [user("first"), saved, user("second")],
+    {
+      text: "Live text so far.",
+      toolSteps: [step({ id: "t9", name: "twinny_todo_list", summary: "twinny_todo_list ran", at: 0, order: 2 })],
+      reasoningRounds: [round("r9", "Still thinking live.", { complete: false, at: 0, order: 1 })]
+    },
+    { exportedAt: EXPORTED_AT }
+  )
+  assertInOrder(text, ["Earlier thinking.", "Earlier answer.", "second", "Still thinking live.", "twinny_todo_list ran", "Live text so far."])
+  assert.match(text, /Reasoning, in progress/)
+})
+
+test("a collapsed and an expanded reasoning block export the same Markdown, because collapse is view state only", () => {
+  const build = () => [user("q"), interleaved()]
+  const first = exportOf(build())
+  const second = exportOf(build())
+  assert.strictEqual(first, second)
+  assert.ok(first.includes("Confirm the result."), "the full reasoning text is exported whether or not it was shown")
+})
+
+test("a conversation reloaded from storage exports exactly as it did before the reload", () => {
+  const before = exportOf([user("q"), interleaved()])
+  const reloaded = JSON.parse(JSON.stringify([user("q"), interleaved()])) as ChatCompletionMessage[]
+  assert.strictEqual(exportOf(reloaded), before)
+})
+
+test("literal asterisks, backticks, and fenced code survive export without malformed delimiters", () => {
+  const code = "```ts\nconst pattern = \"**\" + '`'\n```"
+  const reply = assistant(`Stray **here and an open \`tick.\n\n${code}\n\nDone with *emphasis*.`, {
+    reasoningRounds: [round("r1", "Asterisk * and backtick ` in thought.", { at: 0, order: 1 })],
+    toolSteps: [step({ id: "t1", name: "grep", summary: "grep found **x**", at: 5, order: 2 })]
+  })
+  const text = exportOf([user("q"), reply])
+  assert.ok(text.includes(code), "the fenced code is exported verbatim")
+  assert.ok(text.includes("*emphasis*"), "matched emphasis is kept")
+  assert.ok(text.includes("\\*\\*here"), "an unmatched opener is escaped")
+  assert.strictEqual((text.match(/```/g) ?? []).length % 2, 0, "every fence is closed")
+})
+
+test("every retained activity appears once per reply, with none dropped or repeated", () => {
+  const text = exportOf([user("q"), interleaved(), user("next"), interleaved()])
+  for (const marker of ["Plan: list the tools first.", "Now search for the function.", "Confirm the result.", "twinny_evidence_lookup ran"]) {
+    assert.strictEqual(text.split(marker).length - 1, 2, `"${marker}" appears once per reply`)
+  }
+  const second = text.indexOf("next")
+  assert.ok(second > text.indexOf("Confirm the result."), "the second reply's activity follows the first reply")
+  assert.ok(text.indexOf("Plan: list the tools first.", second) > second, "the second reply's reasoning follows its user message")
 })
