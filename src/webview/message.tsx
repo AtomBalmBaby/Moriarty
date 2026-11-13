@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import Markdown, { Components } from "react-markdown"
-import Mention from "@tiptap/extension-mention"
 import { Editor, EditorContent, Extension, useEditor } from "@tiptap/react"
 import StarterKit from "@tiptap/starter-kit"
 import { VSCodeButton } from "@vscode/webview-ui-toolkit/react"
@@ -29,7 +28,15 @@ import { ReasoningRound } from "./reasoning-block"
 import { ReplyChanges } from "./reply-changes"
 import { useToast } from "./toast"
 import ToolSteps from "./tool-steps"
-import { getThinkingMessage } from "./utils"
+import {
+  getThinkingMessage,
+  handleMarkdownPaste,
+  insertLineBreak,
+  LinkExtension,
+  MentionWithMarkdown,
+  remarkUnderline,
+  UnderlineExtension
+} from "./utils"
 import WorkspaceContext from "./workspace-context"
 
 import styles from "./styles/message.module.css"
@@ -72,16 +79,12 @@ interface MessageProps {
 
 const CustomKeyMap = Extension.create({
   name: "messageKeyMap",
+  // Ahead of StarterKit's HardBreak, which also binds Shift-Enter and Mod-Enter.
+  priority: 1000,
   addKeyboardShortcuts() {
     return {
-      "Mod-Enter": ({ editor }) => {
-        editor.commands.insertContent("\n")
-        return true
-      },
-      "Shift-Enter": ({ editor }) => {
-        editor.commands.insertContent("\n")
-        return true
-      }
+      "Mod-Enter": ({ editor }) => insertLineBreak(editor),
+      "Shift-Enter": ({ editor }) => insertLineBreak(editor)
     }
   }
 })
@@ -377,7 +380,11 @@ export const Message: React.FC<MessageProps> = ({
   const handleRegenerate = useCallback(() => {
     if (!messages?.length) return
     const lastMessage = messages[index - 1]
-    const mentions = extractMentionsFromHtml(lastMessage?.content as string)
+    // Markdown keeps no mention paths in its text, so they are stored on the message.
+    const mentions =
+      lastMessage?.contentFormat === "markdown"
+        ? lastMessage.mentions
+        : extractMentionsFromHtml(lastMessage?.content as string)
     onRegenerate?.(index, mentions)
   }, [onRegenerate, index])
 
@@ -409,7 +416,12 @@ export const Message: React.FC<MessageProps> = ({
     const allImages = (message?.images || []) as ImageAttachment[]
     const filteredImages = allImages.filter(img => img.id && imageIds.includes(img.id))
 
-    const finalContent = doc.body.innerHTML
+    // Markdown messages are saved as Markdown; legacy messages keep their HTML.
+    const markdown = editorRef.current?.storage.markdown?.getMarkdown()
+    const finalContent =
+      message?.contentFormat === "markdown" && markdown !== undefined
+        ? markdown
+        : doc.body.innerHTML
     if (message?.content === finalContent) {
       return setEditing(false)
     }
@@ -421,7 +433,7 @@ export const Message: React.FC<MessageProps> = ({
       filteredImages
     )
     setEditing(false)
-  }, [message?.content, onEdit, index, message?.images])
+  }, [message?.content, message?.contentFormat, onEdit, index, message?.images])
 
   const handleOpenFile = useCallback((filePath: string) => {
     emit(EVENT_NAME.twinnyOpenFile, filePath)
@@ -443,11 +455,13 @@ export const Message: React.FC<MessageProps> = ({
       extensions: [
         StarterKit,
         TiptapMarkdown,
+        UnderlineExtension,
+        LinkExtension,
         MentionExtension,
         CustomImageExtension.configure({
           allowBase64: true,
         }),
-        Mention.configure({
+        MentionWithMarkdown.configure({
           HTMLAttributes: {
             class: "mention"
           },
@@ -461,6 +475,8 @@ export const Message: React.FC<MessageProps> = ({
         })
       ],
       content: message?.content,
+      // StarterKit's mark paste rules would turn literal `*text*` in any paste into emphasis.
+      enablePasteRules: ["link"],
       editorProps: {
         attributes: {
           class: styles.editor
@@ -488,13 +504,8 @@ export const Message: React.FC<MessageProps> = ({
               }
             }
 
-            const text =
-              event.clipboardData?.getData("text/html") ||
-              event.clipboardData?.getData("text/plain")
-            if (text) {
-              view.dispatch(view.state.tr.insertText(text))
-            }
-            return true
+            // Markdown-looking text becomes formatting; anything else pastes as usual.
+            return handleMarkdownPaste(view, event, editorRef.current?.storage.markdown?.parser)
           }
         }
       },
@@ -611,6 +622,12 @@ export const Message: React.FC<MessageProps> = ({
       },
     } as Components),
     [renderCodeBlock, renderContent, message?.images]
+  )
+
+  // Markdown from the user is not HTML: no `p` override, so its text never reaches renderContent.
+  const userMarkdownComponents = useMemo(
+    () => ({ pre: renderCodeBlock }) as Components,
+    [renderCodeBlock]
   )
 
   if (!message) return null
@@ -775,7 +792,18 @@ export const Message: React.FC<MessageProps> = ({
         </>
       ) : (
         <Collapsible>
-          {renderContent(messageContent.trimStart())}
+          {message.contentFormat === "markdown" ? (
+            <div className={styles.messageContent}>
+              <Markdown
+                remarkPlugins={[remarkGfm, remarkUnderline]}
+                components={userMarkdownComponents}
+              >
+                {messageContent.trimStart()}
+              </Markdown>
+            </div>
+          ) : (
+            renderContent(messageContent.trimStart())
+          )}
           {renderImageGallery()}
         </Collapsible>
       )}

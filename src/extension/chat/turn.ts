@@ -60,6 +60,12 @@ export const composerText = (html: string): string => {
   return textOf(body?.children).replace(/\n{3,}/g, "\n\n").trim()
 }
 
+/** A user turn's text as the model reads it: Markdown as written, legacy HTML as plain text. */
+const userText = (message: ChatCompletionMessage): string => {
+  const content = typeof message.content === "string" ? message.content : ""
+  return message.contentFormat === "markdown" ? content : composerText(content)
+}
+
 /**
  * What the model is sent for one message of the webview's conversation:
  * the prompt a feature recorded for a user turn, a user turn as plain
@@ -75,7 +81,7 @@ const modelText = (message: ChatCompletionMessage): string => {
     return content.trim() ? content : STOPPED_REPLY
   }
   if (message.prompt !== undefined) return message.prompt
-  return message.role === USER ? withoutSources(composerText(content)) : content
+  return message.role === USER ? withoutSources(userText(message)) : content
 }
 
 const STOPPED_REPLY = "(This reply was stopped before any text was written.)"
@@ -139,8 +145,7 @@ export const buildChatTurn = async (
     .slice(0, -1)
     .map((message) => ({ message, text: modelText(message) }))
   const last = messages[messages.length - 1]
-  const said =
-    last.prompt ?? composerText(typeof last.content === "string" ? last.content : "")
+  const said = last.prompt ?? userText(last)
   const question = withoutSources(said)
   const extra = await context.additionalContext(
     question,

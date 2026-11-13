@@ -1,13 +1,13 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { Virtuoso, VirtuosoHandle } from "react-virtuoso"
-import Mention from "@tiptap/extension-mention"
 import Placeholder from "@tiptap/extension-placeholder"
 import { Editor, EditorContent, JSONContent, useEditor } from "@tiptap/react"
 import StarterKit from "@tiptap/starter-kit"
 import { VSCodeButton, VSCodePanelView } from "@vscode/webview-ui-toolkit/react"
 import * as cheerio from "cheerio"
 import cx from "classnames"
+import { Markdown as TiptapMarkdown } from "tiptap-markdown"
 import { v4 as uuidv4 } from "uuid"
 
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
@@ -75,7 +75,7 @@ import { TodoPanel } from "./todo-panel"
 import { answerToolStep } from "./tool-steps"
 import { conversationMarkdown } from "./transcript"
 import type { TypingActivity } from "./typing-indicator"
-import { CustomKeyMap, getThinkingMessage } from "./utils"
+import { CustomKeyMap, getThinkingMessage, handleMarkdownPaste, LinkExtension, MentionWithMarkdown, UnderlineExtension } from "./utils"
 
 import styles from "./styles/chat.module.css"
 
@@ -111,6 +111,8 @@ interface QueuedMessage {
   html: string
   /** As sent: paragraphs joined with line breaks. */
   input: string
+  /** Canonical Markdown of the draft: what is stored, exported, and sent to the model. */
+  markdown: string
   /** The actual execution prompt the agent should receive. */
   prompt?: string
   /** The original user wording, kept when a refined execution prompt is later used. */
@@ -672,11 +674,16 @@ export const Chat = (props: ChatProps): JSX.Element => {
         ...prev.slice(0, index),
         {
           ...prev[index],
-          content: message
-            .replace(/<p>/g, "")
-            .replace(/<\/p>/g, "<br>")
-            .replace(/<br>$/, ""),
+          // Markdown is kept as written; only legacy HTML loses its paragraph tags.
+          content:
+            prev[index]?.contentFormat === "markdown"
+              ? message
+              : message
+                  .replace(/<p>/g, "")
+                  .replace(/<\/p>/g, "<br>")
+                  .replace(/<br>$/, ""),
           images: images && images.length > 0 ? images : undefined,
+          mentions: mentions && mentions.length > 0 ? mentions : undefined,
           // The user rewrote it: what a feature recorded no longer applies.
           prompt: undefined
         }
@@ -847,14 +854,16 @@ export const Chat = (props: ChatProps): JSX.Element => {
     const conversationId = message.conversationId || conversation?.id || uuidv4()
 
     setMessages((prevMessages) => {
-      const executedPrompt = message.prompt ?? message.input
+      const executedPrompt = message.prompt ?? message.markdown
       const updatedMessages: ChatCompletionMessage[] = [
         ...(prevMessages || []),
         {
           role: USER,
-          content: message.input,
+          content: message.markdown,
+          contentFormat: "markdown",
+          mentions: message.mentions.length > 0 ? message.mentions : undefined,
           prompt: executedPrompt,
-          originalPrompt: message.originalPrompt ?? message.input,
+          originalPrompt: message.originalPrompt ?? message.markdown,
           images: message.images.length > 0 ? message.images : undefined
         }
       ]
@@ -960,6 +969,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
       conversationId: conversationIdRef.current || uuidv4(),
       html,
       input,
+      markdown: editorRef.current?.storage.markdown?.getMarkdown() ?? "",
       text,
       mentions: getMentions(),
       images: imagesRef.current
@@ -1275,7 +1285,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
     {
       extensions: [
         StarterKit,
-        Mention.configure({
+        TiptapMarkdown,
+        UnderlineExtension,
+        LinkExtension,
+        MentionWithMarkdown.configure({
           HTMLAttributes: {
             class: "mention"
           },
@@ -1306,6 +1319,12 @@ export const Chat = (props: ChatProps): JSX.Element => {
           showOnlyWhenEditable: false
         })
       ],
+      // StarterKit's mark paste rules would turn literal `*text*` in any paste into emphasis.
+      enablePasteRules: ["link"],
+      editorProps: {
+        handlePaste: (view, event) =>
+          handleMarkdownPaste(view, event, editorRef.current?.storage.markdown?.parser)
+      },
       // Typing into a recalled prompt makes it the draft.
       onUpdate: () => {
         composerRevisionRef.current++
@@ -1790,23 +1809,26 @@ export const Chat = (props: ChatProps): JSX.Element => {
                 multiple
                 style={{ display: "none" }}
               />
-              <span className={styles.prompt} aria-hidden="true">
-                {agentMode ? <>&#10095;&#10095;</> : <>&#10095;</>}
-              </span>
-              <div
-                ref={editorWrapRef}
-                className={styles.editorWrap}
-                style={
-                  composerHeight === null
-                    ? undefined
-                    : { height: composerHeight, maxHeight: composerHeight }
-                }
-              >
-                <EditorContent
-                  className={styles.tiptap}
-                  editor={editorRef.current}
-                />
+              <div className={styles.composerBody}>
+                <span className={styles.prompt} aria-hidden="true">
+                  {agentMode ? <>&#10095;&#10095;</> : <>&#10095;</>}
+                </span>
+                <div
+                  ref={editorWrapRef}
+                  className={styles.editorWrap}
+                  style={
+                    composerHeight === null
+                      ? undefined
+                      : { height: composerHeight, maxHeight: composerHeight }
+                  }
+                >
+                  <EditorContent
+                    className={styles.tiptap}
+                    editor={editorRef.current}
+                  />
+                </div>
               </div>
+              <div className={styles.composerToolbar}>
               <div className={styles.modeSwitches}>
                 <div className={styles.agentPicker} ref={agentPickerRef} data-agent-picker>
                   <span className={styles.agentGlyph} data-state={glyphState} title={AGENT_GLYPHS[glyphState].label} aria-hidden="true">{AGENT_GLYPHS[glyphState].glyph}</span>
@@ -1934,6 +1956,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
                     <span className="codicon codicon-send"></span>
                   </VSCodeButton>
                 )}
+              </div>
               </div>
             </div>
           </form>

@@ -1362,3 +1362,45 @@ test("a stopped chat restores queued messages instead of dispatching another req
   assert.equal(shouldResumeQueuedChat(true, false), false, "a user stop does not drain the queue")
   assert.equal(shouldResumeQueuedChat(false, true), false, "a host cancellation does not drain the queue")
 })
+
+const turnText = (message: ChatCompletionMessage): string =>
+  typeof message.content === "string"
+    ? message.content
+    : (message.content as Array<{ text: string }>).map((part) => part.text).join("")
+
+test("a Markdown message reaches the model as written, in history and as the new question", async () => {
+  const context = { systemPrompt: async () => "s", additionalContext: async () => "" }
+  const markdown = "## Steps\n\n1. **Read** `a.ts`\n\n> note <u>this</u>\n\n```ts\nconst a = 1\n```"
+  const turn = await buildChatTurn(
+    [
+      { role: "user", content: markdown, contentFormat: "markdown" },
+      { role: "assistant", content: "Read it." },
+      { role: "user", content: markdown, contentFormat: "markdown" }
+    ] as ChatCompletionMessage[],
+    context
+  )
+  assert.strictEqual(turnText(turn[1]), markdown, "history keeps the Markdown")
+  assert.strictEqual(turnText(turn[3]), markdown, "the new question keeps the Markdown")
+})
+
+test("an HTML message from before Markdown composing reaches the model as its plain text", async () => {
+  const context = { systemPrompt: async () => "s", additionalContext: async () => "" }
+  const turn = await buildChatTurn(
+    [{ role: "user", content: "<p>Use <strong>bold</strong> &amp; go</p>" }] as ChatCompletionMessage[],
+    context
+  )
+  assert.strictEqual(turnText(turn[turn.length - 1]), "Use bold & go")
+})
+
+test("a continued Markdown question keeps its Markdown, after the previous reply's notes", async () => {
+  const context = { systemPrompt: async () => "s", additionalContext: async () => "" }
+  const turn = await buildChatTurn(
+    [
+      { role: "user", content: "- a\n- b", contentFormat: "markdown" },
+      { role: "assistant", content: "", toolNotes: "read_file {\"path\":\"a.ts\"}\n1: x" },
+      { role: "user", content: "1. **go on**", contentFormat: "markdown" }
+    ] as ChatCompletionMessage[],
+    context
+  )
+  assert.ok(turnText(turn[turn.length - 1]).endsWith("1. **go on**"), "the question is the Markdown the user wrote")
+})

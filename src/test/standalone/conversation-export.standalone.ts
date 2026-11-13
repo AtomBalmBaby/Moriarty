@@ -649,3 +649,22 @@ test("a feedback verdict cut short in its step keeps the whole verdict in the ex
   assert.ok(text.includes("Final reason: tests missing."), "the end of the verdict must not be lost")
   assert.match(text, /#### Feedback review: rejected/)
 })
+
+test("a Markdown message is exported as written: its structure and fences survive", () => {
+  const markdown = "# Plan\n\n- **bold** and <u>under</u>\n\n```ts\nconst a = \"<b>\"\n```\n\n[docs](https://example.com)"
+  const text = exportOf([{ role: "user", content: markdown, contentFormat: "markdown" }, assistant("ok")])
+  assert.ok(text.includes(`## 1. You\n\n${markdown}\n\n---`), "the message body is the Markdown itself")
+})
+
+test("a Markdown message's literal HTML-looking text is not escaped or stripped on export", () => {
+  const text = exportOf([{ role: "user", content: "Literal <script>alert(1)</script> text", contentFormat: "markdown" }])
+  assert.ok(text.includes("Literal <script>alert(1)</script> text"))
+  assert.ok(!text.includes("&lt;script"), "the text is not escaped twice")
+})
+
+test("an HTML message from before Markdown composing exports as Markdown, as it always did", () => {
+  const text = exportOf([user("<p>Use <strong>bold</strong> <em>now</em></p><ul><li>a</li></ul>")])
+  assert.ok(text.includes("Use **bold** *now*"), "inline formatting is converted")
+  assert.ok(text.includes("- a"), "the list is converted")
+  assert.ok(!text.includes("<p>"), "no HTML tags are left in the body")
+})

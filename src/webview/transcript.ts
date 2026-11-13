@@ -54,7 +54,10 @@ export const conversationMarkdown = (
     .filter((m) => m.role === USER || m.role === ASSISTANT)
     .map((m) => {
       const content = typeof m.content === "string" ? m.content : ""
-      if (m.role === USER) return `## ${YOU}\n\n${composerMarkdown(content)}`
+      if (m.role === USER) {
+        // Marked messages are already Markdown; older ones are HTML from the composer.
+        return `## ${YOU}\n\n${m.contentFormat === "markdown" ? content : composerMarkdown(content)}`
+      }
       const model = m.meta?.model ? ` · \`${m.meta.model}\`` : ""
       return `## ${TWINNY}${model}\n\n${withSaid(getThinkingMessage(content).message, m.toolSteps).trim()}`
     })

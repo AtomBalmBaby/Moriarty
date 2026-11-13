@@ -50,6 +50,17 @@ export const MentionExtension = Node.create<MentionAttributes>({
     ]
   },
 
+  addStorage() {
+    return {
+      markdown: {
+        serialize: (state: { write: (text: string) => void }, node: { attrs: { dataLabel?: string | null } }) => {
+          state.write(`@${node.attrs.dataLabel ?? ""}`)
+        },
+        parse: {}
+      }
+    }
+  },
+
   addKeyboardShortcuts() {
     return {}
   }

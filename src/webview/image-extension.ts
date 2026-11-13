@@ -15,6 +15,15 @@ export function createCustomImageExtension(onDeleteImage?: (id: string) => void)
         }
       }
     },
+    addStorage() {
+      // Images travel as attachments; base64 data must not reach Markdown.
+      return {
+        markdown: {
+          serialize: () => undefined,
+          parse: {}
+        }
+      }
+    },
     addNodeView() {
       return ({ node, editor, getPos }) => {
         const dom = document.createElement("div")

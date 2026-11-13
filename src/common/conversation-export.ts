@@ -295,7 +295,11 @@ const renderWithheld = (message: ChatCompletionMessage): string => {
 const textOf = (message: ChatCompletionMessage) => messageText(message)
 
 const renderUser = (message: ChatCompletionMessage, number: number): string => {
-  const body = htmlToMarkdown(textOf(message)) || note("empty message")
+  const text = textOf(message)
+  // Marked messages are already Markdown; older ones are HTML from the composer.
+  const body =
+    (message.contentFormat === "markdown" ? text : htmlToMarkdown(text)) ||
+    note("empty message")
   const images = message.images?.length
     ? note(
         `${message.images.length} image${message.images.length === 1 ? "" : "s"} attached`

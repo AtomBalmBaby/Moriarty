@@ -64,6 +64,13 @@ export type ChatCompletionMessage = ChatCompletionMessageParam & {
   tool_call_id?: string
   images?: ImageAttachment[] | string[]
   /**
+   * How `content` is written. Set to "markdown" for messages sent from the
+   * Markdown composer; messages without it hold HTML from the older composer
+   * and are converted where they are read, never rewritten in storage.
+   */
+  contentFormat?: "markdown"
+  mentions?: MentionType[]
+  /**
    * The workspace chunks that were searched out for this reply, kept with
    * the message so a saved conversation still shows its sources. Never
    * sent to the model: `buildChatTurn` builds the API shape from scratch.
