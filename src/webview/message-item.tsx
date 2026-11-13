@@ -3,7 +3,7 @@ import React, { memo } from "react"
 import { WorkspaceSearchReport } from "../common/messaging/protocol"
 import { ChatCompletionMessage, MentionType, ReplyChangesView, ToolStepView } from "../common/types"
 
-import { isPausedReply } from "./composer-operation"
+import { continuablePausedIndex, isPausedReply } from "./composer-operation"
 import Message from "./message"
 import TypingIndicator, { TypingActivity } from "./typing-indicator"
 
@@ -60,9 +60,11 @@ const MessageItem = memo(
     const messageKey = `${message?.role}-0`
     const task = message?.meta?.task
     const paused = isAgentMessage && isPausedReply(messages, index)
-    // The last reply that is not still running. Continue picks up a paused reply, or an out-of-steps one.
+    // Continue picks up the paused reply that no user turn has followed, even when host notices came after it.
+    const continuable = isAgentMessage && continuablePausedIndex(messages) === index
+    // The last reply that is not still running can pick up where it ran out of steps.
     const isLastReply = isAgentMessage && isLastMessage && !isLoading
-    const canContinue = isLastReply && (paused || (!task && !!message.meta?.outOfSteps))
+    const canContinue = continuable || (isLastReply && !task && !!message.meta?.outOfSteps)
     // A paused task stays stoppable wherever its reply sits, even when a later message follows it.
     const canStopTask = paused
     // Shown while a step runs even between turns, such as during a Feedback review.

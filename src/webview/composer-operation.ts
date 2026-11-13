@@ -45,7 +45,7 @@ export const reduceComposerOperation = (
 /** Only running work is busy: a paused task leaves the composer usable and the chevron still. */
 export const composerIsBusy = (phase: ComposerOperationPhase): boolean => phase === "running"
 
-type ReplyMessage = { meta?: ReplyMeta }
+type ReplyMessage = { role?: string; meta?: ReplyMeta }
 
 /**
  * Whether the reply at `index` is a paused task that Continue or Stop can act on.
@@ -57,6 +57,19 @@ export const isPausedReply = <M extends ReplyMessage>(messages: M[], index: numb
   if (!meta) return false
   if (meta.task) return meta.task.state === "paused"
   return !!meta.stopped && index === messages.length - 1
+}
+
+/**
+ * The paused reply that Continue acts on: the newest paused reply with no user
+ * turn after it. Host notices, such as a plan status or a pause reason, may
+ * follow the reply without ending it. -1 when none is continuable.
+ */
+export const continuablePausedIndex = <M extends ReplyMessage>(messages: M[]): number => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") return -1
+    if (isPausedReply(messages, index)) return index
+  }
+  return -1
 }
 
 /**
@@ -76,16 +89,16 @@ export const stopPausedReply = <M extends ReplyMessage>(messages: M[], index: nu
 }
 
 /**
- * Hands the last reply's paused task to a new continuation: it stops reading
- * paused or stopped and no longer offers Continue. Only the last reply can
- * resume, matching where Continue is offered.
+ * Hands the continuable paused task to a new continuation: it stops reading
+ * paused or stopped and no longer offers Continue. Only the reply Continue is
+ * offered on can resume, so a user turn after a paused reply leaves it alone.
  */
 export const resumePausedReply = <M extends ReplyMessage>(messages: M[]): M[] => {
-  const index = messages.length - 1
-  const last = messages[index]
-  if (!last?.meta || !isPausedReply(messages, index)) return messages
-  const meta: ReplyMeta = { ...last.meta }
+  const index = continuablePausedIndex(messages)
+  if (index === -1) return messages
+  const paused = messages[index]
+  const meta: ReplyMeta = { ...paused.meta }
   delete meta.stopped
   delete meta.task
-  return [...messages.slice(0, index), { ...last, meta }]
+  return messages.map((message, position) => (position === index ? { ...message, meta } : message))
 }

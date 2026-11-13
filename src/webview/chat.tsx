@@ -957,7 +957,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
 
     const message: QueuedMessage = {
       id: uuidv4(),
-      conversationId: conversation?.id || uuidv4(),
+      conversationId: conversationIdRef.current || uuidv4(),
       html,
       input,
       text,
@@ -1083,7 +1083,8 @@ export const Chat = (props: ChatProps): JSX.Element => {
    * in the notes this turn carries.
    */
   const handleContinue = useCallback(() => {
-    if (generatingRef.current || chatDisabled) return
+    // Without a bound conversation the continuation would have no owner, so it is not sent.
+    if (generatingRef.current || chatDisabled || !conversation?.id) return
     dispatchOperation({ type: "continue-requested" })
     dispatchOperation({ type: "started" })
     clearSearchReport()

@@ -12,6 +12,7 @@ import {
   composerIsBusy,
   ComposerOperationEvent,
   ComposerOperationPhase,
+  continuablePausedIndex,
   isPausedReply,
   reduceComposerOperation,
   resumePausedReply,
@@ -131,6 +132,29 @@ test("stop and resume leave replies that are not paused alone", () => {
   assert.equal(resumePausedReply(plain), plain)
   const earlier = [...pausedReply(), { role: "user" as const, content: "Later" }]
   assert.equal(resumePausedReply(earlier), earlier)
+})
+
+test("host notices after a paused reply keep Continue on it, and resume leaves the notices alone", () => {
+  const notices: ChatCompletionMessage[] = [
+    ...pausedReply(),
+    { role: "assistant", content: "Execution is paused: waiting for review" },
+    { role: "assistant", content: "Authoritative TODO status for plan plan-001 (revision 1)." }
+  ]
+  assert.equal(continuablePausedIndex(notices), 1)
+  const resumed = resumePausedReply(notices)
+  assert.deepEqual(resumed[1].meta, { durationMs: 4200 })
+  assert.deepEqual(resumed.slice(2), notices.slice(2))
+})
+
+test("only the newest paused reply without a user turn after it is continuable", () => {
+  assert.equal(continuablePausedIndex(pausedReply()), 1)
+  assert.equal(continuablePausedIndex([...pausedReply(), { role: "user", content: "Other work" }]), -1)
+  const empty: ChatCompletionMessage[] = [
+    { role: "user", content: "Read it" },
+    { role: "assistant", content: "", meta: { durationMs: 900, task: { operationId: "op-3", state: "paused" } } }
+  ]
+  assert.equal(continuablePausedIndex(empty), 1)
+  assert.equal(continuablePausedIndex([{ role: "user", content: "Hi" }]), -1)
 })
 
 // The tests below drive the real `Chat` component under jsdom. Host events
@@ -444,6 +468,7 @@ test("Continue resumes a paused task once: the control is replaced at once, so a
   outbound.length = 0
   const chat = await mountChat()
   try {
+    await setConversation("conv-1", [])
     await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
     await clickPause(chat.document)
     await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
@@ -452,9 +477,48 @@ test("Continue resumes a paused task once: the control is replaced at once, so a
     await clickFooterButton(chat.document, "Continue")
 
     assert.equal(postedChats().length, 1)
+    assert.equal((postedChats()[0].data as { conversationId?: string }).conversationId, "conv-1")
     assert.equal(footerButton(chat.document, "Continue"), undefined)
     assert.equal(visibleButton(chat.document), "pause")
     assert.ok(!hasText(chat.document, "paused"), "a resumed reply no longer reads paused")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Continue stays available after a host notice follows the paused reply, and sends to its conversation", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await setConversation("conv-1", [])
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "assistant", content: "Authoritative TODO status for plan plan-001 (revision 1)." })
+
+    assert.ok(footerButton(chat.document, "Continue"), "Continue is offered on the paused reply, not only when it is last")
+    assert.ok(footerButton(chat.document, "Stop"))
+
+    await clickFooterButton(chat.document, "Continue")
+    assert.equal(postedChats().length, 1)
+    assert.equal((postedChats()[0].data as { conversationId?: string }).conversationId, "conv-1")
+  } finally {
+    await chat.unmount()
+  }
+})
+
+test("Continue without a bound conversation sends nothing, rather than inventing one", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-7" })
+    await clickPause(chat.document)
+    await sendHost(EVENT_NAME.twinnyStopGeneration, { operationId: "op-7", cancelled: true, paused: true })
+    await sendHost(EVENT_NAME.twinnyAddMessage, PAUSED_REPLY)
+
+    await clickFooterButton(chat.document, "Continue")
+    assert.equal(postedChats().length, 0)
   } finally {
     await chat.unmount()
   }
