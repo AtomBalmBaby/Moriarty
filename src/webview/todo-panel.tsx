@@ -1,5 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
+import { VSCodeButton } from "@vscode/webview-ui-toolkit/react"
 
 import { TODO_EVENT_NAME } from "../common/constants"
 import { applyTodoSnapshot, snapshotForConversation } from "../common/guards"
@@ -262,9 +263,15 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
                   </button>
         {!!completedCount && <span className={styles.completedCount}>{completedCount} {t("todo-completed-count")}</span>}
         {retired && (
-          <button type="button" className={styles.showCompleted} aria-pressed={showCompleted} onClick={() => setShowCompleted((value) => !value)}>
-            {showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
-          </button>
+          <VSCodeButton
+            appearance="icon"
+            aria-pressed={showCompleted}
+            title={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
+            aria-label={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
+            onClick={() => setShowCompleted((value) => !value)}
+          >
+            <i className={`codicon codicon-${showCompleted ? "eye-closed" : "eye"}`} />
+          </VSCodeButton>
         )}
       </div>
       {expanded && !(retired && !showCompleted) && (
@@ -287,9 +294,15 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
               )}
               {treeRows.length ? <ul className={styles.list}>{treeRows.map(renderItem)}</ul> : !retired && <p className={styles.empty}>{planning ? t("todo-planning-empty") : t("todo-empty")}</p>}
               {!!completedCount && !retired && (
-                <button type="button" className={styles.showCompleted} onClick={() => setShowCompleted((value) => !value)}>
-                  {showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
-                </button>
+                <VSCodeButton
+                  appearance="icon"
+                  className={styles.showCompleted}
+                  title={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
+                  aria-label={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
+                  onClick={() => setShowCompleted((value) => !value)}
+                >
+                  <i className={`codicon codicon-${showCompleted ? "eye-closed" : "eye"}`} />
+                </VSCodeButton>
               )}
             </>
           )}

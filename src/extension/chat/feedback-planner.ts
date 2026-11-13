@@ -78,7 +78,9 @@ const TODO_MACHINERY = /\b(?:todos?|to-dos?|task\s+list|plan\s+items?|tracking\s
 /** A verb that would direct Mycroft to write, maintain, use, or report on a TODO record. */
 const ADMINISTRATIVE_VERB = /\b(?:create|created|add|added|make|open|opened|initiali[sz]e|initiali[sz]ed|set\s+up|populate|populated|record|recorded|log|logged|track|tracked|maintain|maintained|update|updated|mark|marked|verify|verified|confirm|confirmed|report|reported|submit|submitted|complete|completed|close|closed|move|moved|set|keep|kept|use|used|document|documented|file|filed|write|written|entered|noted)\b/gi
 /** Words right after a TODO noun that name Twinny's code rather than its records, e.g. "TODO filter" or "TODO scanner". */
-const CODE_REFERENT_AFTER = /^\s*(?:[\w.'"`/-]+\s+)?(?:path|paths|code|scanner|panel|filter|view|handler|handling|function|implementation|module|source|logic|component|command|feature|webview|parser|schema|migration|tests?|files?|regex|tool)\b/i
+const CODE_REFERENT_AFTER = /^\s*(?:[\w.'"`/-]+\s+)?(?:path|paths|code|scanner|panel|interface|ui|menu|button|checkbox|toggle|header|tab|section|pane|sidebar|dropdown|filter|view|handler|handling|function|implementation|module|source|logic|component|command|feature|webview|parser|schema|migration|tests?|files?|regex|tool)\b/i
+/** Quoted UI text such as "Show completed tasks". Its words are content to display, so they cannot direct anything. */
+const QUOTED_SPAN = /"[^"\n]*"|“[^”\n]*”|`[^`\n]*`/g
 /** A criterion that requires a TODO record to exist or to have a status. */
 const RECORD_STATE_AFTER = /^\s*(?:[\w'-]+\s+){0,3}?(?:exists?|existing|present|recorded|marked|status(?:es)?|reflects?|updated|created|is\s+(?:open|done|closed|complete|completed|in\s+progress|pending|verified))\b/i
 /**
@@ -119,12 +121,14 @@ export const userRequestsTodoCreation = (message: string): boolean => DIRECT_TOD
  * A criterion also counts when it requires that a TODO record exist or have a status.
  */
 const isAdministrativeText = (text: string, criterion: boolean): boolean => {
+  // Blanking quoted spans keeps every index aligned, so only directing verbs outside quotes can govern a TODO noun.
+  const unquoted = text.replace(QUOTED_SPAN, (span) => " ".repeat(span.length))
   for (const noun of text.matchAll(new RegExp(TODO_MACHINERY.source, "gi"))) {
     const end = (noun.index ?? 0) + noun[0].length
     const after = text.slice(end, end + 60)
     if (CODE_REFERENT_AFTER.test(after)) continue
     if (criterion && RECORD_STATE_AFTER.test(after)) return true
-    const before = text.slice(0, noun.index ?? 0).split(/[.!?;:\n]/).pop() ?? ""
+    const before = unquoted.slice(0, noun.index ?? 0).split(/[.!?;:\n]/).pop() ?? ""
     const verb = [...before.matchAll(ADMINISTRATIVE_VERB)].pop()
     if (!verb || verb.index === undefined) continue
     const between = before.slice(verb.index + verb[0].length).trim()

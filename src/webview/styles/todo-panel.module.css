@@ -60,14 +60,6 @@
 .addForm button,
 .editForm button,
 .actions button,
-.showCompleted {
-  color: var(--vscode-textLink-foreground);
-  background: transparent;
-  border: 0;
-  cursor: pointer;
-  padding: 3px 4px;
-}
-
 button:disabled {
   opacity: 0.5;
   cursor: default;

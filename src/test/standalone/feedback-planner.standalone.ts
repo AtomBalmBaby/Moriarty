@@ -632,6 +632,26 @@ test("a legitimate task that touches Twinny's code or a negated TODO mention is 
   }), [])
 })
 
+test("quoted UI text and a TODO-named interface do not make a locating task administrative", () => {
+  const objective = "Where is the \"Show completed tasks\" text defined in the todos interface?"
+  assert.deepEqual(administrativeOf({
+    title: "Locate the UI text",
+    description: "Find the source file and line range where the text \"Show completed tasks\" is defined in the todos interface.",
+    criteria: []
+  }, objective), [])
+  assert.deepEqual(administrativeOf({
+    title: "Locate the UI text",
+    description: "Find the source file and line range where the todos interface renders the text \"Show completed tasks\" so it can be updated.",
+    criteria: []
+  }, objective), [])
+})
+
+test("a directing verb outside quotes still makes a TODO instruction administrative", () => {
+  const objective = "Where is the \"Show completed tasks\" text defined in the todos interface?"
+  assert.deepEqual(administrativeOf({ title: "Locate the UI text", description: "Mark the `todo` as completed once located.", criteria: [] }, objective), ["tasks[0].description"])
+  assert.deepEqual(administrativeOf({ title: "Locate the UI text", description: "Create a TODO for the \"Show completed tasks\" text.", criteria: [] }, objective), ["tasks[0].description"])
+})
+
 test("an objective about the TODO machinery exempts TODO implementation tasks", () => {
   const objective = "Fix the TODO filter so that completed items stay hidden."
   const tasks = { title: "Create TODO entry fixtures for the filter tests", description: "Update the TODO list used by the filter.", criteria: [{ id: "criterion-1", description: "A TODO entry exists in the fixture.", verification: { kind: "semantic_review" } }] }
