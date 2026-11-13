@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef } from "react"
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import Markdown, { Components } from "react-markdown"
 import { Editor, EditorContent, Extension, useEditor } from "@tiptap/react"
@@ -75,6 +75,12 @@ interface MessageProps {
   onStopTask?: () => void
   /** Keep a reply's changed files as they stand after an undo. */
   onChangesUpdate?: (index: number, changes: ReplyChangesView) => void
+  /** The conversation's title, shown as the title of the box around its opening task. */
+  taskTitle?: string
+  /** Identifies the conversation, so a fold made in one conversation does not carry over to another. */
+  taskConversationId?: string
+  /** Whether the agent has started replying to the conversation; the task box folds once it has. */
+  taskReplied?: boolean
 }
 
 const CustomKeyMap = Extension.create({
@@ -303,7 +309,7 @@ const Collapsible = ({ children }: { children: React.ReactNode }) => {
   const [tall, setTall] = React.useState(false)
   const [open, setOpen] = React.useState(false)
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = ref.current
     if (el) setTall(el.scrollHeight > COLLAPSE_HEIGHT + 60)
   }, [children])
@@ -334,6 +340,77 @@ const Collapsible = ({ children }: { children: React.ReactNode }) => {
   )
 }
 
+/**
+ * The conversation's opening task, in a box titled with the conversation. It folds to its header, which keeps the
+ * message actions. The body stays mounted while folded, so an edit in progress is kept.
+ */
+const TaskBox = ({
+  title,
+  open,
+  onToggle,
+  actions,
+  children
+}: {
+  title: string
+  open: boolean
+  onToggle: () => void
+  actions: React.ReactNode
+  children: React.ReactNode
+}) => {
+  const { t } = useTranslation()
+  const bodyId = React.useId()
+  const sectionRef = React.useRef<HTMLElement>(null)
+  // The box's height before a toggle, when the box starts above the viewport.
+  const heightBeforeToggle = React.useRef<number | null>(null)
+
+  const handleToggle = () => {
+    const section = sectionRef.current
+    const scroller = section?.closest<HTMLElement>("[data-testid='virtuoso-scroller']")
+    heightBeforeToggle.current =
+      section && scroller && section.getBoundingClientRect().top < scroller.getBoundingClientRect().top
+        ? section.offsetHeight
+        : null
+    onToggle()
+  }
+
+  // Virtuoso measures the new height on the next frame, and a tall body clamps itself after its first effect.
+  // The offset is taken once both have settled; applying it earlier scrolls Virtuoso to the wrong rows.
+  React.useLayoutEffect(() => {
+    const before = heightBeforeToggle.current
+    heightBeforeToggle.current = null
+    const section = sectionRef.current
+    if (before === null || !section) return
+    const scroller = section.closest<HTMLElement>("[data-testid='virtuoso-scroller']")
+    if (!scroller) return
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const delta = section.offsetHeight - before
+      if (delta) scroller.scrollTop += delta
+    }))
+  })
+
+  return (
+    <section ref={sectionRef} className={styles.taskBox}>
+      <div className={styles.taskBoxHeader}>
+        <button
+          type="button"
+          className={styles.taskBoxToggle}
+          aria-expanded={open}
+          aria-controls={bodyId}
+          title={open ? t("task-box-collapse") : t("task-box-expand")}
+          onClick={handleToggle}
+        >
+          <span className={`codicon codicon-chevron-${open ? "down" : "right"}`} aria-hidden="true" />
+          <span className={styles.taskBoxTitle}>{title}</span>
+        </button>
+        <div className={styles.taskBoxActions}>{actions}</div>
+      </div>
+      <div id={bodyId} className={styles.taskBoxBody} hidden={!open}>
+        {children}
+      </div>
+    </section>
+  )
+}
+
 export const Message: React.FC<MessageProps> = ({
   index = 0,
   part,
@@ -350,11 +427,16 @@ export const Message: React.FC<MessageProps> = ({
   onContinue,
   onStopTask,
   paused,
-  onChangesUpdate
+  onChangesUpdate,
+  taskTitle,
+  taskReplied,
+  taskConversationId
 }) => {
   const { t } = useTranslation()
   const [isThinkingCollapsed, setIsThinkingCollapsed] = React.useState(false)
   const [editing, setEditing] = React.useState<boolean>(false)
+  // A reader's fold or unfold applies to the conversation it was made in; the row is reused when the conversation changes.
+  const [taskChoice, setTaskChoice] = React.useState<{ conversationId?: string; open: boolean } | undefined>(undefined)
   const messageRef = useRef<HTMLDivElement>(null)
   const prevHeightRef = useRef<number>(0)
   const { Toast, showToast } = useToast()
@@ -737,10 +819,13 @@ export const Message: React.FC<MessageProps> = ({
           .join(" ")
       : `${styles.message} ${styles.userMessage}${index === 0 ? ` ${styles.firstMessage}` : ""}`
   const showHead = !part || part.kind === "head"
+  // The conversation's opening message is its task; its box replaces the role label.
+  const isTask = message.role !== ASSISTANT && index === 0 && !part
+  const taskIsOpen =
+    taskChoice?.conversationId === taskConversationId ? taskChoice?.open ?? !taskReplied : !taskReplied
 
-  return (
-    <div ref={messageRef} className={rowClass}>
-      {Toast}
+  const content = (
+    <>
       {showHead && thinking && (
         <ThinkingSection
           thinking={thinking}
@@ -749,7 +834,7 @@ export const Message: React.FC<MessageProps> = ({
           markdownComponents={markdownComponents}
         />
       )}
-      {showHead && (
+      {showHead && !isTask && (
         <div className={styles.messageRole}>
           <span className={styles.roleLabel}>
             {message.role !== ASSISTANT && (
@@ -823,6 +908,24 @@ export const Message: React.FC<MessageProps> = ({
           )}
           {renderImageGallery()}
         </Collapsible>
+      )}
+    </>
+  )
+
+  return (
+    <div ref={messageRef} className={rowClass}>
+      {Toast}
+      {isTask ? (
+        <TaskBox
+          title={taskTitle || t("chat-new-conversation-title")}
+          open={taskIsOpen}
+          onToggle={() => setTaskChoice({ conversationId: taskConversationId, open: !taskIsOpen })}
+          actions={!footerActions && options}
+        >
+          {content}
+        </TaskBox>
+      ) : (
+        content
       )}
     </div>
   )

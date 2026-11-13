@@ -467,6 +467,8 @@
   "agent-mode-off-title": "Agent off. Shift+Tab switches to the last enabled agent.",
   "show-more": "Show more",
   "show-less": "Show less",
+  "task-box-collapse": "Collapse task",
+  "task-box-expand": "Expand task",
   "tool-command-waiting": "run this command?",
   "tool-mcp-waiting": "call this MCP tool?",
   "tool-always-run-mcp-title": "Call it, and call {{tool}} again without asking, whatever its arguments. \"ask again\" in the agent settings clears the list.",

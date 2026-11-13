@@ -103,6 +103,56 @@
   align-items: center;
 }
 
+/* The opening task sits in a box titled with the conversation; the box is in flow, unlike the role label. */
+.taskBox {
+  border: 1px solid var(--tw-rule);
+  border-radius: 6px;
+}
+
+.taskBoxHeader {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 6px;
+  min-width: 0;
+}
+
+.taskBoxToggle {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.taskBoxToggle:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.taskBoxTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.taskBoxActions {
+  flex-shrink: 0;
+}
+
+.taskBoxBody {
+  padding: 0 8px 8px;
+}
+
 .roleLabel {
   position: absolute;
   width: 1px;

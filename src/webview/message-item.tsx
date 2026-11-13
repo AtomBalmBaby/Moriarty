@@ -38,6 +38,12 @@ interface MessageListProps {
   handleContinue?: () => void
   handleStopPausedTask?: (index: number) => void
   handleChangesUpdate?: (index: number, changes: ReplyChangesView) => void
+  /** The conversation's title, which titles the box around its opening task. */
+  taskTitle?: string
+  /** Identifies the conversation, so a fold made in one conversation does not carry over to another. */
+  taskConversationId?: string
+  /** Whether the agent has started replying; the opening task's box folds once it has. */
+  taskReplied?: boolean
 }
 
 const MessageItem = memo(
@@ -55,7 +61,10 @@ const MessageItem = memo(
     handleDeleteImage,
     handleContinue,
     handleStopPausedTask,
-    handleChangesUpdate
+    handleChangesUpdate,
+    taskTitle,
+    taskConversationId,
+    taskReplied
   }: MessageListProps) => {
     const { part } = row
     if (part.kind === "activity") {
@@ -95,6 +104,9 @@ const MessageItem = memo(
           onEdit={handleEditMessage}
           onRegenerate={handleRegenerateMessage}
           onDeleteImage={handleDeleteImage}
+          taskTitle={taskTitle}
+          taskConversationId={taskConversationId}
+          taskReplied={taskReplied}
         />
       )
     }

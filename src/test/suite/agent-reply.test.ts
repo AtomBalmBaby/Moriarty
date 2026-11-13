@@ -27,6 +27,7 @@ import { ExtensionBridge } from "../../extension/messaging/bridge"
 import { commandDigest } from "../../extension/todos/evidence"
 import { todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { PROJECT_TODO_DATABASE_NAME, PROJECT_TODO_DIRECTORY } from "../../extension/todos/sqlite"
 import { contentHash } from "../../extension/tools/line-edit"
 import { BaseProvider } from "../../extension/webview/base"
 
@@ -81,20 +82,24 @@ class ChatIn extends Chat {
 const call = (name: string, args: Record<string, string>) =>
   "```tool\n" + JSON.stringify({ name, arguments: args }) + "\n```"
 
+/** The test owns the whole folder set while it runs, because the TODO repository resolves its storage from live folders and refuses multi-folder workspaces. The previous folders are restored on close. */
 const openWorkspace = async (root: string): Promise<() => Promise<void>> => {
-  const index = vscode.workspace.workspaceFolders?.length ?? 0
-  const update = (deleteCount: number, folder?: vscode.WorkspaceFolder) => new Promise<void>((resolve, reject) => {
+  const saved = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ uri: folder.uri, name: folder.name }))
+  const update = (deleteCount: number, folders: { uri: vscode.Uri, name: string }[]) => new Promise<void>((resolve, reject) => {
     const subscription = vscode.workspace.onDidChangeWorkspaceFolders(() => {
       subscription.dispose()
       resolve()
     })
-    if (!vscode.workspace.updateWorkspaceFolders(index, deleteCount, ...(folder ? [folder] : []))) {
+    if (!vscode.workspace.updateWorkspaceFolders(0, deleteCount, ...folders as vscode.WorkspaceFolder[])) {
       subscription.dispose()
       reject(new Error("Could not update VS Code test workspace folders."))
     }
   })
-  await update(0, { uri: vscode.Uri.file(root), name: "agent-reply-test" } as vscode.WorkspaceFolder)
-  return async () => update(1)
+  await update(saved.length, [{ uri: vscode.Uri.file(root), name: "agent-reply-test" }])
+  return async () => {
+    const current = vscode.workspace.workspaceFolders?.length ?? 0
+    await update(current, saved)
+  }
 }
 
 const fakeWebview = () => {
@@ -1398,10 +1403,10 @@ suite("Read-file acceptance, production controller", function () {
   this.timeout(120000)
 
   const toolsSource = [
-    "export const readFile = {",
+    "export const readFile = (path: string) => ({",
     "  name: \"read_file\",",
     "  run: (path: string) => path,",
-    "}",
+    "})",
     "",
     "export const writeFile = {",
     "  name: \"write_file\",",
@@ -1547,6 +1552,33 @@ suite("Read-file acceptance, production controller", function () {
   }
 
 
+  /**
+   * Scripts TODO submissions for the implementer. Item IDs and versions exist only after planning, so every request
+   * refreshes the submission replies from the repository before the scripted model reads its next reply.
+   */
+  const submissionScript = (workspace: Workspace, conversationId: string, replies: Array<string | Error>, submissions: Array<{ index: number, title: string, requestId: string }>) => {
+    const scope = { projectFingerprint: workspace.projectFingerprint, conversationId, writer: conversationId }
+    const total = replies.length
+    let repository: TodoRepository | undefined
+    return {
+      onRepository: (value: TodoRepository) => {
+        repository = value
+      },
+      hold: async () => {
+        if (!repository) return
+        const { items } = await repository.getList({ ...scope, includeCompleted: true })
+        // The scripted model consumes replies from the front, so an absolute index becomes a queue position after each request.
+        const consumed = total - replies.length
+        for (const submission of submissions) {
+          const position = submission.index - consumed
+          const item = items.find((candidate) => candidate.title === submission.title)
+          if (!item || position < 0 || position >= replies.length) continue
+          replies[position] = call("twinny_todo_update", { item_id: item.id, expected_version: String(item.version), status: "completed", request_id: submission.requestId })
+        }
+      }
+    }
+  }
+
   const statusOf = async (turn: Turn, title: string) => {
     const { items } = await turn.repository.getList({ ...turn.scope, includeCompleted: true })
     return items.find((item) => item.title === title)?.status
@@ -1570,17 +1602,22 @@ suite("Read-file acceptance, production controller", function () {
   test("the read_file investigation is controller-verified, persisted, reused after reopen, and isolated by project", async () => {
     const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {
+      const conversationId = "read-file-first"
+      // Each submission is reconciled only when its pass ends with text, so the new fact exists before the answer is requested.
+      const replies: Array<string | Error> = ["", "The lookup is submitted; the investigation continues.", call("read_file", { path: "src/tools.ts" }), "", "The investigation is submitted; the pass ends here.", `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`]
+      const submit = submissionScript(workspace, conversationId, replies, [
+        { index: 0, title: lookupTitle, requestId: "first-lookup-submit" },
+        { index: 3, title: investigateTitle, requestId: "first-investigate-submit" }
+      ])
       const first = await runTurn(workspace, {
-        conversationId: "read-file-first",
+        conversationId,
         planReply: readFilePlanReply("read-file-plan-first"),
-        replies: [
-          "Checked accepted evidence: nothing is recorded for read_file yet.",
-          call("read_file", { path: "src/tools.ts" }),
-          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
-        ]
+        replies,
+        onRepository: submit.onRepository,
+        hold: submit.hold
       })
 
-      assert.equal(first.agent.requests.length, 3, "the controller stops after the dependent task is proven")
+      assert.equal(first.agent.requests.length, 6, "lookup submission, text that ends its pass, read, investigation submission, text that ends its pass, answer")
       assert.equal(await statusOf(first, lookupTitle), "completed")
       assert.equal(await statusOf(first, investigateTitle), "completed")
 
@@ -1600,10 +1637,18 @@ suite("Read-file acceptance, production controller", function () {
       assert.deepEqual(persisted.map((fact) => fact.id), facts.map((fact) => fact.id))
 
       const observedBefore = await observationCounts(workspace)
+      const secondId = "read-file-second"
+      const secondReplies: Array<string | Error> = ["", "The lookup is submitted; the investigation continues.", "", `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`]
+      const secondSubmit = submissionScript(workspace, secondId, secondReplies, [
+        { index: 0, title: lookupTitle, requestId: "second-lookup-submit" },
+        { index: 2, title: investigateTitle, requestId: "second-investigate-submit" }
+      ])
       const second = await runTurn(workspace, {
-        conversationId: "read-file-second",
+        conversationId: secondId,
         planReply: readFilePlanReply("read-file-plan-second", "accepted_fact"),
-        replies: [`read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`]
+        replies: secondReplies,
+        onRepository: secondSubmit.onRepository,
+        hold: secondSubmit.hold
       })
       assert.equal(await statusOf(second, investigateTitle), "completed")
       assert.equal(sawSourceText(second), false, "the second conversation must not re-read the source")
@@ -1611,7 +1656,7 @@ suite("Read-file acceptance, production controller", function () {
       for (const tool of ["read_file", "twinny_evidence_lookup"]) {
         assert.equal(observedAfter[tool] ?? 0, observedBefore[tool] ?? 0, `${tool} must not execute again when current proof exists`)
       }
-      assert.equal(second.agent.requests.length, 1, "the reused proof releases the dependent task without another implementer investigation")
+      assert.equal(second.agent.requests.length, 4, "the reused proof is assessed, then each task is submitted by the implementer: lookup, text that ends its pass, investigation, answer")
       const secondFacts = await second.repository.listAcceptedEvidence(second.scope)
       assert.deepEqual(secondFacts.map((fact) => fact.id), facts.map((fact) => fact.id))
 
@@ -1909,19 +1954,30 @@ suite("Read-file acceptance, production controller", function () {
     const fingerprint = await contentHash(toolsSource)
     const incomplete = "read_file is implemented in src/tools.ts, lines 1 to 4."
     await withWorkspace(async (workspace) => {
+      const conversationId = "read-file-missing-fingerprint"
+      const replies: Array<string | Error> = [
+        "",
+        "The lookup is submitted; the investigation continues.",
+        call("read_file", { path: "src/tools.ts" }),
+        "",
+        "The investigation is submitted; the pass ends here.",
+        incomplete,
+        `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
+      ]
+      const submit = submissionScript(workspace, conversationId, replies, [
+        { index: 0, title: lookupTitle, requestId: "missing-fingerprint-lookup-submit" },
+        { index: 3, title: investigateTitle, requestId: "missing-fingerprint-investigate-submit" }
+      ])
       const turn = await runTurn(workspace, {
-        conversationId: "read-file-missing-fingerprint",
+        conversationId,
         planReply: readFilePlanReply("read-file-plan-missing-fingerprint"),
-        replies: [
-          "Checked accepted evidence: nothing is recorded for read_file yet.",
-          call("read_file", { path: "src/tools.ts" }),
-          incomplete,
-          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
-        ]
+        replies,
+        onRepository: submit.onRepository,
+        hold: submit.hold
       })
 
       assert.equal(await statusOf(turn, investigateTitle), "completed")
-      assert.equal(turn.agent.requests.length, 4, "the incomplete answer is rejected by a correction, then the corrected answer is delivered")
+      assert.equal(turn.agent.requests.length, 7, "the incomplete answer is rejected by a correction, then the corrected answer is delivered")
       assert.ok(!JSON.stringify(turn.posted).includes(incomplete), "the incomplete answer is never posted to the webview")
       assert.ok(JSON.stringify(turn.posted).includes(`fingerprint ${fingerprint}`), "the corrected answer carries the authoritative fingerprint")
       assert.ok(!turn.reply?.includes(incomplete), "the delivered reply is the corrected answer")
@@ -1969,7 +2025,7 @@ suite("Read-file acceptance, production controller", function () {
 
     await withWorkspace(async (workspace) => {
       const before = treeOf(workspace.root)
-      const invalid = withIdentity(readFilePlanReply("read-file-plan-invalid", "source", file), "declared", undefined)
+      const invalid = withIdentity(readFilePlanReply("read-file-plan-invalid", "source", file), "declared", "unknown")
       const turn = await runTurn(workspace, {
         conversationId: "read-file-repaired-plan",
         planReply: [invalid, readFilePlanReply("read-file-plan-repaired", "source", file)],
@@ -1983,7 +2039,9 @@ suite("Read-file acceptance, production controller", function () {
       const planning = planningRequests(turn.evaluator)
       assert.equal(planning.length, 2, "one invalid plan, then one corrected plan")
       const correction = JSON.stringify(planning[1].messages)
-      assert.ok(correction.includes("plan.tasks[1].criteria[1].verification.identity must be registered_tool or implementation_symbol; received nothing."), "the correction carries the exact validator diagnostic")
+      // The messages are serialized as JSON, so the diagnostic's quotes appear escaped in the serialized text.
+      const diagnostic = "plan.tasks[1].criteria[1].verification.identity must be registered_tool or implementation_symbol when given; received \"unknown\"."
+      assert.ok(correction.includes(JSON.stringify(diagnostic).slice(1, -1)), "the correction carries the exact validator diagnostic")
       assert.ok(correction.includes(userMessage), "the correction keeps the original request")
 
       assert.equal(turn.agent.requests.length, 3, "the controller stops after the dependent task is proven")
@@ -2007,13 +2065,21 @@ suite("Read-file acceptance, production controller", function () {
       assert.deepEqual(treeOf(workspace.root), before, "no file is mutated")
 
       const observedBefore = await observationCounts(workspace)
+      // The reused proof is cited through a submission like any other evidence, so the implementer submits once and the pass ends with text.
+      const reuseConversation = "read-file-repaired-reuse"
+      const replies: Array<string | Error> = ["", "The investigation is submitted; the pass ends here.", `read_file is implemented in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`]
+      const submit = submissionScript(workspace, reuseConversation, replies, [
+        { index: 0, title: investigateTitle, requestId: "reuse-investigate-submit" }
+      ])
       const second = await runTurn(workspace, {
-        conversationId: "read-file-repaired-reuse",
+        conversationId: reuseConversation,
         planReply: readFilePlanReply("read-file-plan-reuse", "accepted_fact", file),
-        replies: [`read_file is implemented in ${file}, lines ${start} to ${end}, fingerprint ${fingerprint}.`]
+        replies,
+        onRepository: submit.onRepository,
+        hold: submit.hold
       })
       assert.equal(await statusOf(second, investigateTitle), "completed")
-      assert.equal(second.agent.requests.length, 1, "the reused proof releases the dependent task without another implementer investigation")
+      assert.equal(second.agent.requests.length, 3, "the submission, the text that ends its pass, and the answer; no read or lookup is requested again")
       const observedAfter = await observationCounts(workspace)
       for (const tool of ["read_file", "twinny_evidence_lookup"]) {
         assert.equal(observedAfter[tool] ?? 0, observedBefore[tool] ?? 0, `${tool} must not execute again when current proof exists`)
@@ -2025,7 +2091,7 @@ suite("Read-file acceptance, production controller", function () {
     await withWorkspace(async (workspace) => {
       const before = treeOf(workspace.root)
       const invalid = (identity: string | undefined) => withIdentity(readFilePlanReply("read-file-plan-exhausted"), "declared", identity)
-      const plans = [invalid(undefined), invalid(undefined), invalid("tool")]
+      const plans = [invalid(undefined), invalid("implementation"), invalid("tool")]
       assert.equal(plans.length, FEEDBACK_PLAN_ATTEMPTS, "the script covers every planning attempt in the budget")
 
       const turn = await runTurn(workspace, {
@@ -2035,7 +2101,7 @@ suite("Read-file acceptance, production controller", function () {
       })
 
       assert.equal(planningRequests(turn.evaluator).length, FEEDBACK_PLAN_ATTEMPTS, "planning stops at its own budget")
-      const exact = "plan.tasks[1].criteria[1].verification.identity must be registered_tool or implementation_symbol; received \"tool\"."
+      const exact = "plan.tasks[1].criteria[1].verification.identity must be registered_tool or implementation_symbol when given; received \"tool\"."
       assert.ok(JSON.stringify(turn.posted).includes(JSON.stringify(exact).slice(1, -1)), "the unresolved exact diagnostic is shown to the user")
       assert.ok(!turn.reply?.startsWith(CONTINUATION_PREFIX), "a planning failure does not auto-continue")
       assert.equal(turn.agent.requests.length, 0, "no implementer request starts")
@@ -2051,24 +2117,35 @@ suite("Read-file acceptance, production controller", function () {
     const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {
       const parserFailure = () => new InferenceError("inference-failure", "llama.cpp HTTP 500: failed to parse tool call", { status: 500, reason: "parser-failure" })
+      const conversationId = "read-file-parser-failure"
+      const replies: Array<string | Error> = [
+        "",
+        "The lookup is submitted; the investigation continues.",
+        parserFailure(),
+        parserFailure(),
+        parserFailure(),
+        call("read_file", { path: "src/tools.ts" }),
+        "",
+        "The investigation is submitted; the pass ends here.",
+        `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
+      ]
+      const submit = submissionScript(workspace, conversationId, replies, [
+        { index: 0, title: lookupTitle, requestId: "parser-lookup-submit" },
+        { index: 6, title: investigateTitle, requestId: "parser-investigate-submit" }
+      ])
       const turn = await runTurn(workspace, {
-        conversationId: "read-file-parser-failure",
+        conversationId,
         planReply: readFilePlanReply("read-file-plan-parser-failure"),
-        replies: [
-          "Checked accepted evidence: nothing is recorded for read_file yet.",
-          parserFailure(),
-          parserFailure(),
-          parserFailure(),
-          call("read_file", { path: "src/tools.ts" }),
-          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
-        ]
+        replies,
+        onRepository: submit.onRepository,
+        hold: submit.hold
       })
 
       assert.equal(await statusOf(turn, lookupTitle), "completed")
       assert.equal(await statusOf(turn, investigateTitle), "completed", "the controller resumes the eligible task after the provider failure")
       assert.ok(turn.reply?.startsWith(CONTINUATION_PREFIX), "the resumed reply is produced by the controller, not by a second user message")
       assert.equal((await observationCounts(workspace)).read_file, 1, "the read executes exactly once, after the failure")
-      assert.equal(turn.agent.requests.length, 6, "lookup, three bounded attempts at the failed read request, the resumed read, then the answer")
+      assert.equal(turn.agent.requests.length, 9, "lookup submission, text, three bounded attempts at the failed read request, the resumed read, investigation submission, text, then the answer")
     })
   })
 
@@ -2147,26 +2224,41 @@ suite("Read-file acceptance, production controller", function () {
   test("a restarted conversation reuses the persisted read and resumes the blocked task without re-reading", async () => {
     const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {
+      const blockedReplies: Array<string | Error> = [
+        "",
+        "The lookup is submitted; the investigation continues.",
+        new InferenceError("timeout", "llama.cpp request timed out")
+      ]
+      const blockedSubmit = submissionScript(workspace, "read-file-restart", blockedReplies, [
+        { index: 0, title: lookupTitle, requestId: "restart-lookup-submit" }
+      ])
       const blocked = await runTurn(workspace, {
         conversationId: "read-file-restart",
         planReply: readFilePlanReply("read-file-plan-restart"),
-        replies: [
-          "Checked accepted evidence: nothing is recorded for read_file yet.",
-          new InferenceError("timeout", "llama.cpp request timed out")
-        ]
+        replies: blockedReplies,
+        onRepository: blockedSubmit.onRepository,
+        hold: blockedSubmit.hold
       })
       assert.notEqual(await statusOf(blocked, investigateTitle), "completed")
       const before = await observationCounts(workspace)
       assert.equal(before.read_file ?? 0, 0)
 
+      const restartedReplies: Array<string | Error> = [
+        call("read_file", { path: "src/tools.ts" }),
+        "",
+        "The investigation is submitted; the pass ends here.",
+        `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
+      ]
+      const restartedSubmit = submissionScript(workspace, "read-file-restart", restartedReplies, [
+        { index: 1, title: investigateTitle, requestId: "restart-investigate-submit" }
+      ])
       const restarted = await runTurn(workspace, {
         conversationId: "read-file-restart",
         message: "Continue the read_file investigation.",
         planReply: readFilePlanReply("read-file-plan-restart"),
-        replies: [
-          call("read_file", { path: "src/tools.ts" }),
-          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
-        ]
+        replies: restartedReplies,
+        onRepository: restartedSubmit.onRepository,
+        hold: restartedSubmit.hold
       })
 
       assert.equal(await statusOf(restarted, lookupTitle), "completed", "the completed lookup is restored, not repeated")
@@ -2174,7 +2266,7 @@ suite("Read-file acceptance, production controller", function () {
       const after = await observationCounts(workspace)
       assert.equal(after.twinny_evidence_lookup ?? 0, before.twinny_evidence_lookup ?? 0, "the lookup is not repeated after restart")
       assert.equal(after.read_file, 1, "the read executes once, after restart")
-      assert.equal(restarted.agent.requests.length, 2, "one read request and one answer request")
+      assert.equal(restarted.agent.requests.length, 4, "the read, the investigation submission, the pass-ending text, then the answer")
     })
   })
 
@@ -2292,19 +2384,30 @@ suite("Read-file acceptance, production controller", function () {
       await seed.initialize()
       const reviewed = await seed.createItem(scope, { title: "Confirm the read_file note" }, "seed-approval-item", "user")
 
+      const replies: Array<string | Error> = [
+        "",
+        "The lookup is submitted; the investigation continues.",
+        call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-1" }),
+        call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-2" }),
+        call("read_file", { path: "src/tools.ts" }),
+        "",
+        "The investigation is submitted; the pass ends here.",
+        `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
+      ]
+      const submit = submissionScript(workspace, conversationId, replies, [
+        { index: 0, title: lookupTitle, requestId: "approval-lookup-submit" },
+        { index: 5, title: investigateTitle, requestId: "approval-investigate-submit" }
+      ])
       const turn = await runTurn(workspace, {
         conversationId,
         planReply: readFilePlanReply("read-file-plan-approval"),
-        replies: [
-          "Checked accepted evidence: nothing is recorded for read_file yet.",
-          call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-1" }),
-          call("twinny_todo_update", { item_id: reviewed.id, expected_version: String(reviewed.version), status: "completed", request_id: "claim-approval-2" }),
-          call("read_file", { path: "src/tools.ts" }),
-          `read_file is implemented in src/tools.ts, lines 1 to 4, fingerprint ${fingerprint}.`
-        ]
+        replies,
+        onRepository: submit.onRepository,
+        hold: submit.hold
       })
 
-      const transcript = JSON.stringify(turn.agent.requests.at(-1)?.messages ?? [])
+      // The claim note is delivered with the tool result that follows the claim, so every request is inspected.
+      const transcript = turn.agent.requests.map((request) => JSON.stringify(request.messages)).join("\n")
       assert.ok(transcript.includes("awaits the user's approval in the TODO panel"), "the claim reports that the user owns approval")
       assert.ok(transcript.includes("already_submitted"), "a repeated claim is not accepted as a second review")
       assert.equal(await statusOf(turn, investigateTitle), "completed", "the satisfied plan completes independently of the non-plan item")
@@ -2500,7 +2603,9 @@ suite("Read-file acceptance, production controller", function () {
     await withWorkspace(async (workspace) => {
       const storage = path.join(workspace.storage, "provider-storage")
       fs.mkdirSync(storage)
-      const shared = { ...workspace, databasePath: path.join(storage, "twinny-state.sqlite") }
+      // The provider resolves its TODO database from the project folder, so the shared repository must use the same file.
+      fs.mkdirSync(path.join(workspace.root, PROJECT_TODO_DIRECTORY), { recursive: true })
+      const shared = { ...workspace, databasePath: path.join(workspace.root, PROJECT_TODO_DIRECTORY, PROJECT_TODO_DATABASE_NAME) }
       const planReply = commandPlanReply("command-plan-dispatch", [madeRequirement])
       await planCommands(shared, "command-dispatch", planReply)
       const activated = await runTurn(shared, { conversationId: "command-dispatch", planReply, replies: ["The requirement is pending."] })

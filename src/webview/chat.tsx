@@ -1606,6 +1606,11 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const { setLayout } = viewport
   useLayoutEffect(() => setLayout(rows.length, anchor), [setLayout, rows, anchor])
 
+  // The opening task's box folds once the agent has begun replying to the conversation.
+  const taskReplied = !!completion || messages.some((message) => message.role === ASSISTANT)
+  const taskTitle = conversation?.title
+  const taskConversationId = conversation?.id
+
   const itemContent = useCallback(
     (_index: number, row: ChatRow) => (
       <MessageItem
@@ -1623,6 +1628,9 @@ export const Chat = (props: ChatProps): JSX.Element => {
         handleChangesUpdate={handleChangesUpdate}
         isLoading={isLoading}
         messages={messages}
+        taskTitle={taskTitle}
+        taskConversationId={taskConversationId}
+        taskReplied={taskReplied}
       />
     ),
     [
@@ -1638,7 +1646,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
       searchReport,
       toolSteps,
       typingActivity,
-      handleDeleteImage
+      handleDeleteImage,
+      taskTitle,
+      taskConversationId,
+      taskReplied
     ]
   )
 
