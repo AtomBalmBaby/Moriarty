@@ -366,7 +366,7 @@ const renderAssistant = (
       const rendered = renderText(part.text, counter)
       wrote ||= rendered.some(Boolean)
       lines.push(...rendered)
-    } else {
+    } else if ("steps" in part) {
       wrote = true
       for (const step of part.steps) lines.push(renderStep(step), "")
     }

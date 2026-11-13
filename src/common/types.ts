@@ -103,6 +103,10 @@ export interface ReasoningRoundView {
   complete: boolean
   /** Only when both ends of the round were seen. */
   durationMs?: number
+  /** How much of the reply's text was written when the round opened; see `ToolStepView.at`. */
+  at?: number
+  /** Arrival order among the reply's reasoning rounds and tool steps; see `ToolStepView.order`. */
+  order?: number
 }
 
 /** A file agent mode changed during a reply, as the chat lists it. */
@@ -149,6 +153,12 @@ export interface ToolStepView {
    * than above it. Missing on steps saved before this was kept.
    */
   at?: number
+  /**
+   * When the step arrived, against the reasoning rounds and other steps of the
+   * same reply. Steps (and rounds) with the same `at` are told apart by this.
+   * Missing on activity saved before this was kept.
+   */
+  order?: number
   /** A running command the user can stop on its own, leaving the reply to carry on. */
   stoppable?: boolean
   /** A waiting command that cannot be set to always run: the team asks for every command. */

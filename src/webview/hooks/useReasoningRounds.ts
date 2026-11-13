@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { EVENT_NAME } from "../../common/constants"
 import type { ReasoningRoundView } from "../../common/types"
 import { useServerEvent } from "../messaging"
-import { appendReasoning, closeReasoning, LiveReasoningRound, toReasoningViews } from "../reasoning-rounds"
+import { appendReasoning, closeReasoning, LiveReasoningRound, nextActivityOrder, toReasoningViews } from "../reasoning-rounds"
 
 /** Reasoning streams token by token; the view is updated at most every REASONING_FLUSH_MS. */
 const REASONING_FLUSH_MS = 200
@@ -11,10 +11,12 @@ const REASONING_FLUSH_MS = 200
 /**
  * The reasoning rounds of the reply being written. Deltas are batched into
  * the view; closing a round publishes at once, so a finished round never
- * shows as still streaming. `take` hands the rounds to the reply that keeps
- * them and clears here for the next turn.
+ * shows as still streaming. A round is marked, when it opens, with how much
+ * of the reply `replyText` says is written and its arrival order, so it sits
+ * among the reply's tool steps as it happened. `take` hands the rounds to the
+ * reply that keeps them and clears here for the next turn.
  */
-export const useReasoningRounds = () => {
+export const useReasoningRounds = (replyText: () => string = () => "") => {
   const [rounds, setRounds] = useState<LiveReasoningRound[]>([])
   const roundsRef = useRef<LiveReasoningRound[]>([])
   const timerRef = useRef<ReturnType<typeof setTimeout>>()
@@ -29,7 +31,10 @@ export const useReasoningRounds = () => {
   }, [])
 
   useServerEvent(EVENT_NAME.twinnyOnReasoning, ({ round, text }) => {
-    const next = appendReasoning(roundsRef.current, round, text, Date.now())
+    const next = appendReasoning(roundsRef.current, round, text, Date.now(), () => ({
+      at: replyText().length,
+      order: nextActivityOrder()
+    }))
     if (next === roundsRef.current) return
     roundsRef.current = next
     if (timerRef.current !== undefined) return

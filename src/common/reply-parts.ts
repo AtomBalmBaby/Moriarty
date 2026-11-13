@@ -1,6 +1,6 @@
-import { ToolStepView } from "./types"
+import { ReasoningRoundView, ToolStepView } from "./types"
 
-export type ReplyPart = { text: string } | { steps: ToolStepView[] }
+export type ReplyPart = { text: string } | { steps: ToolStepView[] } | { round: ReasoningRoundView }
 
 /** A fence's opening line: three or more backticks or tildes, and for backticks an info string without one. */
 const FENCE_OPEN = /^[ \t]{0,3}(`{3,}|~{3,})([^\n]*)$/
@@ -60,24 +60,49 @@ const outsideFence = (text: string, at: number) => {
   return at
 }
 
+/** Saved activity without an order goes before ordered activity at the same place, as it always did. */
+const compareOrder = (a: number | undefined, b: number | undefined) =>
+  a === b ? 0 : a === undefined ? -1 : b === undefined ? 1 : a - b
+
+type Activity = { step: ToolStepView } | { round: ReasoningRoundView }
+
 /**
- * A reply's text cut where its tools ran, with each run of steps in its
- * place: what the model said, the tools it then used, what it said next.
- * Steps saved without a place go first, as they used to.
+ * A reply's text cut where its tools ran and its reasoning rounds opened, with
+ * each piece of activity in its place, in the order it happened: what the
+ * model said, the thinking before a tool, the tool, what it said next. Runs of
+ * steps with nothing between them share one part. Activity saved without a
+ * place goes first, as it used to.
  */
-export const replyParts = (text: string, steps?: ToolStepView[]): ReplyPart[] => {
-  if (!steps?.length) return [{ text }]
-  const groups = new Map<number, ToolStepView[]>()
-  for (const step of steps) {
-    const at = outsideFence(text, Math.min(Math.max(step.at ?? 0, 0), text.length))
-    groups.set(at, [...(groups.get(at) ?? []), step])
-  }
+export const replyParts = (text: string, steps?: ToolStepView[], rounds?: ReasoningRoundView[]): ReplyPart[] => {
+  if (!steps?.length && !rounds?.length) return [{ text }]
+  const placed = [
+    ...(rounds ?? []).map((round) => ({ at: round.at, order: round.order, item: { round } as Activity })),
+    ...(steps ?? []).map((step) => ({ at: step.at, order: step.order, item: { step } as Activity }))
+  ].map((entry, index) => ({
+    ...entry,
+    index,
+    at: outsideFence(text, Math.min(Math.max(entry.at ?? 0, 0), text.length))
+  }))
+  placed.sort((a, b) => a.at - b.at || compareOrder(a.order, b.order) || a.index - b.index)
+
   const parts: ReplyPart[] = []
   let from = 0
-  for (const at of [...groups.keys()].sort((a, b) => a - b)) {
-    if (at > from) parts.push({ text: text.slice(from, at) })
-    parts.push({ steps: groups.get(at)! })
-    from = at
+  let run: ToolStepView[] | undefined
+  for (const entry of placed) {
+    if (entry.at > from) {
+      parts.push({ text: text.slice(from, entry.at) })
+      from = entry.at
+      run = undefined
+    }
+    if ("round" in entry.item) {
+      parts.push({ round: entry.item.round })
+      run = undefined
+    } else if (run) {
+      run.push(entry.item.step)
+    } else {
+      run = [entry.item.step]
+      parts.push({ steps: run })
+    }
   }
   if (from < text.length) parts.push({ text: text.slice(from) })
   return parts

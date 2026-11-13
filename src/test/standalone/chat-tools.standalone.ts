@@ -546,11 +546,61 @@ test("a running command can be stopped on its own: its step says stopped and the
   assert.ok(!result.failed)
 })
 
+test("reasoning rounds and tool steps interleave in the order they happened", () => {
+  const round = (id: string, at: number, order: number) => ({ id, text: id, complete: true, at, order })
+  const step = (id: string, at: number, order: number) => ({ id, name: "grep", summary: id, status: "done" as const, at, order })
+  const text = "Looked.\n\nFound it."
+  const shape = (parts: ReturnType<typeof replyParts>) =>
+    parts.map((part) =>
+      "steps" in part ? `[${part.steps.map((s) => s.id).join(",")}]` : "round" in part ? `<${part.round.id}>` : JSON.stringify(part.text)
+    )
+  // Thinking, read_file, thinking, the text, grep, thinking, then the final text.
+  const rounds = [round("r1", 0, 1), round("r2", 0, 3), round("r3", 9, 5)]
+  const steps = [step("read", 0, 2), step("grep", 9, 4)]
+  assert.deepStrictEqual(shape(replyParts(text, steps, rounds)), [
+    "<r1>",
+    "[read]",
+    "<r2>",
+    JSON.stringify("Looked.\n\n"),
+    "[grep]",
+    "<r3>",
+    JSON.stringify("Found it.")
+  ])
+  // A round and a step at one place keep their arrival order, whichever list they came from.
+  assert.deepStrictEqual(shape(replyParts(text, [step("late", 0, 2)], [round("early", 0, 1), round("later", 0, 3)])), [
+    "<early>",
+    "[late]",
+    "<later>",
+    JSON.stringify(text)
+  ])
+})
+
+test("activity saved without an order goes before ordered activity, as it always did", () => {
+  const text = "abc"
+  const shape = (parts: ReturnType<typeof replyParts>) =>
+    parts.map((part) => ("steps" in part ? `[${part.steps.map((s) => s.id).join(",")}]` : "round" in part ? `<${part.round.id}>` : JSON.stringify(part.text)))
+  const legacyStep = { id: "s", name: "grep", summary: "s", status: "done" as const, at: 1 }
+  assert.deepStrictEqual(shape(replyParts(text, [legacyStep], [{ id: "r", text: "t", complete: true }])), [
+    "<r>",
+    JSON.stringify("a"),
+    "[s]",
+    JSON.stringify("bc")
+  ])
+})
+
+test("a round written inside a code block moves to where the block closes", () => {
+  const text = "Look.\n```ts\nconst a = 1\n```\nDone."
+  const parts = replyParts(text, [], [{ id: "r", text: "t", complete: true, at: text.indexOf("const") }])
+  assert.deepStrictEqual(parts, [{ text: "Look.\n```ts\nconst a = 1\n```" }, { round: { id: "r", text: "t", complete: true, at: text.indexOf("const") } }, { text: "\nDone." }])
+})
+
 test("a reply's text is cut where its tools ran, never inside a code block", () => {
   const step = (id: string, at?: number) => ({ id, name: "grep", summary: id, status: "done" as const, ...(at === undefined ? {} : { at }) })
   const text = "Looking.\n\nFound it:\n```ts\nconst a = 1\n```\nDone."
   const shape = (parts: ReturnType<typeof replyParts>) =>
-    parts.map((part) => ("steps" in part ? `[${part.steps.map((s) => s.id).join(",")}]` : JSON.stringify(part.text)))
+    parts.map((part) =>
+      "steps" in part ? `[${part.steps.map((s) => s.id).join(",")}]` : "round" in part ? `<${part.round.id}>` : JSON.stringify(part.text)
+    )
   assert.deepStrictEqual(shape(replyParts(text, [step("a", 8), step("b", 8)])), [
     JSON.stringify("Looking."),
     "[a,b]",

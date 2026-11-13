@@ -19,15 +19,36 @@ export interface ReasoningView {
   activeId?: string
 }
 
-/** Adds streamed text to its round, opening a new round when the id is new. */
-export const appendReasoning = (rounds: LiveReasoningRound[], round: string, text: string, now: number): LiveReasoningRound[] => {
+/**
+ * The arrival order of a reply's activity: reasoning rounds and tool steps
+ * share one counter, so a reply lists them as they happened. It starts from
+ * the clock, so a reloaded page never hands out an order a saved reply holds.
+ */
+let lastOrder = Date.now() * 1000
+
+export const nextActivityOrder = (): number => {
+  lastOrder += 1
+  return lastOrder
+}
+
+/** Where a round opened among the reply's activity. */
+type RoundPlace = Pick<ReasoningRoundView, "at" | "order">
+
+/** Adds streamed text to its round, opening a new round when the id is new; `place` is read only for a new round. */
+export const appendReasoning = (
+  rounds: LiveReasoningRound[],
+  round: string,
+  text: string,
+  now: number,
+  place: () => RoundPlace = () => ({})
+): LiveReasoningRound[] => {
   const index = rounds.findIndex((item) => item.id === round)
   if (index !== -1) {
     // Text for a round that already closed arrived late, and does not reopen it.
     if (rounds[index].endedAt !== undefined) return rounds
     return rounds.map((item, position) => (position === index ? { ...item, text: item.text + text } : item))
   }
-  return [...closeReasoning(rounds, true, now), { id: round, text, complete: false, startedAt: now }]
+  return [...closeReasoning(rounds, true, now), { id: round, text, complete: false, startedAt: now, ...place() }]
 }
 
 /** Closes every round still streaming; a round that is not complete was interrupted. */
@@ -40,11 +61,13 @@ export const closeReasoning = (rounds: LiveReasoningRound[], complete: boolean, 
 export const toReasoningViews = (rounds: LiveReasoningRound[]): ReasoningRoundView[] =>
   rounds
     .filter((item) => item.text.trim())
-    .map(({ id, text, complete, startedAt, endedAt }) => ({
+    .map(({ id, text, complete, startedAt, endedAt, at, order }) => ({
       id,
       text,
       complete,
-      ...(complete && endedAt !== undefined ? { durationMs: Math.max(0, endedAt - startedAt) } : {})
+      ...(complete && endedAt !== undefined ? { durationMs: Math.max(0, endedAt - startedAt) } : {}),
+      ...(at !== undefined ? { at } : {}),
+      ...(order !== undefined ? { order } : {})
     }))
 
 /** Earlier rounds of a reply, then the later ones; a round kept twice counts once. */

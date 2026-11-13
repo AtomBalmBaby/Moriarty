@@ -7,8 +7,15 @@ import {
   closeReasoning,
   LiveReasoningRound,
   mergeReasoningRounds,
+  nextActivityOrder,
   toReasoningViews
 } from "../../webview/reasoning-rounds"
+
+test("activity order only grows, so a later arrival always sorts after an earlier one", () => {
+  const first = nextActivityOrder()
+  const second = nextActivityOrder()
+  assert.ok(second > first)
+})
 
 const stream = (chunks: Array<[string, string]>, start = 0) =>
   chunks.reduce<LiveReasoningRound[]>(
@@ -73,6 +80,32 @@ test("rounds without text are dropped rather than shown as empty blocks", () => 
     ["a:1"]
   )
   assert.deepEqual(toReasoningViews(stream([])), [])
+})
+
+test("a round keeps where it opened and its order into the reply's view", () => {
+  const rounds = appendReasoning([], "a:0", "think", 0, () => ({ at: 0, order: 1 }))
+  const later = appendReasoning(rounds, "a:1", "more", 10, () => ({ at: 9, order: 3 }))
+  assert.deepEqual(toReasoningViews(closeReasoning(later, true, 20)), [
+    { id: "a:0", text: "think", complete: true, durationMs: 10, at: 0, order: 1 },
+    { id: "a:1", text: "more", complete: true, durationMs: 10, at: 9, order: 3 }
+  ])
+})
+
+test("a round's place is read once, when it opens, and not for its later text", () => {
+  let reads = 0
+  const place = () => {
+    reads += 1
+    return { at: 0, order: reads }
+  }
+  const rounds = appendReasoning([], "a:0", "one ", 0, place)
+  appendReasoning(rounds, "a:0", "two", 1, place)
+  assert.equal(reads, 1)
+})
+
+test("rounds opened without a place carry none, as saved replies always did", () => {
+  assert.deepEqual(toReasoningViews(closeReasoning(stream([["a:0", "think"]], 0), true, 5)), [
+    { id: "a:0", text: "think", complete: true, durationMs: 5 }
+  ])
 })
 
 test("merging keeps earlier rounds and does not count a repeated round twice", () => {

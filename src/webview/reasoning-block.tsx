@@ -27,7 +27,7 @@ interface ReasoningRoundProps {
   interrupted?: "paused" | "stopped"
 }
 
-const ReasoningRound = ({ round, active, interrupted }: ReasoningRoundProps) => {
+export const ReasoningRound = ({ round, active, interrupted }: ReasoningRoundProps) => {
   const { t } = useTranslation()
   const [choice, setChoice] = useState<boolean | undefined>(() => choices.get(round.id))
   // Streaming opens the round; finishing collapses it unless the reader chose otherwise.

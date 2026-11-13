@@ -1002,6 +1002,50 @@ test("a new reasoning round starts its own block and closes the previous one", a
   }
 })
 
+/** Reasoning sections and tool rows in the order they appear in the rendered reply. */
+const renderedActivityOrder = (document: Document, toolSummaries: string[]): string[] => {
+  const sections = reasoningSections(document)
+  return [...document.querySelectorAll("[data-reasoning-state], li")].flatMap((node) => {
+    const section = sections.indexOf(node)
+    if (section >= 0) return [`reasoning ${section}`]
+    const tool = toolSummaries.find((summary) => node.textContent?.includes(summary))
+    return tool ? [`tool ${tool}`] : []
+  })
+}
+
+test("reasoning and tool rows render in the order they happened, not grouped", async () => {
+  outbound.length = 0
+  const chat = await mountChat()
+  try {
+    const read = { id: "t-read", name: "read_file", summary: "read a.ts", status: "done" }
+    const grep = { id: "t-grep", name: "grep", summary: "searched for foo", status: "done" }
+    await sendHost(EVENT_NAME.twinnyAddMessage, { role: "user", content: "Investigate" })
+    await sendHost(EVENT_NAME.twinnyOnLoading, { continuation: 0, operationId: "op-order" })
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r9:0", text: "Thinking one" })
+    await sendHost(EVENT_NAME.twinnyToolSteps, [read])
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r9:1", text: "Thinking two" })
+    await sendHost(EVENT_NAME.twinnyToolSteps, [read, grep])
+    await sendHost(EVENT_NAME.twinnyOnReasoning, { round: "r9:2", text: "Thinking three" })
+    await settleReasoning()
+
+    assert.deepEqual(renderedActivityOrder(chat.document, [read.summary, grep.summary]), [
+      "reasoning 0",
+      "tool read a.ts",
+      "reasoning 1",
+      "tool searched for foo",
+      "reasoning 2"
+    ])
+
+    await sendHost(EVENT_NAME.twinnyOnCompletion, { role: "assistant", content: "Final answer" })
+    const body = chat.document.body.textContent ?? ""
+    assert.ok(body.indexOf("searched for foo") < body.indexOf("Final answer"), "the answer follows the last tool row")
+    assert.equal(reasoningSections(chat.document).length, 3, "each round keeps its own block")
+    assert.equal(hasText(chat.document, "Thinking one"), false, "completed earlier rounds collapse")
+  } finally {
+    await chat.unmount()
+  }
+})
+
 test("a reply without reasoning shows no reasoning block", async () => {
   outbound.length = 0
   const chat = await mountChat()

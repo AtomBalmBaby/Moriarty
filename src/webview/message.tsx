@@ -26,7 +26,7 @@ import CodeBlock from "./code-block"
 import { createCustomImageExtension } from "./image-extension"
 import { MentionExtension } from "./mention-extention"
 import { emit } from "./messaging"
-import ReasoningBlock from "./reasoning-block"
+import ReasoningBlock, { ReasoningRound } from "./reasoning-block"
 import type { ReasoningView } from "./reasoning-rounds"
 import { ReplyChanges } from "./reply-changes"
 import { useToast } from "./toast"
@@ -726,7 +726,7 @@ export const Message: React.FC<MessageProps> = ({
         </span>
         {!footerActions && options}
       </div>
-      {message.role === ASSISTANT && (
+      {editing && message.role === ASSISTANT && (
         <ReasoningBlock reasoning={reasoningView} interrupted={paused ? "paused" : "stopped"} />
       )}
       {message.role === ASSISTANT && (
@@ -739,8 +739,15 @@ export const Message: React.FC<MessageProps> = ({
         <EditorContent className={styles.tiptap} editor={editor} />
       ) : message.role === ASSISTANT ? (
         <>
-          {replyParts(messageContent, message.toolSteps ?? steps).map((part, i) =>
-            "steps" in part ? (
+          {replyParts(messageContent, message.toolSteps ?? steps, reasoningView.rounds).map((part, i) =>
+            "round" in part ? (
+              <ReasoningRound
+                key={`round:${part.round.id}`}
+                round={part.round}
+                active={part.round.id === reasoningView.activeId}
+                interrupted={paused ? "paused" : "stopped"}
+              />
+            ) : "steps" in part ? (
               <ToolSteps key={i} steps={part.steps} />
             ) : part.text.trim() ? (
               <Markdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>

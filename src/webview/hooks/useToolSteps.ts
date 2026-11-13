@@ -3,6 +3,7 @@ import { useCallback, useRef, useState } from "react"
 import { EVENT_NAME } from "../../common/constants"
 import { ToolStepView } from "../../common/types"
 import { useServerEvent } from "../messaging"
+import { nextActivityOrder } from "../reasoning-rounds"
 
 /**
  * The tool steps of the reply being written. The extension sends the whole
@@ -12,25 +13,26 @@ import { useServerEvent } from "../messaging"
  * latest list without a stale closure.
  *
  * Each step is marked, when first seen, with how much of the reply
- * `replyText` says is written, so it shows at that point in the reply.
+ * `replyText` says is written, and its arrival order, so it shows at that
+ * point in the reply among the reasoning rounds.
  */
 export const useToolSteps = (replyText: () => string = () => "") => {
   const [steps, setSteps] = useState<ToolStepView[]>([])
   const stepsRef = useRef<ToolStepView[]>([])
-  const atRef = useRef(new Map<string, number>())
+  const placeRef = useRef(new Map<string, Pick<ToolStepView, "at" | "order">>())
 
   useServerEvent(EVENT_NAME.twinnyToolSteps, (incoming) => {
-    const marks = atRef.current
+    const places = placeRef.current
     stepsRef.current = (incoming ?? []).map((step) => {
-      if (!marks.has(step.id)) marks.set(step.id, replyText().length)
-      return { ...step, at: marks.get(step.id) }
+      if (!places.has(step.id)) places.set(step.id, { at: replyText().length, order: nextActivityOrder() })
+      return { ...step, ...places.get(step.id) }
     })
     setSteps(stepsRef.current)
   })
 
   const clear = useCallback(() => {
     stepsRef.current = []
-    atRef.current = new Map()
+    placeRef.current = new Map()
     setSteps([])
   }, [])
 

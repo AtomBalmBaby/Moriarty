@@ -1,10 +1,11 @@
-import React, { useEffect, useState } from "react"
+import React, { useEffect, useMemo, useState } from "react"
 
 import { TWINNY } from "../common/constants"
 import { WorkspaceSearchReport } from "../common/messaging/protocol"
+import { replyParts } from "../common/reply-parts"
 import { ToolStepView } from "../common/types"
 
-import ReasoningBlock from "./reasoning-block"
+import { ReasoningRound } from "./reasoning-block"
 import type { ReasoningView } from "./reasoning-rounds"
 import ToolSteps from "./tool-steps"
 import WorkspaceContext from "./workspace-context"
@@ -46,6 +47,8 @@ const phaseOf = (steps: ToolStepView[] | undefined, activity: TypingActivity | u
 
 const TypingIndicator = ({ context, steps, activity }: TypingIndicatorProps) => {
   const [seconds, setSeconds] = useState(0)
+  // Nothing is written yet, so every round and step sits at the start, ordered by when it arrived.
+  const parts = useMemo(() => replyParts("", steps, activity?.reasoning.rounds), [steps, activity?.reasoning.rounds])
 
   useEffect(() => {
     const started = Date.now()
@@ -67,16 +70,23 @@ const TypingIndicator = ({ context, steps, activity }: TypingIndicatorProps) => 
         {activity?.activeTask && <span>task: {activity.activeTask}</span>}
         {!!activity?.verified?.total && <span>verified {activity.verified.done}/{activity.verified.total}</span>}
       </div>
-      {activity && <ReasoningBlock reasoning={activity.reasoning} />}
       {context && (
         <div className={styles.context}>
           <WorkspaceContext report={context} />
         </div>
       )}
-      {!!steps?.length && (
-        <div className={styles.context}>
-          <ToolSteps steps={steps} />
-        </div>
+      {parts.map((part, i) =>
+        "round" in part ? (
+          <ReasoningRound
+            key={`round:${part.round.id}`}
+            round={part.round}
+            active={part.round.id === activity?.reasoning.activeId}
+          />
+        ) : "steps" in part ? (
+          <div key={i} className={styles.context}>
+            <ToolSteps steps={part.steps} />
+          </div>
+        ) : null
       )}
     </div>
   )

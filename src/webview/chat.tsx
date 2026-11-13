@@ -177,9 +177,8 @@ export const Chat = (props: ChatProps): JSX.Element => {
   // right behind a chunk of text is placed after that chunk.
   const completionRef = useRef<ChatCompletionMessage | null | undefined>()
   completionRef.current = completion
-  const { steps: toolSteps, clear: clearToolSteps, take: takeToolSteps } = useToolSteps(
-    () => getThinkingMessage(String(completionRef.current?.content ?? "")).message
-  )
+  const replyText = () => getThinkingMessage(String(completionRef.current?.content ?? "")).message
+  const { steps: toolSteps, clear: clearToolSteps, take: takeToolSteps } = useToolSteps(replyText)
   const viewport = useViewportAnchor(virtuosoRef, messages.length)
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([])
   const { conversation, conversationLoaded, saveLastConversation, setActiveConversation } = useConversationHistory()
@@ -377,7 +376,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
     clearTimeout(celebrationTimerRef.current)
   }, [])
 
-  const reasoningRounds = useReasoningRounds()
+  const reasoningRounds = useReasoningRounds(replyText)
   const reasoning = useMemo<ReasoningView>(
     () => ({ rounds: toReasoningViews(reasoningRounds.rounds), activeId: activeReasoningId(reasoningRounds.rounds) }),
     [reasoningRounds.rounds]
