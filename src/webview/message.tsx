@@ -11,14 +11,13 @@ import { Markdown as TiptapMarkdown } from "tiptap-markdown"
 
 import { ASSISTANT, EVENT_NAME, TWINNY, YOU } from "../common/constants"
 import { WorkspaceSearchReport } from "../common/messaging/protocol"
-import { replyParts } from "../common/reply-parts"
+import type { ReplyRowPart } from "../common/reply-parts"
 import {
   ChatCompletionMessage,
   ImageAttachment,
   MentionType,
   ReplyChangesView,
-  ReplyMeta,
-  ToolStepView
+  ReplyMeta
 } from "../common/types"
 
 import { useSuggestion } from "./hooks/useSuggestion"
@@ -26,8 +25,7 @@ import CodeBlock from "./code-block"
 import { createCustomImageExtension } from "./image-extension"
 import { MentionExtension } from "./mention-extention"
 import { emit } from "./messaging"
-import ReasoningBlock, { ReasoningRound } from "./reasoning-block"
-import type { ReasoningView } from "./reasoning-rounds"
+import { ReasoningRound } from "./reasoning-block"
 import { ReplyChanges } from "./reply-changes"
 import { useToast } from "./toast"
 import ToolSteps from "./tool-steps"
@@ -38,14 +36,17 @@ import styles from "./styles/message.module.css"
 
 interface MessageProps {
   index?: number
+  /**
+   * The part of an assistant reply this row renders. A user message has none.
+   * Each assistant part is its own row, so each can measure and collapse on its own.
+   */
+  part?: ReplyRowPart
   isAssistant?: boolean
   /**
    * The workspace search behind a reply still streaming. A finished reply
    * carries its own in `message.context`.
    */
   context?: WorkspaceSearchReport
-  /** Tool steps behind a reply still streaming; a finished reply carries its own. */
-  steps?: ToolStepView[]
   isLoading?: boolean
   message?: ChatCompletionMessage
   messages?: ChatCompletionMessage[]
@@ -61,8 +62,6 @@ interface MessageProps {
   onDeleteImage?: (id: string) => void
   /** A reply whose task the user paused: it reads paused and offers Continue or Stop. */
   paused?: boolean
-  /** Reasoning streamed for a reply still in progress; a saved reply carries its own. */
-  reasoning?: ReasoningView
   /** Continue a paused or out-of-steps reply. Only the last reply offers it. */
   onContinue?: () => void
   /** End a paused reply's task for good. Any paused reply offers it. */
@@ -320,9 +319,9 @@ const Collapsible = ({ children }: { children: React.ReactNode }) => {
 
 export const Message: React.FC<MessageProps> = ({
   index = 0,
+  part,
   isAssistant,
   context,
-  steps,
   isLoading,
   message,
   onDelete,
@@ -334,7 +333,6 @@ export const Message: React.FC<MessageProps> = ({
   onContinue,
   onStopTask,
   paused,
-  reasoning,
   onChangesUpdate
 }) => {
   const { t } = useTranslation()
@@ -615,11 +613,9 @@ export const Message: React.FC<MessageProps> = ({
     [renderCodeBlock, renderContent, message?.images]
   )
 
-  // A reply can be all steps and no text: its tools ran, then it was stopped.
   if (!message) return null
-  const reasoningView = reasoning ?? { rounds: message.reasoningRounds ?? [] }
-  const hasReasoning = reasoningView.rounds.length > 0
-  if (!message.content && !message.toolSteps?.length && !steps?.length && !hasReasoning) return null
+  // Assistant rows are only built for replies with something to show, so only a user message can be empty here.
+  if (!part && !message.content) return null
 
   const { thinking, message: messageContent } = getThinkingMessage(
     message.content as string
@@ -697,17 +693,24 @@ export const Message: React.FC<MessageProps> = ({
     editorRef.current?.commands.focus()
   }, [editor])
 
+  // A reply is split into rows, so each row keeps its own padding; the head carries the top and the tail the bottom.
+  const rowClass =
+    message.role === ASSISTANT
+      ? [
+          styles.message,
+          styles.row,
+          part?.kind === "head" && styles.rowHead,
+          part?.kind === "tail" && styles.rowTail
+        ]
+          .filter(Boolean)
+          .join(" ")
+      : `${styles.message} ${styles.userMessage}${index === 0 ? ` ${styles.firstMessage}` : ""}`
+  const showHead = !part || part.kind === "head"
+
   return (
-    <div
-      ref={messageRef}
-      className={
-        message.role === ASSISTANT
-          ? styles.message
-          : `${styles.message} ${styles.userMessage}${index === 0 ? ` ${styles.firstMessage}` : ""}`
-      }
-    >
+    <div ref={messageRef} className={rowClass}>
       {Toast}
-      {thinking && (
+      {showHead && thinking && (
         <ThinkingSection
           thinking={thinking}
           isCollapsed={isThinkingCollapsed}
@@ -715,62 +718,59 @@ export const Message: React.FC<MessageProps> = ({
           markdownComponents={markdownComponents}
         />
       )}
-      <div className={styles.messageRole}>
-        <span className={styles.roleLabel}>
-          {message.role !== ASSISTANT && (
-            <span className={styles.rolePrompt} aria-hidden="true">
-              &#10095;
-            </span>
-          )}
-          {message.role === ASSISTANT ? TWINNY : YOU}
-        </span>
-        {!footerActions && options}
-      </div>
-      {editing && message.role === ASSISTANT && (
-        <ReasoningBlock reasoning={reasoningView} interrupted={paused ? "paused" : "stopped"} />
+      {showHead && (
+        <div className={styles.messageRole}>
+          <span className={styles.roleLabel}>
+            {message.role !== ASSISTANT && (
+              <span className={styles.rolePrompt} aria-hidden="true">
+                &#10095;
+              </span>
+            )}
+            {message.role === ASSISTANT ? TWINNY : YOU}
+          </span>
+          {!footerActions && options}
+        </div>
       )}
-      {message.role === ASSISTANT && (
-        <>
-          <WorkspaceContext report={message.context ?? context} />
-          {editing && <ToolSteps steps={message.toolSteps ?? steps} />}
-        </>
+      {showHead && message.role === ASSISTANT && (
+        <WorkspaceContext report={message.context ?? context} />
       )}
       {editing ? (
         <EditorContent className={styles.tiptap} editor={editor} />
-      ) : message.role === ASSISTANT ? (
+      ) : part ? (
         <>
-          {replyParts(messageContent, message.toolSteps ?? steps, reasoningView.rounds).map((part, i) =>
-            "round" in part ? (
-              <ReasoningRound
-                key={`round:${part.round.id}`}
-                round={part.round}
-                active={part.round.id === reasoningView.activeId}
-                interrupted={paused ? "paused" : "stopped"}
-              />
-            ) : "steps" in part ? (
-              <ToolSteps key={i} steps={part.steps} />
-            ) : part.text.trim() ? (
-              <Markdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                {part.text.trim()}
-              </Markdown>
-            ) : null
-          )}
-          {renderImageGallery()}
-          {message.changes && (
-            <ReplyChanges
-              changes={message.changes}
-              onUpdate={(changes) => index !== undefined && onChangesUpdate?.(index, changes)}
-              onError={showToast}
+          {part.kind === "round" && (
+            <ReasoningRound
+              round={part.round}
+              active={part.active}
+              interrupted={paused ? "paused" : "stopped"}
             />
           )}
-          {message.meta && (
-            <ReplyFooter
-              meta={message.meta}
-              paused={paused}
-              onContinue={onContinue}
-              onStopTask={onStopTask}
-              actions={footerActions ? options : undefined}
-            />
+          {part.kind === "steps" && <ToolSteps steps={part.steps} />}
+          {part.kind === "text" && (
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {part.text}
+            </Markdown>
+          )}
+          {part.kind === "tail" && (
+            <>
+              {renderImageGallery()}
+              {message.changes && (
+                <ReplyChanges
+                  changes={message.changes}
+                  onUpdate={(changes) => index !== undefined && onChangesUpdate?.(index, changes)}
+                  onError={showToast}
+                />
+              )}
+              {message.meta && (
+                <ReplyFooter
+                  meta={message.meta}
+                  paused={paused}
+                  onContinue={onContinue}
+                  onStopTask={onStopTask}
+                  actions={footerActions ? options : undefined}
+                />
+              )}
+            </>
           )}
         </>
       ) : (

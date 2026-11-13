@@ -1,4 +1,5 @@
-import { ReasoningRoundView, ToolStepView } from "./types"
+import { getThinkingMessage } from "./text"
+import { ChatCompletionMessage, ReasoningRoundView, ToolStepView } from "./types"
 
 export type ReplyPart = { text: string } | { steps: ToolStepView[] } | { round: ReasoningRoundView }
 
@@ -106,4 +107,132 @@ export const replyParts = (text: string, steps?: ToolStepView[], rounds?: Reason
   }
   if (from < text.length) parts.push({ text: text.slice(from) })
   return parts
+}
+
+/** One part of a reply, rendered as its own virtualized row. */
+export type ReplyRowPart =
+  | { kind: "head" }
+  | { kind: "round"; round: ReasoningRoundView; active: boolean }
+  | { kind: "steps"; steps: ToolStepView[] }
+  | { kind: "text"; text: string }
+  | { kind: "tail" }
+
+export type ChatRowPart = { kind: "message" } | { kind: "activity" } | ReplyRowPart
+
+export interface ChatRow {
+  /** Stable across streaming, collapse, reload, and continuation; never an array index. */
+  key: string
+  /** The message the row belongs to, shared by every row of one assistant execution. */
+  index: number
+  /** The reply in progress rather than a saved message. */
+  live: boolean
+  part: ChatRowPart
+}
+
+export interface ChatRowsInput {
+  messages: ChatCompletionMessage[]
+  /** The reply streaming in, shown after the saved messages. */
+  completion?: ChatCompletionMessage | null
+  /** Reasoning rounds of the reply in progress. */
+  reasoning?: { rounds: ReasoningRoundView[]; activeId?: string }
+  /** Tool steps of the reply in progress. */
+  steps?: ToolStepView[]
+  /** The typing indicator shows while nothing has streamed yet. */
+  pending?: boolean
+}
+
+export interface ChatRows {
+  rows: ChatRow[]
+  /** The first row of the last message: where its response is anchored. */
+  anchor: number
+}
+
+const replyKey = (message: ChatCompletionMessage, index: number) => message.id ?? `index-${index}`
+
+const replyRows = (
+  rows: ChatRow[],
+  source: ChatCompletionMessage,
+  index: number,
+  key: string,
+  live: boolean,
+  rounds: ReasoningRoundView[],
+  activeId: string | undefined,
+  steps: ToolStepView[] | undefined
+) => {
+  const content = typeof source.content === "string" ? source.content : ""
+  if (!content && !source.toolSteps?.length && !steps?.length && !rounds.length) return
+  const { message: text } = getThinkingMessage(content)
+  const push = (suffix: string, part: ChatRowPart) => rows.push({ key: `${key}:${suffix}`, index, live, part })
+
+  push("head", { kind: "head" })
+  // Offsets into the text are keyed by where each piece starts, so a text row keeps its key as the reply grows.
+  let offset = 0
+  for (const part of replyParts(text, source.toolSteps ?? steps, rounds)) {
+    if ("round" in part) {
+      push(`round:${part.round.id}`, { kind: "round", round: part.round, active: part.round.id === activeId })
+    } else if ("steps" in part) {
+      push(`steps:${part.steps[0].id}`, { kind: "steps", steps: part.steps })
+    } else {
+      if (part.text.trim()) push(`text:${offset}`, { kind: "text", text: part.text.trim() })
+      offset += part.text.length
+    }
+  }
+  push("tail", { kind: "tail" })
+}
+
+/**
+ * The rows that render a chat: one per user message, and per assistant
+ * reply, a head, each reasoning round, each run of tool steps, each text
+ * piece, and a tail, all in the order they happened. Rows of the reply in
+ * progress take the `live` key prefix, so they keep their keys when it is
+ * saved.
+ */
+export const buildChatRows = ({ messages, completion, reasoning, steps, pending }: ChatRowsInput): ChatRows => {
+  const rows: ChatRow[] = []
+  const last = messages.length - 1
+  let anchor = 0
+  messages.forEach((message, index) => {
+    if (index === last) anchor = rows.length
+    if (message.role === "user") {
+      rows.push({ key: `${replyKey(message, index)}:message`, index, live: false, part: { kind: "message" } })
+    } else if (message.role === "assistant") {
+      replyRows(
+        rows,
+        message,
+        index,
+        replyKey(message, index),
+        false,
+        message.reasoningRounds ?? [],
+        undefined,
+        undefined
+      )
+    }
+  })
+  if (last >= 0 && completion) {
+    replyRows(
+      rows,
+      completion,
+      last,
+      "live",
+      true,
+      reasoning ? reasoning.rounds : completion.reasoningRounds ?? [],
+      reasoning?.activeId,
+      steps
+    )
+  } else if (last >= 0 && pending) {
+    rows.push({ key: "live:activity", index: last, live: true, part: { kind: "activity" } })
+    for (const part of replyParts("", steps, reasoning?.rounds)) {
+      if ("round" in part) {
+        rows.push({
+          key: `live:round:${part.round.id}`,
+          index: last,
+          live: true,
+          part: { kind: "round", round: part.round, active: part.round.id === reasoning?.activeId }
+        })
+      } else if ("steps" in part) {
+        rows.push({ key: `live:steps:${part.steps[0].id}`, index: last, live: true, part: { kind: "steps", steps: part.steps } })
+      }
+    }
+  }
+  return { rows, anchor }
 }

@@ -3,6 +3,12 @@
   user-select: none;
 }
 
+/* Rounds and steps that arrive before any text, each its own row under the header. */
+.pendingPart {
+  padding: 0 var(--tw-pad) 8px calc(var(--tw-pad) + var(--tw-gutter));
+  user-select: none;
+}
+
 .label {
   display: flex;
   align-items: center;

@@ -11,6 +11,23 @@
   overflow-wrap: anywhere;
 }
 
+/*
+ * A reply is split into rows, one per round, run of steps, and text piece.
+ * Only the head and tail keep the reply's vertical spacing, so the rows stack flush.
+ */
+.row {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.rowHead {
+  padding-top: 10px;
+}
+
+.rowTail {
+  padding-bottom: 14px;
+}
+
 .userMessage {
   margin-top: 8px;
   padding-top: 8px;

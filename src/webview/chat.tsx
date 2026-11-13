@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { Virtuoso, VirtuosoHandle } from "react-virtuoso"
 import Mention from "@tiptap/extension-mention"
@@ -18,6 +18,7 @@ import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
 import { isStaleTodoSnapshot } from "../common/guards"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
 import type { EntireChatAction, PromptCompileResult } from "../common/messaging/protocol"
+import { buildChatRows, type ChatRow } from "../common/reply-parts"
 import { attachLateSteps } from "../common/reply-steps"
 import { messageText } from "../common/text"
 import {
@@ -179,7 +180,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   completionRef.current = completion
   const replyText = () => getThinkingMessage(String(completionRef.current?.content ?? "")).message
   const { steps: toolSteps, clear: clearToolSteps, take: takeToolSteps } = useToolSteps(replyText)
-  const viewport = useViewportAnchor(virtuosoRef, messages.length)
+  const viewport = useViewportAnchor<ChatRow>(virtuosoRef)
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([])
   const { conversation, conversationLoaded, saveLastConversation, setActiveConversation } = useConversationHistory()
   const [agentProfilesSettled, setAgentProfilesSettled] = useState(false)
@@ -1570,15 +1571,28 @@ export const Chat = (props: ChatProps): JSX.Element => {
     [reasoning, continuation, activeTask, feedbackPlanning, glyphState, verifiedDone, verifiedTotal]
   )
 
+  const chatRows = useMemo(
+    () => buildChatRows({
+      messages,
+      completion,
+      reasoning,
+      steps: toolSteps,
+      pending: isLoading && !completion
+    }),
+    [messages, completion, reasoning, toolSteps, isLoading]
+  )
+  const { rows, anchor } = chatRows
+  const { setLayout } = viewport
+  useLayoutEffect(() => setLayout(rows.length, anchor), [setLayout, rows, anchor])
+
   const itemContent = useCallback(
-    (index: number) => (
+    (_index: number, row: ChatRow) => (
       <MessageItem
-        key={`message-list-${index}`}
+        row={row}
         completion={completion}
         context={searchReport}
         steps={toolSteps}
         activity={typingActivity}
-        generatingRef={generatingRef}
         handleDeleteImage={handleDeleteImage}
         handleDeleteMessage={handleDeleteMessage}
         handleEditMessage={handleEditMessage}
@@ -1586,9 +1600,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         handleContinue={handleContinue}
         handleStopPausedTask={handleStopPausedTask}
         handleChangesUpdate={handleChangesUpdate}
-        index={index}
         isLoading={isLoading}
-        message={messages[index]}
         messages={messages}
       />
     ),
@@ -1605,7 +1617,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
       searchReport,
       toolSteps,
       typingActivity,
-      generatingRef
+      handleDeleteImage
     ]
   )
 
@@ -1644,9 +1656,10 @@ export const Chat = (props: ChatProps): JSX.Element => {
             <Virtuoso
               style={{ height: "100%" }}
               ref={virtuosoRef}
-              data={messages}
-              initialTopMostItemIndex={messages?.length}
-              defaultItemHeight={800}
+              data={rows}
+              computeItemKey={(_index, row) => row.key}
+              initialTopMostItemIndex={rows.length}
+              defaultItemHeight={120}
               itemContent={itemContent}
               components={viewport.components}
               scrollerRef={viewport.scrollerRef}

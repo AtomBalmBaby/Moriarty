@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
+import { buildChatRows, ChatRow } from "../../common/reply-parts"
+import { ChatCompletionMessage, ReasoningRoundView, ToolStepView } from "../../common/types"
 import {
   activeReasoningId,
   appendReasoning,
@@ -118,4 +120,76 @@ test("merging keeps earlier rounds and does not count a repeated round twice", (
   assert.equal(mergeReasoningRounds(undefined, undefined), undefined)
   assert.deepEqual(mergeReasoningRounds(earlier, undefined), earlier)
   assert.deepEqual(mergeReasoningRounds(undefined, later), later)
+})
+
+const round = (id: string, at: number, order: number) =>
+  ({ id, text: `thought ${id}`, complete: true, at, order }) as ReasoningRoundView
+const step = (id: string, at: number, order: number) =>
+  ({ id, name: "read_file", summary: "", args: {}, status: "done", at, order }) as ToolStepView
+const kinds = (rows: ChatRow[]) => rows.map((row) => row.part.kind)
+
+test("a reply's rows follow the order its rounds, steps and text happened", () => {
+  const reply = {
+    id: "a1",
+    role: "assistant",
+    content: "Before. After.",
+    reasoningRounds: [round("r1", 0, 1), round("r2", 14, 3)],
+    toolSteps: [step("s1", 8, 2)]
+  } as ChatCompletionMessage
+  const { rows, anchor } = buildChatRows({
+    messages: [{ id: "u1", role: "user", content: "hi" } as ChatCompletionMessage, reply]
+  })
+  assert.deepEqual(kinds(rows), ["message", "head", "round", "text", "steps", "text", "round", "tail"])
+  assert.equal(anchor, 1)
+  assert.deepEqual(
+    rows.map((row) => row.key),
+    [
+      "u1:message",
+      "a1:head",
+      "a1:round:r1",
+      "a1:text:0",
+      "a1:steps:s1",
+      "a1:text:8",
+      "a1:round:r2",
+      "a1:tail"
+    ]
+  )
+  assert.ok(rows.every((row) => row.index === 0 || row.index === 1))
+  assert.equal(new Set(rows.map((row) => row.key)).size, rows.length)
+})
+
+test("the reply in progress keeps its round and step keys when it is saved", () => {
+  const reasoning = { rounds: [round("r1", 0, 1)], activeId: "r1" }
+  const pending = buildChatRows({
+    messages: [{ id: "u1", role: "user", content: "hi" } as ChatCompletionMessage],
+    reasoning,
+    steps: [step("s1", 0, 2)],
+    pending: true
+  })
+  assert.deepEqual(kinds(pending.rows), ["message", "activity", "round", "steps"])
+  assert.equal(pending.rows[2].part.kind === "round" && pending.rows[2].part.active, true)
+  assert.equal(pending.rows.every((row) => row.live === (row.part.kind !== "message")), true)
+
+  const streaming = buildChatRows({
+    messages: [{ id: "u1", role: "user", content: "hi" } as ChatCompletionMessage],
+    completion: { role: "assistant", content: "" } as ChatCompletionMessage,
+    reasoning,
+    steps: [step("s1", 0, 2)]
+  })
+  assert.deepEqual(kinds(streaming.rows), ["message", "head", "round", "steps", "tail"])
+  assert.equal(streaming.rows.filter((row) => row.live).length, 4)
+})
+
+test("an empty reply has no rows, and a streaming reply is anchored with its prompt", () => {
+  const empty = buildChatRows({
+    messages: [
+      { id: "u1", role: "user", content: "hi" } as ChatCompletionMessage,
+      { id: "a1", role: "assistant", content: "" } as ChatCompletionMessage
+    ]
+  })
+  assert.deepEqual(kinds(empty.rows), ["message"])
+  assert.equal(empty.anchor, 1)
+
+  const idle = buildChatRows({ messages: [] })
+  assert.deepEqual(idle, { rows: [], anchor: 0 })
 })

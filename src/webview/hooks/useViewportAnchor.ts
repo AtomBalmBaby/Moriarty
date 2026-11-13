@@ -22,6 +22,9 @@ const prefersReducedMotion = () =>
 const isNearBottom = (scroller: HTMLElement) =>
   scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= BOTTOM_THRESHOLD
 
+const rowElement = (scroller: HTMLElement, index: number) =>
+  index < 0 ? null : scroller.querySelector<HTMLElement>(`[data-index="${index}"]`)
+
 const SCROLL_UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"])
 const SCROLL_KEYS = new Set([...SCROLL_UP_KEYS, "ArrowDown", "PageDown", "End", " "])
 
@@ -32,17 +35,18 @@ const SCROLL_KEYS = new Set([...SCROLL_UP_KEYS, "ArrowDown", "PageDown", "End", 
  * scrolling away suspends following; `jumpToLatest` or returning to the
  * bottom resumes it.
  */
-export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count: number) {
+export function useViewportAnchor<Item>(virtuosoRef: RefObject<VirtuosoHandle>) {
   const stateRef = useRef<ViewportAnchor>(followingViewport)
   const [following, setFollowing] = useState(true)
   const [scroller, setScroller] = useState<HTMLElement | null>(null)
   const scrollerRef = useRef<HTMLElement | null>(null)
   const spacerRef = useRef<HTMLDivElement | null>(null)
   const observerRef = useRef<ResizeObserver | null>(null)
-  const countRef = useRef(count)
-  countRef.current = count
+  const rowCountRef = useRef(0)
+  const anchorRowRef = useRef(0)
   const contentHeightRef = useRef(0)
   const frameRef = useRef<number | null>(null)
+  const scrollTopRef = useRef(0)
 
   const commit = useCallback((next: ViewportAnchor) => {
     stateRef.current = next
@@ -54,14 +58,27 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
     const spacer = spacerRef.current
     if (!scrollerElement || !spacer) return
     const list = scrollerElement.querySelector<HTMLElement>(ITEM_LIST)
-    const last = scrollerElement.querySelector<HTMLElement>(`[data-index="${countRef.current - 1}"]`)
+    const anchor = rowElement(scrollerElement, anchorRowRef.current)
+    const last = rowElement(scrollerElement, rowCountRef.current - 1)
     if (list) observerRef.current?.observe(list)
-    if (!last) return
-    observerRef.current?.observe(last)
-    const height = stateRef.current.anchoredKey
-      ? anchorSpacer(scrollerElement.clientHeight, last.offsetHeight)
-      : 0
-    spacer.style.height = `${height}px`
+    if (anchor) observerRef.current?.observe(anchor)
+    if (last) observerRef.current?.observe(last)
+    // Measured from the anchored row's top, so the spacer only fills the viewport the response has not reached yet.
+    // An anchor or last row that is not mounted means the response already overflows the viewport.
+    const fill =
+      stateRef.current.anchoredKey && anchor && last
+        ? anchorSpacer(
+            scrollerElement.clientHeight,
+            last.getBoundingClientRect().bottom - anchor.getBoundingClientRect().top
+          )
+        : 0
+    // A collapse can shrink the content below the reader's scroll position, and the browser then clamps it.
+    // Reserving just the missing space keeps the reader where it was. Scrolling up releases the reservation.
+    const contentHeight = scrollerElement.scrollHeight - spacer.offsetHeight
+    const reserve = stateRef.current.following
+      ? 0
+      : Math.max(0, scrollTopRef.current + scrollerElement.clientHeight - contentHeight)
+    spacer.style.height = `${Math.max(fill, reserve)}px`
   }, [])
 
   const scrollToEnd = useCallback(() => {
@@ -73,10 +90,6 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
   }, [virtuosoRef])
 
   useEffect(() => {
-    fitSpacer()
-  }, [count, fitSpacer])
-
-  useEffect(() => {
     if (!scroller) return
     const away = () => commit(scrollAway(stateRef.current))
     // Checked after the scroll applies, so a wheel or drag that reaches the end keeps following.
@@ -86,6 +99,19 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
       })
     const onKey = (event: KeyboardEvent) => {
       if (SCROLL_KEYS.has(event.key)) awayUnlessAtEnd()
+    }
+    const onScroll = () => {
+      const top = scroller.scrollTop
+      const max = scroller.scrollHeight - scroller.clientHeight
+      // Landing on the maximum from beyond it can only be the browser clamping after content shrank, not a user scroll.
+      const clamped = top >= max && top < scrollTopRef.current
+      if (clamped) {
+        fitSpacer()
+        scroller.scrollTop = scrollTopRef.current
+        return
+      }
+      scrollTopRef.current = top
+      fitSpacer()
     }
     const onWheel = (event: WheelEvent) => {
       if (event.deltaY !== 0) awayUnlessAtEnd()
@@ -109,6 +135,8 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
     scroller.addEventListener("touchmove", onDrag, { passive: true })
     scroller.addEventListener("pointerdown", onDrag)
     scroller.addEventListener("keydown", onKey)
+    scroller.addEventListener("scroll", onScroll, { passive: true })
+    scrollTopRef.current = scroller.scrollTop
     return () => {
       observer.disconnect()
       observerRef.current = null
@@ -116,6 +144,7 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
       scroller.removeEventListener("touchmove", onDrag)
       scroller.removeEventListener("pointerdown", onDrag)
       scroller.removeEventListener("keydown", onKey)
+      scroller.removeEventListener("scroll", onScroll)
       if (frameRef.current !== null) cancelAnimationFrame(frameRef.current)
       frameRef.current = null
     }
@@ -132,11 +161,21 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
     fitSpacer()
   }, [fitSpacer])
 
-  const components = useMemo<Components>(
+  const components = useMemo<Components<Item>>(
     () => ({
       Footer: () => createElement("div", { ref: attachSpacer, "aria-hidden": "true" })
     }),
     [attachSpacer]
+  )
+
+  /** Records how many rows the list shows and which row the newest response starts at. */
+  const setLayout = useCallback(
+    (rowCount: number, anchorRow: number) => {
+      rowCountRef.current = rowCount
+      anchorRowRef.current = anchorRow
+      fitSpacer()
+    },
+    [fitSpacer]
   )
 
   /** Anchors the response `key` at the top; a key already anchored, or a scrolled-away viewport, changes nothing. */
@@ -148,7 +187,7 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
       requestAnimationFrame(() => {
         fitSpacer()
         virtuosoRef.current?.scrollToIndex({
-          index: countRef.current - 1,
+          index: anchorRowRef.current,
           align: "start",
           behavior: scrollBehavior(prefersReducedMotion())
         })
@@ -175,6 +214,7 @@ export function useViewportAnchor(virtuosoRef: RefObject<VirtuosoHandle>, count:
     following,
     components,
     scrollerRef: attachScroller,
+    setLayout,
     anchorOperation,
     scrolledAway,
     resume,
