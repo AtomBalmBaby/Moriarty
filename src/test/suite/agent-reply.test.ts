@@ -1928,7 +1928,7 @@ suite("Read-file acceptance, production controller", function () {
     }, { "src/tools.ts": toolsSource })
   })
 
-  test("an answer that never supplies its required values exhausts the correction budget and is not delivered", async () => {
+  test("an answer that never supplies its required values exhausts the correction budget, is shown marked unverified, and stops the turn", async () => {
     const incomplete = "read_file is implemented in src/tools.ts, lines 1 to 4."
     await withWorkspace(async (workspace) => {
       const turn = await runTurn(workspace, {
@@ -1947,7 +1947,11 @@ suite("Read-file acceptance, production controller", function () {
       })
 
       const posted = JSON.stringify(turn.posted)
-      assert.ok(!posted.includes(incomplete), "no incomplete answer is posted to the webview")
+      // The answer arrives in a continuation, so it is stored after the continuation marker.
+      const answerContents = [incomplete, `${CONTINUATION_PREFIX}${incomplete}`]
+      const shownAnswer = turn.posted.filter((message) => message.type === EVENT_NAME.twinnyAddMessage && answerContents.includes((message.data as { content?: string }).content ?? ""))
+      assert.equal(shownAnswer.length, 1, "the unverified answer is shown once, not dropped")
+      assert.equal((shownAnswer[0].data as { meta?: { unverified?: { reason?: string } } }).meta?.unverified?.reason, "delivery", "the shown answer is marked as unverified")
       assert.ok(posted.includes("Execution stopped"), "the exhausted correction stops the turn with a visible notice")
     }, { "src/tools.ts": toolsSource })
   })

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
+import { EVENT_NAME } from "../../common/constants"
 import type { TwinnyProvider } from "../../common/types"
 import { FeedbackGate, FeedbackPlanner, type FeedbackPlanRepository } from "../../extension/chat/feedback-planner"
 import { ChatGeneration } from "../../extension/chat/generation"
@@ -105,6 +106,65 @@ test("stopping mid-stream aborts the request, and no later request starts", asyn
   assert.equal(generation.cancelled, true)
   assert.equal(await generation.generate(inference, chatRequest, provider), "")
   assert.equal(calls.started, 1)
+  generation.dispose()
+})
+
+test("a held answer still streams its reasoning, and only its text waits for the delivery gate", async () => {
+  const emitted: string[] = []
+  const recording = { emit: (type: string) => emitted.push(type) } as unknown as ExtensionBridge
+  const generation = new ChatGeneration(recording, new GenerationTracker())
+  const inference = {
+    async *chat() {
+      yield { content: "", reasoning: "Weighing the source" }
+      yield { content: "read_file is at lines 218 to 282", finishReason: "stop" as const }
+    }
+  } as unknown as InferenceClient
+  await generation.generate(inference, chatRequest, provider, "", { hold: () => true })
+  assert.equal(emitted.filter((type) => type === EVENT_NAME.twinnyOnReasoning).length, 1)
+  assert.equal(emitted.filter((type) => type === EVENT_NAME.twinnyOnCompletion).length, 0)
+  generation.dispose()
+})
+
+test("a held answer released as unverified keeps the reason, with its detail bounded", async () => {
+  const shown: { content: string; meta?: { unverified?: { reason: string; detail?: string } } }[] = []
+  const recording = {
+    emit: (type: string, data?: unknown) => {
+      if (type === EVENT_NAME.twinnyAddMessage) shown.push(data as (typeof shown)[number])
+    }
+  } as unknown as ExtensionBridge
+  const generation = new ChatGeneration(recording, new GenerationTracker())
+  const inference = {
+    async *chat() {
+      yield { content: "read_file is at lines 218 to 282", finishReason: "stop" as const }
+    }
+  } as unknown as InferenceClient
+  await generation.generate(inference, chatRequest, provider, "", { hold: () => true })
+  assert.equal(shown.length, 0)
+  generation.releaseHeld({ reason: "delivery", detail: "x".repeat(400) })
+  assert.equal(shown.length, 1)
+  assert.equal(shown[0].content, "read_file is at lines 218 to 282")
+  assert.equal(shown[0].meta?.unverified?.reason, "delivery")
+  assert.equal(shown[0].meta?.unverified?.detail?.length, 300)
+  generation.dispose()
+})
+
+test("a held answer released without a verdict carries no unverified marker", async () => {
+  const shown: { meta?: { unverified?: unknown } }[] = []
+  const recording = {
+    emit: (type: string, data?: unknown) => {
+      if (type === EVENT_NAME.twinnyAddMessage) shown.push(data as (typeof shown)[number])
+    }
+  } as unknown as ExtensionBridge
+  const generation = new ChatGeneration(recording, new GenerationTracker())
+  const inference = {
+    async *chat() {
+      yield { content: "read_file is at lines 218 to 282", finishReason: "stop" as const }
+    }
+  } as unknown as InferenceClient
+  await generation.generate(inference, chatRequest, provider, "", { hold: () => true })
+  generation.releaseHeld()
+  assert.equal(shown.length, 1)
+  assert.equal(shown[0].meta?.unverified, undefined)
   generation.dispose()
 })
 

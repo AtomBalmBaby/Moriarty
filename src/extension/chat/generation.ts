@@ -40,8 +40,8 @@ export interface ReplyExtras {
   /** True when the reply is worth keeping with no text: its tools ran, and their steps are its record. */
   keepEmpty?(): boolean
   /**
-   * Asked as the reply starts. When true, nothing of the reply is shown until `releaseHeld` or `discardHeld`, so the host
-   * can check it against its evidence first.
+   * Asked as the reply starts. When true, the reply's answer text is not shown until `releaseHeld`, so the host can
+   * check it against its evidence first. The reasoning still streams.
    */
   hold?(): boolean
   /** Waited for once the reply has ended, before it is kept: work that reads the workspace as the reply left it. */
@@ -67,8 +67,8 @@ export class ChatGeneration {
   private _trace?: InferenceTraceContext
   /** Runs stopped because the user left their conversation: what they wrote is not kept. */
   private readonly _discarded = new WeakSet<GenerationRun>()
-  /** The last reply, held back by `ReplyExtras.hold`, as the call that would show it. */
-  private _held?: () => void
+  /** The last reply, held back by `ReplyExtras.hold`, until it is released. */
+  private _held?: { content: string; meta: ReplyMeta; toolNotes?: string; changes?: ReplyChangesView }
   private readonly _stopSubscription: { dispose(): void }
 
   constructor(
@@ -192,7 +192,7 @@ export class ChatGeneration {
           streamChunks++
           streamedContentChars += chunk.content.length
           reasoningChars += chunk.reasoning?.length ?? 0
-          if (chunk.reasoning && !holding) {
+          if (chunk.reasoning) {
             this._bridge.emit(EVENT_NAME.twinnyOnReasoning, {
               round: `${reasoningRun}:${chunk.reasoningStep ?? 0}`,
               text: redactEvidence(chunk.reasoning)
@@ -262,23 +262,28 @@ export class ChatGeneration {
     }
   }
 
-  /** Shows the reply now, or keeps it back until the host releases or discards it. */
+  /** Shows the reply now, or keeps it back until the host releases it. */
   private present(holding: boolean, content: string, meta: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView) {
     if (!holding) {
       this.addMessage(content, meta, toolNotes, changes)
       return
     }
-    this._held = () => this.addMessage(content, meta, toolNotes, changes)
+    this._held = { content, meta, toolNotes, changes }
   }
 
-  /** Shows the reply the last generation held back. */
-  public releaseHeld() {
-    const show = this._held
+  /**
+   * Shows the reply the last generation held back. When it was not verified, it is shown marked as such, so the
+   * reader sees what the model said without mistaking it for a checked answer.
+   */
+  public releaseHeld(unverified?: NonNullable<ReplyMeta["unverified"]>) {
+    const held = this._held
     this._held = undefined
-    show?.()
+    if (!held) return
+    const meta = unverified ? { ...held.meta, unverified: { ...unverified, detail: unverified.detail?.slice(0, 300) } } : held.meta
+    this.addMessage(held.content, meta, held.toolNotes, held.changes)
   }
 
-  /** Forgets the reply the last generation held back, without showing it. */
+  /** Drops the held answer when a correction replaces it; its reasoning has already been shown. */
   public discardHeld() {
     this._held = undefined
   }

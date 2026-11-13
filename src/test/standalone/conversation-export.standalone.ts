@@ -136,6 +136,25 @@ test("a reply withheld by delivery rejection is not exported as Completed, and k
   assert.match(text, /Reason: delivery gate rejected the reply/)
 })
 
+test("an unverified answer is exported with its label, and a checked answer is not", () => {
+  const unverified = exportOf([
+    user("where is run_command defined?"),
+    assistant("runCommand is at lines 666 to 710", {
+      meta: {
+        unverified: { reason: "delivery", detail: "answer cites no source" }
+      }
+    } as Partial<ChatCompletionMessage>)
+  ])
+  assert.match(unverified, /runCommand is at lines 666 to 710/)
+  assert.match(unverified, /Unverified: the check did not accept this answer\. answer cites no source/)
+
+  const checked = exportOf([
+    user("where is run_command defined?"),
+    assistant("runCommand is at lines 666 to 710")
+  ])
+  assert.doesNotMatch(checked, /Unverified:/)
+})
+
 test("a stalled execution is exported as stalled, not as Completed", () => {
   const text = exportOf([
     user("where is run_command defined?"),

@@ -484,6 +484,18 @@ const renderWithheld = (message: ChatCompletionMessage): string => {
   return note(`Credentials withheld before sending to the model: ${kinds}.`)
 }
 
+const renderUnverified = (message: ChatCompletionMessage): string => {
+  const unverified = message.meta?.unverified
+  if (!unverified) return ""
+  const why =
+    unverified.reason === "stopped"
+      ? "stopped before the check finished"
+      : "the check did not accept this answer"
+  return note(
+    `Unverified: ${why}.${unverified.detail ? ` ${unverified.detail}` : ""}`
+  )
+}
+
 const textOf = (message: ChatCompletionMessage) => messageText(message)
 
 const renderUser = (message: ChatCompletionMessage, number: number): string => {
@@ -577,6 +589,8 @@ const renderAssistant = (
   if (changes) lines.push(changes, "")
   const withheld = renderWithheld(message)
   if (withheld) lines.push(withheld, "")
+  const unverified = renderUnverified(message)
+  if (unverified) lines.push(unverified, "")
   if (message.meta?.execution) lines.push(renderExecution(message.meta.execution), "")
   lines.push(replyStatus(message, inProgress, stalledAfter))
   return lines.join("\n")

@@ -260,6 +260,20 @@ const WithheldBadge = ({ withheld }: { withheld: NonNullable<ReplyMeta["withheld
   )
 }
 
+/** A reply shown without passing its check: the label says why, and the body is tinted to match. */
+const UnverifiedBanner = ({ unverified }: { unverified: NonNullable<ReplyMeta["unverified"]> }) => {
+  const { t } = useTranslation()
+  return (
+    <div
+      className={styles.replyUnverified}
+      title={unverified.detail ? t("reply-unverified-title", { detail: unverified.detail }) : undefined}
+    >
+      <span className="codicon codicon-warning" aria-hidden="true" />
+      {t(unverified.reason === "stopped" ? "reply-unverified-stopped" : "reply-unverified-delivery")}
+    </div>
+  )
+}
+
 /** The project's instruction files agent mode followed; opens the first. */
 const InstructionsBadge = ({ files }: { files: string[] }) => {
   const { t } = useTranslation()
@@ -751,6 +765,7 @@ export const Message: React.FC<MessageProps> = ({
       {showHead && message.role === ASSISTANT && (
         <WorkspaceContext report={message.context ?? context} />
       )}
+      {showHead && message.meta?.unverified && <UnverifiedBanner unverified={message.meta.unverified} />}
       {editing ? (
         <EditorContent className={styles.tiptap} editor={editor} />
       ) : part ? (
@@ -764,9 +779,11 @@ export const Message: React.FC<MessageProps> = ({
           )}
           {part.kind === "steps" && <ToolSteps steps={part.steps} />}
           {part.kind === "text" && (
-            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-              {part.text}
-            </Markdown>
+            <div className={message.meta?.unverified ? styles.unverifiedBody : undefined}>
+              <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {part.text}
+              </Markdown>
+            </div>
           )}
           {part.kind === "tail" && (
             <>

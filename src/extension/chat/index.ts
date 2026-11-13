@@ -1616,14 +1616,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         this.currentSourceReader()
       )
       if (verdict.outcome !== "delivered") {
-        this._generation.discardHeld()
         const outcome = workflow.reconcile("revise", `delivery:${intent.planId}:${verdict.outcome}:${verdict.detail}`, "none")
         if (outcome.continue) {
+          this._generation.discardHeld()
           this._awaitingDelivery = { execution: workflow, intent }
           logger.warn(`[Execution] delivery withheld (${verdict.outcome}): ${verdict.detail}`)
           return verdict.correction
         }
         this._awaitingDelivery = undefined
+        this._generation.releaseHeld({ reason: "delivery", detail: verdict.detail })
         const reason = `The answer was not delivered. ${outcome.reason ?? ""}`.trim()
         this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
           role: ASSISTANT,
@@ -2344,8 +2345,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.error("Automatic TODO evaluation could not load review tasks: " + (error instanceof Error ? error.message : String(error)))
       })
     }
-    // A held reply whose turn never reached the gate (cancelled, or not tracked) is shown as it stood.
-    this._generation.releaseHeld()
+    // A held reply whose turn never reached the gate (cancelled, or not tracked) is shown as it stood, marked when the user stopped it.
+    this._generation.releaseHeld(this.cancelled ? { reason: "stopped" } : undefined)
     if (!this.cancelled && (!recoveryNotice || recoveryNotice.restored)) await activeCheckpoints?.clear()
     if (reply !== undefined && feedbackEnabled && todoScope) await this.emitAuthoritativeReport(todoScope, execution.executionId)
     if (this._activeExecution === execution) {

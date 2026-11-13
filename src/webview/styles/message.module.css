@@ -364,6 +364,24 @@
   font-size: 11px;
 }
 
+/* A reply shown without passing its check: its text is tinted amber and labelled above. */
+.unverifiedBody {
+  color: var(--vscode-editorWarning-foreground);
+}
+
+.replyUnverified {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  color: var(--vscode-editorWarning-foreground);
+}
+
+.replyUnverified .codicon {
+  font-size: 12px;
+}
+
 /* The AGENTS.md agent mode followed: quiet, opens the file. */
 .replyInstructions {
   display: inline-flex;

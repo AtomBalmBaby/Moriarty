@@ -1,3 +1,9 @@
 {
-  "cmake.ignoreCMakeListsMissing": true
+"cmake.ignoreCMakeListsMissing": true,
+"chat.mcp.serverSampling": {
+
+},
+"chat.customizations.mcpServerMigration.enabled": true,
+"chat.mcp.collisionBehavior": "suffix",
+"chat.mcp.gallery.enabled": true
 }

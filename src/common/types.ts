@@ -227,6 +227,11 @@ export interface ReplyMeta {
   /** The user stopped it before the model finished. */
   stopped?: boolean
   /**
+   * The reply is shown without having passed its check: the delivery check rejected it, or the
+   * user stopped it before the check ran. `detail` is the check's verdict, bounded.
+   */
+  unverified?: { reason: "delivery" | "stopped"; detail?: string }
+  /**
    * The task the reply belongs to, once the user has paused or stopped it. A paused task can be
    * continued; a stopped one is closed for good. Replies without it are plain stops.
    */
