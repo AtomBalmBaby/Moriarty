@@ -13,7 +13,8 @@ import { ToolStart, ToolStep } from "../tools/loop"
  * created file's whole content or a long diff is not kept in full; the
  * model's own copy is not cut here.
  */
-const MAX_SHOWN_OUTPUT = 4000
+/** The largest result the model is given back (see `planContext`), so a saved transcript keeps everything the model saw. */
+const MAX_SHOWN_OUTPUT = 100_000
 const MAX_SHOWN_ARG = 2000
 const MAX_ARG_IN_SUMMARY = 80
 /** What a running command has printed is shown as its tail, refreshed this often. */

@@ -27,6 +27,7 @@ import {
   setContextClock
 } from "../../extension/inference/context-window"
 import { ChatChunk } from "../../extension/inference/types"
+import { ContextUsageStore } from "../../extension/tools/budget"
 
 const provider = (kind: string, extra: Partial<TwinnyProvider> = {}): TwinnyProvider =>
   ({ id: kind, label: kind, provider: kind, type: "chat", modelName: "m", ...extra }) as TwinnyProvider
@@ -571,9 +572,13 @@ test("a step cut off by a stop says so, and what is kept of a step is held to a 
   const steps = new ToolSteps((all) => sent.push(all.map((s) => `${s.id}:${s.status}`)))
   steps.start({ id: "0.0", name: "read_file", args: { path: "a.ts" } })
   steps.finish({ id: "0.0", index: 0, mode: "native", summary: "read `a.ts`", output: "x".repeat(9000), promptChars: 0 })
+  assert.strictEqual(steps.steps[0].output, "x".repeat(9000), "a result well under the limit is kept whole")
+  const large = new ToolSteps(() => {})
+  large.start({ id: "0.0", name: "read_file", args: { path: "c.ts" } })
+  large.finish({ id: "0.0", index: 0, mode: "native", summary: "read `c.ts`", output: "z".repeat(120_000), promptChars: 0 })
+  assert.ok((large.steps[0].output ?? "").length < 100_100)
+  assert.match(large.steps[0].output ?? "", /… \(20000 more characters\)$/)
   steps.start({ id: "1.0", name: "create_file", args: { path: "b.ts", content: "y".repeat(50_000) } })
-  assert.ok((steps.steps[0].output ?? "").length < 4100)
-  assert.match(steps.steps[0].output ?? "", /… \(5000 more characters\)$/)
   assert.ok((steps.steps[1].args?.content ?? "").length < 2100, "a created file's whole content is not saved with the conversation")
 
   steps.start({ id: "1.1", name: "run_command", args: { command: "npm test" } })
@@ -599,3 +604,25 @@ test("a tool call with no arguments goes back as {} so the SDKs can parse it", (
   const sent = buildStreamingRequest(provider("anthropic"), [...conversation, call("")], { tools: [tool] })
   assert.strictEqual(argsOf(sent.messages[2] as ChatCompletionMessage), "{}")
 })
+
+test("live usage is the estimate until the server counts, the count replaces it, and another conversation reads none", () => {
+  const store = new ContextUsageStore()
+  assert.strictEqual(store.read("chat-a"), undefined)
+  store.record("chat-a", { tokens: 12_000, counted: false })
+  assert.deepStrictEqual(store.read("chat-a"), { tokens: 12_000, counted: false })
+  store.record("chat-a", { tokens: 12_400, counted: true })
+  assert.deepStrictEqual(store.read("chat-a"), { tokens: 12_400, counted: true })
+  assert.strictEqual(store.read("chat-b"), undefined)
+  store.record("chat-b", { tokens: 3_000, counted: false })
+  assert.strictEqual(store.read("chat-a"), undefined)
+  assert.deepStrictEqual(store.read("chat-b"), { tokens: 3_000, counted: false })
+})
+
+test("live usage without a conversation id is kept under the empty key, not mistaken for a named conversation", () => {
+  const store = new ContextUsageStore()
+  store.record(undefined, { tokens: 900, counted: false })
+  assert.deepStrictEqual(store.read(""), { tokens: 900, counted: false })
+  assert.deepStrictEqual(store.read(undefined), { tokens: 900, counted: false })
+  assert.strictEqual(store.read("chat-a"), undefined)
+})
+

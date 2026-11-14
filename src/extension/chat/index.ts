@@ -72,8 +72,8 @@ import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, de
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
-import { type ContextCapacity, type ContextDiagnostics,FALLBACK_CONTEXT_TOKENS } from "../tools/budget"
-import { formatCountedTokens, formatRequestBreakdown } from "../tools/context-breakdown"
+import { type ContextCapacity, type ContextDiagnostics, type ContextUsage, ContextUsageStore, FALLBACK_CONTEXT_TOKENS } from "../tools/budget"
+import { formatCountedTokens, formatRequestBreakdown, type RequestBreakdown } from "../tools/context-breakdown"
 import { DEFAULT_MAX_STEPS, describeResultBudget, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import { type ToolCall, toolDefinition } from "../tools/protocol"
@@ -329,6 +329,8 @@ export class Chat extends Base {
   private _agentToolDiagnostic?: string
   private readonly _runtimeInventorySignatures = new Map<string, string>()
   private readonly _warnedCapacity = new Set<string>()
+  /** The running conversation's live prompt usage, read by the composer's bar. */
+  private readonly _contextUsage = new ContextUsageStore()
   private readonly _steps: ToolSteps
   private readonly _stopSubscription: { dispose(): void }
   /** What agent replies changed, kept so each can be compared or undone from the chat. */
@@ -1308,6 +1310,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return { tokens, source, confirmed }
   }
 
+  /** Memory only; answers the bar's timer without any model or network call. */
+  public contextUsageOf(conversationId: string | undefined): ContextUsage | null {
+    return this._contextUsage.read(conversationId) ?? null
+  }
+
   private async contextCapacity(provider: TwinnyProvider): Promise<ContextCapacity> {
     const capacity = await contextCapacityOf(provider, this.contextOptions())
     const key = `${provider.modelName}|${capacity.warning ?? ""}`
@@ -1316,6 +1323,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       logger.warn(`Chat context · ${provider.modelName}: ${capacity.warning}`)
     }
     return capacity
+  }
+
+  /** Each model request's estimate becomes the live usage until the server reports its own count. */
+  private observeContext(provider: TwinnyProvider, conversationId: string | undefined, entry: ContextDiagnostics) {
+    this.logContext(provider, entry)
+    this._contextUsage.record(conversationId, { tokens: entry.estimatedPromptTokens, counted: false })
+  }
+
+  private observeCounted(conversationId: string | undefined, step: number, breakdown: RequestBreakdown, promptTokens: number) {
+    logger.trace(formatCountedTokens(step + 1, breakdown, promptTokens))
+    this._contextUsage.record(conversationId, { tokens: promptTokens, counted: true })
   }
 
   /** Counts only; no prompt or tool content is logged. */
@@ -2394,6 +2412,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   ) {
     this._steps.reset()
+    const conversationId = this._activeConversationId
     const available = todoWorkspaceTools(this._todoRepository!, scope, () => {
       void this._todoRepository!.getList(scope).then((snapshot) => this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)).catch((error) => {
         logger.error(`Native TODO snapshot refresh failed: ${error}`)
@@ -2415,7 +2434,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       maxResultChars,
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
       contextWindow: () => this.contextCapacity(provider),
-      onContext: (entry) => this.logContext(provider, entry),
+      onContext: (entry) => this.observeContext(provider, conversationId, entry),
       stepLines: false,
       steering: () => this.takeSteering(),
       requestContext: () => this.planRequestContext(),
@@ -2426,7 +2445,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.debug(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
         logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
       },
-      onRequestCounted: (step, breakdown, promptTokens) => logger.trace(formatCountedTokens(step + 1, breakdown, promptTokens)),
+      onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
       onStep: (step) => {
@@ -2456,6 +2475,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     onCatastrophic: (notice: EditRecoveryNotice) => Promise<void>
   ) {
     this._steps.reset()
+    const conversationId = this._activeConversationId
     // The team's rules only ever tighten what the developer set.
     const team = currentTeamPolicy()?.agent
     const commandMode = team?.commands === "off" ? "off" : this.config.get<ChatCommandMode>("chatToolsCommands", "ask")
@@ -2613,7 +2633,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       // default effort one tool step can take minutes.
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
       contextWindow: () => this.contextCapacity(provider),
-      onContext: (entry) => this.logContext(provider, entry),
+      onContext: (entry) => this.observeContext(provider, conversationId, entry),
       stepLines: false,
       steering: () => this.takeSteering(),
       requestContext: () => this.planRequestContext(),
@@ -2624,7 +2644,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.debug(`Chat tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
         logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
       },
-      onRequestCounted: (step, breakdown, promptTokens) => logger.trace(formatCountedTokens(step + 1, breakdown, promptTokens)),
+      onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
       shouldStop: () => !safety.canMutate(),

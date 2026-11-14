@@ -134,3 +134,25 @@ export const trimmedResult = (output: string): string => {
   const first = output.split("\n", 1)[0].slice(0, 160)
   return `${first}\n[The rest was trimmed to save context. Run the tool again if you need it.]`
 }
+
+/** The prompt size of a conversation's latest model request: the server's count once it reports one, otherwise Twinny's estimate. */
+export interface ContextUsage {
+  tokens: number
+  counted: boolean
+}
+
+/** Holds live usage for the conversation that is running. Another conversation reads as no usage. */
+export class ContextUsageStore {
+  private conversationId = ""
+  private usage: ContextUsage | undefined
+
+  public record(conversationId: string | undefined, usage: ContextUsage): void {
+    const key = conversationId ?? ""
+    if (key !== this.conversationId) this.conversationId = key
+    this.usage = usage
+  }
+
+  public read(conversationId: string | undefined): ContextUsage | undefined {
+    return (conversationId ?? "") === this.conversationId ? this.usage : undefined
+  }
+}

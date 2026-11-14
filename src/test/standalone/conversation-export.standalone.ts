@@ -654,7 +654,7 @@ test("an empty export is refused with a message and never written", async () => 
 
 test("a tool's cut output and arguments carry their amounts into the export, not silent gaps", () => {
   const steps = new ToolSteps(() => undefined)
-  const huge = "x".repeat(20000)
+  const huge = "x".repeat(120_000)
   steps.start({ id: "0.0", name: "read_file", args: { path: "big.txt", content: huge } })
   steps.finish({ id: "0.0", index: 0, mode: "native", summary: "read big.txt", output: huge, promptChars: 0 })
   const [step] = steps.steps

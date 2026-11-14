@@ -37,7 +37,7 @@ import { useAutoRun } from "./hooks/useAutoRun"
 import { useAutosizeTextArea } from "./hooks/useAutosizeTextArea"
 import { useComposerSuggestions } from "./hooks/useComposerSuggestions"
 import { useConversationHistory } from "./hooks/useConversationHistory"
-import { useContextWindow, useProviders } from "./hooks/useProviders"
+import { useContextUsage, useContextWindow, useProviders } from "./hooks/useProviders"
 import { useReasoningRounds } from "./hooks/useReasoningRounds"
 import { useSelection } from "./hooks/useSelection"
 import { useSuggestion } from "./hooks/useSuggestion"
@@ -168,24 +168,6 @@ export const Chat = (props: ChatProps): JSX.Element => {
   // until one is set; the empty transcript says where to set it.
   const { chatProvider, ready: providersReady } = useProviders()
   const contextWindow = useContextWindow(chatProvider, messages.length)
-  // The latest reply's backend-reported prompt size; live usage isn't reported mid-reply.
-  const contextUsed = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const tokens = messages[i].meta?.promptTokens
-      if (tokens) return tokens
-    }
-    return 0
-  }, [messages])
-  const contextPercent = contextWindow?.tokens
-    ? Math.min(100, Math.round((contextUsed / contextWindow.tokens) * 100))
-    : 0
-  const contextTitle = contextWindow
-    ? t("context-used", {
-        used: compactCount(contextUsed),
-        window: compactCount(contextWindow.tokens),
-        percent: contextPercent
-      })
-    : undefined
   const chatDisabled = providersReady && !chatProvider
   const [completion, setCompletion] = useState<ChatCompletionMessage | null>()
   const virtuosoRef = useRef<VirtuosoHandle>(null)
@@ -204,6 +186,27 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const viewport = useViewportAnchor<ChatRow>(virtuosoRef)
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([])
   const { conversation, conversationLoaded, saveLastConversation, setActiveConversation } = useConversationHistory()
+  // The extension's live usage for this conversation, polled from memory. A restored
+  // conversation has none yet, so it shows its last reply's persisted prompt size.
+  const liveContext = useContextUsage(conversation?.id)
+  const contextUsed = useMemo(() => {
+    if (liveContext) return liveContext.tokens
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const tokens = messages[i].meta?.promptTokens
+      if (tokens) return tokens
+    }
+    return 0
+  }, [liveContext, messages])
+  const contextPercent = contextWindow?.tokens
+    ? Math.min(100, Math.round((contextUsed / contextWindow.tokens) * 100))
+    : 0
+  const contextTitle = contextWindow
+    ? t("context-used", {
+        used: compactCount(contextUsed),
+        window: compactCount(contextWindow.tokens),
+        percent: contextPercent
+      })
+    : undefined
   const [agentProfilesSettled, setAgentProfilesSettled] = useState(false)
   const { agentMode, teamAgentRules, agentSelection, storedAgentSelection, lastAgentSelection, setAgentSelection, resetAgentSelectionForNewChat, agentPreferenceError, agentSessionReady } = useAgentMode(
     agentProfiles.filter((profile) => profile.enabled && profile.valid && profile.userInvocable).map((profile) => profile.id),

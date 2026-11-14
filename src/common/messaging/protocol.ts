@@ -441,6 +441,12 @@ export interface ContextWindowStatus {
   confirmed: boolean
 }
 
+/** The live prompt usage of the running conversation; `counted` is true once the server has reported its own count. */
+export interface ContextUsageStatus {
+  tokens: number
+  counted: boolean
+}
+
 export interface ClientEvents {
   [TODO_EVENT_NAME.getList]: Channel<{ conversationId: string }, TodoListSnapshot | undefined>
   [TODO_EVENT_NAME.createItem]: Channel<TodoCreateRequest, TodoListSnapshot>
@@ -469,6 +475,7 @@ export interface ClientEvents {
   [EVENT_NAME.twinnyGetConfigValue]: Channel<{ key: string }, ConfigValue>
   [EVENT_NAME.twinnyGetContextItems]: Channel
   [EVENT_NAME.twinnyGetContextWindow]: Channel<TwinnyProvider, ContextWindowStatus | null>
+  [EVENT_NAME.twinnyGetContextUsage]: Channel<{ conversationId?: string }, ContextUsageStatus | null>
   [EVENT_NAME.twinnyGetGitChanges]: Channel
   [EVENT_NAME.twinnyGetModels]: Channel<void, ModelCatalogue>
   [EVENT_NAME.twinnyGetWorkspaceContext]: Channel<{ key: string }, ContextValue>

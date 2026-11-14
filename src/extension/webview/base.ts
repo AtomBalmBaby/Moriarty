@@ -406,6 +406,8 @@ export class BaseProvider {
         this.broadcastContextItems(this.readContextItems()),
       [EVENT_NAME.twinnyGetContextWindow]: async (provider) =>
         (await this.chat?.contextWindowOf(provider)) ?? null,
+      [EVENT_NAME.twinnyGetContextUsage]: ({ conversationId }) =>
+        this.chat?.contextUsageOf(conversationId) ?? null,
       [EVENT_NAME.twinnyGetGitChanges]: () =>
         void vscode.commands.executeCommand(
           TWINNY_COMMAND_NAME.generateCommitMessage

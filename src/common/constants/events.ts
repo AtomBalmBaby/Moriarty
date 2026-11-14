@@ -23,6 +23,7 @@ export const EVENT_NAME = {
   twinnyGetConfigValue: "twinny-get-config-value",
   twinnyGetContextItems: "twinny-get-context-items",
   twinnyGetContextWindow: "twinny-get-context-window",
+  twinnyGetContextUsage: "twinny-get-context-usage",
   twinnyGetGitChanges: "twinny-get-git-changes",
   twinnyGetModels: "twinny-get-models",
   twinnyGetWorkspaceContext: "twinny-workspace-context",

@@ -4,6 +4,7 @@ import { EVENT_NAME, PROVIDER_EVENT_NAME } from "../../common/constants"
 import { messageOf } from "../../common/errors"
 import {
   ChatGPTPlanStatus,
+  ContextUsageStatus,
   ContextWindowStatus,
   ProviderModelList,
   ProviderSaveResult,
@@ -52,6 +53,42 @@ export const useContextWindow = (
   }, [key, refreshKey])
 
   return status
+}
+
+/** How often the composer reads the running conversation's live usage. */
+export const CONTEXT_USAGE_POLL_MS = 1000
+
+/**
+ * The running conversation's live prompt usage, read on a timer. `null` until a
+ * model request for this conversation has been made.
+ */
+export const useContextUsage = (conversationId: string | undefined): ContextUsageStatus | null => {
+  const [usage, setUsage] = useState<ContextUsageStatus | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const read = () => {
+      bridge
+        .request(EVENT_NAME.twinnyGetContextUsage, { conversationId })
+        .then((answer) => {
+          if (cancelled) return
+          setUsage((previous) =>
+            previous?.tokens === answer?.tokens && previous?.counted === answer?.counted ? previous : answer ?? null
+          )
+        })
+        .catch(() => {
+          if (!cancelled) setUsage(null)
+        })
+    }
+    read()
+    const timer = setInterval(read, CONTEXT_USAGE_POLL_MS)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [conversationId])
+
+  return usage
 }
 
 export const useProviders = () => {

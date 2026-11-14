@@ -142,7 +142,7 @@ export interface ToolStepView {
   /** What it did, in a line: "searched for `foo` · 3 matches". */
   summary: string
   args?: Record<string, string>
-  /** What the model was given back, cut to a size worth showing. */
+  /** What the model was given back, kept whole up to the largest result it is given. */
   output?: string
   /** Characters of the output that were cut before being kept; the full output was never stored. */
   outputOmitted?: number
