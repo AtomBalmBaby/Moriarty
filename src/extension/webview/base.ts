@@ -1,5 +1,4 @@
 import { models } from "fluency.js"
-import path from "node:path"
 import * as vscode from "vscode"
 
 import { AGENT_STARTUP_SELECTION_SETTING } from "../../common/agents"
@@ -112,10 +111,7 @@ export class BaseProvider {
     workspaceSearch?: WorkspaceSearchProvider
   ) {
     this.context = context
-    this._todoRepository = new TodoRepository(
-      async () => prepareProjectTodoStorage(currentProjectTodoStorage()),
-      path.join(context.extensionPath, "out", "sql-wasm.wasm")
-    )
+    this._todoRepository = new TodoRepository(async () => prepareProjectTodoStorage(currentProjectTodoStorage()))
     this._agentRegistry = new AgentRegistry(context)
     this._fileTreeProvider = new FileTreeProvider()
     this._workspaceIndex = index

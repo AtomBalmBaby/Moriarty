@@ -14,8 +14,6 @@ import { CRITERION_FIELDS } from "../../extension/todos/intent-plan"
 import { TodoRepository, trustedTodoPanelApproval } from "../../extension/todos/repository"
 import type { AcceptedFact, ChildTodoContext, ChildTodoProposal } from "../../extension/todos/types"
 
-const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
-
 const quietly = async <T>(run: () => Promise<T>) => {
   const records: string[] = []
   const { info, warn, debug, trace } = logger
@@ -54,7 +52,7 @@ const endpoint = (infer: RoleInference): RoleResolution => ({
 const withRepository = async (run: (repository: TodoRepository) => Promise<void>) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-feedback-planner-"))
   try {
-    await run(new TodoRepository(path.join(directory, "todos.sqlite"), wasmPath))
+    await run(new TodoRepository(path.join(directory, "todos.sqlite")))
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }

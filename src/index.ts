@@ -66,6 +66,7 @@ import { TemplateProvider } from "./extension/templates/provider"
 import { terminalHistory } from "./extension/terminal"
 import { runDescribedCommand } from "./extension/terminal/command"
 import { fixTerminalError } from "./extension/terminal/fix"
+import { closeTodoDatabases } from "./extension/todos/sqlite"
 import { ContentHashAlgorithm, isContentHashAlgorithm, setContentHashAlgorithmProvider } from "./extension/tools/fingerprint"
 import { delayExecution } from "./extension/utils"
 import { FullScreenProvider } from "./extension/webview/panel"
@@ -767,5 +768,6 @@ const teamNudge = async (context: ExtensionContext) => {
 }
 
 export function deactivate() {
+  closeTodoDatabases()
   logger.info("Twinny deactivated")
 }

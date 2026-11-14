@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto"
-import { Database, SqlValue } from "sql.js"
 
 import { logger } from "../../common/logger"
 
@@ -13,7 +12,7 @@ import {
   samePath
 } from "./evidence"
 import { validateIntentTaskPlan } from "./intent-plan"
-import { SqliteFile, type SqliteLocation } from "./sqlite"
+import { type Database, SqliteFile, type SqliteLocation } from "./sqlite"
 import {
   type AcceptedFact,
   type AcceptedFactUsage,
@@ -121,17 +120,11 @@ const statusTransitions: Record<TodoStatus, Set<TodoStatus>> = {
   cancelled: new Set(["pending", "in_progress"])
 }
 
-const rows = <T>(database: Database, sql: string, values: SqlValue[] = []): T[] => {
-  const statement = database.prepare(sql)
-  try {
-    statement.bind(values)
-    const result: T[] = []
-    while (statement.step()) result.push(statement.getAsObject() as T)
-    return result
-  } finally {
-    statement.free()
-  }
-}
+type SqlValue = string | number | bigint | Buffer | null
+
+const rows = <T>(database: Database, sql: string, values: SqlValue[] = []): T[] => database.prepare(sql).all(...values) as T[]
+
+const execute = (database: Database, sql: string, values: SqlValue[] = []) => database.prepare(sql).run(...values)
 
 const itemOf = (row: ItemRow): TodoItem => ({
   id: row.id,
@@ -164,7 +157,7 @@ const parseRequest = <T>(database: Database, listId: string, requestId: string, 
 }
 
 const recordRequest = (database: Database, listId: string, requestId: string, operation: string, result: unknown) => {
-  database.run(
+  execute(database,
     "INSERT INTO todo_requests(list_id, request_id, operation, result_json, created_at) VALUES (?, ?, ?, ?, ?)",
     [listId, requestId, operation, JSON.stringify(result), now()]
   )
@@ -266,7 +259,7 @@ const insertItem = (
 ): string => {
   const createdAt = now()
   const id = randomUUID()
-  database.run(
+  execute(database,
     `INSERT INTO todo_items(id, list_id, parent_id, title, details, status, verification, priority, created_by, source, sort_order, version, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'pending', 'not_checked', ?, ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM todo_items WHERE list_id = ?), 1, ?, ?)`,
     [id, listId, input.parentId ?? null, input.title, input.details ?? null, input.priority, input.actor, input.actor, listId, createdAt, createdAt]
@@ -346,7 +339,7 @@ const ensureList = (database: Database, request: TodoListRequest): ListRow => {
 
   const existingProject = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [fingerprint])[0]
   const projectId = existingProject?.id ?? randomUUID()
-  if (!existingProject) database.run("INSERT INTO todo_projects(id, fingerprint, created_at) VALUES (?, ?, ?)", [projectId, fingerprint, now()])
+  if (!existingProject) execute(database, "INSERT INTO todo_projects(id, fingerprint, created_at) VALUES (?, ?, ?)", [projectId, fingerprint, now()])
 
   let list = rows<ListRow>(
     database,
@@ -355,7 +348,7 @@ const ensureList = (database: Database, request: TodoListRequest): ListRow => {
   )[0]
   if (!list) {
     const listId = randomUUID()
-    database.run(
+    execute(database,
       "INSERT INTO todo_lists(id, project_id, conversation_id, revision, created_at) VALUES (?, ?, ?, 0, ?)",
       [listId, projectId, conversationId, now()]
     )
@@ -385,9 +378,9 @@ const snapshotFor = (database: Database, list: ListRow, includeCompleted = true)
 }
 
 const bumpList = (database: Database, listId: string, itemId: string | undefined, eventType: string, actor: string, requestId: string, payload: unknown) => {
-  database.run("UPDATE todo_lists SET revision = revision + 1 WHERE id = ?", [listId])
+  execute(database, "UPDATE todo_lists SET revision = revision + 1 WHERE id = ?", [listId])
   const [revision] = rows<{ revision: number }>(database, "SELECT revision FROM todo_lists WHERE id = ?", [listId])
-  database.run(
+  execute(database,
     `INSERT INTO todo_events(id, list_id, item_id, list_revision, event_type, actor, request_id, payload_json, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [randomUUID(), listId, itemId ?? null, revision.revision, eventType, actor, requestId, JSON.stringify(payload), now()]
@@ -630,11 +623,11 @@ const recordAcceptedFacts = (
     }
     if (fact.registeredTool !== undefined && !fact.registeredTool.trim()) refuse(index, "registered tool name is empty")
     const id = randomUUID()
-    database.run(
+    execute(database,
       "INSERT INTO todo_accepted_evidence(id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, registered_tool, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
       [id, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, fact.registeredTool ?? null, acceptedAt]
     )
-    database.run(
+    execute(database,
       "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
       [id, listId, fact.symbol, fact.path, id]
     )
@@ -702,7 +695,7 @@ const enforceEvidenceBudget = (database: Database, listId: string, keepId: strin
     "SELECT observation_id, preserved_chars FROM todo_tool_evidence WHERE list_id = ? AND retained = 1 AND observation_id != ? ORDER BY created_at, observation_id", [listId, keepId])
   for (const candidate of candidates) {
     if (excess <= 0) break
-    database.run("UPDATE todo_tool_evidence SET retained = 0, content = NULL WHERE observation_id = ?", [candidate.observation_id])
+    execute(database, "UPDATE todo_tool_evidence SET retained = 0, content = NULL WHERE observation_id = ?", [candidate.observation_id])
     excess -= candidate.preserved_chars
   }
 }
@@ -711,13 +704,17 @@ export class TodoRepository {
   private readonly sqlite: SqliteFile
   private readonly evidenceLimits: EvidenceStorageLimits
 
-  constructor(databasePath: SqliteLocation, wasmPath: string, evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS) {
-    this.sqlite = new SqliteFile(databasePath, wasmPath)
+  constructor(databasePath: SqliteLocation, evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS) {
+    this.sqlite = new SqliteFile(databasePath)
     this.evidenceLimits = evidenceLimits
   }
 
   initialize(): Promise<void> {
     return this.sqlite.initialize()
+  }
+
+  close(): void {
+    this.sqlite.close()
   }
 
   getIntentTaskPlan(request: TodoListRequest): Promise<IntentTaskPlan | undefined> {
@@ -815,7 +812,7 @@ export class TodoRepository {
           return !prior || !prior.active || prior.title !== task.title || prior.details !== task.description ||
             prior.dependencies_json !== JSON.stringify(task.dependencies) || prior.criteria_json !== criteriaJson(task.criteria)
         })) throw new TodoConflictError("Intent tasks changed without increasing plan.revision")
-        database.run("UPDATE todo_intent_plans SET intent_result_json = ?, updated_at = ? WHERE list_id = ?", [resultJson, now(), list.id])
+        execute(database, "UPDATE todo_intent_plans SET intent_result_json = ?, updated_at = ? WHERE list_id = ?", [resultJson, now(), list.id])
         return snapshotFor(database, list, request.includeCompleted)
       }
 
@@ -828,7 +825,7 @@ export class TodoRepository {
         } else {
           const itemId = randomUUID()
           const order = rows<{ next_order: number }>(database, "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM todo_items WHERE list_id = ?", [list.id])[0].next_order
-          database.run(
+          execute(database,
             `INSERT INTO todo_items(id, list_id, title, details, status, verification, priority, created_by, source, sort_order, version, created_at, updated_at)
              VALUES (?, ?, ?, ?, 'pending', 'not_checked', 'normal', 'model', 'intent_compiler', ?, 1, ?, ?)`,
             [itemId, list.id, task.title, task.description, order + index, createdAt, createdAt]
@@ -837,7 +834,7 @@ export class TodoRepository {
         }
       }
 
-      database.run("UPDATE todo_intent_tasks SET active = 0 WHERE list_id = ?", [list.id])
+      execute(database, "UPDATE todo_intent_tasks SET active = 0 WHERE list_id = ?", [list.id])
       const userOrder = rows<{ max_order: number | null }>(database, "SELECT MAX(sort_order) AS max_order FROM todo_items WHERE list_id = ? AND source != 'intent_compiler'", [list.id])[0].max_order
       const firstPlanOrder = (userOrder ?? -1) + 1
       for (const [index, task] of plan.tasks.entries()) {
@@ -847,31 +844,31 @@ export class TodoRepository {
         if (prior) {
           const changedDefinition = prior.title !== task.title || prior.details !== task.description || prior.sort_order !== desiredOrder
           if (changedDefinition) {
-            database.run("UPDATE todo_items SET title = ?, details = ?, sort_order = ?, version = version + 1, updated_at = ? WHERE id = ?", [task.title, task.description, desiredOrder, createdAt, itemId])
+            execute(database, "UPDATE todo_items SET title = ?, details = ?, sort_order = ?, version = version + 1, updated_at = ? WHERE id = ?", [task.title, task.description, desiredOrder, createdAt, itemId])
           }
         }
-        database.run(
+        execute(database,
           `INSERT INTO todo_intent_tasks(list_id, task_id, item_id, dependencies_json, criteria_json, active)
            VALUES (?, ?, ?, ?, ?, 1)
            ON CONFLICT(list_id, task_id) DO UPDATE SET item_id = excluded.item_id,
              dependencies_json = excluded.dependencies_json, criteria_json = excluded.criteria_json, active = 1`,
           [list.id, task.id, itemId, JSON.stringify(task.dependencies), criteriaJson(task.criteria)]
         )
-        database.run("DELETE FROM todo_dependencies WHERE item_id = ?", [itemId])
+        execute(database, "DELETE FROM todo_dependencies WHERE item_id = ?", [itemId])
       }
       for (const task of plan.tasks) {
         const itemId = itemIds.get(task.id)!
         for (const dependency of task.dependencies) {
-          database.run("INSERT INTO todo_dependencies(item_id, depends_on_item_id) VALUES (?, ?)", [itemId, itemIds.get(dependency)!])
+          execute(database, "INSERT INTO todo_dependencies(item_id, depends_on_item_id) VALUES (?, ?)", [itemId, itemIds.get(dependency)!])
         }
       }
       if (existing) {
-        database.run(
+        execute(database,
           "UPDATE todo_intent_plans SET plan_id = ?, revision = ?, goal = ?, constraints_json = ?, intent_result_json = ?, answer_json = ?, updated_at = ? WHERE list_id = ?",
           [plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, answerJson, createdAt, list.id]
         )
       } else {
-        database.run(
+        execute(database,
           "INSERT INTO todo_intent_plans(list_id, plan_id, revision, goal, constraints_json, intent_result_json, answer_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           [list.id, plan.planId, plan.revision, plan.goal, JSON.stringify(plan.constraints), resultJson, answerJson, createdAt]
         )
@@ -1134,10 +1131,10 @@ export class TodoRepository {
       }
       const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence, executionId: input.executionId }
       const listRevision = bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
-      database.run("INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      execute(database, "INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision, input.executionId ?? null])
       if (preserved) {
-        database.run("INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        execute(database, "INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
         enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
       }
@@ -1164,7 +1161,7 @@ export class TodoRepository {
       if (unresolved) throw new TodoConflictError(`Edit target ${input.target} has an unresolved operation ${unresolved.id}`)
       const timestamp = Date.now()
       const record: EditOperationRecord = { ...input, status: "dispatched", detail: "", createdAt: timestamp, updatedAt: timestamp }
-      database.run("INSERT INTO todo_edit_operations(id, list_id, item_id, owner_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      execute(database, "INSERT INTO todo_edit_operations(id, list_id, item_id, owner_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [record.id, list.id, record.itemId ?? null, record.ownerId ?? null, record.target, record.mode, record.preDigest, record.postDigest, record.status, record.detail, record.createdAt, record.updatedAt])
       return record
     })
@@ -1179,9 +1176,8 @@ export class TodoRepository {
     return this.sqlite.write((database) => {
       const list = findList(database, request)
       if (!list) return false
-      database.run("UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND list_id = ? AND status = 'dispatched'",
-        [status, detail.slice(0, 500), Date.now(), operationId, list.id])
-      return database.getRowsModified() === 1
+      return execute(database, "UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND list_id = ? AND status = 'dispatched'",
+        [status, detail.slice(0, 500), Date.now(), operationId, list.id]).changes === 1
     })
   }
 
@@ -1230,9 +1226,8 @@ export class TodoRepository {
     return this.sqlite.write((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
       if (!project) return false
-      database.run("UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND status = ? AND list_id IN (SELECT id FROM todo_lists WHERE project_id = ?)",
-        [status, detail.slice(0, 500), Date.now(), operationId, expected, project.id])
-      return database.getRowsModified() === 1
+      return execute(database, "UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND status = ? AND list_id IN (SELECT id FROM todo_lists WHERE project_id = ?)",
+        [status, detail.slice(0, 500), Date.now(), operationId, expected, project.id]).changes === 1
     })
   }
 
@@ -1265,7 +1260,7 @@ export class TodoRepository {
       if (!intentTask) throw new Error("Requirement activations are limited to active Intent tasks")
       const listRevision = bumpList(database, list.id, itemId, kind === "activation" ? "requirement_activated" : "requirement_renewed", "system", requestId, { kind })
       const activation: RequirementActivation = { id: randomUUID(), itemId, kind, listRevision, activatedAt: Date.now() }
-      database.run("INSERT INTO todo_requirement_activations(id, list_id, item_id, request_id, kind, list_revision, activated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      execute(database, "INSERT INTO todo_requirement_activations(id, list_id, item_id, request_id, kind, list_revision, activated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         [activation.id, list.id, itemId, requestId, kind, listRevision, activation.activatedAt])
       return activation
     })
@@ -1330,11 +1325,11 @@ export class TodoRepository {
       const status = evaluation.decision === "accept" ? "completed" : evaluation.decision === "revise" ? "in_progress" : evaluation.decision === "blocked" ? "blocked" : "in_review"
       const verification = evaluation.decision === "accept" ? "passed" : evaluation.decision === "revise" ? "failed" : "not_checked"
       const blockedReason = evaluation.decision === "blocked" ? evaluation.explanation : null
-      database.run("INSERT INTO todo_evaluations(id, list_id, item_id, request_id, task_version, decision, evaluation_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      execute(database, "INSERT INTO todo_evaluations(id, list_id, item_id, request_id, task_version, decision, evaluation_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [randomUUID(), list.id, itemId, requestId, expectedVersion, evaluation.decision, JSON.stringify(evaluation), updatedAt])
-      database.run("UPDATE todo_items SET status = ?, verification = ?, blocked_reason = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
+      const updateResult = execute(database, "UPDATE todo_items SET status = ?, verification = ?, blocked_reason = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
         [status, verification, blockedReason, updatedAt, itemId, expectedVersion])
-      if (database.getRowsModified() !== 1) throw new TodoConflictError("TODO changed while applying its evaluation")
+      if (updateResult.changes !== 1) throw new TodoConflictError("TODO changed while applying its evaluation")
       if (evaluation.decision === "accept") recordAcceptedFacts(database, list.id, currentPlan, itemId, evaluation, new Map(observations.map((observation) => [observation.id, observation])), updatedAt)
       bumpList(database, list.id, itemId, "evaluation_recorded", "system", requestId, { decision: evaluation.decision, evaluation })
       logTodoEvent("feedback.reconciled", { operation_id: list.id, item_id: itemId, decision: evaluation.decision, status, verification, request_id: requestId })
@@ -1364,11 +1359,11 @@ export class TodoRepository {
       let recorded = 0
       for (const factId of new Set(input.factIds)) {
         if (!current.has(factId)) continue
-        database.run(
+        const { changes } = execute(database,
           "INSERT OR IGNORE INTO todo_evidence_usage (id, fact_id, project_id, conversation_id, execution_id, kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
           [randomUUID(), factId, project.id, request.conversationId.trim(), input.executionId, input.kind, now()]
         )
-        recorded += database.getRowsModified()
+        recorded += changes
       }
       return recorded
     })
@@ -1641,7 +1636,7 @@ export class TodoRepository {
         } else {
           itemId = insertItem(database, list.id, { parentId, title, details, priority: proposal.priority, actor: "model", requestId: proposal.requestId })
           planRevision = plan.revision + 1
-          database.run("UPDATE todo_intent_plans SET revision = revision + 1, updated_at = ? WHERE list_id = ?", [now(), list.id])
+          execute(database, "UPDATE todo_intent_plans SET revision = revision + 1, updated_at = ? WHERE list_id = ?", [now(), list.id])
         }
       } else if (kind === "existing_task") {
         if (!itemId || !membership.planTaskOf.has(itemId)) throw new Error("An existing-task decision must name an active item in the authoritative plan")
@@ -1650,7 +1645,7 @@ export class TodoRepository {
       }
 
       const outcome: ChildTodoOutcome = { decision: kind, parentId, itemId, planRevision, instruction }
-      database.run(
+      execute(database,
         "INSERT INTO todo_child_proposals(list_id, request_id, fingerprint, parent_id, decision, item_id, plan_revision, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [list.id, proposal.requestId, fingerprint, proposal.parentId, kind, itemId ?? null, planRevision, JSON.stringify(outcome), now()]
       )
@@ -1726,9 +1721,9 @@ export class TodoRepository {
       if (sortOrder !== row.sort_order) {
         const neighbor = rows<ItemRow>(database, "SELECT * FROM todo_items WHERE list_id = ? AND sort_order = ?", [list.id, sortOrder])[0]
         if (!neighbor) throw new Error("Cannot move TODO beyond the list boundary")
-        database.run("UPDATE todo_items SET sort_order = ?, version = version + 1, updated_at = ? WHERE id = ?", [row.sort_order, updatedAt, neighbor.id])
+        execute(database, "UPDATE todo_items SET sort_order = ?, version = version + 1, updated_at = ? WHERE id = ?", [row.sort_order, updatedAt, neighbor.id])
       }
-      database.run(
+      execute(database,
         "UPDATE todo_items SET title = ?, details = ?, status = ?, verification = ?, priority = ?, sort_order = ?, blocked_reason = ?, version = version + 1, updated_at = ? WHERE id = ?",
         [title, details ?? null, status, verification, priority, sortOrder, blockedReason ?? null, updatedAt, row.id]
       )
@@ -1790,11 +1785,11 @@ export class TodoRepository {
       if (!alreadyInReview && !statusTransitions[row.status].has("in_review")) throw new Error(`Invalid TODO transition: ${row.status} -> in_review`)
 
       if (!alreadyInReview) {
-        database.run(
+        const claim = execute(database,
           "UPDATE todo_items SET status = 'in_review', verification = 'not_checked', blocked_reason = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
           [now(), row.id, row.version]
         )
-        if (database.getRowsModified() !== 1) throw new TodoConflictError("TODO changed while recording its completion claim")
+        if (claim.changes !== 1) throw new TodoConflictError("TODO changed while recording its completion claim")
       }
       const resultVersion = alreadyInReview ? row.version : row.version + 1
       bumpList(database, list.id, row.id, "completion_claimed", "model", input.requestId, { expectedVersion: input.expectedVersion, resultVersion, previousStatus: row.status, review })
@@ -1830,7 +1825,7 @@ export class TodoRepository {
       )[0]
       if (unfinishedDependency) throw new Error("Complete prerequisite TODOs before completing this task")
       const updatedAt = now()
-      database.run(
+      execute(database,
         "UPDATE todo_items SET status = 'completed', verification = 'waived', blocked_reason = NULL, version = version + 1, updated_at = ? WHERE id = ?",
         [updatedAt, itemId]
       )
@@ -1857,7 +1852,7 @@ export class TodoRepository {
       const item = rows<{ id: string }>(database, "SELECT id FROM todo_items WHERE id = ? AND list_id = ?", [input.itemId, list.id])[0]
       if (!item) throw new Error("TODO item was not found in the active conversation")
       const evidence: TodoEvidence = { id: randomUUID(), itemId: input.itemId, kind, summary, result: input.result, createdAt: now() }
-      database.run("INSERT INTO todo_evidence(id, item_id, kind, summary, result, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      execute(database, "INSERT INTO todo_evidence(id, item_id, kind, summary, result, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         [evidence.id, evidence.itemId, evidence.kind, evidence.summary, evidence.result, evidence.createdAt]
       )
       bumpList(database, list.id, input.itemId, "evidence_added", "model", input.requestId, { kind, result: input.result, summary })

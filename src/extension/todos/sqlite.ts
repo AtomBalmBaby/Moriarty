@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto"
+import BetterSqlite from "better-sqlite3"
+import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
-import initSqlJs, { Database, SqlJsStatic } from "sql.js"
 
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
@@ -208,139 +208,175 @@ CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(l
 PRAGMA user_version = 12;
 `
 
+/** The authoritative native connection type for the TODO database. */
+export type Database = BetterSqlite.Database
+
+const CURRENT_SCHEMA_VERSION = 18
+const BUSY_TIMEOUT_MS = 5000
+
+/**
+ * The prebuilt binary for this runtime, or undefined to let better-sqlite3 choose. better-sqlite3 detects musl by reading
+ * process.report.getReport().header without a guard, and that throws in some extension-host processes where the report
+ * is undefined. Like the lancedb build patch, a missing report is treated as glibc.
+ */
+const sqlitePrebuildBinding = (): string | undefined => {
+  const report = process.report?.getReport?.() as { header?: { glibcVersionRuntime?: unknown } } | undefined
+  const musl = process.platform === "linux" && report?.header !== undefined && !report.header.glibcVersionRuntime
+  const target = `${musl ? "linuxmusl" : process.platform}-${process.arch}`
+  const binding = path.join(path.dirname(require.resolve("better-sqlite3")), "..", "prebuilds", `${target}.node`)
+  return existsSync(binding) ? binding : undefined
+}
+
+const tableColumns = (database: Database, table: string): { name: string; notnull: number }[] =>
+  database.pragma(`table_info(${table})`) as { name: string; notnull: number }[]
+
+const schemaVersion = (database: Database): number => Number(database.pragma("user_version", { simple: true }))
+
+const verifyIntegrity = (database: Database): void => {
+  const problems = (database.pragma("integrity_check") as { integrity_check: string }[])
+    .map((row) => row.integrity_check)
+    .filter((message) => message !== "ok")
+  if (problems.length > 0) throw new Error(`integrity_check failed: ${problems.slice(0, 5).join("; ")}`)
+}
+
 /** A database path, or a resolver awaited on first use so a failure is reported by the operation that needed the database. */
 export type SqliteLocation = string | (() => Promise<string>)
 
+/**
+ * The one authoritative native SQLite connection for a TODO database, opened on first use and kept until close().
+ * Durability: WAL with synchronous=FULL, so a committed transaction is fsynced before its write resolves.
+ * WAL requires a local filesystem; the database must not be placed on network storage.
+ */
+const openSqliteFiles = new Set<SqliteFile>()
+
 export class SqliteFile {
   private databasePath = ""
-  private lockPath = ""
   private readonly location: SqliteLocation
-  private readonly wasmPath: string
-  private sqlPromise?: Promise<SqlJsStatic>
-  private initialization?: Promise<void>
+  private connection?: Promise<Database>
+  private database?: Database
+  private closed = false
 
-  constructor(location: SqliteLocation, wasmPath: string) {
+  constructor(location: SqliteLocation) {
     this.location = location
-    this.wasmPath = wasmPath
-    if (typeof location === "string") this.assignDatabasePath(location)
-  }
-
-  private assignDatabasePath(databasePath: string) {
-    this.databasePath = databasePath
-    this.lockPath = `${databasePath}.lock`
+    if (typeof location === "string") this.databasePath = location
+    openSqliteFiles.add(this)
   }
 
   initialize(): Promise<void> {
-    if (!this.initialization) {
-      this.initialization = this.initializeOnce().catch((error) => {
-        this.initialization = undefined
+    return this.open().then(() => undefined)
+  }
+
+  private open(): Promise<Database> {
+    if (this.closed) return Promise.reject(new Error("The Twinny TODO database is closed"))
+    if (!this.connection) {
+      this.connection = this.openDatabase().catch((error) => {
+        this.connection = undefined
         throw error
       })
     }
-    return this.initialization
+    return this.connection
   }
 
-  private async initializeOnce(): Promise<void> {
-    if (typeof this.location !== "string") this.assignDatabasePath(await this.location())
-    await this.withLock(async () => {
-      const database = await this.openDatabase()
-      try {
-        const version = database.exec("PRAGMA user_version")[0]?.values[0]?.[0] ?? 0
-        if (typeof version !== "number") throw new Error("Could not read TODO database schema version")
-        if (version > 18) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
-        if (version === 0) {
-          database.run(SCHEMA)
-          await this.persist(database)
-        } else if (version === 1) {
-          database.run("ALTER TABLE todo_items ADD COLUMN source TEXT NOT NULL DEFAULT 'model' CHECK(source IN ('user','model','intent_compiler'))")
-          database.run(
-            "CREATE TABLE IF NOT EXISTS todo_intent_plans (list_id TEXT PRIMARY KEY REFERENCES todo_lists(id) ON DELETE CASCADE, plan_id TEXT NOT NULL, revision INTEGER NOT NULL, goal TEXT NOT NULL, constraints_json TEXT NOT NULL, intent_result_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS todo_intent_tasks (list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE, task_id TEXT NOT NULL, item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE, acceptance_json TEXT NOT NULL, dependencies_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(list_id, task_id)); PRAGMA user_version = 2;"
-          )
-          await this.persist(database)
-        }
-        if (version > 0 && version < 3) {
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_observations"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
-          await this.persist(database)
-        } else if (version === 3) {
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_evidence"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
-          await this.persist(database)
-        }
-        if (version > 0 && version < 5) {
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_child_proposals"), SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence")))
-          await this.persist(database)
-        }
-        if (version > 0 && version < 6) {
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence"), SCHEMA.indexOf("PRAGMA user_version = 6;") + "PRAGMA user_version = 6;".length))
-          await this.persist(database)
-        }
-        if (version > 0 && version < 7) {
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_symbol_aliases"), SCHEMA.indexOf("PRAGMA user_version = 7;") + "PRAGMA user_version = 7;".length))
-          await this.persist(database)
-        }
-        if (version > 0 && version < 8) {
-          const taskColumns = database.exec("PRAGMA table_info(todo_intent_tasks)")[0]?.values.map((row) => row[1]) ?? []
-          if (!taskColumns.includes("criteria_json")) database.run("ALTER TABLE todo_intent_tasks ADD COLUMN criteria_json TEXT")
-          database.run("PRAGMA user_version = 8")
-          await this.persist(database)
-        }
-        if (version > 0 && version < 9) {
-          // Pre-typed plans have no criteria_json. Their links are deactivated, never deleted, and the file is kept as a backup.
-          await fs.copyFile(this.databasePath, `${this.databasePath}.v8.bak`)
-          database.run("UPDATE todo_intent_tasks SET active = 0 WHERE criteria_json IS NULL")
-          const taskColumns = database.exec("PRAGMA table_info(todo_intent_tasks)")[0]?.values.map((row) => row[1]) ?? []
-          if (taskColumns.includes("acceptance_json")) database.run("ALTER TABLE todo_intent_tasks DROP COLUMN acceptance_json")
-          database.run("PRAGMA user_version = 9")
-          await this.persist(database)
-        }
-        if (version > 0 && version < 10) {
-          // Observations record the list revision that ordered them. Legacy rows stay NULL and sort before any new observation.
-          const observationColumns = database.exec("PRAGMA table_info(todo_tool_observations)")[0]?.values.map((row) => row[1]) ?? []
-          if (!observationColumns.includes("list_revision")) database.run("ALTER TABLE todo_tool_observations ADD COLUMN list_revision INTEGER")
-          database.run("CREATE INDEX IF NOT EXISTS todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision); PRAGMA user_version = 10")
-          await this.persist(database)
-        }
-        if (version > 0 && version < 11) {
-          // Activations are host-owned and additive: no existing row changes, and a v10 database gains an empty table.
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_requirement_activations"), SCHEMA.indexOf("PRAGMA user_version = 11;") + "PRAGMA user_version = 11;".length))
-          await this.persist(database)
-        }
-        if (version > 0 && version < 12) {
-          // Edit operations are additive: an existing database gains an empty ledger and no existing row changes.
-          database.run(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_edit_operations"), SCHEMA.indexOf("PRAGMA user_version = 12;") + "PRAGMA user_version = 12;".length))
-          await this.persist(database)
-        }
-        if (version < 13) {
-          await this.migrateEditOperationsToV13(database, version)
-        }
-        if (version < 14) {
-          await this.migrateEditOperationsToV14(database)
-        }
-        if (version < 15) {
-          await this.migrateIntentPlanAnswerToV15(database)
-        }
-        if (version < 16) {
-          await this.migrateAcceptedEvidenceToV16(database)
-        }
-        if (version < 17) {
-          await this.migrateObservationExecutionToV17(database)
-        }
-        if (version < 18) {
-          await this.migrateEvidenceUsageToV18(database)
-        }
-      } finally {
-        database.close()
-      }
-    })
+  private async openDatabase(): Promise<Database> {
+    if (typeof this.location !== "string") this.databasePath = await this.location()
+    await fs.mkdir(path.dirname(this.databasePath), { recursive: true })
+    const nativeBinding = sqlitePrebuildBinding()
+    const database = nativeBinding ? new BetterSqlite(this.databasePath, { nativeBinding }) : new BetterSqlite(this.databasePath)
+    try {
+      database.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`)
+      database.pragma("foreign_keys = ON")
+      database.pragma("synchronous = FULL")
+      if (database.pragma("journal_mode = WAL", { simple: true }) !== "wal") throw new Error("SQLite did not enable WAL journaling")
+      verifyIntegrity(database)
+      this.migrate(database)
+      if (this.closed) throw new Error("The Twinny TODO database was closed while opening")
+      this.database = database
+      return database
+    } catch (error) {
+      database.close()
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new Error(`Could not open the Twinny TODO database at ${this.databasePath}: ${reason}. The existing file was left in place and no replacement was created.`)
+    }
+  }
+
+  private migrate(database: Database): void {
+    const version = schemaVersion(database)
+    if (version > CURRENT_SCHEMA_VERSION) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
+    if (version === CURRENT_SCHEMA_VERSION) return
+    if (version > 0) this.backup(database, version)
+    database.transaction(() => {
+      const current = schemaVersion(database)
+      if (current > CURRENT_SCHEMA_VERSION) throw new Error(`TODO database version ${current} is newer than this Twinny version`)
+      this.applyMigrations(database, current)
+    }).immediate()
+  }
+
+  // VACUUM INTO writes a consistent snapshot, including WAL content, and cannot run inside a transaction.
+  // Each backup gets a new name, so an earlier backup is never overwritten.
+  private backup(database: Database, version: number): void {
+    database.prepare("VACUUM INTO ?").run(`${this.databasePath}.v${version}.${Date.now()}.bak`)
+  }
+
+  private applyMigrations(database: Database, version: number): void {
+    if (version === 0) {
+      database.exec(SCHEMA)
+    } else if (version === 1) {
+      database.exec("ALTER TABLE todo_items ADD COLUMN source TEXT NOT NULL DEFAULT 'model' CHECK(source IN ('user','model','intent_compiler'))")
+      database.exec(
+        "CREATE TABLE IF NOT EXISTS todo_intent_plans (list_id TEXT PRIMARY KEY REFERENCES todo_lists(id) ON DELETE CASCADE, plan_id TEXT NOT NULL, revision INTEGER NOT NULL, goal TEXT NOT NULL, constraints_json TEXT NOT NULL, intent_result_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS todo_intent_tasks (list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE, task_id TEXT NOT NULL, item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE, acceptance_json TEXT NOT NULL, dependencies_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(list_id, task_id)); PRAGMA user_version = 2;"
+      )
+    }
+    if (version > 0 && version < 3) {
+      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_observations"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
+    } else if (version === 3) {
+      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_evidence"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
+    }
+    if (version > 0 && version < 5) {
+      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_child_proposals"), SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence")))
+    }
+    if (version > 0 && version < 6) {
+      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence"), SCHEMA.indexOf("PRAGMA user_version = 6;") + "PRAGMA user_version = 6;".length))
+    }
+    if (version > 0 && version < 7) {
+      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_symbol_aliases"), SCHEMA.indexOf("PRAGMA user_version = 7;") + "PRAGMA user_version = 7;".length))
+    }
+    if (version > 0 && version < 8) {
+      if (!tableColumns(database, "todo_intent_tasks").some((column) => column.name === "criteria_json")) database.exec("ALTER TABLE todo_intent_tasks ADD COLUMN criteria_json TEXT")
+      database.exec("PRAGMA user_version = 8")
+    }
+    if (version > 0 && version < 9) {
+      // Pre-typed plans have no criteria_json. Their links are deactivated, never deleted; the pre-migration backup keeps the original rows.
+      database.exec("UPDATE todo_intent_tasks SET active = 0 WHERE criteria_json IS NULL")
+      if (tableColumns(database, "todo_intent_tasks").some((column) => column.name === "acceptance_json")) database.exec("ALTER TABLE todo_intent_tasks DROP COLUMN acceptance_json")
+      database.exec("PRAGMA user_version = 9")
+    }
+    if (version > 0 && version < 10) {
+      // Observations record the list revision that ordered them. Legacy rows stay NULL and sort before any new observation.
+      if (!tableColumns(database, "todo_tool_observations").some((column) => column.name === "list_revision")) database.exec("ALTER TABLE todo_tool_observations ADD COLUMN list_revision INTEGER")
+      database.exec("CREATE INDEX IF NOT EXISTS todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision); PRAGMA user_version = 10")
+    }
+    if (version > 0 && version < 11) {
+      // Activations are host-owned and additive: no existing row changes, and a v10 database gains an empty table.
+      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_requirement_activations"), SCHEMA.indexOf("PRAGMA user_version = 11;") + "PRAGMA user_version = 11;".length))
+    }
+    if (version > 0 && version < 12) {
+      // Edit operations are additive: an existing database gains an empty ledger and no existing row changes.
+      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_edit_operations"), SCHEMA.indexOf("PRAGMA user_version = 12;") + "PRAGMA user_version = 12;".length))
+    }
+    if (version < 13) this.migrateEditOperationsToV13(database)
+    if (version < 14) this.migrateEditOperationsToV14(database)
+    if (version < 15) this.migrateIntentPlanAnswerToV15(database)
+    if (version < 16) this.migrateAcceptedEvidenceToV16(database)
+    if (version < 17) this.migrateObservationExecutionToV17(database)
+    if (version < 18) this.migrateEvidenceUsageToV18(database)
   }
 
   // v13 makes an operation's task optional so project-scoped edits can be recorded without an active TODO.
   // Fresh databases pass through here after SCHEMA creates the v12 shape. Only the NOT NULL item column is rebuilt.
-  private async migrateEditOperationsToV13(database: Database, version: number): Promise<void> {
-    const columns = database.exec("PRAGMA table_info(todo_edit_operations)")[0]?.values ?? []
-    const itemColumn = columns.find((row) => row[1] === "item_id")
-    if (itemColumn?.[3] === 1) {
-      if (version > 0) await fs.copyFile(this.databasePath, `${this.databasePath}.v12.bak`)
-      database.run(`
+  private migrateEditOperationsToV13(database: Database): void {
+    const itemColumn = tableColumns(database, "todo_edit_operations").find((column) => column.name === "item_id")
+    if (itemColumn?.notnull === 1) {
+      database.exec(`
 CREATE TABLE todo_edit_operations_v13 (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
@@ -361,55 +397,46 @@ ALTER TABLE todo_edit_operations_v13 RENAME TO todo_edit_operations;
 CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
 `)
     }
-    database.run("PRAGMA user_version = 13")
-    await this.persist(database)
+    database.exec("PRAGMA user_version = 13")
   }
 
   // v14 records the extension host that dispatched each edit. The column is additive; rows from earlier versions keep
   // a NULL owner, which another host can never settle as absent.
-  private async migrateEditOperationsToV14(database: Database): Promise<void> {
-    const columns = database.exec("PRAGMA table_info(todo_edit_operations)")[0]?.values ?? []
-    if (!columns.some((row) => row[1] === "owner_id")) database.run("ALTER TABLE todo_edit_operations ADD COLUMN owner_id TEXT")
-    database.run("PRAGMA user_version = 14")
-    await this.persist(database)
+  private migrateEditOperationsToV14(database: Database): void {
+    if (!tableColumns(database, "todo_edit_operations").some((column) => column.name === "owner_id")) database.exec("ALTER TABLE todo_edit_operations ADD COLUMN owner_id TEXT")
+    database.exec("PRAGMA user_version = 14")
   }
 
   // v15 stores the objective answer requirements of an intent plan. The column is additive; plans from earlier versions
   // have no requirements, which is the same as a plan that asks for none.
-  private async migrateIntentPlanAnswerToV15(database: Database): Promise<void> {
-    const columns = database.exec("PRAGMA table_info(todo_intent_plans)")[0]?.values ?? []
-    if (!columns.some((row) => row[1] === "answer_json")) database.run("ALTER TABLE todo_intent_plans ADD COLUMN answer_json TEXT NOT NULL DEFAULT '[]'")
-    database.run("PRAGMA user_version = 15")
-    await this.persist(database)
+  private migrateIntentPlanAnswerToV15(database: Database): void {
+    if (!tableColumns(database, "todo_intent_plans").some((column) => column.name === "answer_json")) database.exec("ALTER TABLE todo_intent_plans ADD COLUMN answer_json TEXT NOT NULL DEFAULT '[]'")
+    database.exec("PRAGMA user_version = 15")
   }
 
   // v16 makes an accepted evidence row the single authority for a tool registration it proves: registered_tool names the
   // tool, and symbol names the implementation. Rows from earlier versions keep a NULL registered_tool and are not
   // backfilled from todo_symbol_aliases, because those rows came from the removed line-indentation heuristic. The alias
   // table is kept unchanged as history and is no longer written or read.
-  private async migrateAcceptedEvidenceToV16(database: Database): Promise<void> {
-    const columns = database.exec("PRAGMA table_info(todo_accepted_evidence)")[0]?.values ?? []
-    if (!columns.some((row) => row[1] === "registered_tool")) database.run("ALTER TABLE todo_accepted_evidence ADD COLUMN registered_tool TEXT")
-    database.run("PRAGMA user_version = 16")
-    await this.persist(database)
+  private migrateAcceptedEvidenceToV16(database: Database): void {
+    if (!tableColumns(database, "todo_accepted_evidence").some((column) => column.name === "registered_tool")) database.exec("ALTER TABLE todo_accepted_evidence ADD COLUMN registered_tool TEXT")
+    database.exec("PRAGMA user_version = 16")
   }
 
   // v17 records the host-generated execution that produced each tool observation, so failures can be reported for the
   // execution that made them. Rows from earlier versions keep a NULL execution_id: they stay as history and are never
   // attributed to a later execution. No rows are rewritten or deleted.
-  private async migrateObservationExecutionToV17(database: Database): Promise<void> {
-    const columns = database.exec("PRAGMA table_info(todo_tool_observations)")[0]?.values ?? []
-    if (!columns.some((row) => row[1] === "execution_id")) database.run("ALTER TABLE todo_tool_observations ADD COLUMN execution_id TEXT")
-    database.run("CREATE INDEX IF NOT EXISTS todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id)")
-    database.run("PRAGMA user_version = 17")
-    await this.persist(database)
+  private migrateObservationExecutionToV17(database: Database): void {
+    if (!tableColumns(database, "todo_tool_observations").some((column) => column.name === "execution_id")) database.exec("ALTER TABLE todo_tool_observations ADD COLUMN execution_id TEXT")
+    database.exec("CREATE INDEX IF NOT EXISTS todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id)")
+    database.exec("PRAGMA user_version = 17")
   }
 
   // v18 records project-wide accepted-evidence usage. One row per fact, kind, and execution, so repeated identical
   // requests within one execution count once, while each execution in any conversation of the project counts once.
   // Usage rows never change the accepted fact they reference; they are removed only if their fact is removed.
-  private async migrateEvidenceUsageToV18(database: Database): Promise<void> {
-    database.run(`
+  private migrateEvidenceUsageToV18(database: Database): void {
+    database.exec(`
 CREATE TABLE IF NOT EXISTS todo_evidence_usage (
   id TEXT PRIMARY KEY,
   fact_id TEXT NOT NULL REFERENCES todo_accepted_evidence(id) ON DELETE CASCADE,
@@ -422,107 +449,33 @@ CREATE TABLE IF NOT EXISTS todo_evidence_usage (
 );
 CREATE INDEX IF NOT EXISTS todo_evidence_usage_project ON todo_evidence_usage(project_id, fact_id);
 PRAGMA user_version = 18;`)
-    await this.persist(database)
   }
 
   async read<T>(operation: (database: Database) => T): Promise<T> {
-    await this.initialize()
-    const database = await this.openDatabase()
-    try {
-      return operation(database)
-    } finally {
-      database.close()
-    }
+    return operation(await this.open())
   }
 
   async write<T>(operation: (database: Database) => T): Promise<T> {
-    await this.initialize()
-    return this.withLock(async () => {
-      const database = await this.openDatabase()
-      try {
-        database.run("BEGIN IMMEDIATE")
-        const result = operation(database)
-        database.run("COMMIT")
-        await this.persist(database)
-        return result
-      } catch (error) {
-        try {
-          database.run("ROLLBACK")
-        } catch {
-          // The transaction may already have rolled back after a commit error.
-        }
-        throw error
-      } finally {
-        database.close()
-      }
-    })
+    const database = await this.open()
+    return database.transaction(() => {
+      const result = operation(database)
+      if (result instanceof Promise) throw new Error("TODO database writes must complete synchronously")
+      return result
+    }).immediate()
   }
 
-  private async openDatabase(): Promise<Database> {
-    let bytes: Uint8Array | undefined
-    try {
-      bytes = await fs.readFile(this.databasePath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    }
-    const sql = await (this.sqlPromise ??= initSqlJs({ locateFile: () => this.wasmPath }))
-    const database = new sql.Database(bytes)
-    database.run("PRAGMA foreign_keys = ON")
-    return database
+  close(): void {
+    this.closed = true
+    this.connection = undefined
+    this.database?.close()
+    this.database = undefined
+    openSqliteFiles.delete(this)
   }
+}
 
-  private async persist(database: Database): Promise<void> {
-    const temporaryPath = `${this.databasePath}.${process.pid}.${randomUUID()}.tmp`
-    try {
-      const handle = await fs.open(temporaryPath, "wx", 0o600)
-      try {
-        await handle.writeFile(database.export())
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-      await fs.rename(temporaryPath, this.databasePath)
-    } catch (error) {
-      try {
-        await fs.unlink(temporaryPath)
-      } catch (cleanupError) {
-        if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") throw cleanupError
-      }
-      throw error
-    }
-  }
-
-  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
-    await fs.mkdir(path.dirname(this.databasePath), { recursive: true })
-    const deadline = Date.now() + 15_000
-    let lock: Awaited<ReturnType<typeof fs.open>> | undefined
-    while (!lock) {
-      try {
-        lock = await fs.open(this.lockPath, "wx", 0o600)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-        try {
-          const stat = await fs.stat(this.lockPath)
-          if (Date.now() - stat.mtimeMs > 120_000) {
-            await fs.unlink(this.lockPath)
-            continue
-          }
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError
-          continue
-        }
-        if (Date.now() >= deadline) throw new Error("Timed out waiting for the Twinny TODO database lock")
-        await new Promise((resolve) => setTimeout(resolve, 40))
-      }
-    }
-    try {
-      await lock.writeFile(`${process.pid}\n`)
-      return await operation()
-    } finally {
-      await lock.close()
-      await fs.unlink(this.lockPath)
-    }
-  }
+/** Closes every TODO database connection so a checkpoint completes before the extension host exits. */
+export const closeTodoDatabases = (): void => {
+  for (const file of [...openSqliteFiles]) file.close()
 }
 
 export const PROJECT_TODO_DIRECTORY = ".twinny"

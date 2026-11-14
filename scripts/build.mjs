@@ -30,7 +30,7 @@ const lanceGlibcCheck = {
   const extensionConfig = {
     bundle: true,
     entryPoints: ["src/index.ts", "src/extension/embeddings/rerank-worker.ts"],
-    external: ["vscode", "esbuild", "./xhr-sync-worker.js", "sodium-native", "udx-native", "b4a", "sqlite3"],
+    external: ["vscode", "esbuild", "./xhr-sync-worker.js", "sodium-native", "udx-native", "b4a", "sqlite3", "better-sqlite3"],
     format: "cjs",
     outdir: "out",
     platform: "node",
@@ -45,10 +45,6 @@ const lanceGlibcCheck = {
           {
             from: "./node_modules/onnxruntime-web/dist/ort-wasm-simd.wasm",
             to: "./out/ort-wasm-simd.wasm"
-          },
-          {
-            from: "./node_modules/sql.js/dist/sql-wasm.wasm",
-            to: "./out/sql-wasm.wasm"
           },
           {
             from: "./node_modules/tree-sitter-wasms/out/**/*.wasm",

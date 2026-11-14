@@ -165,7 +165,7 @@ suite("Prompt Compiler and Feedback", () => {
     const chatProvider = { ...roleProvider, id: "chat-provider", modelName: "chat-model", provider: "scripted-chat-executor", type: "chat" as const }
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-compile-only-"))
     const context = makeContext({}, { [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: roleProvider, [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: chatProvider })
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const emitted: Array<{ event: string; data: unknown }> = []
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
     const scope = {
@@ -191,7 +191,7 @@ suite("Prompt Compiler and Feedback", () => {
     await setSetting(PROMPT_COMPILER_PROVIDER_KEY, "missing-compiler-provider")
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-compile-isolation-"))
     const context = makeContext()
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined, undefined, repository)
     const scope = { projectFingerprint: "isolation-project", conversationId: "isolation-chat", writer: "isolation-chat" }
     try {
@@ -212,7 +212,7 @@ suite("Prompt Compiler and Feedback", () => {
   test("Feedback plans TODOs for an ordinary prompt with the compiler disabled, without duplicates", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-plan-"))
     const context = makeContext()
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const emitted: Array<{ event: string; data: unknown }> = []
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
     const scope = { projectFingerprint: "feedback-project", conversationId: "feedback-chat", writer: "feedback-chat" }
@@ -244,7 +244,7 @@ suite("Prompt Compiler and Feedback", () => {
   test("an ordinary chat with agent mode off still gets Feedback TODOs", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-agent-off-"))
     const context = makeContext({}, { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: roleProvider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: roleProvider })
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const emitted: Array<{ event: string; data: unknown }> = []
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
     try {
@@ -264,7 +264,7 @@ suite("Prompt Compiler and Feedback", () => {
   test("a compiled execution prompt still starts Feedback and the first chat request sees the plan", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-compiled-"))
     const context = makeContext({}, { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: roleProvider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: roleProvider })
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const emitted: Array<{ event: string; data: unknown }> = []
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
     try {
@@ -284,7 +284,7 @@ suite("Prompt Compiler and Feedback", () => {
     await setSetting(FEEDBACK_ENABLED_KEY, false)
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-off-"))
     const context = makeContext()
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(), undefined, undefined, repository)
     try {
       assert.equal((await feedbackPlanner(chat).start({ projectFingerprint: "p", conversationId: "c", writer: "c" }, "Fix it.")).status, "disabled")
@@ -299,7 +299,7 @@ suite("Prompt Compiler and Feedback", () => {
     model.failWith = Object.assign(new Error("401 Unauthorized"), { status: 401 })
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "twinny-feedback-auth-"))
     const context = makeContext()
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const emitted: Array<{ event: string; data: unknown }> = []
     const chat = new Chat(new GenerationTracker(), undefined, context, makeBridge(emitted), undefined, undefined, repository)
     try {

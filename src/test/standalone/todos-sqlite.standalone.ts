@@ -1,16 +1,36 @@
+import BetterSqlite from "better-sqlite3"
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import initSqlJs from "sql.js"
 
 import { logger } from "../../common/logger"
 import { TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import { type LegacyTodoRetirement, prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase } from "../../extension/todos/sqlite"
 import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
 
-const wasmPath = path.join(process.cwd(), "out", "sql-wasm.wasm")
+
+test("the TODO database opens when process.report yields no report, as in some extension-host processes", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-native-binding-"))
+  try {
+    const databasePath = path.join(directory, "twinny-state.sqlite")
+    // A child process has a fresh better-sqlite3 binding cache, so the open must not depend on earlier opens.
+    const script = `
+      process.report.getReport = () => undefined
+      const { SqliteFile, closeTodoDatabases } = require(process.argv[1])
+      new SqliteFile(process.argv[2]).initialize().then(
+        () => closeTodoDatabases(),
+        (error) => { console.error(error); process.exitCode = 1; closeTodoDatabases() }
+      )
+    `
+    execFileSync(process.execPath, ["-e", script, path.join(__dirname, "../../extension/todos/sqlite.js"), databasePath], { stdio: "pipe" })
+    assert.ok(fs.existsSync(databasePath))
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
 
 test("the repository rejects TODO writes whose writer is not the target conversation, and leaves the list unchanged", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-write-isolation-"))
@@ -19,7 +39,7 @@ test("the repository rejects TODO writes whose writer is not the target conversa
     const project = workspaceProjectFingerprint(["file:///write-isolation"])
     const owner = { projectFingerprint: project, conversationId: "owner-chat", writer: "owner-chat" }
     const intruder = { ...owner, writer: "intruder-chat" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
     const item = await repository.createItem(owner, { title: "Owner task" }, "owner-create")
     const itemCountBefore = (await repository.getList(owner)).items.length
     const before = JSON.stringify(await repository.getList(owner))
@@ -53,7 +73,7 @@ test("native TODO SQLite repository persists scoped lists, idempotency, and user
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-a"]), conversationId: "chat-a", writer: "chat-a" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
 
     const firstSnapshot = await repository.getList(scope)
     const created = await repository.createItem(scope, { title: "Persist this task" }, "request-create")
@@ -70,7 +90,7 @@ test("native TODO SQLite repository persists scoped lists, idempotency, and user
     assert.notEqual(sameRequestInOtherChat.id, created.id)
     assert.notEqual(otherChat.id, firstSnapshot.id)
 
-    const reopened = new TodoRepository(databasePath, wasmPath)
+    const reopened = new TodoRepository(databasePath)
     const persisted = await reopened.getList(scope)
     assert.equal(persisted.items[0].id, created.id)
     assert.equal(persisted.items[0].title, "Persist this task")
@@ -141,8 +161,8 @@ test("native TODO repository serializes concurrent writers across repository ins
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
     const scope = { projectFingerprint: "project", conversationId: "chat", writer: "chat" }
-    const first = new TodoRepository(databasePath, wasmPath)
-    const second = new TodoRepository(databasePath, wasmPath)
+    const first = new TodoRepository(databasePath)
+    const second = new TodoRepository(databasePath)
 
     await Promise.all([
       first.createItem(scope, { title: "First" }, "concurrent-first"),
@@ -161,7 +181,7 @@ test("native TODO toolset is namespaced, scoped, and sends authoritative snapsho
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-todos-tools-"))
   try {
     const scope = { projectFingerprint: "tool-project", conversationId: "tool-chat", writer: "tool-chat" }
-    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"))
     let changed = 0
     const tools = (await import("../../extension/tools/todos")).todoWorkspaceTools(repository, scope, () => { changed += 1 })
     assert.deepEqual(tools.tools.map((tool) => tool.name), [
@@ -253,7 +273,7 @@ test("concurrent and stale plan revisions are resolved transactionally without l
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-revision"]), conversationId: "chat-revision", writer: "chat-revision" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
     const makePlan = (revision: number, title = "Inspect parser") => ({
       planId: "plan-revision",
       version: 1 as const,
@@ -324,7 +344,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-a"]), conversationId: "chat-plan-a", writer: "chat-plan-a" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
     const makePlan = (revision: number, title = "Inspect parser") => ({
       planId: "plan-parser",
       version: 1 as const,
@@ -399,7 +419,7 @@ test("intent plans reconcile atomically, preserve progress, evidence, and chat i
     await assert.rejects(repository.synchronizeIntentPlan(scope, makePlan(3, "Stale plan"), { plan: makePlan(3, "Stale plan") }), /older than the stored revision/)
     assert.deepEqual(await repository.getList(scope), beforeInvalid)
 
-    const reopened = new TodoRepository(databasePath, wasmPath)
+    const reopened = new TodoRepository(databasePath)
     const persistedPlan = await reopened.getIntentTaskPlan(scope)
     assert.equal(persistedPlan?.revision, 4)
     assert.equal(persistedPlan?.tasks.length, 2)
@@ -420,7 +440,7 @@ test("a replacement for a completed plan relinks reused task IDs to new items an
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-replace"]), conversationId: "chat-replace", writer: "chat-replace" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
     const planWith = (planId: string, revision: number, tasks: { id: string; title: string }[]) => ({
       planId,
       version: 1 as const,
@@ -458,7 +478,7 @@ test("failed tool operations report only the active plan's tasks across revision
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-failure-scope"]), conversationId: "chat-failure-scope", writer: "chat-failure-scope" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
     const planWith = (planId: string, revision: number, tasks: { id: string; title: string }[]) => ({
       planId,
       version: 1 as const,
@@ -510,7 +530,7 @@ test("a review of a task the plan superseded names the supersession, while unkno
     const project = workspaceProjectFingerprint(["file:///project-superseded-review"])
     const scope = { projectFingerprint: project, conversationId: "chat-superseded", writer: "chat-superseded" }
     const other = { projectFingerprint: project, conversationId: "chat-other", writer: "chat-other" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
     const planWith = (planId: string, revision: number, tasks: { id: string; title: string }[]) => ({
       planId,
       version: 1 as const,
@@ -546,7 +566,7 @@ test("evidence records log successes at DEBUG and failures at INFO, so routine e
   try {
     const databasePath = path.join(directory, "twinny-state.sqlite")
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-evidence-log"]), conversationId: "chat-evidence-log", writer: "chat-evidence-log" }
-    const repository = new TodoRepository(databasePath, wasmPath)
+    const repository = new TodoRepository(databasePath)
     const plan = {
       planId: "plan-evidence-log", version: 1 as const, revision: 1, goal: "Locate the parser", constraints: [],
       tasks: [{ id: "locate", title: "Locate the parser", description: "Find the parser", criteria: [{ id: "parser-located", description: "Parser located", verification: { kind: "semantic_review" } }], dependencies: [] }]
@@ -572,7 +592,7 @@ test("native TODO transitions reject placeholder blocks, recover blocked tasks, 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-transition-todos-"))
   try {
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-transitions"]), conversationId: "chat-transitions", writer: "chat-transitions" }
-    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"))
     const item = await repository.createItem(scope, { title: "Locate the parser" }, "request-create-transition")
 
     await assert.rejects(
@@ -613,7 +633,7 @@ test("model-created TODO reconciliation ignores articles but keeps distinct task
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-dedupe-todos-"))
   try {
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-dedupe"]), conversationId: "chat-dedupe", writer: "chat-dedupe" }
-    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"))
     const planned = await repository.createItem(scope, { title: "Locate and verify the native read_file definition" }, "plan-item", "user")
     const recreated = await repository.createItem(scope, { title: "Locate and verify native read_file definition" }, "model-recreate")
     assert.equal(recreated.id, planned.id)
@@ -629,7 +649,7 @@ test("the first completion claim is accepted once and repeats are acknowledged w
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-claim-todos-"))
   try {
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-claims"]), conversationId: "chat-claims", writer: "chat-claims" }
-    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"))
     const item = await repository.createItem(scope, { title: "Locate the read_file definition" }, "create-claim")
 
     const first = await repository.claimCompletion(scope, { itemId: item.id, expectedVersion: item.version, requestId: "claim-first" })
@@ -669,7 +689,7 @@ test("eleven repeated completion requests produce one accepted claim, one review
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-repeat-claims-"))
   try {
     const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-repeat-claims"]), conversationId: "chat-repeat-claims", writer: "chat-repeat-claims" }
-    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"), wasmPath)
+    const repository = new TodoRepository(path.join(directory, "twinny-state.sqlite"))
     const item = await repository.createItem(scope, { title: "Locate the native read_file definition" }, "create-repeat")
 
     const claims: TodoCompletionClaim[] = []
@@ -698,7 +718,7 @@ test("eleven repeated completion requests produce one accepted claim, one review
 const TMP_SIDECAR = "twinny-state.sqlite.4242.0f8fad5b-d9cb-469f-a165-8c45a5d2c123.tmp"
 
 const projectLocation = (folders: { scheme: string; fsPath: string }[]) => async () => prepareProjectTodoStorage(resolveProjectTodoStorage(folders))
-const projectRepository = (root: string) => new TodoRepository(projectLocation([{ scheme: "file", fsPath: root }]), wasmPath)
+const projectRepository = (root: string) => new TodoRepository(projectLocation([{ scheme: "file", fsPath: root }]))
 const projectScope = (root: string, conversationId = "project-chat") => ({
   projectFingerprint: workspaceProjectFingerprint([`file://${root}`]),
   conversationId,
@@ -719,7 +739,12 @@ const makeProject = (directory: string, name = "project") => {
 }
 const legacyDatabaseIn = async (globalStorageDir: string, root: string) => {
   const legacyPath = path.join(globalStorageDir, "twinny-state.sqlite")
-  await new TodoRepository(legacyPath, wasmPath).createItem(projectScope(root), { title: "Legacy task" }, "legacy-create")
+  const repository = new TodoRepository(legacyPath)
+  try {
+    await repository.createItem(projectScope(root), { title: "Legacy task" }, "legacy-create")
+  } finally {
+    repository.close()
+  }
   return legacyPath
 }
 const blockedReason = (outcome: LegacyTodoRetirement): string => {
@@ -734,10 +759,9 @@ test("a project creates .twinny/evidence.sqlite with the current schema and git-
 
     const databasePath = path.join(root, ".twinny", "evidence.sqlite")
     assert.equal(fs.existsSync(databasePath), true)
-    const sql = await initSqlJs({ locateFile: () => wasmPath })
-    const database = new sql.Database(fs.readFileSync(databasePath))
+    const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
     try {
-      assert.equal(database.exec("PRAGMA user_version")[0].values[0][0], 18)
+      assert.equal(database.pragma("user_version", { simple: true }), 18)
     } finally {
       database.close()
     }
@@ -777,7 +801,7 @@ test("a fresh project database contains no legacy TODOs even when the legacy dat
     fs.mkdirSync(globalStorageDir)
     const root = makeProject(directory)
     await legacyDatabaseIn(globalStorageDir, root)
-    assert.equal((await new TodoRepository(path.join(globalStorageDir, "twinny-state.sqlite"), wasmPath).getList(projectScope(root))).items.length, 1)
+    assert.equal((await new TodoRepository(path.join(globalStorageDir, "twinny-state.sqlite")).getList(projectScope(root))).items.length, 1)
 
     const fresh = projectRepository(root)
     assert.equal((await fresh.getList(projectScope(root))).items.length, 0)
@@ -886,9 +910,9 @@ test("ambiguous, empty, and non-local workspace folders fail explicitly and crea
     assert.throws(() => resolveProjectTodoStorage([{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]), /cannot choose between multiple workspace folders/)
     assert.throws(() => resolveProjectTodoStorage([{ scheme: "vscode-remote", fsPath: first }]), /not a "vscode-remote" folder/)
 
-    const ambiguous = new TodoRepository(projectLocation([{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]), wasmPath)
+    const ambiguous = new TodoRepository(projectLocation([{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]))
     await assert.rejects(ambiguous.getList(projectScope(first)), /cannot choose between multiple workspace folders/)
-    const none = new TodoRepository(projectLocation([]), wasmPath)
+    const none = new TodoRepository(projectLocation([]))
     await assert.rejects(none.getList(projectScope(first)), /needs an open project folder/)
     assert.equal(fs.existsSync(path.join(first, ".twinny")), false)
     assert.equal(fs.existsSync(path.join(second, ".twinny")), false)
@@ -952,15 +976,77 @@ test("a project database from a newer Twinny schema is refused and left untouche
     const root = makeProject(directory)
     await projectRepository(root).initialize()
     const databasePath = path.join(root, ".twinny", "evidence.sqlite")
-    const sql = await initSqlJs({ locateFile: () => wasmPath })
-    const database = new sql.Database(fs.readFileSync(databasePath))
-    database.run("PRAGMA user_version = 19")
-    fs.writeFileSync(databasePath, Buffer.from(database.export()))
+    const database = new BetterSqlite(databasePath)
+    database.pragma("user_version = 19")
     database.close()
     const before = fs.readFileSync(databasePath)
 
     await assert.rejects(projectRepository(root).initialize(), /newer than this Twinny version/)
     assert.deepEqual(fs.readFileSync(databasePath), before, "no automatic reset or deletion occurs")
   })
+})
+
+test("a failed intent plan transaction rolls back every item, dependency, task, plan, and event write", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-rollback-todos-"))
+  const databasePath = path.join(directory, "twinny-state.sqlite")
+  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///project-rollback"]), conversationId: "chat-rollback", writer: "chat-rollback" }
+  const repository = new TodoRepository(databasePath)
+  try {
+    const planWith = (revision: number, tasks: { id: string; title: string; dependencies: string[] }[]) => ({
+      planId: "plan-rollback",
+      version: 1 as const,
+      revision,
+      goal: "Keep the parser working",
+      constraints: [],
+      tasks: tasks.map((task) => ({ id: task.id, title: task.title, description: `${task.title} details`, criteria: [{ id: `${task.id}-done`, description: `${task.title} is done`, verification: { kind: "semantic_review" as const } }], dependencies: task.dependencies }))
+    })
+    const sync = (plan: ReturnType<typeof planWith>) => repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: plan.goal, plan })
+    const readCounts = () => {
+      const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+      try {
+        const count = (sql: string) => (database.prepare(sql).get() as { n: number }).n
+        return {
+          events: count("SELECT COUNT(*) AS n FROM todo_events"),
+          items: count("SELECT COUNT(*) AS n FROM todo_items"),
+          dependencies: count("SELECT COUNT(*) AS n FROM todo_dependencies"),
+          activeTasks: count("SELECT COUNT(*) AS n FROM todo_intent_tasks WHERE active = 1")
+        }
+      } finally {
+        database.close()
+      }
+    }
+
+    await sync(planWith(1, [
+      { id: "inspect", title: "Inspect parser", dependencies: [] },
+      { id: "verify", title: "Verify parser", dependencies: ["inspect"] }
+    ]))
+    const before = await repository.getList(scope)
+    const planBefore = await repository.getIntentTaskPlan(scope)
+    const countsBefore = readCounts()
+
+    const injecting = new BetterSqlite(databasePath)
+    injecting.exec("CREATE TRIGGER fail_new_task BEFORE INSERT ON todo_intent_tasks WHEN NEW.task_id = 'review' BEGIN SELECT RAISE(ABORT, 'injected failure'); END")
+    injecting.close()
+
+    const revised = [
+      { id: "inspect", title: "Inspect parser deeply", dependencies: [] },
+      { id: "verify", title: "Verify parser", dependencies: ["inspect"] },
+      { id: "review", title: "Review parser", dependencies: ["verify"] }
+    ]
+    await assert.rejects(sync(planWith(2, revised)), /injected failure/)
+    assert.deepEqual(await repository.getList(scope), before)
+    assert.deepEqual(await repository.getIntentTaskPlan(scope), planBefore)
+    assert.deepEqual(readCounts(), countsBefore)
+
+    const removing = new BetterSqlite(databasePath)
+    removing.exec("DROP TRIGGER fail_new_task")
+    removing.close()
+    const recovered = await sync(planWith(2, revised))
+    assert.deepEqual(recovered.items.map((item) => item.title), ["Inspect parser deeply", "Verify parser", "Review parser"])
+    assert.equal((await repository.getIntentTaskPlan(scope))?.revision, 2)
+  } finally {
+    repository.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
 })
 

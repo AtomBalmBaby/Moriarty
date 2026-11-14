@@ -19,6 +19,7 @@ target
 
 # Never in the extension: local state, editor-side tooling, compiled tests, packages.
 .claude/**
+.twinny/**
 .vscode-test.js
 twinny.gateway.json
 out/test/**
@@ -41,5 +42,9 @@ out/test/**
 !node_modules/events-universal/**
 
 !node_modules/sqlite3/**
+!node_modules/better-sqlite3/lib/**
+!node_modules/better-sqlite3/prebuilds/**
+!node_modules/better-sqlite3/package.json
+node_modules/better-sqlite3/node_modules/**
 !node_modules/bindings/**
 !node_modules/file-uri-to-path/**

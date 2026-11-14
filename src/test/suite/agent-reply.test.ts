@@ -7,11 +7,11 @@
  * changed, and undo puts the workspace back.
  */
 import * as assert from "assert"
+import BetterSqlite from "better-sqlite3"
 import { execFileSync } from "child_process"
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
-import initSqlJs from "sql.js"
 import * as vscode from "vscode"
 
 import { AGENT_SELECTION_STORAGE_KEY } from "../../common/agents"
@@ -168,7 +168,7 @@ const feedbackRig = async (
     workspaceState: { get: () => undefined, update: async () => undefined },
     subscriptions: []
   } as unknown as vscode.ExtensionContext
-  const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+  const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
   const goal = "Make the requested change to the cancellation fixture."
   const scope = {
     projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
@@ -229,10 +229,7 @@ suite("Agent reply, end to end", function () {
       subscriptions: []
     } as unknown as vscode.ExtensionContext
     const bridge = new ExtensionBridge(fakeWebview() as unknown as vscode.Webview)
-    const repository = new TodoRepository(
-      path.join(directory, "todos.sqlite"),
-      path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm")
-    )
+    const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
     const chat = new Chat(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
 
     try {
@@ -270,7 +267,7 @@ suite("Agent reply, end to end", function () {
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
     } as unknown as vscode.ExtensionContext
-    const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
     const scope = { projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))), conversationId: "feedback-disabled-chat", writer: "feedback-disabled-chat" }
     const plan = { planId: "feedback-disabled-plan", version: 1 as const, revision: 1, goal: "Verify one task", constraints: [], tasks: [
       { id: "review-me", title: "Review me", description: "A task to remain in review", criteria: [{ id: "criterion-1", description: "Source inspected", verification: { kind: "semantic_review" } }], dependencies: [] as string[] }
@@ -309,10 +306,7 @@ suite("Agent reply, end to end", function () {
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
     } as unknown as vscode.ExtensionContext
-    const repository = new TodoRepository(
-      path.join(directory, "todos.sqlite"),
-      path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm")
-    )
+    const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
     const scope = {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
       conversationId: "bounded-task-chat",
@@ -402,7 +396,7 @@ suite("Agent reply, end to end", function () {
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
     } as unknown as vscode.ExtensionContext
-    const repository = new TodoRepository(path.join(directory, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
     const goal = "Implement the requested TODO panel improvements."
     const scope = {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
@@ -598,7 +592,7 @@ suite("Agent reply, end to end", function () {
       workspaceState: { get: () => undefined, update: async () => undefined },
       subscriptions: []
     } as unknown as vscode.ExtensionContext
-    const repository = new TodoRepository(path.join(root, "todos.sqlite"), path.join(context.extensionUri.fsPath, "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const goal = "Modify src/webview/todo-panel.tsx with collapsible TODO cards; do not delete the component."
     const scope = {
       projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
@@ -671,7 +665,7 @@ suite("Agent reply, end to end", function () {
     providerRegistry.register("scripted-intent", { id: "scripted-intent", create: () => intent })
     stored[ACTIVE_INTENT_PROVIDER_STORAGE_KEY] = { ...provider, id: "scripted-intent", provider: "scripted-intent", type: "intent" }
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-webview-storage-"))
-    const repository = new TodoRepository(path.join(storage, "todos.sqlite"), path.join(path.resolve(__dirname, "../../.."), "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(storage, "todos.sqlite"))
     await repository.initialize()
     const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
     chat.root = root
@@ -937,7 +931,7 @@ suite("Agent reply, end to end", function () {
     providerRegistry.register("scripted-intent", { id: "scripted-intent", create: () => intent })
     stored[ACTIVE_INTENT_PROVIDER_STORAGE_KEY] = { ...provider, id: "scripted-intent", provider: "scripted-intent", type: "intent" }
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-e2e-storage-"))
-    const repository = new TodoRepository(path.join(storage, "todos.sqlite"), path.join(path.resolve(__dirname, "../../.."), "out", "sql-wasm.wasm"))
+    const repository = new TodoRepository(path.join(storage, "todos.sqlite"))
     await repository.initialize()
     const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
     chat.root = root
@@ -1422,7 +1416,6 @@ suite("Read-file acceptance, production controller", function () {
     root: string
     storage: string
     databasePath: string
-    wasmPath: string
     projectFingerprint: string
   }
 
@@ -1442,7 +1435,6 @@ suite("Read-file acceptance, production controller", function () {
         root,
         storage,
         databasePath: path.join(storage, "todos.sqlite"),
-        wasmPath: path.join(path.resolve(__dirname, "../../.."), "out", "sql-wasm.wasm"),
         projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true)))
       })
     } finally {
@@ -1469,7 +1461,7 @@ suite("Read-file acceptance, production controller", function () {
     onWaiting?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
     onStoppable?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
   }) => {
-    const repository = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+    const repository = new TodoRepository(workspace.databasePath)
     await repository.initialize()
     options.onRepository?.(repository)
     const agentId = `${options.conversationId}-agent`
@@ -1589,10 +1581,9 @@ suite("Read-file acceptance, production controller", function () {
 
   /** Counts the tool observations persisted in the workspace database, by tool name. */
   const observationCounts = async (workspace: Workspace) => {
-    const sql = await initSqlJs({ locateFile: () => workspace.wasmPath })
-    const database = new sql.Database(fs.readFileSync(workspace.databasePath))
+    const database = new BetterSqlite(workspace.databasePath, { fileMustExist: true })
     try {
-      const rows = database.exec("SELECT tool_name, COUNT(*) FROM todo_tool_observations GROUP BY tool_name")[0]?.values ?? []
+      const rows = database.prepare("SELECT tool_name, COUNT(*) FROM todo_tool_observations GROUP BY tool_name").raw().all() as [unknown, unknown][]
       return Object.fromEntries(rows.map(([tool, count]) => [String(tool), Number(count)]))
     } finally {
       database.close()
@@ -1631,7 +1622,7 @@ suite("Read-file acceptance, production controller", function () {
       assert.equal(facts[0].endLine, 4)
       assert.equal(facts[0].planId, "read-file-plan-first")
 
-      const reopened = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+      const reopened = new TodoRepository(workspace.databasePath)
       await reopened.initialize()
       const persisted = await reopened.listAcceptedEvidence({ projectFingerprint: workspace.projectFingerprint, conversationId: first.scope.conversationId })
       assert.deepEqual(persisted.map((fact) => fact.id), facts.map((fact) => fact.id))
@@ -2363,7 +2354,7 @@ suite("Read-file acceptance, production controller", function () {
           "the stale predicate is named to the implementer"
         )
 
-        const origin = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+        const origin = new TodoRepository(workspace.databasePath)
         await origin.initialize()
         const originScope = { projectFingerprint: workspace.projectFingerprint, conversationId: "read-file-recorded", writer: "read-file-recorded" }
         const originItems = (await origin.getList({ ...originScope, includeCompleted: true })).items
@@ -2380,7 +2371,7 @@ suite("Read-file acceptance, production controller", function () {
     await withWorkspace(async (workspace) => {
       const conversationId = "read-file-approval"
       const scope = { projectFingerprint: workspace.projectFingerprint, conversationId, writer: conversationId }
-      const seed = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+      const seed = new TodoRepository(workspace.databasePath)
       await seed.initialize()
       const reviewed = await seed.createItem(scope, { title: "Confirm the read_file note" }, "seed-approval-item", "user")
 
@@ -2425,12 +2416,9 @@ suite("Read-file acceptance, production controller", function () {
 
   /** Reads persisted rows from the workspace database; used for host-recorded observations and activations. */
   const queryRows = async (workspace: Workspace, query: string, params: (string | number)[] = []) => {
-    const sql = await initSqlJs({ locateFile: () => workspace.wasmPath })
-    const database = new sql.Database(fs.readFileSync(workspace.databasePath))
+    const database = new BetterSqlite(workspace.databasePath, { fileMustExist: true })
     try {
-      const [result] = database.exec(query, params)
-      if (!result) return []
-      return result.values.map((values) => Object.fromEntries(result.columns.map((column, index) => [column, values[index]])))
+      return database.prepare(query).all(...params) as Record<string, unknown>[]
     } finally {
       database.close()
     }
@@ -2447,7 +2435,7 @@ suite("Read-file acceptance, production controller", function () {
   }
 
   const reopenedStatus = async (workspace: Workspace, turn: Turn, title: string) => {
-    const reopened = new TodoRepository(workspace.databasePath, workspace.wasmPath)
+    const reopened = new TodoRepository(workspace.databasePath)
     await reopened.initialize()
     const { items } = await reopened.getList({ ...turn.scope, includeCompleted: true })
     return items.find((item) => item.title === title)?.status
