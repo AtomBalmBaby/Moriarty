@@ -31,7 +31,7 @@ import {
   RoleSelection
 } from "../../common/feedback-settings"
 import { formatCount, logger, redact } from "../../common/logger"
-import type { ComposerTurn, PromptCompileRequest, PromptCompileResult, ToolInventoryItem } from "../../common/messaging/protocol"
+import type { ComposerTurn, ContextWindowStatus, PromptCompileRequest, PromptCompileResult, ToolInventoryItem } from "../../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
 import { kebabToSentence } from "../../common/text"
@@ -1300,6 +1300,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       setting: this.config.get("chatContextWindow", "Auto"),
       fallback: this.config.get("chatContextFallback", FALLBACK_CONTEXT_TOKENS)
     }
+  }
+
+  /** The size the composer's bar and footer show for a provider. */
+  public async contextWindowOf(provider: TwinnyProvider): Promise<ContextWindowStatus> {
+    const { tokens, source, confirmed } = await this.contextCapacity(provider)
+    return { tokens, source, confirmed }
   }
 
   private async contextCapacity(provider: TwinnyProvider): Promise<ContextCapacity> {

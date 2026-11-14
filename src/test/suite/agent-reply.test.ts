@@ -79,8 +79,20 @@ class ChatIn extends Chat {
   }
 }
 
-const call = (name: string, args: Record<string, string>) =>
+const call = (name: string, args: Record<string, unknown>) =>
   "```tool\n" + JSON.stringify({ name, arguments: args }) + "\n```"
+
+/** An edit_lines call that replaces the first line of `text` containing `find`, fingerprinted against `text` as read_file reports it. */
+const replaceLineCall = async (file: string, text: string, find: string, replace: string) => {
+  const rows = text.split("\n")
+  const line = rows.findIndex((row) => row.includes(find))
+  if (line < 0) throw new Error(`"${find}" is not in ${file}`)
+  return call("edit_lines", {
+    path: file,
+    expected_hash: await contentHash(text),
+    edits: [{ operation: "replace", start_line: line + 1, end_line: line + 1, content: [rows[line].replace(find, replace)] }]
+  })
+}
 
 /** The test owns the whole folder set while it runs, because the TODO repository resolves its storage from live folders and refuses multi-folder workspaces. The previous folders are restored on close. */
 const openWorkspace = async (root: string): Promise<() => Promise<void>> => {
@@ -636,7 +648,7 @@ suite("Agent reply, end to end", function () {
 
     const model = new ScriptedModel([
       call("read_file", { path: "a.ts" }),
-      call("edit_file", { path: "a.ts", find: "export const a = 1", replace: "export const a = 2" }),
+      await replaceLineCall("a.ts", "export const a = 1\n", "export const a = 1", "export const a = 2"),
       "Done."
     ])
     providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
@@ -693,7 +705,7 @@ suite("Agent reply, end to end", function () {
           ? finalContent === "Update the constant in a.ts to 2."
           : Array.isArray(finalContent) && finalContent.some((part) => "text" in part && part.text === "Update the constant in a.ts to 2.")
       )
-      assert.ok(fs.readFileSync(file, "utf8").includes("export const a = 2"))
+      assert.ok((await vscode.workspace.openTextDocument(file)).getText().includes("export const a = 2"), "the edit is in the editor buffer, unsaved")
       assert.ok(
         (webview.sent as unknown[]).some(
           (payload) =>
@@ -906,8 +918,8 @@ suite("Agent reply, end to end", function () {
 
     const model = new ScriptedModel([
       call("read_file", { path: "src/a.ts" }),
-      call("edit_file", { path: "src/a.ts", find: "export const a = 1", replace: "export const a: string = 2" }),
-      call("edit_file", { path: "src/a.ts", find: "export const a: string = 2", replace: "export const a = 2" }),
+      await replaceLineCall("src/a.ts", "export const a = 1\n", "export const a = 1", "export const a: string = 2"),
+      await replaceLineCall("src/a.ts", "export const a: string = 2\n", "export const a: string = 2", "export const a = 2"),
       call("run_command", { command: "echo made > made.txt" }),
       "I set a to 2 and made made.txt."
     ])
@@ -949,7 +961,7 @@ suite("Agent reply, end to end", function () {
       assert.match(results[4], /exit code 0/)
 
       // What the workspace now holds.
-      assert.strictEqual(fs.readFileSync(path.join(root, "src", "a.ts"), "utf8"), "export const a = 2\n")
+      assert.strictEqual((await vscode.workspace.openTextDocument(path.join(root, "src", "a.ts"))).getText(), "export const a = 2\n", "the edits are in the editor buffer, unsaved")
       assert.strictEqual(fs.readFileSync(path.join(root, "made.txt"), "utf8"), "made\n")
 
       // What the webview was handed.
@@ -958,8 +970,8 @@ suite("Agent reply, end to end", function () {
         steps.map((s) => [s.name, s.status]),
         [
           ["read_file", "done"],
-          ["edit_file", "done"],
-          ["edit_file", "done"],
+          ["edit_lines", "done"],
+          ["edit_lines", "done"],
           ["run_command", "done"]
         ]
       )
@@ -2830,7 +2842,10 @@ suite("Read-file acceptance, production controller", function () {
     const editTarget = "src/tools.ts"
     const editFind = "  name: \"write_file\","
     const editReplace = "  name: \"write_file_v2\","
-    const editCall = call("edit_file", { path: editTarget, find: editFind, replace: editReplace })
+    let editCall = ""
+    suiteSetup(async () => {
+      editCall = await replaceLineCall(editTarget, toolsSource, editFind, editReplace)
+    })
     const editPlan = (planId: string) => commandPlanReply(planId, [{ id: "edited", command: "test -f made.txt" }])
     const editOperations = (workspace: Workspace) => queryRows(workspace, "SELECT target, status, detail FROM todo_edit_operations ORDER BY created_at")
     const bufferOf = async (workspace: Workspace) => (await vscode.workspace.openTextDocument(path.join(workspace.root, editTarget))).getText()
@@ -3198,7 +3213,7 @@ suite("Read-file acceptance, production controller", function () {
         assert.ok(JSON.stringify(reconciled.agent.requests[0]?.messages).includes("matches neither"), "the controller surfaces the unresolved reason to the model")
         assert.equal(await bufferOf(workspace), third, "the unexplained text is preserved")
 
-        const retriedCall = call("edit_file", { path: editTarget, find: "export const third = true", replace: "export const third = false" })
+        const retriedCall = await replaceLineCall(editTarget, await bufferOf(workspace), "export const third = true", "export const third = false")
         const retried = await runTurn(workspace, {
           conversationId: "edit-diverged",
           planReply: editPlan("edit-diverged-plan"),
@@ -3267,7 +3282,7 @@ suite("Read-file acceptance, production controller", function () {
         await runTurn(workspace, {
           conversationId: "edit-untracked",
           planReply: JSON.stringify({ track: false, plan: null }),
-          replies: [call("edit_file", { path: editTarget, find: editReplace, replace: "write_file_v3" }), "The edit was applied."],
+          replies: [await replaceLineCall(editTarget, await bufferOf(workspace), editReplace, "write_file_v3"), "The edit was applied."],
           editCommands
         })
         assert.equal(counts.runs, 2, "the untracked edit runs once; the holder's edit is not run again")
@@ -3300,7 +3315,7 @@ suite("Read-file acceptance, production controller", function () {
         const refused = await runTurn(workspace, {
           conversationId: "edit-untracked",
           planReply: JSON.stringify({ track: false, plan: null }),
-          replies: [call("edit_file", { path: editTarget, find: "export const third", replace: "export const fourth" }), "The edit was refused."],
+          replies: [await replaceLineCall(editTarget, await bufferOf(workspace), "export const third", "export const fourth"), "The edit was refused."],
           editCommands
         })
         assert.equal(counts.runs, 1, "the untracked edit never reaches the editor")

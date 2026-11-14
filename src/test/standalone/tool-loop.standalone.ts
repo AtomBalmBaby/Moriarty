@@ -1166,17 +1166,19 @@ test("an already-aborted inference signal does not start a provider request", as
 
 test("a read after a change runs again, and so does one whose result was trimmed away", async () => {
   const root = workspace({ "a.ts": "one\n" })
+  const before = await contentHash("one\n")
   const edits = {
     mode: "apply" as const,
-    edit: async (file: string) => {
+    edit: async () => ({ ok: false, message: "edit_file is retired" }),
+    editLines: async (file: string) => {
       fs.writeFileSync(file, "two\n")
-      return { ok: true, message: "Applied." }
+      return { ok: true, message: "Applied.", contentHash: await contentHash("two\n") }
     },
     create: async () => ({ ok: true, message: "Created." })
   }
   const { client } = scripted([
     { calls: [read("1", "a.ts")] },
-    { calls: [{ id: "2", name: "edit_file", arguments: JSON.stringify({ path: "a.ts", find: "one", replace: "two" }) }] },
+    { calls: [{ id: "2", name: "edit_lines", arguments: JSON.stringify({ path: "a.ts", expected_hash: before, edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["two"] }]) }) }] },
     { calls: [read("3", "a.ts")] },
     "Changed."
   ])

@@ -342,7 +342,7 @@ test("planReplacement finds text once, tolerates pasted line numbers and indenta
     text: `  "default": 20000,\n  "description": "${"x".repeat(300)}"`
   })
   assert.match(planReplacement(long, "\"default\": 16000,", `"default": 1,\n"y${"x".repeat(9)}…`) as string, /cut short/)
-  assert.match(planReplacement(file, "missing()", "x") as string, /^find is not in the file; read the lines again/)
+  assert.match(planReplacement(file, "missing()", "x") as string, /^find is not in the file; read the file again with read_file/)
   assert.match(planReplacement(file, "", "x") as string, /find is empty/)
   assert.match(planReplacement(file, "run()", "run()") as string, /nothing would change/)
   assert.strictEqual(
@@ -354,7 +354,7 @@ test("planReplacement finds text once, tolerates pasted line numbers and indenta
 test("edit_file plans against the open buffer and hands the change to the sink", async () => {
   const root = makeWorkspace()
   const edited: Array<{ file: string; startLine: number; text: string }> = []
-  const tools = workspaceTools(root, [], { edits: {
+  const tools = workspaceTools(root, [], { legacyEditFile: true, edits: {
     mode: "apply",
     read: async (file) => (file.endsWith("warmer.ts") ? "export class ModelWarmer {\n  unsaved() {}\n}\n" : undefined),
     edit: async (file, replacement) => {
@@ -430,7 +430,7 @@ test("create_file writes new files only, inside the workspace and outside .gitig
   assert.strictEqual(found.output, "src/new/util.ts\n1- export const a = 1\n2: export const b = 2", "searches see the new file")
 
   for (const [bad, why] of [
-    ["src/warmer.ts", /already exists; use edit_file/],
+    ["src/warmer.ts", /already exists; read it, then use edit_lines/],
     ["../escape.ts", /outside the workspace/],
     ["link/sneaky.ts", /outside the workspace/],
     ["build/gen.js", /ignored by \.gitignore/],
@@ -761,26 +761,27 @@ test("a find that misses shows the nearest lines as they are now, and where they
       "5:   for (const item of items) sum += item",
       "6:   return sum",
       "7: }",
-      "Copy the lines exactly as they are, without the line numbers. To add new code rather than change what is there, put the existing lines it goes next to in find, and those same lines with the new code in replace."
+      "Use edit_lines with the content_hash from read_file. To add new code, use insert_before or insert_after at the line it belongs next to."
     ].join("\n")
   )
   // A look-alike block (a sibling function, or the new code itself) is not offered as the place to edit.
   const twins = "export function add(a: number, b: number) {\n  // Adds them.\n  return a + b\n}\n"
   const sub = planReplacement(twins, "export function sub(a: number, b: number) {\n  // Subtracts them.\n  return a - b\n}", "x") as string
   assert.ok(!sub.includes("nearest match"), sub)
-  assert.match(sub, /To add new code rather than change what is there/)
-  assert.match(planReplacement(file, "something else entirely()", "x") as string, /^find is not in the file; read the lines again/, "nothing near enough")
+  assert.match(sub, /then make the change with edit_lines/)
+  assert.match(planReplacement(file, "something else entirely()", "x") as string, /^find is not in the file; read the file again with read_file/, "nothing near enough")
 
   // The tool hands the model the whole refusal, not its first line.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-tools-"))
   fs.writeFileSync(path.join(root, "sum.ts"), file)
   const tools = workspaceTools(root, [], {
+    legacyEditFile: true,
     edits: { mode: "apply", edit: async () => ({ ok: true, message: "Applied." }), create: async () => ({ ok: true, message: "Created." }) }
   })
   const result = await tools.run({ name: "edit_file", args: { path: "sum.ts", find: "  let sum = 1", replace: "  let sum = 2" } })
   assert.ok(result.failed)
   assert.match(result.output, /^sum\.ts: find is not in the file\. The nearest match is line 4, where line 4 is `let sum = 0` but find has `let sum = 1`\. As they are now:\n3: export function total/)
-  assert.match(result.output, /with the new code in replace\.$/)
+  assert.match(result.output, /insert_before or insert_after at the line it belongs next to\.$/)
   assert.strictEqual(result.summary, "edit_file failed · sum.ts: find is not in the file. The nearest match is line 4, where line 4 is `let sum = 0` but find has `let sum = 1`. As they are now:")
 })
 

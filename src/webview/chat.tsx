@@ -37,7 +37,7 @@ import { useAutoRun } from "./hooks/useAutoRun"
 import { useAutosizeTextArea } from "./hooks/useAutosizeTextArea"
 import { useComposerSuggestions } from "./hooks/useComposerSuggestions"
 import { useConversationHistory } from "./hooks/useConversationHistory"
-import { useProviders } from "./hooks/useProviders"
+import { useContextWindow, useProviders } from "./hooks/useProviders"
 import { useReasoningRounds } from "./hooks/useReasoningRounds"
 import { useSelection } from "./hooks/useSelection"
 import { useSuggestion } from "./hooks/useSuggestion"
@@ -75,7 +75,7 @@ import { TodoPanel } from "./todo-panel"
 import { answerToolStep } from "./tool-steps"
 import { conversationMarkdown } from "./transcript"
 import type { TypingActivity } from "./typing-indicator"
-import { CustomKeyMap, getThinkingMessage, handleMarkdownPaste, LinkExtension, MentionWithMarkdown, UnderlineExtension } from "./utils"
+import { compactCount, CustomKeyMap, getThinkingMessage, handleMarkdownPaste, LinkExtension, MentionWithMarkdown, UnderlineExtension } from "./utils"
 
 import styles from "./styles/chat.module.css"
 
@@ -167,6 +167,25 @@ export const Chat = (props: ChatProps): JSX.Element => {
   // Nothing can answer without a chat provider, so the composer is off
   // until one is set; the empty transcript says where to set it.
   const { chatProvider, ready: providersReady } = useProviders()
+  const contextWindow = useContextWindow(chatProvider, messages.length)
+  // The latest reply's backend-reported prompt size; live usage isn't reported mid-reply.
+  const contextUsed = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const tokens = messages[i].meta?.promptTokens
+      if (tokens) return tokens
+    }
+    return 0
+  }, [messages])
+  const contextPercent = contextWindow?.tokens
+    ? Math.min(100, Math.round((contextUsed / contextWindow.tokens) * 100))
+    : 0
+  const contextTitle = contextWindow
+    ? t("context-used", {
+        used: compactCount(contextUsed),
+        window: compactCount(contextWindow.tokens),
+        percent: contextPercent
+      })
+    : undefined
   const chatDisabled = providersReady && !chatProvider
   const [completion, setCompletion] = useState<ChatCompletionMessage | null>()
   const virtuosoRef = useRef<VirtuosoHandle>(null)
@@ -1817,6 +1836,24 @@ export const Chat = (props: ChatProps): JSX.Element => {
               title={chatDisabled ? t("chat-disabled-no-provider") : undefined}
               onMouseDown={handleComposerMouseDown}
             >
+              {contextWindow && (
+                <div
+                  className={styles.contextBar}
+                  role="meter"
+                  aria-label={contextTitle}
+                  aria-valuemin={0}
+                  aria-valuemax={contextWindow.tokens}
+                  aria-valuenow={contextUsed}
+                  title={contextTitle}
+                >
+                  <div
+                    className={cx(styles.contextBarFill, {
+                      [styles.contextBarNearlyFull]: contextPercent >= 80
+                    })}
+                    style={{ width: `${contextPercent}%` }}
+                  />
+                </div>
+              )}
               <input
                 type="file"
                 ref={fileInputRef}
@@ -1977,7 +2014,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
             </div>
           </form>
           <div className={styles.footer}>
-            <ProviderSelect />
+            <ProviderSelect contextWindow={contextWindow} />
             <button
               type="button"
               className={styles.shortcutsHint}

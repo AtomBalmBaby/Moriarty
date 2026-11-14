@@ -17,11 +17,14 @@ export interface AgentToolSelection<TNative extends NamedAgentTool, TMcp extends
 const NATIVE_GROUPS: Record<string, string[]> = {
   read: ["list_dir", "find_files", "search_workspace", "read_file", "grep", "find_symbol", "editor_context", "find_references", "go_to_definition", "diagnostics"],
   search: ["search_workspace", "search_code", "grep", "find_files", "find_symbol", "find_references"],
-  edit: ["edit_file", "edit_lines", "create_file", "rename_symbol", "move_file", "delete_file"],
+  edit: ["edit_lines", "create_file", "rename_symbol", "move_file", "delete_file"],
   execute: ["run_command"],
   run: ["run_command"],
   terminal: ["run_command"]
 }
+
+/** Retired native tools that saved profiles may still name; they resolve to their replacement. */
+const RETIRED_NATIVE_TOOLS: Record<string, string> = { editfile: "editlines" }
 
 const normalize = (name: string) => name.trim().replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().replace(/^tool:/, "").replace(/[_-]/g, "")
 const builtinName = (name: string) => {
@@ -52,7 +55,8 @@ export const resolveAgentToolSelection = <TNative extends NamedAgentTool, TMcp e
       continue
     }
     const builtin = builtinName(name)
-    const nativeMatch = nativeByName.get(normalize(builtin))
+    const key = normalize(builtin)
+    const nativeMatch = nativeByName.get(RETIRED_NATIVE_TOOLS[key] ?? key)
     let matched = false
     if (nativeMatch) {
       selectedNative.add(nativeMatch)

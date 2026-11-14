@@ -6,14 +6,16 @@ import {
   VSCodeTextField} from "@vscode/webview-ui-toolkit/react"
 
 import { EVENT_NAME } from "../../common/constants"
+import { ContextWindowStatus } from "../../common/messaging/protocol"
 import { usesEndpoint } from "../../common/provider-validation"
 import { useModels } from "../hooks/useModels"
 import { useProviders } from "../hooks/useProviders"
 import { emit } from "../messaging"
+import { compactCount } from "../utils"
 
 import styles from "../styles/providers.module.css"
 
-export const ProviderSelect = () => {
+export const ProviderSelect = ({ contextWindow }: { contextWindow?: ContextWindowStatus | null }) => {
   const { t } = useTranslation()
   const { models } = useModels()
   const {
@@ -172,6 +174,16 @@ export const ProviderSelect = () => {
           />
         )}
       </div>
+      {contextWindow && (
+        <span
+          className={styles.contextSize}
+          title={contextWindow.confirmed ? undefined : t("context-size-unconfirmed-title")}
+        >
+          {contextWindow.confirmed
+            ? t("context-size", { size: compactCount(contextWindow.tokens) })
+            : t("context-size-unconfirmed", { size: compactCount(contextWindow.tokens) })}
+        </span>
+      )}
     </div>
   )
 }

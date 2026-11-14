@@ -263,7 +263,7 @@ const fakeServer = async (routes: Record<string, (body: unknown) => unknown>) =>
   return { hits, port, close: () => server.close() }
 }
 
-const auto = { setting: "Auto", fallback: 32_768 }
+const auto = { setting: "Auto", fallback: 65_536 }
 const at = (port: number): Partial<TwinnyProvider> => ({
   apiHostname: "127.0.0.1",
   apiPort: port,
@@ -294,8 +294,8 @@ test("the chat setting is Auto, a whole number of tokens, or invalid; the fallba
   for (const bad of ["8k", "0", "-1", 1.5, 0]) {
     assert.strictEqual(parseContextSetting(bad).mode, "invalid", String(bad))
   }
-  assert.strictEqual(resolveFallback(undefined), 32_768)
-  assert.strictEqual(resolveFallback(0), 32_768)
+  assert.strictEqual(resolveFallback(undefined), 65_536)
+  assert.strictEqual(resolveFallback(0), 65_536)
   assert.strictEqual(resolveFallback(65_536), 65_536)
 })
 
@@ -323,9 +323,9 @@ test("Ollama: a loaded model's runtime context is confirmed, an unloaded model's
     try {
       const qwen = provider("ollama", { ...at(server.port), modelName: "qwen3-coder:30b" })
       const unloaded = await contextCapacityOf(qwen, auto)
-      assert.deepStrictEqual([unloaded.tokens, unloaded.source, unloaded.confirmed], [32_768, "fallback", false])
+      assert.deepStrictEqual([unloaded.tokens, unloaded.source, unloaded.confirmed], [65_536, "fallback", false])
       assert.strictEqual(unloaded.advertised, 262_144, "the model's maximum is advertised, not confirmed")
-      assert.match(unloaded.warning ?? "", /planning for 32768 tokens/)
+      assert.match(unloaded.warning ?? "", /planning for 65536 tokens/)
       assert.strictEqual(knownContextCapacity(qwen, auto)?.source, "fallback")
 
       const tuned = await contextCapacityOf(provider("ollama", { ...at(server.port), modelName: "tuned" }), auto)
@@ -357,24 +357,82 @@ test("Ollama: a loaded model's runtime context is confirmed, an unloaded model's
     }
   }))
 
-test("llama.cpp: the per-slot context is confirmed with its slot count, and a router-mode server is named and not made to load", () =>
+test("llama.cpp: the per-slot context is confirmed with its slot count, whatever the model is called", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/props": () => ({ default_generation_settings: { n_ctx: 8192 }, total_slots: 4 })
+    })
+    try {
+      const capacity = await contextCapacityOf(provider("llamacpp", { ...at(server.port), modelName: "/mnt/models/not-the-served-name.gguf" }), auto)
+      assert.deepStrictEqual(
+        [capacity.tokens, capacity.source, capacity.confirmed, capacity.slots],
+        [8_192, "runtime", true, 4]
+      )
+      assert.deepStrictEqual(server.hits, ["GET /props"], "a single-model server is asked once, without the model name")
+    } finally {
+      server.close()
+    }
+  }))
+
+test("llama.cpp: a router-mode server that gives no size for plain /props is asked for the named model, without loading it", () =>
   discovery(async () => {
     const server = await fakeServer({
       "/props?model=m&autoload=false": () => ({ default_generation_settings: { n_ctx: 8192 }, total_slots: 4 })
     })
     try {
       const capacity = await contextCapacityOf(provider("llamacpp", at(server.port)), auto)
-      assert.deepStrictEqual(
-        [capacity.tokens, capacity.source, capacity.confirmed, capacity.slots],
-        [8_192, "runtime", true, 4]
-      )
-      assert.deepStrictEqual(server.hits, ["GET /props?model=m&autoload=false"])
+      assert.deepStrictEqual([capacity.tokens, capacity.source, capacity.confirmed], [8_192, "runtime", true])
+      assert.deepStrictEqual(server.hits, ["GET /props", "GET /props?model=m&autoload=false"])
     } finally {
       server.close()
     }
   }))
 
+test("llama.cpp: when neither probe confirms a size the fallback applies, and no probe loads a model", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/props?model=m&autoload=false": () => undefined
+    })
+    try {
+      const capacity = await contextCapacityOf(provider("llamacpp", at(server.port)), auto)
+      assert.deepStrictEqual([capacity.tokens, capacity.source, capacity.confirmed], [65_536, "fallback", false])
+      assert.ok(server.hits.every((hit) => !hit.includes("autoload=true")), "nothing asks for a model to be loaded")
+    } finally {
+      server.close()
+    }
+  }))
+
+test("a failed probe is logged with its URL and status, and a server that gives no size is reported; the key is never logged", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/props": () => ({ total_slots: 1 })
+    })
+    const records: string[] = []
+    const { warn } = logger
+    logger.warn = (message) => records.push(message)
+    try {
+      const capacity = await contextCapacityOf(
+        provider("llamacpp", { ...at(server.port), modelName: "m", apiKey: "secret-key" }),
+        auto
+      )
+      assert.strictEqual(capacity.source, "fallback")
+      assert.ok(
+        records.some((record) => record.includes("/props?model=m&autoload=false answered HTTP 404")),
+        "the named-model probe that fails is logged with its status"
+      )
+      assert.ok(
+        records.some((record) => record.includes("gave no context size for m")),
+        "an answer that confirms no size is logged"
+      )
+      assert.ok(records.every((record) => !record.includes("secret-key")), "the API key is never logged")
+    } finally {
+      logger.warn = warn
+      server.close()
+    }
+  }))
+
 test("LM Studio: the loaded context is confirmed; the model's maximum is advertised only", () =>
+
   discovery(async () => {
     const server = await fakeServer({
       "/api/v0/models": () => ({
@@ -393,7 +451,7 @@ test("LM Studio: the loaded context is confirmed; the model's maximum is adverti
       const idle = await contextCapacityOf(provider("lmstudio", { ...at(server.port), modelName: "idle" }), auto)
       assert.deepStrictEqual(
         [idle.tokens, idle.source, idle.confirmed, idle.advertised],
-        [32_768, "fallback", false, 131_072]
+        [65_536, "fallback", false, 131_072]
       )
     } finally {
       server.close()
@@ -419,7 +477,7 @@ test("an OpenAI-compatible server: the smallest confirmed size wins; advertised 
       assert.strictEqual(both.warning, undefined)
 
       const maximum = await contextCapacityOf(provider("openai-compatible", { ...at(server.port), modelName: "maximum" }), auto)
-      assert.deepStrictEqual([maximum.tokens, maximum.source, maximum.confirmed, maximum.advertised], [32_768, "fallback", false, 262_144])
+      assert.deepStrictEqual([maximum.tokens, maximum.source, maximum.confirmed, maximum.advertised], [65_536, "fallback", false, 262_144])
 
       const plain = await contextCapacityOf(provider("openai-compatible", { ...at(server.port), modelName: "plain" }), auto)
       assert.deepStrictEqual([plain.source, plain.advertised], ["fallback", undefined])
@@ -434,19 +492,19 @@ test("an OpenAI-compatible server: the smallest confirmed size wins; advertised 
 test("a user's figure wins over the server; a figure that disagrees with the server or sits below 64K is reported", () =>
   discovery(async () => {
     const server = await fakeServer({
-      "/props?model=m&autoload=false": () => ({ default_generation_settings: { n_ctx: 65536 } })
+      "/props": () => ({ default_generation_settings: { n_ctx: 65536 } })
     })
     try {
       const llama = provider("llamacpp", at(server.port))
-      const above = await contextCapacityOf(llama, { setting: 131_072, fallback: 32_768 })
+      const above = await contextCapacityOf(llama, { setting: 131_072, fallback: 65_536 })
       assert.deepStrictEqual([above.tokens, above.source], [131_072, "override"])
       assert.match(above.warning ?? "", /the server confirmed 65536/)
 
-      const small = await contextCapacityOf(llama, { setting: 4_096, fallback: 32_768 })
+      const small = await contextCapacityOf(llama, { setting: 4_096, fallback: 65_536 })
       assert.strictEqual(small.tokens, 4_096)
       assert.match(small.warning ?? "", /below the 65536-token minimum/)
 
-      const same = await contextCapacityOf(llama, { setting: "65536", fallback: 32_768 })
+      const same = await contextCapacityOf(llama, { setting: "65536", fallback: 65_536 })
       assert.deepStrictEqual([same.tokens, same.source, same.warning], [65_536, "override", undefined])
     } finally {
       server.close()
@@ -457,7 +515,7 @@ test("a hosted API is not asked and is never assumed to hold 64K; an invalid set
   discovery(async () => {
     for (const kind of ["anthropic", "openai"]) {
       const capacity = await contextCapacityOf(provider(kind), auto)
-      assert.deepStrictEqual([capacity.tokens, capacity.source, capacity.confirmed], [32_768, "fallback", false], kind)
+      assert.deepStrictEqual([capacity.tokens, capacity.source, capacity.confirmed], [65_536, "fallback", false], kind)
     }
     const invalid = await contextCapacityOf(provider("anthropic"), { setting: "8k", fallback: 8_192 })
     assert.deepStrictEqual([invalid.tokens, invalid.source], [8_192, "fallback"])

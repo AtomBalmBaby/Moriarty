@@ -89,6 +89,7 @@ test("blocked paths are kept from every tool, and the agent is told why", async 
     edits: {
       mode: "apply",
       edit: async () => ({ ok: true, message: "Changed." }),
+      editLines: async (file) => (created.push(file), { ok: true, message: "Changed.", contentHash: `xxh64:${"0".repeat(16)}` }),
       create: async (file) => {
         created.push(file)
         return { ok: true, message: "Created." }
@@ -110,7 +111,7 @@ test("blocked paths are kept from every tool, and the agent is told why", async 
   const refused = await run("create_file", { path: "infra/new.ts", content: "x" })
   assert.ok(refused.failed)
   assert.match(refused.output, /kept from the agent by the team's rules; twinny does not write there/)
-  assert.match((await run("edit_file", { path: "infra/deploy.ts", find: "vault", replace: "env" })).output, /kept from the agent/)
+  assert.match((await run("edit_lines", { path: "infra/deploy.ts", expected_hash: `xxh64:${"0".repeat(16)}`, edits: "[]" })).output, /kept from the agent/)
   assert.deepStrictEqual(created, [], "nothing reached the editor")
   assert.ok(view.blocked("infra/deploy.ts") && !view.blocked("src/app.ts"))
   // Without the team's rules the same files are the agent's to read.

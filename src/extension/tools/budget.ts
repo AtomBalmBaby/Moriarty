@@ -20,7 +20,7 @@ export const SMALL_CONTEXT_TOKENS = 8192
 export const SUPPORTED_CONTEXT_TOKENS = 65_536
 
 /** Planned for when no server confirms a model's context and the user has not set one. */
-export const FALLBACK_CONTEXT_TOKENS = 32_768
+export const FALLBACK_CONTEXT_TOKENS = SUPPORTED_CONTEXT_TOKENS
 
 export type CapacitySource = "override" | "runtime" | "configured" | "listing" | "fallback" | "unspecified"
 

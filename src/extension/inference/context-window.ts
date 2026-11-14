@@ -15,6 +15,7 @@
  */
 import { API_PROVIDERS } from "../../common/constants"
 import { deadline } from "../../common/deadline"
+import { logger } from "../../common/logger"
 import { getProviderOrigin } from "../../common/provider-validation"
 import { TwinnyProvider } from "../../common/types"
 import { ConfirmedCapacity, ContextCapacity, FALLBACK_CONTEXT_TOKENS, SUPPORTED_CONTEXT_TOKENS } from "../tools/budget"
@@ -24,6 +25,8 @@ import { providerRegistry } from "./registry"
 const KEEP_CONFIRMED_MS = 30_000
 const KEEP_UNCONFIRMED_MS = 3000
 const ASK_TIMEOUT_MS = 1500
+/** How much of a failed probe's body is put in the log. */
+const PROBE_DETAIL_CHARS = 200
 /** Far above any window in use; a larger number is taken as malformed. */
 const MAX_PLAUSIBLE_TOKENS = 10_000_000
 
@@ -65,6 +68,7 @@ const keyOf = (provider: TwinnyProvider) =>
 const originOf = (provider: TwinnyProvider) =>
   getProviderOrigin({ ...provider, apiHostname: provider.apiHostname || "localhost" })
 
+/** Every failed probe is logged with its URL and reason; the API key is never logged. */
 const ask = async (provider: TwinnyProvider, url: string, body?: unknown): Promise<unknown> => {
   const { signal, done } = deadline(ASK_TIMEOUT_MS)
   try {
@@ -77,8 +81,25 @@ const ask = async (provider: TwinnyProvider, url: string, body?: unknown): Promi
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal
     })
-    return response.ok ? await response.json() : undefined
-  } catch {
+    const text = await response.text()
+    if (!response.ok) {
+      const detail = text.trim().slice(0, PROBE_DETAIL_CHARS)
+      logger.warn(`[Context] ${url} answered HTTP ${response.status}${detail ? `: ${detail}` : ""}`)
+      return undefined
+    }
+    try {
+      return JSON.parse(text)
+    } catch {
+      logger.warn(`[Context] ${url} answered HTTP ${response.status} without JSON`)
+      return undefined
+    }
+  } catch (error) {
+    if (signal.aborted) {
+      logger.warn(`[Context] ${url} gave no answer within ${ASK_TIMEOUT_MS} ms`)
+    } else {
+      const reason = error instanceof Error ? error.message : String(error)
+      logger.warn(`[Context] ${url} failed: ${reason}`)
+    }
     return undefined
   } finally {
     done()
@@ -128,18 +149,22 @@ const fromOllama = async (provider: TwinnyProvider): Promise<ServerProbe> => {
 }
 
 /**
- * llama.cpp: `n_ctx` is the context one slot holds, and a request uses one
- * slot; `total_slots` is how many run at once, so the server's total is that
- * times the slots. A router-mode server needs the model named and would load
- * it to answer; asking must not load anything.
+ * llama.cpp: `n_ctx` is the context one slot holds. A request runs in one
+ * slot, so planning uses `n_ctx`. The server's whole context is `n_ctx` times
+ * `total_slots`, because llama.cpp splits its context across slots; the slot
+ * count is kept on the capacity but is not used for planning. A plain `/props`
+ * answers for a single-model server whatever the model is called, so it is
+ * asked first. Only a router-mode server that gives no size for it is asked
+ * again naming the model, with `autoload=false` so that asking never loads
+ * anything.
  */
 const fromLlamaCpp = async (provider: TwinnyProvider): Promise<ServerProbe> => {
-  const query = provider.modelName
-    ? `?model=${encodeURIComponent(provider.modelName)}&autoload=false`
-    : ""
-  const props = (await ask(provider, `${originOf(provider)}/props${query}`)) as
-    | { default_generation_settings?: { n_ctx?: unknown }; total_slots?: unknown }
-    | undefined
+  const origin = originOf(provider)
+  type Props = { default_generation_settings?: { n_ctx?: unknown }; total_slots?: unknown }
+  let props = (await ask(provider, `${origin}/props`)) as Props | undefined
+  if (!positive(props?.default_generation_settings?.n_ctx) && provider.modelName) {
+    props = (await ask(provider, `${origin}/props?model=${encodeURIComponent(provider.modelName)}&autoload=false`)) as Props | undefined
+  }
   return {
     confirmed: sized("runtime", positive(props?.default_generation_settings?.n_ctx)),
     slots: positive(props?.total_slots)
@@ -189,7 +214,8 @@ const fromModelList = async (provider: TwinnyProvider): Promise<ServerProbe> => 
   }
 }
 
-const probeOf = (provider: TwinnyProvider): Promise<ServerProbe> => {
+/** `undefined` for providers that are not asked at all (hosted APIs and anything unlisted). */
+const probeOf = (provider: TwinnyProvider): Promise<ServerProbe | undefined> => {
   switch (provider.provider) {
     case API_PROVIDERS.Ollama:
       return fromOllama(provider)
@@ -206,8 +232,7 @@ const probeOf = (provider: TwinnyProvider): Promise<ServerProbe> => {
     case API_PROVIDERS.Qvac:
       return fromModelList(provider)
     default:
-      // Hosted APIs and anything unlisted are not asked; they resolve as unconfirmed.
-      return Promise.resolve({ confirmed: [] })
+      return Promise.resolve(undefined)
   }
 }
 
@@ -218,7 +243,13 @@ export const serverProbeOf = async (provider: TwinnyProvider): Promise<ServerPro
   const age = cached ? clock() - cached.at : Infinity
   const keep = cached?.probe.confirmed.length ? KEEP_CONFIRMED_MS : KEEP_UNCONFIRMED_MS
   if (cached && age < keep) return cached.probe
-  const probe = await probeOf(provider)
+  const answer = await probeOf(provider)
+  const probe = answer ?? { confirmed: [] }
+  if (answer && probe.confirmed.length === 0) {
+    logger.warn(
+      `[Context] ${originOf(provider)} gave no context size for ${provider.modelName}; planning on the fallback`
+    )
+  }
   known.set(key, { probe, at: clock() })
   return probe
 }

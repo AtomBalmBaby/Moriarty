@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from "react"
 
-import { PROVIDER_EVENT_NAME } from "../../common/constants"
+import { EVENT_NAME, PROVIDER_EVENT_NAME } from "../../common/constants"
 import { messageOf } from "../../common/errors"
 import {
   ChatGPTPlanStatus,
+  ContextWindowStatus,
   ProviderModelList,
   ProviderSaveResult,
   ProviderTestResult
@@ -17,6 +18,41 @@ const failed = (error: unknown): ProviderTestResult => ({
   success: false,
   error: messageOf(error)
 })
+
+/**
+ * The size the active chat provider's server says its model holds. Asked again
+ * when the provider or `refreshKey` changes; `null` until the answer arrives.
+ */
+export const useContextWindow = (
+  provider: TwinnyProvider | null,
+  refreshKey: number
+): ContextWindowStatus | null => {
+  const [status, setStatus] = useState<ContextWindowStatus | null>(null)
+  const key = provider
+    ? [provider.id, provider.provider, provider.modelName, provider.apiProtocol, provider.apiHostname, provider.apiPort, provider.apiPath, provider.deviceId].join("|")
+    : ""
+
+  useEffect(() => {
+    if (!provider) {
+      setStatus(null)
+      return
+    }
+    let cancelled = false
+    bridge
+      .request(EVENT_NAME.twinnyGetContextWindow, provider)
+      .then((answer) => {
+        if (!cancelled) setStatus(answer ?? null)
+      })
+      .catch(() => {
+        if (!cancelled) setStatus(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [key, refreshKey])
+
+  return status
+}
 
 export const useProviders = () => {
   const [providers, setProviders] = useState<Record<string, TwinnyProvider>>({})

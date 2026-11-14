@@ -42,6 +42,10 @@ export const getLanguageMatch = (
 
 
 
+/** 12412 as "12.4k": enough to see how full a context is. */
+export const compactCount = (count: number) =>
+  count < 1000 ? String(count) : count < 10_000 ? `${(count / 1000).toFixed(1)}k` : `${Math.round(count / 1000)}k`
+
 export const getModelShortName = (name: string) => {
   if (name.length > 40) {
     return `${name.substring(0, 35)}...`

@@ -3,7 +3,7 @@ import { test } from "node:test"
 
 import { agentToolSelectionDiagnostic, projectTaskRelevantTools, resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 
-const native = ["read_file", "list_dir", "grep", "edit_file", "run_command"].map((name) => ({ name }))
+const native = ["read_file", "list_dir", "grep", "edit_lines", "run_command"].map((name) => ({ name }))
 const mcp = [
   { server: "ha-mcp", tool: "search" },
   { server: "ha-mcp", tool: "status" }
@@ -15,6 +15,19 @@ test("an omitted tools declaration preserves all eligible native and MCP tools",
   assert.deepEqual(resolved.native, native)
   assert.deepEqual(resolved.mcp, mcp)
   assert.deepEqual(resolved.unmatched, [])
+})
+
+test("a saved profile that names the retired edit_file is given edit_lines", () => {
+  const available = ["read_file", "edit_lines", "create_file"].map((name) => ({ name }))
+  const resolved = resolveAgentToolSelection(["read_file", "edit_file"], available, [])
+  assert.deepEqual(resolved.native.map((tool) => tool.name), ["read_file", "edit_lines"])
+  assert.deepEqual(resolved.unmatched, [])
+})
+
+test("the Edit category offers edit_lines and create_file, never the retired edit_file", () => {
+  const available = ["edit_file", "edit_lines", "create_file", "read_file"].map((name) => ({ name }))
+  const resolved = resolveAgentToolSelection(["Edit"], available, [])
+  assert.deepEqual(resolved.native.map((tool) => tool.name).sort(), ["create_file", "edit_lines"])
 })
 
 test("Copilot categories and built-in aliases resolve to Twinny native tools", () => {

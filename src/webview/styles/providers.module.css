@@ -637,6 +637,15 @@
   max-width: 34%;
 }
 
+/* The context size sits after the model, in the same quiet type. */
+.contextSize {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  white-space: nowrap;
+  color: var(--tw-fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+
 .providerSelector > div + div {
   border-left: 1px solid var(--tw-rule-soft);
 }

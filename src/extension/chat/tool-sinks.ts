@@ -796,7 +796,7 @@ export const editorKnowledge = (
     if (!edit || !edit.size) {
       return {
         ok: false,
-        message: "The language server has no rename here; edit the uses with edit_file instead."
+        message: "The language server has no rename here; read the uses and edit them with edit_lines instead."
       }
     }
     // A rename reaches wherever the language server follows the symbol.

@@ -169,7 +169,7 @@ export class WorkspaceView {
     // Anything at the path counts, a link that leads nowhere included:
     // writing the new file would follow it, wherever it points.
     if (present(absolute)) {
-      throw new ToolInputError(`${cleaned} already exists; use edit_file to change it.`)
+      throw new ToolInputError(`${cleaned} already exists; read it, then use edit_lines to change it.`)
     }
     let parent = path.dirname(absolute)
     while (!present(parent)) parent = path.dirname(parent)

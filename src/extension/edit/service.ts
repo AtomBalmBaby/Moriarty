@@ -379,7 +379,7 @@ export class InlineEditService extends Base {
       return { ok: false, message: `Not created: ${relative} is outside the workspace.` }
     }
     if (fs.existsSync(file)) {
-      return { ok: false, message: `Not created: ${relative} already exists. Use edit_file to change it.` }
+      return { ok: false, message: `Not created: ${relative} already exists. Read it, then use edit_lines to change it.` }
     }
     if (this.running || (this._pending && mode === "review")) {
       return {

@@ -427,6 +427,27 @@
   transition: border-color 0.12s ease;
 }
 
+/* A thin meter along the top edge of the composer: how much of the context is used. */
+.contextBar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--tw-rule-soft);
+  pointer-events: none;
+}
+
+.contextBarFill {
+  height: 100%;
+  background: var(--tw-accent);
+  transition: width 0.2s ease;
+}
+
+.contextBarNearlyFull {
+  background: var(--vscode-editorWarning-foreground);
+}
+
 .chatBox:focus-within {
   border-color: var(--tw-fg-faint);
 }

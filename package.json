@@ -1084,7 +1084,7 @@
         "twinny.chatContextFallback": {
           "order": 19,
           "type": "number",
-          "default": 32768,
+          "default": 65536,
           "minimum": 1,
           "markdownDescription": "The context size, in tokens, to plan chat requests for when no server confirms the model's context (with `#twinny.chatContextWindow#` on Auto). It is an assumption, not a confirmed capacity, and the chat says so with a warning.",
           "scope": "machine"

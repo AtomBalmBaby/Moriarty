@@ -223,7 +223,7 @@ test("edit_file dispatch still refuses clipped replacements while read_file retu
     async edit(_file: string, replacement: { text: string }) { edits++; planned = replacement.text; return { ok: true, message: "applied" } },
     async create() { return { ok: true, message: "created" } }
   }
-  const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
+  const tools = workspaceTools(root, [], { legacyEditFile: true, edits: sink, git: false, instructions: false })
   try {
     const read = await tools.run({ name: "read_file", args: { path: "panel.tsx" } })
     assert.ok(read.output.includes("2: " + longLine))
@@ -283,7 +283,7 @@ test("real edit_file dispatch allows temporary small errors and restores content
     },
     async create() { return { ok: true, message: "created" } }
   }
-  const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
+  const tools = workspaceTools(root, [], { legacyEditFile: true, edits: sink, git: false, instructions: false })
   try {
     for (let value = 1; value <= 3; value++) {
       const current = fs.readFileSync(file, "utf8").trim()

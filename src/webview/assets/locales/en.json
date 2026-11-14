@@ -498,7 +498,11 @@
   "reply-context": "{{used}} context",
   "reply-context-of": "{{used}} / {{window}} context",
   "reply-context-title": "The conversation now takes {{used}} tokens of the model's context, as the server counted this reply's largest request.",
-  "reply-context-of-title": "The conversation now takes {{used}} of the {{window}} tokens this model is loaded to hold. As it fills, older tool results are trimmed; past full, the server drops the oldest messages."
+  "reply-context-of-title": "The conversation now takes {{used}} of the {{window}} tokens this model is loaded to hold. As it fills, older tool results are trimmed; past full, the server drops the oldest messages.",
+  "context-used": "{{used}}/{{window}} ({{percent}}%) context used",
+  "context-size": "{{size}} context",
+  "context-size-unconfirmed": "~{{size}} context",
+  "context-size-unconfirmed-title": "The server did not report its context size, so this is an assumed default."
 ,
   "todo-title": "TODOs",
   "todo-of": "of",

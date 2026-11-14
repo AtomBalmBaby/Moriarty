@@ -1,5 +1,5 @@
 /**
- * Where a search-and-replace lands in a file. Pure: the chat's `edit_file`
+ * Where a search-and-replace lands in a file. Pure: the retired `edit_file`
  * tool plans the change here and hands the result to the editor, which
  * applies it or shows it for review.
  *
@@ -92,11 +92,11 @@ const restoreCutLines = (replace: string, original: string[]): string | undefine
 const CUT_LINE_REFUSAL =
   "replace has a line cut short with … that is not in find; read that line with read_file, start_line and end_line both set to its number, or leave it out of find and replace"
 
-const NOT_FOUND = "find is not in the file; read the lines again and copy them exactly, without the line numbers"
+const NOT_FOUND = "find is not in the file; read the file again with read_file, then make the change with edit_lines"
 
-/** Small models put new code in find; this is what they need to hear instead. */
-const TO_ADD =
-  "To add new code rather than change what is there, put the existing lines it goes next to in find, and those same lines with the new code in replace."
+/** Adding code by find and replace is the retired way; edit_lines inserts it directly. */
+const EDIT_LINES_HINT =
+  "Use edit_lines with the content_hash from read_file. To add new code, use insert_before or insert_after at the line it belongs next to."
 
 /** Lines of `find` scored when looking for the nearest match; a file this long is not searched for one. */
 const MAX_HINT_FIND_LINES = 12
@@ -222,9 +222,8 @@ export const planReplacement = (
   }
   if (!loose.length) {
     const nearest = nearestLines(lines, wanted)
-    return nearest
-      ? `find is not in the file. ${nearest}\nCopy the lines exactly as they are, without the line numbers. ${TO_ADD}`
-      : `${NOT_FOUND}. ${TO_ADD}`
+    if (!nearest) return `${NOT_FOUND}.`
+    return `find is not in the file. ${nearest}\n${EDIT_LINES_HINT}`
   }
   const startLine = loose[0]
   const endLine = startLine + wanted.length - 1

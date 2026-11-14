@@ -29,6 +29,7 @@ import { ReplyChanges } from "./reply-changes"
 import { useToast } from "./toast"
 import ToolSteps from "./tool-steps"
 import {
+  compactCount,
   getThinkingMessage,
   handleMarkdownPaste,
   insertLineBreak,
@@ -156,10 +157,6 @@ const ThinkingSection = React.memo(
 
 const formatDuration = (ms: number) =>
   ms < 1000 ? `${ms}ms` : ms < 60_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`
-
-/** 12412 as "12.4k": enough to see how full a context is. */
-const compactCount = (count: number) =>
-  count < 1000 ? String(count) : count < 10_000 ? `${(count / 1000).toFixed(1)}k` : `${Math.round(count / 1000)}k`
 
 /** From here a context is close enough to full to say so. */
 const CONTEXT_NEARLY_FULL = 0.8

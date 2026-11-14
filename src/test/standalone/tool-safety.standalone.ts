@@ -108,6 +108,7 @@ test("read_file counts lines as an editor does and never shows a byte-order mark
   // The edit planner sees the same text: line 1 of a file with a mark is still found.
   const edited: string[] = []
   const editing = workspaceTools(root, [], {
+    legacyEditFile: true,
     edits: {
       mode: "apply",
       edit: async (_file, replacement) => (edited.push(replacement.text), { ok: true, message: "ok" }),
@@ -357,6 +358,7 @@ test("the files an edit must not change unreviewed", () => {
 test("a tool that throws gives the model an error to read; it does not end the reply", async () => {
   const root = monorepo()
   const tools = workspaceTools(root, [], {
+    legacyEditFile: true,
     edits: {
       mode: "apply",
       edit: async () => {

@@ -106,12 +106,25 @@ test("editor tools, rename, delete and move are offered only when there is an ed
     rename: noop,
     context: async () => ({ openFiles: [] })
   }
-  const edits = { mode: "apply" as const, edit: noop, create: noop, remove: noop, move: noop }
+  const edits = { mode: "apply" as const, edit: noop, create: noop, editLines: noop, remove: noop, move: noop }
   assert.deepStrictEqual(names(workspaceTools(root, [], { edits, editor })), [
     "editor_context", "list_dir", "find_files", "read_file", "grep", "find_symbol",
     "go_to_definition", "find_references", "diagnostics", "git",
-    "edit_file", "create_file", "rename_symbol", "move_file", "delete_file"
+    "create_file", "edit_lines", "rename_symbol", "move_file", "delete_file"
   ])
+})
+
+test("edit_file is not offered; a call to it is refused with the tools that are, and edit_lines is among them", async () => {
+  const root = repo()
+  const noop = async () => ({ ok: true, message: "" })
+  const tools = workspaceTools(root, [], {
+    edits: { mode: "apply" as const, edit: noop, create: noop, editLines: noop }
+  })
+  assert.ok(tools.tools.some((t) => t.name === "edit_lines"))
+  assert.ok(!tools.tools.some((t) => t.name === "edit_file"))
+  const refused = await tools.run({ name: "edit_file", args: { path: "src/a.ts", find: "a", replace: "b" } })
+  assert.match(refused.output, /There is no tool called edit_file\./)
+  assert.match(refused.output, /edit_lines/)
 })
 
 test("read_file obeys the configured line cap and advertises it", async () => {

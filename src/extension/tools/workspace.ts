@@ -468,7 +468,7 @@ const createFile = (view: WorkspaceView, sink: EditSink): Tool => ({
     (sink.mode === "apply"
       ? "Create a new file with the given content; missing folders are made. It is written straight away."
       : "Propose a new file with the given content. The user reviews it before it is saved.") +
-    " The file must not exist yet; use edit_file to change an existing one.",
+    " The file must not exist yet; to change an existing file, read it and use edit_lines.",
   parameters: [
     { name: "path", description: "Where the new file goes, relative to the workspace root." },
     { name: "content", description: "The whole file." }
@@ -508,15 +508,17 @@ const lineEditErrorResult = (error: LineEditFailure): ToolResult => ({
 const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]>): Tool => ({
   name: "edit_lines",
   description:
-    "Edit complete source lines atomically, guarded by expected_hash from read_file (the fingerprint of the entire editor buffer). " +
+    "The standard way to change an existing source file. Edit complete source lines atomically, guarded by expected_hash from read_file (the fingerprint of the entire editor buffer). " +
     "All coordinates refer to the SAME original snapshot, not earlier edits. Lines are 1-based; a terminal newline is not an extra line. " +
     "replace/delete use inclusive start_line/end_line. insert_before accepts 1 through total_lines+1; insert_after accepts 1 through total_lines. " +
     "For an empty document only insert_before line=1 or insert_after line=0 is valid. EOF insertion preserves the final-newline convention. " +
     "content is an array of complete lines without newline characters (use [''] for a blank line). " +
     "Overlaps, same-boundary insertions and insertions touching a replaced/deleted boundary are rejected. " +
     "Hash mismatch leaves everything unchanged and returns current_hash; reread, never retry blindly. " +
-    "Uses existing edit permissions; review/protected files require approval. Changes remain unsaved in the editor buffer. Returns the resulting content_hash.",
-  guidance: "Prefer read_file then edit_lines for deterministic changes, especially long/repeated JSX lines; edit_file remains available for exact-text replacements.",
+    "Uses existing edit permissions; review/protected files require approval. Changes remain unsaved in the editor buffer. Returns the resulting content_hash, which is the expected_hash for the next edit to the same file.",
+  guidance:
+    "To change existing source: read_file for its numbered lines and content_hash, then call edit_lines with that expected_hash and the line operations. " +
+    "Use the content_hash it returns for the next edit to the same file. Reread only after a hash_mismatch, or when the lines you need were not in the last read.",
   parameters: [
     { name: "path", description: "Workspace-relative file path." },
     { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted." },
@@ -575,6 +577,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
   }
 })
 
+/** Retired exact-text replacement; registered only when `legacyEditFile` is set. Models edit with `edit_lines`. */
 const editFile = (view: WorkspaceView, sink: EditSink): Tool => ({
   name: "edit_file",
   description: `${EDIT_DESCRIPTION[sink.mode]} Copy find from read_file output, without the line numbers, with enough lines that it matches once.`,
@@ -799,6 +802,11 @@ const searchWorkspace = (view: WorkspaceView, index: WorkspaceSearchProvider): T
 /** What the tools can reach beyond reading files, when the host provides it. */
 export interface ToolExtras {
   edits?: EditSink & Partial<FileOpsSink>
+  /**
+   * Registers the retired exact-text `edit_file` for internal callers and tests.
+   * Model-facing sessions never set it; they edit with `edit_lines`.
+   */
+  legacyEditFile?: boolean
   commands?: CommandSink
   codeSearch?: CodeSearch
   workspaceSearch?: WorkspaceSearchProvider
@@ -836,8 +844,8 @@ const mcpTool = (spec: McpToolSpec, sink: McpSink): Tool => ({
 const PLACE_ARGUMENTS = ["path", "from", "to"]
 
 /**
- * The reading tools, plus `search_code`, the editor's tools, `edit_file`
- * and its kin, and `run_command`, when there is an index to search, an
+ * The reading tools, plus `search_code`, the editor's tools, `create_file`,
+ * `edit_lines` and its kin, and `run_command`, when there is an index to search, an
  * editor to ask, somewhere for edits to go and a terminal to run in.
  * `root` is the folder, or a view of it the host already made (so its
  * sinks can share the view's rules).
@@ -862,7 +870,8 @@ export const workspaceTools = (
     ...(editor ? [goToDefinition(view, editor), findReferences(view, editor), diagnostics(view, editor)] : []),
     ...(extras.git !== false && insideGitRepository(view.root) ? [git(view)] : [])
   ]
-  if (edits) tools.push(editFile(view, edits), createFile(view, edits))
+  if (edits && extras.legacyEditFile) tools.push(editFile(view, edits))
+  if (edits) tools.push(createFile(view, edits))
   if (edits?.editLines) tools.push(editLines(view, edits.editLines.bind(edits)))
   if (edits && editor) tools.push(renameSymbol(view, editor))
   if (edits?.remove && edits.move) {
