@@ -17,7 +17,7 @@ import { EVIDENCE_BUDGET, type EvidenceBudget, projectEvidence, rankPromotionCan
 import { assessAcceptedFacts, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, DETERMINISTIC_EVALUATOR, evaluateTodoReview, EVIDENCE_CHECK_TOOL, evidenceCheckRecord, evidencePreflight, factNamedBy, feedbackContext, hostDecidesReview, parseTodoEvaluation, provenTodoEvaluation, renderEvidencePreflight, reviewCandidates, reviewReconciliations, selectAcceptedFacts, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationValidationError, todoReviewInput,todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { validateIntentTaskPlan } from "../../extension/todos/intent-plan"
 import { authoritativeExecutionReport, renderPlanContext } from "../../extension/todos/plan-context"
-import { editDigest, TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { editDigest, TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import type { AcceptedFact, AnswerRequirement, ChildTodoDecision, ChildTodoReview, IntentPlanOutline, RetainedObservationEvidence, SymbolAlias, TodoEvaluation, TodoReviewPackage, TodoWriteRequest } from "../../extension/todos/types"
 import { RUNTIME_INVENTORY_TOOL, TodoConflictError } from "../../extension/todos/types"
 import { capabilityOf } from "../../extension/todos/verification-capabilities"
@@ -100,6 +100,7 @@ const responseFor = (review: TodoReviewPackage, options: {
   refs?: string[]
   correctiveInstructions?: string[]
   problems?: string[]
+  assessment?: unknown
 } = {}) => JSON.stringify({
   schemaVersion: 1,
   taskId: review.planTaskId,
@@ -112,7 +113,8 @@ const responseFor = (review: TodoReviewPackage, options: {
   problems: options.problems ?? [],
   correctiveInstructions: options.correctiveInstructions ?? [],
   explanation: "Reviewed the task against the supplied observations.",
-  scores: { completion: 7, correctness: 7, alignment: 8 }
+  scores: { completion: 7, correctness: 7, alignment: 8 },
+  assessment: options.assessment
 })
 
 const runCommandArguments = (command: string) => compactArguments(compactToolEvidence({ name: "run_command", args: { command }, output: "", failed: false, exitCode: 0, invocationId: "fixture" }))
@@ -584,7 +586,7 @@ test("a version-15 database keeps its alias rows as history, gains a nullable re
     await reopened.initialize()
     const check = new BetterSqlite(state.databasePath, { fileMustExist: true })
     try {
-      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 18)
+      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
       assert.equal(sqliteRows(check, "PRAGMA table_info(todo_accepted_evidence)").some((row) => row[1] === "registered_tool"), true, "the migration adds registered_tool")
       assert.equal(sqliteRows(check, "SELECT COUNT(*) FROM todo_symbol_aliases")[0][0], 1, "the legacy alias row is kept as history")
     } finally {
@@ -626,7 +628,7 @@ test("a version-16 database keeps its tool observations as history with no execu
     await reopened.initialize()
     const check = new BetterSqlite(state.databasePath, { fileMustExist: true })
     try {
-      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 18)
+      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
       assert.equal(sqliteRows(check, "PRAGMA table_info(todo_tool_observations)").some((row) => row[1] === "execution_id"), true, "the migration adds execution_id")
       assert.equal(sqliteRows(check, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'todo_tool_observations_execution'").length, 1)
       const [row] = sqliteRows(check, `SELECT output, failed, execution_id FROM todo_tool_observations WHERE id = '${historical.id}'`)
@@ -650,7 +652,7 @@ test("existing version-4 TODO databases gain child proposals and accepted eviden
     const reopened = new TodoRepository(state.databasePath)
     assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
     const check = new BetterSqlite(state.databasePath, { fileMustExist: true })
-    assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 18)
+    assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
     assert.equal(sqliteRows(check, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0][0], 1)
     assert.equal(sqliteRows(check, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_symbol_aliases'")[0][0], 1)
     check.close()
@@ -2208,26 +2210,11 @@ test("a delivery check verifies every required objective value against current a
   const hash = await fingerprintContent(workspaceText)
   const check = (reply: string, readCurrent: CurrentSourceReader | undefined = twoCopiesWorkspace, facts: AcceptedFact[] = [deliveryFact(hash)]) =>
     checkDelivery(reply, [deliveryRequirement], facts, readCurrent)
-  const expectRejected = async (reply: string, pattern: RegExp) => {
-    const verdict = blocked(await check(reply), "rejected")
-    assert.match(verdict.detail, pattern)
-    assert.ok(verdict.correction.includes(hash), "the correction restates the host-verified fingerprint")
-    assert.match(verdict.correction, /Do not run commands or recalculate any hash/)
-    return verdict
-  }
   const complete = `${EVIDENCE_FILE} lines 169-219, authoritative fingerprint ${hash}`
 
   assert.deepEqual(await check(complete), { outcome: "delivered" })
   assert.deepEqual(await check(`${complete}. The file has TODO comments that are not placeholder answers.`), { outcome: "delivered" })
   assert.deepEqual(await checkDelivery("anything", [], [], undefined), { outcome: "delivered" }, "a plan without answer requirements is never gated")
-
-  await expectRejected(`${EVIDENCE_FILE} authoritative fingerprint ${hash}`, /implementation line range/)
-  await expectRejected(`${EVIDENCE_FILE} lines 1-400 of 868, fingerprint ${hash}`, /implementation line range/)
-  await expectRejected(`${EVIDENCE_FILE} lines 169-219`, /authoritative whole-file source fingerprint/)
-  await expectRejected(`src/extension/tools/other.ts lines 169-219, fingerprint ${hash}`, /implementation file/)
-  await expectRejected(`${complete}; also xxh64:bbbbbbbbbbbbbbbb`, /xxh64:bbbbbbbbbbbbbbbb/)
-  await expectRejected(`${EVIDENCE_FILE} lines 169-219, fingerprint xxh64:<hash_value>`, /placeholder/)
-  await expectRejected(`${EVIDENCE_FILE} lines 169-219, fingerprint <fingerprint>`, /placeholder/)
 
   const stale = blocked(await check(complete, async (file) => (file === EVIDENCE_FILE ? `${workspaceText}\n// edited` : undefined)), "unresolved")
   assert.match(stale.detail, /changed after this fact was accepted/)
@@ -2238,6 +2225,52 @@ test("a delivery check verifies every required objective value against current a
   const irrelevant = blocked(await check(complete, twoCopiesWorkspace, [deliveryFact(hash, { symbol: "otherFunction" })]), "unresolved")
   assert.match(irrelevant.detail, /no accepted fact records/)
   blocked(await check(complete, twoCopiesWorkspace, [deliveryFact(hash, { supersededBy: "newer-fact" })]), "unresolved")
+})
+
+test("extra fingerprints in an answer do not block delivery when the required fingerprint is stated", async () => {
+  const hash = await fingerprintContent(workspaceText)
+  const superseded = "xxh64:a55538019a50a692"
+  const check = (reply: string) => checkDelivery(reply, [deliveryRequirement], [deliveryFact(hash)], twoCopiesWorkspace)
+  const complete = `${EVIDENCE_FILE} lines 169-219, authoritative fingerprint ${hash}`
+
+  assert.deepEqual(await check(complete), { outcome: "delivered" }, "the required fingerprint alone")
+  assert.deepEqual(await check(`${complete}. The earlier fingerprint ${superseded} is historical and superseded.`), { outcome: "delivered" }, "a historical value")
+  assert.deepEqual(await check(`${complete}. The fingerprint changed from ${superseded} to ${hash}.`), { outcome: "delivered" }, "a comparison")
+  assert.deepEqual(await check(`${complete}. The check failed: expected ${superseded}, found ${hash}.`), { outcome: "delivered" }, "a quoted error")
+  assert.deepEqual(await check(`${complete}; also xxh64:bbbbbbbbbbbbbbbb and xxh64:cccccccccccccccc.`), { outcome: "delivered" }, "unrelated values")
+  assert.deepEqual(await check(`${complete}. Superseded: ${superseded}; also historical xxh64:dddddddddddddddd.`), { outcome: "delivered" }, "several extra values")
+
+  const missing = blocked(await checkDelivery(`${EVIDENCE_FILE} lines 169-219, previously ${superseded}`, [deliveryRequirement], [deliveryFact(hash)], twoCopiesWorkspace), "rejected")
+  assert.match(missing.detail, /authoritative whole-file source fingerprint/)
+  assert.ok(missing.correction.includes(hash), "the correction restates the host-verified fingerprint")
+})
+
+test("a required value is checked against the same current fact, so attribution to its file and range is verified", async () => {
+  const hash = await fingerprintContent(workspaceText)
+  const check = (reply: string) => checkDelivery(reply, [deliveryRequirement], [deliveryFact(hash)], twoCopiesWorkspace)
+  const rejected = async (reply: string, pattern: RegExp) => {
+    const verdict = blocked(await check(reply), "rejected")
+    assert.match(verdict.detail, pattern)
+    assert.match(verdict.correction, /Do not run commands or recalculate any hash/)
+    return verdict
+  }
+
+  await rejected(`${EVIDENCE_FILE} authoritative fingerprint ${hash}`, /implementation line range/)
+  await rejected(`${EVIDENCE_FILE} lines 1-400 of 868, fingerprint ${hash}`, /implementation line range/)
+  await rejected(`${EVIDENCE_FILE} lines 169-219`, /authoritative whole-file source fingerprint/)
+  await rejected(`src/extension/tools/other.ts lines 169-219, fingerprint ${hash}`, /implementation file/)
+  await rejected(`${EVIDENCE_FILE} lines 169-219, fingerprint xxh64:<hash_value>`, /placeholder/)
+  await rejected(`${EVIDENCE_FILE} lines 169-219, fingerprint <fingerprint>`, /placeholder/)
+})
+
+test("repeated identical delivery corrections stop without progress", () => {
+  const controller = new ExecutionReconciliationController()
+  const progress = "delivery:read-file-plan:rejected:the answer does not state the authoritative whole-file source fingerprint"
+  const first = controller.reconcile("revise", progress, "none")
+  assert.equal(first.continue, true, "the first correction is requested")
+  const repeated = controller.reconcile("revise", progress, "none")
+  assert.equal(repeated.continue, false, "an identical rejection with no new evidence is not corrected again")
+  assert.match(repeated.reason ?? "", /no measurable progress/)
 })
 
 test("the answer contract is validated against same-plan source criteria, and each field needs its matching criterion", () => {
@@ -5240,14 +5273,14 @@ test("a version-10 database with accepted evidence upgrades to version 11 with e
     await reopened.initialize()
     assert.deepEqual(await reopened.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "the accepted fact and its provenance survive the upgrade unchanged")
     const upgraded = inspect()
-    assert.equal(upgraded.version, 18)
+    assert.equal(upgraded.version, 19)
     assert.equal(upgraded.activationTable, 1, "the requirement activation table is added")
     assert.deepEqual(upgraded.observations, before.observations, "no observation row or list revision changes during the upgrade")
 
     const again = new TodoRepository(state.databasePath)
     await again.initialize()
     assert.deepEqual(await again.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "a second reopen is stable")
-    assert.equal(inspect().version, 18)
+    assert.equal(inspect().version, 19)
     assert.equal(calls.count, 0)
   } finally {
     removeAll(state.directory)
@@ -5332,7 +5365,7 @@ test("the v12 edit ledger rebuilds for optional task association, keeps its rows
     })
   try {
     const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
-    assert.deepEqual(inspect(state.databasePath), { version: 18, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
+    assert.deepEqual(inspect(state.databasePath), { version: 19, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
     assert.deepEqual(backupFiles(12), [], "a new database has no earlier version to back up")
 
     await state.repository.beginEditOperation(state.scope, { id: "v12-edit", itemId, target: "src/old.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
@@ -5364,7 +5397,7 @@ PRAGMA user_version = 12;`))
     const reopened = new TodoRepository(state.databasePath)
     await reopened.initialize()
     const upgraded = inspect(state.databasePath)
-    assert.equal(upgraded.version, 18)
+    assert.equal(upgraded.version, 19)
     assert.equal(upgraded.itemNullable, true, "the task column becomes optional")
     assert.deepEqual(upgraded.statuses, [["v12-edit", "succeeded"]], "existing ledger rows keep their identity and settlement")
     assert.equal(upgraded.index, 1, "the target index is recreated")
@@ -5382,7 +5415,7 @@ PRAGMA user_version = 12;`))
     const again = new TodoRepository(state.databasePath)
     await again.initialize()
     assert.deepEqual(inspect(state.databasePath).ids, ["v12-edit", "v13-free"], "a second reopen is stable")
-    assert.equal(inspect(state.databasePath).version, 18)
+    assert.equal(inspect(state.databasePath).version, 19)
   } finally {
     removeAll(state.directory)
   }
@@ -5402,14 +5435,14 @@ test("the owner column is additive: legacy edit rows stay unowned and each reope
 
     const reopened = new TodoRepository(state.databasePath)
     await reopened.initialize()
-    assert.deepEqual(versionAndOwnerColumn(), { version: 18, ownerColumn: true }, "the upgrade adds the owner column")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 19, ownerColumn: true }, "the upgrade adds the owner column")
     assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined]], "a legacy row has no owner")
 
     await reopened.beginEditOperation(state.scope, { id: "2-owned-edit", ownerId: "host-b", target: "src/owned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
     const again = new TodoRepository(state.databasePath)
     await again.initialize()
     assert.deepEqual((await again.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined], ["2-owned-edit", "host-b"]], "owners survive a reopen")
-    assert.deepEqual(versionAndOwnerColumn(), { version: 18, ownerColumn: true }, "a second reopen is stable")
+    assert.deepEqual(versionAndOwnerColumn(), { version: 19, ownerColumn: true }, "a second reopen is stable")
   } finally {
     removeAll(state.directory)
   }
@@ -5468,7 +5501,7 @@ test("the v11 TODO database gains the edit operation ledger while keeping the ac
     await reopened.beginEditOperation(state.scope, { id: "edit-after-upgrade", itemId: after!.task.id, target: "src/a.ts", mode: "apply", preDigest: editDigest("a"), postDigest: editDigest("b") })
 
     withSqlite(state.databasePath, (check) => {
-      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 18)
+      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
       assert.equal((check.prepare("SELECT COUNT(*) FROM todo_edit_operations WHERE item_id = ?").raw().get(after!.task.id) as [number] | undefined)?.[0], 1)
     })
   } finally {
@@ -6636,5 +6669,528 @@ test("project-wide promotion does not elevate a source-backed semantic finding i
     assert.deepEqual(await judged.state.repository.promotionCandidates(judged.state.scope), [])
   } finally {
     fs.rmSync(judged.state.directory, { recursive: true, force: true })
+  }
+})
+
+const assessmentObserver = { provider: "cerebras", model: "llama-test" }
+
+const assessmentFor = (review: TodoReviewPackage, observationId: string, scores = { progress: 5, verification: 3 }, overrides: Record<string, unknown> = {}) => ({
+  schemaVersion: 1,
+  taskId: review.planTaskId,
+  progress: { score: scores.progress, explanation: "CSS change applied" },
+  verification: { score: scores.verification, explanation: "Rendered contrast not checked" },
+  evidenceRefs: [observationId],
+  ...overrides
+})
+
+const reviewOpenOf = async (state: FeedbackFixture, itemId: string) => {
+  const review = (await state.repository.getReviewPackages(state.scope, { includeOpen: true })).find((entry) => entry.task.id === itemId)
+  assert.ok(review, `review for ${itemId} is available`)
+  return review
+}
+
+const reviewed = async (state: FeedbackFixture, itemId: string, observationId: string, options: {
+  decision?: TodoEvaluation["decision"]
+  status?: "passed" | "failed"
+  assessment?: (review: TodoReviewPackage) => unknown
+} = {}) => {
+  const review = await reviewOpenOf(state, itemId)
+  return evaluateTodoReview(state.repository, state.scope, review,
+    async () => responseFor(review, {
+      decision: options.decision,
+      status: options.status,
+      refs: [observationId],
+      correctiveInstructions: options.decision === "revise" ? ["Inspect the changed file and rerun the check."] : undefined,
+      assessment: options.assessment?.(review)
+    }),
+    "mock-reviewer", { observer: assessmentObserver })
+}
+
+const listedItem = async (state: FeedbackFixture, itemId: string) => {
+  const item = (await state.repository.getList(state.scope)).items.find((entry) => entry.id === itemId)
+  assert.ok(item, `TODO ${itemId} is listed`)
+  return item
+}
+
+const observeOnce = (repository: TodoRepository, scope: TodoWriteRequest, itemId: string, requestId: string, toolName = "read_file", exitCode?: number) =>
+  repository.recordToolObservation(scope, {
+    itemId,
+    toolName,
+    arguments: toolName === "run_command" ? runCommandArguments("npx tsc --noEmit") : { path: "src/contrast.css" },
+    output: exitCode === undefined ? "Read the stylesheet." : "error TS2322: Type mismatch.",
+    failed: false,
+    exitCode,
+    requestId
+  })
+
+const capturedLogs = async <T>(action: () => Promise<T>) => {
+  const lines: string[] = []
+  const originalInfo = logger.info
+  const originalWarn = logger.warn
+  logger.info = (...args: unknown[]) => { lines.push(args.map(String).join(" ")) }
+  logger.warn = (...args: unknown[]) => { lines.push(args.map(String).join(" ")) }
+  try {
+    const result = await action()
+    return { result, lines }
+  } finally {
+    logger.info = originalInfo
+    logger.warn = originalWarn
+  }
+}
+
+test("a valid assessment stores two independent scores on its TODO without changing the review decision", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast", "Contrast meets the requested ratio")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+    const evaluation = await reviewed(state, itemId, observation.id, { assessment: (review) => assessmentFor(review, observation.id) })
+    assert.equal(evaluation.decision, "accept")
+    assert.equal(evaluation.observation?.status, "assessed")
+    const item = await listedItem(state, itemId)
+    assert.equal(item.status, "completed")
+    assert.equal(item.verification, "passed")
+    assert.equal(item.assessment?.status, "assessed")
+    assert.equal(item.assessment?.progress?.score, 5)
+    assert.equal(item.assessment?.verification?.score, 3)
+    assert.equal(item.assessment?.verification?.explanation, "Rendered contrast not checked")
+    assert.equal(item.assessment?.stale, false)
+    assert.equal(item.assessment?.reaction, undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("malformed or out-of-range assessments are recorded as unavailable and never change the review", async () => {
+  const cases: [string, (review: TodoReviewPackage, observationId: string) => unknown][] = [
+    ["progress above the scale", (review, id) => assessmentFor(review, id, { progress: 6, verification: 3 })],
+    ["verification below the scale", (review, id) => assessmentFor(review, id, { progress: 3, verification: 0 })],
+    ["non-integer score", (review, id) => assessmentFor(review, id, { progress: 3.5, verification: 3 })],
+    ["missing verification", (review, id) => ({ ...assessmentFor(review, id), verification: undefined })],
+    ["empty explanation", (review, id) => ({ ...assessmentFor(review, id), progress: { score: 4, explanation: "  " } })],
+    ["evaluator-supplied identifier", (review, id) => assessmentFor(review, id, undefined, { id: "model-chosen" })],
+    ["unsupported schema version", (review, id) => assessmentFor(review, id, undefined, { schemaVersion: 2 })],
+    ["mismatched task identity", (review, id) => assessmentFor(review, id, undefined, { taskId: "another-task" })],
+    ["unknown evidence reference", (review, id) => assessmentFor(review, id, undefined, { evidenceRefs: ["observation-missing"] })],
+    ["non-object assessment", () => "high"],
+    ["assessment omitted", () => undefined]
+  ]
+  for (const [name, build] of cases) {
+    const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+    try {
+      const itemId = state.items[0].id
+      const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+      const evaluation = await reviewed(state, itemId, observation.id, { assessment: (review) => build(review, observation.id) })
+      assert.equal(evaluation.decision, "accept", name)
+      const item = await listedItem(state, itemId)
+      assert.equal(item.status, "completed", name)
+      assert.equal(item.verification, "passed", name)
+      assert.equal(item.assessment?.status, "unavailable", name)
+      assert.ok(item.assessment?.reason, name)
+      assert.equal(item.assessment?.progress, undefined, name)
+      assert.equal(item.assessment?.verification, undefined, name)
+    } finally {
+      fs.rmSync(state.directory, { recursive: true, force: true })
+    }
+  }
+})
+
+test("a TODO that has never been assessed reports no assessment", async () => {
+  const state = await fixture([{ id: "untouched", criteria: [semantic("untouched")] }])
+  try {
+    assert.equal((await listedItem(state, state.items[0].id)).assessment, undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("one evaluation cycle assesses each reviewed TODO independently and leaves the others unassessed", async () => {
+  const state = await fixture([
+    { id: "first", criteria: [semantic("first")] },
+    { id: "second", criteria: [semantic("second")] },
+    { id: "third", criteria: [semantic("third")] }
+  ])
+  try {
+    const [first, second, third] = state.items.map((item) => item.id)
+    const firstObservation = await addObservation(state.repository, state.scope, first, "run_command", 0)
+    const secondObservation = await addObservation(state.repository, state.scope, second, "run_command", 0)
+    await reviewed(state, first, firstObservation.id, { assessment: (review) => assessmentFor(review, firstObservation.id, { progress: 4, verification: 2 }) })
+    await reviewed(state, second, secondObservation.id, { assessment: (review) => assessmentFor(review, secondObservation.id, { progress: 5, verification: 5 }) })
+    const firstAssessment = (await listedItem(state, first)).assessment
+    const secondAssessment = (await listedItem(state, second)).assessment
+    assert.equal(firstAssessment?.progress?.score, 4)
+    assert.equal(firstAssessment?.verification?.score, 2)
+    assert.equal(secondAssessment?.progress?.score, 5)
+    assert.equal(secondAssessment?.verification?.score, 5)
+    assert.notEqual(firstAssessment?.id, secondAssessment?.id)
+    assert.equal((await listedItem(state, third)).assessment, undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a repeated delivery of the same evaluation keeps one immutable assessment", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+    const review = await reviewOpenOf(state, itemId)
+    const evaluator = async () => responseFor(review, { refs: [observation.id], assessment: assessmentFor(review, observation.id) })
+    const first = await evaluateTodoReview(state.repository, state.scope, review, evaluator, "mock-reviewer", { observer: assessmentObserver })
+    const second = await evaluateTodoReview(state.repository, state.scope, review, evaluator, "mock-reviewer", { observer: assessmentObserver })
+    assert.equal(second.observation?.id, first.observation?.id)
+    assert.equal((await state.repository.getAssessmentHistory(state.scope, itemId)).length, 1)
+    const stored = withSqlite(state.databasePath, (database) => (database.prepare("SELECT COUNT(*) AS count FROM todo_assessments WHERE item_id = ?").get(itemId) as { count: number }).count)
+    assert.equal(stored, 1)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a newer assessment becomes current while the earlier one, its reaction and its history remain", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const first = await observeOnce(state.repository, state.scope, itemId, "observe-first")
+    await reviewed(state, itemId, first.id, { decision: "revise", status: "failed", assessment: (review) => assessmentFor(review, first.id, { progress: 5, verification: 3 }) })
+    const earlier = (await listedItem(state, itemId)).assessment
+    assert.ok(earlier)
+    await state.repository.setAssessmentReaction(state.scope, earlier.id, "disagree", "react-earlier")
+    const reopenedItem = await listedItem(state, itemId)
+    await state.repository.updateItem(state.scope, { itemId, expectedVersion: reopenedItem.version, patch: { status: "completed" }, actor: "model", requestId: "reclaim-after-revise" })
+    const second = await observeOnce(state.repository, state.scope, itemId, "observe-second")
+    await reviewed(state, itemId, second.id, { assessment: (review) => assessmentFor(review, second.id, { progress: 4, verification: 2 }) })
+    const current = (await listedItem(state, itemId)).assessment
+    assert.ok(current)
+    assert.notEqual(current.id, earlier.id)
+    assert.equal(current.progress?.score, 4)
+    assert.equal(current.reaction, undefined)
+    const history = await state.repository.getAssessmentHistory(state.scope, itemId)
+    assert.deepEqual(history.map((entry) => entry.id), [earlier.id, current.id])
+    assert.equal(history[0].progress?.score, 5)
+    assert.equal(history[0].reaction, "disagree")
+    assert.equal(history[0].stale, true)
+    assert.equal(history[1].stale, false)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("reactions select, replace, clear and replay idempotently on the assessment they target", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+    await reviewed(state, itemId, observation.id, { assessment: (review) => assessmentFor(review, observation.id) })
+    const assessmentId = (await listedItem(state, itemId)).assessment?.id
+    assert.ok(assessmentId)
+    const reactionOf = async () => (await listedItem(state, itemId)).assessment?.reaction
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, "agree", "react-1")
+    assert.equal(await reactionOf(), "agree")
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, "facepalm", "react-2")
+    assert.equal(await reactionOf(), "facepalm")
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, null, "react-3")
+    assert.equal(await reactionOf(), undefined)
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, "disagree", "react-2")
+    assert.equal(await reactionOf(), undefined, "a replayed request does not reapply its reaction")
+    const rows = withSqlite(state.databasePath, (database) => (database.prepare("SELECT COUNT(*) AS count FROM todo_assessment_reactions WHERE assessment_id = ?").get(assessmentId) as { count: number }).count)
+    assert.equal(rows, 3)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("reactions and scores survive reopening the native store", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+    await reviewed(state, itemId, observation.id, { assessment: (review) => assessmentFor(review, observation.id) })
+    const assessmentId = (await listedItem(state, itemId)).assessment?.id
+    assert.ok(assessmentId)
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, "agree", "react-reload")
+    const reopened = new TodoRepository(state.databasePath)
+    const item = (await reopened.getList(state.scope)).items.find((entry) => entry.id === itemId)
+    assert.equal(item?.assessment?.id, assessmentId)
+    assert.equal(item?.assessment?.progress?.score, 5)
+    assert.equal(item?.assessment?.verification?.score, 3)
+    assert.equal(item?.assessment?.reaction, "agree")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("reaction buttons change no TODO status, evidence, evaluation or event state", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+    await reviewed(state, itemId, observation.id, { assessment: (review) => assessmentFor(review, observation.id) })
+    const assessmentId = (await listedItem(state, itemId)).assessment?.id
+    assert.ok(assessmentId)
+    const executionState = async () => JSON.stringify((await state.repository.getList(state.scope)).items.map((item) => ({ ...item, assessment: undefined })))
+    const counts = () => withSqlite(state.databasePath, (database) => ["todo_events", "todo_evaluations", "todo_evidence"].map((table) =>
+      (database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count))
+    const before = { items: await executionState(), counts: counts() }
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, "agree", "no-exec-1")
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, "facepalm", "no-exec-2")
+    await state.repository.setAssessmentReaction(state.scope, assessmentId, null, "no-exec-3")
+    assert.deepEqual({ items: await executionState(), counts: counts() }, before)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a stale evaluation from a superseded TODO version is rejected without storing an assessment", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await observeOnce(state.repository, state.scope, itemId, "observe-stale")
+    const review = await reviewOpenOf(state, itemId)
+    const item = await listedItem(state, itemId)
+    await state.repository.updateItem(state.scope, { itemId, expectedVersion: item.version, patch: { title: "Contrast revised" }, actor: "model", requestId: "revise-title" })
+    await assert.rejects(evaluateTodoReview(state.repository, state.scope, review,
+      async () => responseFor(review, { refs: [observation.id], assessment: assessmentFor(review, observation.id) }), "mock-reviewer", { observer: assessmentObserver }), TodoConflictError)
+    assert.equal((await state.repository.getAssessmentHistory(state.scope, itemId)).length, 0)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("assessments are isolated by project and conversation, and reactions require the owning writer", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+    await reviewed(state, itemId, observation.id, { assessment: (review) => assessmentFor(review, observation.id) })
+    const assessmentId = (await listedItem(state, itemId)).assessment?.id
+    assert.ok(assessmentId)
+    const otherProject = { ...state.scope, projectFingerprint: workspaceProjectFingerprint(["file:///other-project"]) }
+    const otherConversation = { ...state.scope, conversationId: "other-chat", writer: "other-chat" }
+    assert.deepEqual(await state.repository.getAssessmentHistory(otherProject, itemId), [])
+    assert.deepEqual(await state.repository.getAssessmentHistory(otherConversation, itemId), [])
+    await assert.rejects(state.repository.setAssessmentReaction(otherProject, assessmentId, "agree", "cross-project"), /not found/)
+    assert.throws(() => state.repository.setAssessmentReaction({ ...state.scope, writer: "other-chat" }, assessmentId, "agree", "cross-writer"), TodoWriteDeniedError)
+    assert.equal((await listedItem(state, itemId)).assessment?.reaction, undefined)
+    assert.equal((await state.repository.getAssessmentHistory(state.scope, itemId)).length, 1)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("assessments and user reactions are traced with their task and assessment identities", async () => {
+  const state = await fixture([{ id: "contrast", criteria: [semantic("contrast")] }])
+  try {
+    const itemId = state.items[0].id
+    const observation = await addObservation(state.repository, state.scope, itemId, "run_command", 0)
+    const { lines } = await capturedLogs(() => reviewed(state, itemId, observation.id, { assessment: (review) => assessmentFor(review, observation.id) }))
+    const trace = lines.find((line) => line.startsWith(`feedback.assessment task=${itemId} assessment=`))
+    assert.ok(trace, "assessment trace is emitted")
+    assert.match(trace, /P=5 V=3 mode=observe-only/)
+    assert.match(trace, /evaluator=cerebras\/llama-test/)
+    assert.match(trace, /progress="CSS change applied"/)
+    const assessmentId = (await listedItem(state, itemId)).assessment?.id
+    assert.ok(assessmentId)
+    const reaction = await capturedLogs(() => state.repository.setAssessmentReaction(state.scope, assessmentId, "facepalm", "trace-react"))
+    assert.ok(reaction.lines.includes(`feedback.user_reaction task=${itemId} assessment=${assessmentId} reaction=facepalm actor=user`))
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("regression scenarios: scores never change the decision, status or verification", async () => {
+  type Scenario = { name: string; toolName: string; exitCode?: number; repeats: number }
+  const scenarios: Scenario[] = [
+    { name: "CSS edit without independent visual check", toolName: "read_file", repeats: 1 },
+    { name: "run_command location with authoritative fingerprint", toolName: "run_command", exitCode: 0, repeats: 1 },
+    { name: "compiler diagnostics contradict the claimed fix", toolName: "run_command", exitCode: 1, repeats: 1 },
+    { name: "repeated unsuccessful lookup", toolName: "read_file", repeats: 3 }
+  ]
+  const outcome = async (scenario: Scenario, scores: { progress: number; verification: number }) => {
+    const state = await fixture([{ id: "work", criteria: [semantic("work")] }])
+    try {
+      const itemId = state.items[0].id
+      let observationId = ""
+      for (let index = 0; index < scenario.repeats; index++) {
+        observationId = (await observeOnce(state.repository, state.scope, itemId, `obs-${index}`, scenario.toolName, scenario.exitCode)).id
+      }
+      const evaluation = await reviewed(state, itemId, observationId, { assessment: (review) => assessmentFor(review, observationId, scores) })
+      const item = await listedItem(state, itemId)
+      return {
+        decision: evaluation.decision,
+        status: item.status,
+        verification: item.verification,
+        progress: item.assessment?.progress?.score,
+        verificationScore: item.assessment?.verification?.score
+      }
+    } finally {
+      fs.rmSync(state.directory, { recursive: true, force: true })
+    }
+  }
+  for (const scenario of scenarios) {
+    const high = await outcome(scenario, { progress: 5, verification: 5 })
+    const low = await outcome(scenario, { progress: 1, verification: 1 })
+    assert.deepEqual(
+      { decision: high.decision, status: high.status, verification: high.verification },
+      { decision: low.decision, status: low.status, verification: low.verification },
+      scenario.name
+    )
+    assert.equal(high.progress, 5, scenario.name)
+  }
+})
+
+const waitForAssessment = async (state: FeedbackFixture, itemId: string) => {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    const item = await listedItem(state, itemId)
+    if (item.assessment && !item.assessmentPending) return item
+    await new Promise((resolve) => setTimeout(resolve, 2))
+  }
+  assert.fail(`observation for ${itemId} was not recorded`)
+}
+
+test("a deterministically decided TODO receives a Cerebras observation that cannot change its verdict", async () => {
+  const command = "npx tsc --noEmit"
+  const state = await fixture([{ id: "verify", criteria: [exitZero(command)] }])
+  try {
+    const item = state.items[0]
+    const observation = await commandObservation(state.repository, state.scope, item.id, command, 0)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    let requests = 0
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => { throw new Error("the semantic evaluator must not run") }, "mock-reviewer", {
+      observer: assessmentObserver,
+      observation: { request: async () => { requests++; return JSON.stringify({ assessment: assessmentFor(review, observation.id) }) }, publish: async () => undefined }
+    })
+    assert.equal(evaluation.decision, "accept")
+    assert.equal(evaluation.metadata?.evaluator, DETERMINISTIC_EVALUATOR)
+    const listed = await waitForAssessment(state, item.id)
+    assert.equal(requests, 1)
+    assert.equal(listed.status, "completed")
+    assert.equal(listed.verification, "passed")
+    assert.equal(listed.assessment?.status, "assessed")
+    assert.equal(listed.assessment?.progress?.score, 5)
+    assert.equal(listed.assessment?.verification?.score, 3)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a pending observation is projected as pending, and reactions attach only once the assessment is recorded", async () => {
+  const command = "npx tsc --noEmit"
+  const state = await fixture([{ id: "verify", criteria: [exitZero(command)] }])
+  try {
+    const item = state.items[0]
+    const observation = await commandObservation(state.repository, state.scope, item.id, command, 0)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    await evaluateTodoReview(state.repository, state.scope, review, async () => "{}", "mock-reviewer", {
+      observer: assessmentObserver,
+      observation: { request: async () => { await gate; return JSON.stringify({ assessment: assessmentFor(review, observation.id) }) }, publish: async () => undefined }
+    })
+    const pending = await listedItem(state, item.id)
+    assert.equal(pending.assessmentPending, true)
+    assert.equal(pending.assessment, undefined)
+    assert.equal(pending.status, "completed")
+    release()
+    const assessed = await waitForAssessment(state, item.id)
+    assert.equal(assessed.assessment?.status, "assessed")
+    const reacted = await state.repository.setAssessmentReaction(state.scope, assessed.assessment!.id, "agree", "react-observed")
+    assert.equal(reacted.items.find((entry) => entry.id === item.id)?.assessment?.reaction, "agree")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a failed observation records an unavailable assessment and leaves the deterministic verdict and status unchanged", async () => {
+  const command = "npx tsc --noEmit"
+  const state = await fixture([{ id: "verify", criteria: [exitZero(command)] }])
+  try {
+    const item = state.items[0]
+    await commandObservation(state.repository, state.scope, item.id, command, 0)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => "{}", "mock-reviewer", {
+      observer: assessmentObserver,
+      observation: { request: async () => { throw new Error("Feedback evaluation timed out") }, publish: async () => undefined }
+    })
+    assert.equal(evaluation.decision, "accept")
+    const listed = await waitForAssessment(state, item.id)
+    assert.equal(listed.status, "completed")
+    assert.equal(listed.verification, "passed")
+    assert.equal(listed.assessment?.status, "unavailable")
+    assert.match(listed.assessment?.reason ?? "", /timed out/)
+    assert.equal(listed.assessment?.progress, undefined)
+    await assert.rejects(state.repository.setAssessmentReaction(state.scope, listed.assessment!.id, "disagree", "react-unavailable"), /Only assessed evaluations/)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a malformed or out-of-range observation is recorded as unavailable without changing the verdict", async () => {
+  const cases: [string, (review: TodoReviewPackage, observationId: string) => string][] = [
+    ["a response that is not JSON", () => "I think it is fine."],
+    ["a progress score above the scale", (review, id) => JSON.stringify({ assessment: assessmentFor(review, id, { progress: 6, verification: 3 }) })]
+  ]
+  for (const [label, respond] of cases) {
+    const command = "npx tsc --noEmit"
+    const state = await fixture([{ id: "verify", criteria: [exitZero(command)] }])
+    try {
+      const item = state.items[0]
+      const observation = await commandObservation(state.repository, state.scope, item.id, command, 0)
+      const review = (await state.repository.getReviewPackages(state.scope))[0]
+      const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => "{}", "mock-reviewer", {
+        observer: assessmentObserver,
+        observation: { request: async () => respond(review, observation.id), publish: async () => undefined }
+      })
+      assert.equal(evaluation.decision, "accept", label)
+      const listed = await waitForAssessment(state, item.id)
+      assert.equal(listed.status, "completed", label)
+      assert.equal(listed.assessment?.status, "unavailable", label)
+      assert.ok(listed.assessment?.reason, label)
+    } finally {
+      fs.rmSync(state.directory, { recursive: true, force: true })
+    }
+  }
+})
+
+test("replaying a deterministic verdict does not request a second observation", async () => {
+  const command = "npx tsc --noEmit"
+  const state = await fixture([{ id: "verify", criteria: [exitZero(command)] }])
+  try {
+    const item = state.items[0]
+    const observation = await commandObservation(state.repository, state.scope, item.id, command, 0)
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    let requests = 0
+    const observe = { observer: assessmentObserver, observation: { request: async () => { requests++; return JSON.stringify({ assessment: assessmentFor(review, observation.id) }) }, publish: async () => undefined } }
+    await evaluateTodoReview(state.repository, state.scope, review, async () => "{}", "mock-reviewer", observe)
+    const first = await waitForAssessment(state, item.id)
+    await evaluateTodoReview(state.repository, state.scope, review, async () => "{}", "mock-reviewer", observe)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const replayed = await listedItem(state, item.id)
+    assert.equal(requests, 1)
+    assert.equal(replayed.assessment?.id, first.assessment?.id)
+    assert.equal(replayed.assessmentPending, undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a command that timed out is unverified for its exit-status criterion, and never passes it", async () => {
+  const command = "npm test"
+  const state = await fixture([{ id: "verify", criteria: [exitZero(command)] }])
+  try {
+    await state.repository.recordToolObservation(state.scope, {
+      itemId: state.items[0].id,
+      toolName: "run_command",
+      arguments: runCommandArguments(command),
+      output: "still running when the wait ran out",
+      failed: true,
+      requestId: "command-timed-out"
+    })
+    const review = (await state.repository.getReviewPackages(state.scope))[0]
+    const evaluation = await evaluateTodoReview(state.repository, state.scope, review, async () => JSON.stringify({ schemaVersion: 1, taskId: review.planTaskId, decision: "needs_evidence", criteria: [], problems: [], correctiveInstructions: [], explanation: "the command did not finish", scores: { completion: 0, correctness: 0, alignment: 0 } }), "mock-reviewer")
+    assert.notEqual(evaluation.decision, "accept")
+    assert.notEqual(evaluation.criteria[0].status, "passed")
+    assert.equal((await state.repository.getList(state.scope)).items[0].status, "in_review")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
   }
 })

@@ -36,6 +36,7 @@ import type {
   ModelCatalogue,
   ReplyChangesView,
   ThemeType,
+  TodoAssessmentReaction,
   TodoFeedbackStatus,
   TodoItem,
   TodoListSnapshot,
@@ -114,6 +115,14 @@ export interface TodoRenewRequirementRequest {
 export interface TodoEvaluateRequest {
   conversationId: string
   itemId: string
+}
+
+/** Records the user's reaction to one assessment. `reaction: null` clears it. Observational only. */
+export interface TodoAssessmentReactionRequest {
+  conversationId: string
+  requestId: string
+  assessmentId: string
+  reaction: TodoAssessmentReaction | null
 }
 
 export interface ChatRequest {
@@ -432,6 +441,7 @@ export interface ClientEvents {
   [TODO_EVENT_NAME.completeItem]: Channel<TodoCompleteRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.renewRequirement]: Channel<TodoRenewRequirementRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.evaluateItem]: Channel<TodoEvaluateRequest, TodoListSnapshot>
+  [TODO_EVENT_NAME.setAssessmentReaction]: Channel<TodoAssessmentReactionRequest, TodoListSnapshot>
   [TODO_EVENT_NAME.retryFeedback]: Channel<{ conversationId: string }, { status: string }>
   [EVENT_NAME.twinnyToolInventory]: Channel<void, ToolInventoryItem[]>
   [EVENT_NAME.twinntGetLocale]: Channel<void, string>

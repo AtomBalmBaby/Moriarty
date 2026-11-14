@@ -17,7 +17,6 @@ export type DeliveryVerdict =
 
 /** Template text the model left behind instead of a value, such as `xxh64:<hash_value>` or `<fingerprint>`. */
 const PLACEHOLDER = /[a-z][a-z0-9_]*:<[^<>\s]*>|<[a-z_]*(?:hash|fingerprint)[a-z_]*>/i
-const FINGERPRINT = /\b[a-z][a-z0-9_]*:[0-9a-f]{16,}\b/g
 
 const escapePattern = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
@@ -45,7 +44,7 @@ const valueFor = (field: AnswerField, fact: AcceptedFact): RequiredValue => {
   }
 }
 
-type Resolution = { values: RequiredValue[]; trusted: string[] } | { unresolved: string }
+type Resolution = { values: RequiredValue[] } | { unresolved: string }
 
 /**
  * Resolves one requirement from the project's current accepted facts. A stale, unverifiable, missing, or conflicting
@@ -74,18 +73,19 @@ const resolveRequirement = async (
   const disagrees = current.some((other) =>
     other.path !== fact.path || other.startLine !== fact.startLine || other.endLine !== fact.endLine || other.sourceHash !== fact.sourceHash)
   if (disagrees) return { unresolved: `the current accepted facts for ${subject} disagree` }
-  return { values: requirement.fields.map((field) => valueFor(field, fact)), trusted: [fact.sourceHash] }
+  return { values: requirement.fields.map((field) => valueFor(field, fact)) }
 }
 
-/** The first missing or contradicting part of a reply, or undefined when every required value is stated and nothing invented. */
-const replyFault = (reply: string, values: RequiredValue[], trusted: Set<string>): string | undefined => {
+/**
+ * The first missing part of a reply, or undefined when every requested value is stated. Each requested value is checked
+ * against the one current accepted fact that supplies it, so the path, range and fingerprint all describe the same source.
+ * Other content in the reply, including other fingerprints, is not checked.
+ */
+const replyFault = (reply: string, values: RequiredValue[]): string | undefined => {
   const placeholder = PLACEHOLDER.exec(reply)
   if (placeholder) return `the answer contains the placeholder "${placeholder[0]}"`
   for (const value of values) {
     if (!value.pattern.test(reply)) return `the answer does not state the ${value.label}`
-  }
-  for (const match of reply.matchAll(FINGERPRINT)) {
-    if (!trusted.has(match[0])) return `the answer states the fingerprint "${match[0]}", which no current accepted fact supports`
   }
   return undefined
 }
@@ -94,7 +94,7 @@ const rejectedCorrection = (detail: string, values: RequiredValue[]) => [
   `The answer was not delivered: ${detail}.`,
   "The task is complete, but the answer must state these host-verified values:",
   ...values.map((value) => `- ${value.label}: ${value.value}`),
-  "Reply with the complete answer using only these values. Do not run commands or recalculate any hash."
+  "Reply with the complete answer, stating each of these values. Do not run commands or recalculate any hash."
 ].join("\n")
 
 const unresolvedCorrection = (detail: string) => [
@@ -114,16 +114,14 @@ export const checkDelivery = async (
 ): Promise<DeliveryVerdict> => {
   if (requirements.length === 0) return { outcome: "delivered" }
   const values: RequiredValue[] = []
-  const trusted = new Set<string>()
   for (const requirement of requirements) {
     const resolution = await resolveRequirement(requirement, facts, readCurrent)
     if ("unresolved" in resolution) {
       return { outcome: "unresolved", detail: resolution.unresolved, correction: unresolvedCorrection(resolution.unresolved) }
     }
     values.push(...resolution.values)
-    resolution.trusted.forEach((value) => trusted.add(value))
   }
-  const fault = replyFault(reply, values, trusted)
+  const fault = replyFault(reply, values)
   if (fault) return { outcome: "rejected", detail: fault, correction: rejectedCorrection(fault, values) }
   return { outcome: "delivered" }
 }

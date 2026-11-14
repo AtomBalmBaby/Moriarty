@@ -254,24 +254,64 @@ test("a start_line without end_line reads to the end of the file, subject to the
   isFailure(await readFrom(workspace({ readFileAllowFullFile: true }), { start_line: "130" }))
 })
 
-test("full_file cannot be combined with a range or full_line, and its flag must be true or false", async () => {
+test("full_file takes precedence over range and full_line arguments, which are ignored", async () => {
   const tools = workspace()
+  const whole = await readFrom(tools, { full_file: "true" }, "three.ts")
+  assert.notEqual(whole.failed, true)
+  assert.match(whole.output, /^three\.ts \(lines 1–3 of 3\)\n/)
+  assert.ok(whole.output.includes(`content_hash: ${await contentHash(TEXT)}; total_lines: 3`), whole.output)
+  assert.ok(whole.output.endsWith("1: const a = 1\n2: const b = 2\n3: const c = 3"), whole.output)
+
   const conflicting: Record<string, string>[] = [
-    { full_file: "true", start_line: "1" },
+    { full_file: "true", start_line: "2" },
     { full_file: "true", end_line: "2" },
     { full_file: "true", start_line: "1", end_line: "2" },
-    { full_file: "true", start_line: "2", full_line: "true" }
+    { full_file: "true", full_line: "true" },
+    { full_file: "true", start_line: "2", full_line: "true" },
+    { full_file: "true", start_line: "1", end_line: "3", full_line: "true" },
+    { full_file: "TRUE", start_line: "2", end_line: "2" }
   ]
   for (const args of conflicting) {
     const result = await readFrom(tools, args, "three.ts")
-    isFailure(result)
-    assert.match(result.output, /full_file reads the whole file, so it cannot be combined with start_line, end_line or full_line/, JSON.stringify(args))
+    assert.notEqual(result.failed, true, JSON.stringify(args))
+    assert.equal(result.output, whole.output, JSON.stringify(args))
   }
-  const unknown = await readFrom(tools, { full_file: "maybe" }, "three.ts")
+
+  const unknown = await readFrom(tools, { full_file: "maybe", start_line: "2" }, "three.ts")
   isFailure(unknown)
   assert.match(unknown.output, /full_file must be true or false, got "maybe"/)
   const falseWithRange = await readFrom(tools, { full_file: "false", start_line: "2", end_line: "2" }, "three.ts")
   assert.equal(falseWithRange.output.split("\n")[0], "three.ts (lines 2–2 of 3)")
+})
+
+test("without full_file, range arguments are validated as before", async () => {
+  const tools = workspace()
+  const invalid: [Record<string, string>, RegExp][] = [
+    [{ start_line: "0" }, /start_line must be a line number from 1, got "0"/],
+    [{ full_file: "false", start_line: "0" }, /start_line must be a line number from 1, got "0"/],
+    [{ start_line: "3", end_line: "2" }, /end_line 2 is before start_line 3/],
+    [{ start_line: "1", end_line: "3", full_line: "true" }, /full_line returns exactly one line/]
+  ]
+  for (const [args, pattern] of invalid) {
+    const result = await readFrom(tools, args, "three.ts")
+    isFailure(result)
+    assert.match(result.output, pattern, JSON.stringify(args))
+  }
+})
+
+test("full_file with a range keeps the whole-file limit and the full-file override on a file over the limit", async () => {
+  const refused = await readFrom(workspace(), { full_file: "true", end_line: "2" })
+  isFailure(refused)
+  assert.match(refused.output, /^read_file: long\.ts/)
+  assert.deepEqual(preserveEvidence(refused.output).sources, [], "a refused read produces no evidence")
+
+  const allowed = await readFrom(workspace({ readFileAllowFullFile: true }), { full_file: "true", end_line: "2", start_line: "5" })
+  assert.notEqual(allowed.failed, true)
+  assert.match(allowed.output, /^long\.ts \(lines 1–250 of 250\)\n/)
+  const [source] = preserveEvidence(allowed.output).sources
+  assert.equal(source.startLine, 1)
+  assert.equal(source.endLine, 250)
+  assert.equal(source.contentHash, await contentHash(LONG))
 })
 
 test("full_line stays accepted but is not advertised, and full_file is advertised as an optional boolean", async () => {
@@ -320,12 +360,14 @@ test("a refused oversized read produces no accepted source evidence", async () =
   }
 })
 
-test("the full-file override does not reach files outside the workspace or ignored files", async () => {
+test("the full-file override does not reach files outside the workspace or ignored files, with or without range arguments", async () => {
   const tools = workspace({ readFileAllowFullFile: true }, ["secret.env"])
   isFailure(await readFrom(tools, {}, "../outside.txt"))
   isFailure(await readFrom(tools, { full_file: "true" }, "../outside.txt"))
+  isFailure(await readFrom(tools, { full_file: "true", start_line: "1", end_line: "2" }, "../outside.txt"))
   isFailure(await readFrom(tools, {}, "secret.env"))
   isFailure(await readFrom(tools, { full_file: "true" }, "secret.env"))
+  isFailure(await readFrom(tools, { full_file: "true", end_line: "2" }, "secret.env"))
 })
 
 test("the configuration reader supplies the maximum and the override to the tool", async () => {

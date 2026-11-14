@@ -897,19 +897,21 @@ test("rapid conversation switches clear the previous list at once and ignore lat
 
 const EMPTY_CONVERSATION = "todo-empty-conversation"
 
+const SHOW_COMPLETED_CONTROL = "[data-control=\"show-completed\"]"
+
 test("the Show Completed toggle is one header control whenever some TODOs are completed", async () => {
   todoLists.set(TODO_CONVERSATION, todoSnapshot(TODO_CONVERSATION, 3, { first: "completed", second: "in_progress" }))
   const panel = await mountTodoPanel(TODO_CONVERSATION)
   try {
-    const toggles = panel.document.querySelectorAll("[aria-pressed]")
+    const toggles = panel.document.querySelectorAll(SHOW_COMPLETED_CONTROL)
     assert.equal(toggles.length, 1, "exactly one Show Completed control")
     assert.equal(toggles[0].getAttribute("aria-pressed"), "false")
     const header = toggles[0].parentElement
     assert.ok(header?.querySelector("strong")?.textContent?.length, "the control sits in the panel header beside the title")
     assert.equal(showsTask(panel.document, "first"), false)
-    await panel.click("[aria-pressed]")
+    await panel.click(SHOW_COMPLETED_CONTROL)
     assert.equal(showsTask(panel.document, "first"), true)
-    assert.equal(panel.document.querySelector("[aria-pressed]")?.getAttribute("aria-pressed"), "true")
+    assert.equal(panel.document.querySelector(SHOW_COMPLETED_CONTROL)?.getAttribute("aria-pressed"), "true")
   } finally {
     await panel.unmount()
   }
@@ -923,7 +925,7 @@ test("two completed TODOs both show after switching away and back once Show Comp
     // An all-completed list is retired, so its items stay hidden until Show Completed is pressed.
     assert.equal(showsTask(panel.document, "first"), false)
     assert.equal(showsTask(panel.document, "second"), false)
-    await panel.click("[aria-pressed]")
+    await panel.click(SHOW_COMPLETED_CONTROL)
     assert.equal(showsTask(panel.document, "first"), true)
     assert.equal(showsTask(panel.document, "second"), true)
 
@@ -934,7 +936,7 @@ test("two completed TODOs both show after switching away and back once Show Comp
     await panel.render(TODO_CONVERSATION)
     assert.equal(showsTask(panel.document, "first"), true, "the first completed TODO is restored on return")
     assert.equal(showsTask(panel.document, "second"), true, "the second completed TODO is restored on return")
-    assert.equal(panel.document.querySelector("[aria-pressed]")?.getAttribute("aria-pressed"), "true")
+    assert.equal(panel.document.querySelector(SHOW_COMPLETED_CONTROL)?.getAttribute("aria-pressed"), "true")
   } finally {
     await panel.unmount()
   }
@@ -948,7 +950,7 @@ test("a conversation with no TODO list stays empty, with no fabricated items and
     await panel.render(EMPTY_CONVERSATION)
     assert.equal(showsTask(panel.document, "first"), false, "the previous conversation's TODO must not carry over")
     assert.equal(inProgressCount(panel.document), 0)
-    assert.equal(panel.document.querySelector("[aria-pressed]"), null, "no Show Completed control without completed TODOs")
+    assert.equal(panel.document.querySelector(SHOW_COMPLETED_CONTROL), null, "no Show Completed control without completed TODOs")
     assert.equal(panel.document.body.textContent?.includes("No TODO list"), false, "a missing list is not reported as an error")
     await panel.render(TODO_CONVERSATION)
     assert.equal(showsTask(panel.document, "first"), true)

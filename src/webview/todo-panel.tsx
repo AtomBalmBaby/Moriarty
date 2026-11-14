@@ -4,7 +4,7 @@ import { VSCodeButton } from "@vscode/webview-ui-toolkit/react"
 
 import { TODO_EVENT_NAME } from "../common/constants"
 import { applyTodoSnapshot, snapshotForConversation } from "../common/guards"
-import { TodoFeedbackStatus, TodoItem, TodoListSnapshot } from "../common/types"
+import { TodoAssessmentReaction, TodoAssessmentView, TodoFeedbackStatus, TodoItem, TodoListSnapshot } from "../common/types"
 
 import { bridge, useServerEvent } from "./messaging"
 
@@ -20,6 +20,33 @@ interface TodoTreeRow {
   item: TodoItem
   depth: number
   children: number
+}
+
+const reactionChoices: { reaction: TodoAssessmentReaction; glyph: string; label: string; hint: string }[] = [
+  { reaction: "agree", glyph: "✓", label: "todo-reaction-agree", hint: "todo-reaction-agree-hint" },
+  { reaction: "disagree", glyph: "✕", label: "todo-reaction-disagree", hint: "todo-reaction-disagree-hint" },
+  { reaction: "facepalm", glyph: "🤦", label: "todo-reaction-facepalm", hint: "todo-reaction-facepalm-hint" }
+]
+
+const AssessmentSummary = ({ assessment, pending }: { assessment?: TodoAssessmentView; pending?: boolean }): JSX.Element => {
+  const { t } = useTranslation()
+  const pendingNote = pending ? <span className={styles.note}>{t("todo-assessment-pending")}</span> : null
+  if (!assessment) return pendingNote ?? <span className={styles.note}>{t("todo-assessment-not-evaluated")}</span>
+  if (assessment.status !== "assessed" || !assessment.progress || !assessment.verification) {
+    return pendingNote ?? <span className={styles.note} title={assessment.reason}>{t("todo-assessment-unavailable")}</span>
+  }
+  return (
+    <>
+      {pendingNote}
+      <span className={styles.score} title={`${t("todo-assessment-progress-full")}: ${assessment.progress.explanation}`}>
+        {t("todo-assessment-progress-short")}: {assessment.progress.score}/5
+      </span>
+      <span className={styles.score} title={`${t("todo-assessment-verification-full")}: ${assessment.verification.explanation}`}>
+        {t("todo-assessment-verification-short")}: {assessment.verification.score}/5
+      </span>
+      {assessment.stale && <span className={styles.note} title={t("todo-assessment-stale-hint")}>{t("todo-assessment-stale")}</span>}
+    </>
+  )
 }
 
 export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
@@ -176,6 +203,46 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
     void mutate(() => bridge.request(TODO_EVENT_NAME.evaluateItem, { conversationId, itemId: item.id }))
   }
 
+  // A reaction belongs to one assessment and never changes the TODO itself; selecting the active one clears it.
+  const react = (item: TodoItem, reaction: TodoAssessmentReaction) => {
+    const assessment = item.assessment
+    if (!conversationId || assessment?.status !== "assessed") return
+    void mutate(() => bridge.request(TODO_EVENT_NAME.setAssessmentReaction, {
+      conversationId,
+      requestId: newRequestId(),
+      assessmentId: assessment.id,
+      reaction: assessment.reaction === reaction ? null : reaction
+    }))
+  }
+
+  const renderMenu = (item: TodoItem) => (
+    <details className={styles.menu}>
+      <summary className={styles.menuToggle} aria-label={t("todo-more-actions")} title={t("todo-more-actions")}>…</summary>
+      <div className={styles.actions}>
+        <button type="button" disabled={busy || item.sortOrder === 0} title={t("todo-move-up")} onClick={() => update(item, { sortOrder: item.sortOrder - 1 })}>↑</button>
+        <button type="button" disabled={busy || item.sortOrder === (snapshot?.items.length ?? 1) - 1} title={t("todo-move-down")} onClick={() => update(item, { sortOrder: item.sortOrder + 1 })}>↓</button>
+        <button type="button" disabled={busy} onClick={() => { setEditing(item.id); setEditTitle(item.title); setEditDetails(item.details ?? ""); setEditPriority(item.priority) }}>{t("todo-edit")}</button>
+        {item.status === "completed" || item.status === "cancelled" ? (
+          <button type="button" disabled={busy} onClick={() => update(item, { status: "pending" })}>{t("todo-reopen")}</button>
+        ) : (
+          <>
+            {item.status === "in_review" && <button type="button" disabled={busy} onClick={() => evaluate(item)}>{t("todo-review-now")}</button>}
+            <button type="button" disabled={busy} onClick={() => complete(item)}>{t("todo-complete")}</button>
+            {item.status !== "blocked" ? (
+              <button type="button" disabled={busy} onClick={() => {
+                const reason = window.prompt(t("todo-block-reason"))
+                if (reason?.trim()) update(item, { status: "blocked", blockedReason: reason.trim() })
+              }}>{t("todo-block")}</button>
+            ) : (
+              <button type="button" disabled={busy} onClick={() => update(item, { status: "in_progress" })}>{t("todo-resume")}</button>
+            )}
+            <button type="button" disabled={busy} onClick={() => update(item, { status: "cancelled" })}>{t("todo-cancel-item")}</button>
+          </>
+        )}
+      </div>
+    </details>
+  )
+
   const renderItem = ({ item, depth, children }: TodoTreeRow) => (
   <li key={item.id} className={styles.item} data-status={item.status} data-depth={depth} style={{ marginLeft: depth * 16 }}>
           <span className={styles.status} title={item.status.replace(/_/g, " ")} aria-label={item.status.replace(/_/g, " ")}>
@@ -201,6 +268,28 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
               </button>
             )}
           </div>
+          {editing !== item.id && (
+            <div className={styles.assessment}>
+              <AssessmentSummary assessment={item.assessment} pending={item.assessmentPending} />
+              <div className={styles.reactions} role="group" aria-label={t("todo-reactions-label")}>
+                {reactionChoices.map(({ reaction, glyph, label, hint }) => (
+                  <button
+                    key={reaction}
+                    type="button"
+                    className={styles.reaction}
+                    aria-pressed={item.assessment?.reaction === reaction}
+                    aria-label={t(label)}
+                    title={`${t(label)}: ${t(hint)}. ${t("todo-reaction-clear")}`}
+                    disabled={busy || item.assessment?.status !== "assessed"}
+                    onClick={() => react(item, reaction)}
+                  >
+                    <span aria-hidden="true">{glyph}</span>
+                  </button>
+                ))}
+              </div>
+              {renderMenu(item)}
+            </div>
+          )}
           {editing === item.id ? (
             <form className={styles.editForm} onSubmit={(event) => {
               event.preventDefault()
@@ -225,28 +314,8 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
                 {!!item.details && <span className={styles.details}>{item.details}</span>}
                 {!!item.criteria?.length && <span className={styles.details}>{t("todo-acceptance-criteria")}: {item.criteria.map((criterion) => criterion.description).join(" · ")}</span>}
                 {!!item.blockedReason && <span className={styles.blockedReason}>{item.blockedReason}</span>}
-                <div className={styles.actions}>
-                  <button type="button" disabled={busy || item.sortOrder === 0} title={t("todo-move-up")} onClick={() => update(item, { sortOrder: item.sortOrder - 1 })}>↑</button>
-                  <button type="button" disabled={busy || item.sortOrder === (snapshot?.items.length ?? 1) - 1} title={t("todo-move-down")} onClick={() => update(item, { sortOrder: item.sortOrder + 1 })}>↓</button>
-                  <button type="button" disabled={busy} onClick={() => { setEditing(item.id); setEditTitle(item.title); setEditDetails(item.details ?? ""); setEditPriority(item.priority) }}>{t("todo-edit")}</button>
-                  {item.status === "completed" || item.status === "cancelled" ? (
-                    <button type="button" disabled={busy} onClick={() => update(item, { status: "pending" })}>{t("todo-reopen")}</button>
-                  ) : (
-                    <>
-                      {item.status === "in_review" && <button type="button" disabled={busy} onClick={() => evaluate(item)}>{t("todo-review-now")}</button>}
-                      <button type="button" disabled={busy} onClick={() => complete(item)}>{t("todo-complete")}</button>
-                      {item.status !== "blocked" ? (
-                        <button type="button" disabled={busy} onClick={() => {
-                          const reason = window.prompt(t("todo-block-reason"))
-                          if (reason?.trim()) update(item, { status: "blocked", blockedReason: reason.trim() })
-                        }}>{t("todo-block")}</button>
-                      ) : (
-                        <button type="button" disabled={busy} onClick={() => update(item, { status: "in_progress" })}>{t("todo-resume")}</button>
-                      )}
-                      <button type="button" disabled={busy} onClick={() => update(item, { status: "cancelled" })}>{t("todo-cancel-item")}</button>
-                    </>
-                  )}
-                </div>
+                {item.assessment?.progress && <span className={styles.details}>{t("todo-assessment-progress-full")} {item.assessment.progress.score}/5: {item.assessment.progress.explanation}</span>}
+                {item.assessment?.verification && <span className={styles.details}>{t("todo-assessment-verification-full")} {item.assessment.verification.score}/5: {item.assessment.verification.explanation}</span>}
               </div>
               )
             )}
@@ -265,6 +334,7 @@ export const TodoPanel = ({ conversationId }: TodoPanelProps): JSX.Element => {
         {!!completedCount && (
           <VSCodeButton
             appearance="icon"
+            data-control="show-completed"
             aria-pressed={showCompleted}
             title={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}
             aria-label={showCompleted ? t("todo-hide-completed") : t("todo-show-completed")}

@@ -211,7 +211,7 @@ PRAGMA user_version = 12;
 /** The authoritative native connection type for the TODO database. */
 export type Database = BetterSqlite.Database
 
-const CURRENT_SCHEMA_VERSION = 18
+const CURRENT_SCHEMA_VERSION = 19
 const BUSY_TIMEOUT_MS = 5000
 
 /**
@@ -369,6 +369,7 @@ export class SqliteFile {
     if (version < 16) this.migrateAcceptedEvidenceToV16(database)
     if (version < 17) this.migrateObservationExecutionToV17(database)
     if (version < 18) this.migrateEvidenceUsageToV18(database)
+    if (version < 19) this.migrateAssessmentsToV19(database)
   }
 
   // v13 makes an operation's task optional so project-scoped edits can be recorded without an active TODO.
@@ -449,6 +450,65 @@ CREATE TABLE IF NOT EXISTS todo_evidence_usage (
 );
 CREATE INDEX IF NOT EXISTS todo_evidence_usage_project ON todo_evidence_usage(project_id, fact_id);
 PRAGMA user_version = 18;`)
+  }
+
+  /**
+   * Observational assessments are additive. Assessments and reactions are immutable history: a new evaluation
+   * supersedes the current projection, and a changed reaction is a new row. Neither table gains execution state.
+   */
+  private migrateAssessmentsToV19(database: Database): void {
+    database.exec(`
+CREATE TABLE IF NOT EXISTS todo_assessments (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  evaluation_id TEXT NOT NULL REFERENCES todo_evaluations(id) ON DELETE CASCADE,
+  evaluation_request_id TEXT NOT NULL,
+  task_version INTEGER NOT NULL,
+  result_version INTEGER NOT NULL,
+  plan_revision INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('assessed', 'unavailable')),
+  progress_score INTEGER CHECK (progress_score BETWEEN 1 AND 5),
+  progress_explanation TEXT,
+  verification_score INTEGER CHECK (verification_score BETWEEN 1 AND 5),
+  verification_explanation TEXT,
+  evidence_refs_json TEXT NOT NULL,
+  reason TEXT,
+  evaluator_provider TEXT NOT NULL,
+  evaluator_model TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (list_id, evaluation_request_id, item_id),
+  CHECK (
+    (status = 'assessed' AND progress_score IS NOT NULL AND progress_explanation IS NOT NULL
+      AND verification_score IS NOT NULL AND verification_explanation IS NOT NULL AND reason IS NULL)
+    OR (status = 'unavailable' AND progress_score IS NULL AND progress_explanation IS NULL
+      AND verification_score IS NULL AND verification_explanation IS NULL AND reason IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS todo_assessments_item ON todo_assessments(item_id, created_at);
+CREATE TRIGGER IF NOT EXISTS todo_assessments_immutable BEFORE UPDATE ON todo_assessments
+BEGIN SELECT RAISE(ABORT, 'TODO assessments are immutable'); END;
+CREATE TABLE IF NOT EXISTS todo_assessment_current (
+  item_id TEXT PRIMARY KEY REFERENCES todo_items(id) ON DELETE CASCADE,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  assessment_id TEXT NOT NULL REFERENCES todo_assessments(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS todo_assessment_current_list ON todo_assessment_current(list_id);
+CREATE TABLE IF NOT EXISTS todo_assessment_reactions (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  assessment_id TEXT NOT NULL REFERENCES todo_assessments(id) ON DELETE CASCADE,
+  reaction TEXT CHECK (reaction IS NULL OR reaction IN ('agree', 'disagree', 'facepalm')),
+  actor TEXT NOT NULL CHECK (actor = 'user'),
+  request_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (list_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS todo_assessment_reactions_assessment ON todo_assessment_reactions(assessment_id, seq);
+CREATE TRIGGER IF NOT EXISTS todo_assessment_reactions_append_only BEFORE UPDATE ON todo_assessment_reactions
+BEGIN SELECT RAISE(ABORT, 'TODO assessment reactions are append-only'); END;
+PRAGMA user_version = 19;`)
   }
 
   async read<T>(operation: (database: Database) => T): Promise<T> {

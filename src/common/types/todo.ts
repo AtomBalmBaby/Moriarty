@@ -20,6 +20,62 @@ export interface TodoItem {
   version: number
   createdAt: string
   updatedAt: string
+  /** Latest observational assessment projection; absent when this TODO has never been assessed. */
+  assessment?: TodoAssessmentView
+  /** True while a Cerebras observation for this TODO's latest verdict is in flight. Observational only. */
+  assessmentPending?: boolean
+}
+
+/** Ordinal rating on a five-point scale. Not a probability or percentage. */
+export type TodoAssessmentScoreValue = 1 | 2 | 3 | 4 | 5
+export type TodoAssessmentReaction = "agree" | "disagree" | "facepalm"
+export type TodoObservationStatus = "assessed" | "unavailable"
+
+export interface TodoAssessmentScore {
+  score: TodoAssessmentScoreValue
+  explanation: string
+}
+
+interface TodoObservationBase {
+  schemaVersion: 1
+  /** Host-generated identity. Reactions attach to this value. */
+  id: string
+  taskId: string
+  taskVersion: number
+  planRevision: number
+  /** Evaluation request that produced this observation (the run or operation identity). */
+  runId: string
+  evaluator: { provider: string; model: string }
+  createdAt: string
+}
+
+export interface TodoObservationAssessed extends TodoObservationBase {
+  status: "assessed"
+  progress: TodoAssessmentScore
+  verification: TodoAssessmentScore
+  evidenceRefs: string[]
+}
+
+export interface TodoObservationUnavailable extends TodoObservationBase {
+  status: "unavailable"
+  reason: string
+}
+
+/** Optional observational assessment carried beside a review. It never changes the review verdict. */
+export type TodoObservation = TodoObservationAssessed | TodoObservationUnavailable
+
+/** Current assessment projection for one TODO, with the user's current reaction to it. */
+export interface TodoAssessmentView {
+  id: string
+  status: TodoObservationStatus
+  taskVersion: number
+  /** True when the TODO has changed since this assessment was made. */
+  stale: boolean
+  createdAt: string
+  progress?: TodoAssessmentScore
+  verification?: TodoAssessmentScore
+  reason?: string
+  reaction?: TodoAssessmentReaction
 }
 
 export interface TodoEvidence {
@@ -108,6 +164,7 @@ export interface TodoEvaluation {
   explanation: string
   scores: { completion: number; correctness: number; alignment: number }
   metadata: { evaluator: string; evaluatedAt: string; taskVersion: number; planRevision: number }
+  observation?: TodoObservation
 }
 
 export interface TodoToolEvidenceStatus {

@@ -544,5 +544,23 @@
   "todo-collapse-children": "Hide subtasks"
 ,
   "todo-edit-details": "Task details",
-  "todo-priority-label": "Priority"
+  "todo-priority-label": "Priority",
+  "todo-assessment-not-evaluated": "Not evaluated",
+  "todo-assessment-pending": "Scoring…",
+  "todo-assessment-unavailable": "Evaluation failed",
+  "todo-assessment-progress-short": "P",
+  "todo-assessment-verification-short": "V",
+  "todo-assessment-progress-full": "Task progress",
+  "todo-assessment-verification-full": "Verification support",
+  "todo-assessment-stale": "Earlier version",
+  "todo-assessment-stale-hint": "Scores were recorded before this TODO changed.",
+  "todo-reactions-label": "Your feedback on this assessment",
+  "todo-reaction-agree": "Good",
+  "todo-reaction-agree-hint": "The assessment is reasonable",
+  "todo-reaction-disagree": "Wrong",
+  "todo-reaction-disagree-hint": "The assessment is incorrect or insufficient",
+  "todo-reaction-facepalm": "Facepalm",
+  "todo-reaction-facepalm-hint": "The assessment is fundamentally unreasonable",
+  "todo-reaction-clear": "Select again to clear.",
+  "todo-more-actions": "More actions"
 }

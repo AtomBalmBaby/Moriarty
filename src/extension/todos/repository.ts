@@ -35,6 +35,9 @@ import {
   type RequirementActivation,
   type RetainedObservationEvidence,
   type SymbolAlias,
+  type TodoAssessmentReaction,
+  type TodoAssessmentScoreValue,
+  type TodoAssessmentView,
   type TodoCompletionClaim,
   TodoConflictError,
   type TodoCreateOutcome,
@@ -44,6 +47,8 @@ import {
   type TodoItem,
   type TodoListRequest,
   type TodoListSnapshot,
+  type TodoObservation,
+  type TodoObservationStatus,
   type TodoPriority,
   type TodoReviewPackage,
   type TodoSource,
@@ -357,7 +362,48 @@ const ensureList = (database: Database, request: TodoListRequest): ListRow => {
   return list
 }
 
-const snapshotFor = (database: Database, list: ListRow, includeCompleted = true): TodoListSnapshot => {
+interface AssessmentRow {
+  id: string
+  item_id: string
+  item_version: number
+  status: TodoObservationStatus
+  task_version: number
+  result_version: number
+  created_at: string
+  progress_score: number | null
+  progress_explanation: string | null
+  verification_score: number | null
+  verification_explanation: string | null
+  reason: string | null
+  reaction: TodoAssessmentReaction | null
+}
+
+const assessmentSelect = `SELECT assessments.id, assessments.item_id, items.version AS item_version, assessments.status, assessments.task_version,
+  assessments.result_version, assessments.created_at, assessments.progress_score, assessments.progress_explanation,
+  assessments.verification_score, assessments.verification_explanation, assessments.reason,
+  (SELECT reactions.reaction FROM todo_assessment_reactions AS reactions WHERE reactions.assessment_id = assessments.id ORDER BY reactions.seq DESC LIMIT 1) AS reaction
+  FROM todo_assessments AS assessments JOIN todo_items AS items ON items.id = assessments.item_id`
+
+/** An assessment is stale once its TODO has changed after the evaluation write that produced it. */
+const assessmentViewOf = (row: AssessmentRow): TodoAssessmentView => {
+  const view: TodoAssessmentView = {
+    id: row.id,
+    status: row.status,
+    taskVersion: row.task_version,
+    stale: row.result_version !== row.item_version,
+    createdAt: row.created_at
+  }
+  if (row.status === "assessed") {
+    view.progress = { score: row.progress_score as TodoAssessmentScoreValue, explanation: row.progress_explanation ?? "" }
+    view.verification = { score: row.verification_score as TodoAssessmentScoreValue, explanation: row.verification_explanation ?? "" }
+  } else {
+    view.reason = row.reason ?? "unavailable"
+  }
+  if (row.reaction) view.reaction = row.reaction
+  return view
+}
+
+const snapshotFor = (database: Database, list: ListRow, includeCompleted = true, pending: ReadonlyMap<string, ReadonlySet<string>> = new Map()): TodoListSnapshot => {
   const itemRows = rows<ItemRow>(
     database,
     `SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority,
@@ -368,12 +414,19 @@ const snapshotFor = (database: Database, list: ListRow, includeCompleted = true)
      ORDER BY items.sort_order, items.created_at`,
     [list.id]
   )
+  const assessments = new Map(rows<AssessmentRow>(database, `${assessmentSelect} JOIN todo_assessment_current AS current ON current.assessment_id = assessments.id WHERE current.list_id = ?`, [list.id])
+    .map((row) => [row.item_id, row]))
   return {
     id: list.id,
     projectId: list.project_id,
     conversationId: list.conversation_id,
     revision: list.revision,
-    items: itemRows.map(itemOf)
+    items: itemRows.map((row) => {
+      const item = itemOf(row)
+      const assessment = assessments.get(row.id)
+      const projected = assessment ? { ...item, assessment: assessmentViewOf(assessment) } : item
+      return (pending.get(row.id)?.size ?? 0) > 0 ? { ...projected, assessmentPending: true } : projected
+    })
   }
 }
 
@@ -386,6 +439,53 @@ const bumpList = (database: Database, listId: string, itemId: string | undefined
     [randomUUID(), listId, itemId ?? null, revision.revision, eventType, actor, requestId, JSON.stringify(payload), now()]
   )
   return revision.revision
+}
+
+const assessmentReactions = new Set<string>(["agree", "disagree", "facepalm"])
+
+/**
+ * Keeps an evaluator's observation only when it matches this write's identity and has in-range scores.
+ * A mismatch is stored as an unavailable assessment with its reason, so the review result is never discarded.
+ */
+const storableObservation = (observation: TodoObservation, itemId: string, taskVersion: number, planRevision: number): TodoObservation => {
+  const problem = observation.schemaVersion !== 1 ? "assessment schema version is unsupported"
+    : observation.taskId !== itemId ? "assessment belongs to a different TODO"
+    : observation.taskVersion !== taskVersion ? "assessment was made for a different TODO version"
+    : observation.planRevision !== planRevision ? "assessment was made for a different plan revision"
+    : observation.status === "assessed" && [observation.progress, observation.verification].some((score) =>
+      !Number.isInteger(score.score) || score.score < 1 || score.score > 5 || !score.explanation.trim()) ? "assessment scores are out of range"
+    : undefined
+  if (!problem) return observation
+  return {
+    schemaVersion: 1,
+    id: observation.id,
+    taskId: observation.taskId,
+    taskVersion: observation.taskVersion,
+    planRevision: observation.planRevision,
+    runId: observation.runId,
+    evaluator: observation.evaluator,
+    createdAt: observation.createdAt,
+    status: "unavailable",
+    reason: problem
+  }
+}
+
+/** Immutable assessment row plus the current projection for its TODO. Superseded rows remain as history. */
+const recordAssessment = (database: Database, listId: string, itemId: string, evaluationId: string, requestId: string, observation: TodoObservation, resultVersion: number, moveCurrent = true): void => {
+  const assessed = observation.status === "assessed" ? observation : undefined
+  execute(database,
+    `INSERT INTO todo_assessments(id, list_id, item_id, evaluation_id, evaluation_request_id, task_version, result_version, plan_revision, status,
+       progress_score, progress_explanation, verification_score, verification_explanation, evidence_refs_json, reason, evaluator_provider, evaluator_model, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [observation.id, listId, itemId, evaluationId, requestId, observation.taskVersion, resultVersion, observation.planRevision, observation.status,
+      assessed?.progress.score ?? null, assessed?.progress.explanation ?? null, assessed?.verification.score ?? null, assessed?.verification.explanation ?? null,
+      JSON.stringify(assessed?.evidenceRefs ?? []), observation.status === "unavailable" ? observation.reason : null,
+      observation.evaluator.provider, observation.evaluator.model, observation.createdAt])
+  if (!moveCurrent) return
+  execute(database,
+    `INSERT INTO todo_assessment_current(item_id, list_id, assessment_id) VALUES (?, ?, ?)
+     ON CONFLICT(item_id) DO UPDATE SET list_id = excluded.list_id, assessment_id = excluded.assessment_id`,
+    [itemId, listId, observation.id])
 }
 
 /**
@@ -703,6 +803,8 @@ const enforceEvidenceBudget = (database: Database, listId: string, keepId: strin
 export class TodoRepository {
   private readonly sqlite: SqliteFile
   private readonly evidenceLimits: EvidenceStorageLimits
+  // In-memory only: a scoring request in flight. Restarts clear it, and unscored items then read as not evaluated.
+  private readonly pendingObservations = new Map<string, Set<string>>()
 
   constructor(databasePath: SqliteLocation, evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS) {
     this.sqlite = new SqliteFile(databasePath)
@@ -813,7 +915,7 @@ export class TodoRepository {
             prior.dependencies_json !== JSON.stringify(task.dependencies) || prior.criteria_json !== criteriaJson(task.criteria)
         })) throw new TodoConflictError("Intent tasks changed without increasing plan.revision")
         execute(database, "UPDATE todo_intent_plans SET intent_result_json = ?, updated_at = ? WHERE list_id = ?", [resultJson, now(), list.id])
-        return snapshotFor(database, list, request.includeCompleted)
+        return snapshotFor(database, list, request.includeCompleted, this.pendingObservations)
       }
 
       const createdAt = now()
@@ -876,7 +978,7 @@ export class TodoRepository {
       bumpList(database, list.id, undefined, "intent_plan_synchronized", "model", "intent-plan:" + plan.planId + ":" + plan.revision, {
         planId: plan.planId, revision: plan.revision, taskIds: plan.tasks.map((task) => task.id)
       })
-      return snapshotFor(database, list, request.includeCompleted)
+      return snapshotFor(database, list, request.includeCompleted, this.pendingObservations)
     })
   }
 
@@ -1325,16 +1427,20 @@ export class TodoRepository {
       const status = evaluation.decision === "accept" ? "completed" : evaluation.decision === "revise" ? "in_progress" : evaluation.decision === "blocked" ? "blocked" : "in_review"
       const verification = evaluation.decision === "accept" ? "passed" : evaluation.decision === "revise" ? "failed" : "not_checked"
       const blockedReason = evaluation.decision === "blocked" ? evaluation.explanation : null
+      const evaluationId = randomUUID()
+      const observation = evaluation.observation && storableObservation(evaluation.observation, itemId, expectedVersion, currentPlan.revision)
+      const recorded: TodoEvaluation = observation ? { ...evaluation, observation } : evaluation
       execute(database, "INSERT INTO todo_evaluations(id, list_id, item_id, request_id, task_version, decision, evaluation_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [randomUUID(), list.id, itemId, requestId, expectedVersion, evaluation.decision, JSON.stringify(evaluation), updatedAt])
+        [evaluationId, list.id, itemId, requestId, expectedVersion, evaluation.decision, JSON.stringify(recorded), updatedAt])
       const updateResult = execute(database, "UPDATE todo_items SET status = ?, verification = ?, blocked_reason = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
         [status, verification, blockedReason, updatedAt, itemId, expectedVersion])
       if (updateResult.changes !== 1) throw new TodoConflictError("TODO changed while applying its evaluation")
+      if (observation) recordAssessment(database, list.id, itemId, evaluationId, requestId, observation, expectedVersion + 1)
       if (evaluation.decision === "accept") recordAcceptedFacts(database, list.id, currentPlan, itemId, evaluation, new Map(observations.map((observation) => [observation.id, observation])), updatedAt)
-      bumpList(database, list.id, itemId, "evaluation_recorded", "system", requestId, { decision: evaluation.decision, evaluation })
+      bumpList(database, list.id, itemId, "evaluation_recorded", "system", requestId, { decision: evaluation.decision, evaluation: recorded })
       logTodoEvent("feedback.reconciled", { operation_id: list.id, item_id: itemId, decision: evaluation.decision, status, verification, request_id: requestId })
       if (status === "completed") logTodoEvent("todo.completed", { operation_id: list.id, item_id: itemId, verification, request_id: requestId })
-      return evaluation
+      return recorded
     })
   }
 
@@ -1397,6 +1503,83 @@ export class TodoRepository {
     })
   }
 
+  /**
+   * Records the user's reaction to one assessment. This is observational: it touches neither the TODO row nor the
+   * list revision, so it cannot change status, verification, scheduling, or recovery.
+   */
+  setAssessmentReaction(request: TodoWriteRequest, assessmentId: string, reaction: TodoAssessmentReaction | null, requestId: string): Promise<TodoListSnapshot> {
+    assertWriter(request)
+    validateRequestId(requestId)
+    return this.sqlite.write((database) => {
+      const list = findList(database, request)
+      if (!list) throw new Error("TODO list was not found in the active conversation")
+      const assessment = rows<{ item_id: string; status: string }>(database, "SELECT item_id, status FROM todo_assessments WHERE id = ? AND list_id = ?", [assessmentId, list.id])[0]
+      if (!assessment) throw new Error("Assessment was not found in the active conversation")
+      if (assessment.status !== "assessed") throw new Error("Only assessed evaluations can receive a reaction")
+      if (reaction !== null && !assessmentReactions.has(reaction)) throw new Error("Assessment reaction is not supported")
+      const replayed = rows<{ id: string }>(database, "SELECT id FROM todo_assessment_reactions WHERE list_id = ? AND request_id = ?", [list.id, requestId]).length > 0
+      const latest = rows<{ reaction: TodoAssessmentReaction | null }>(database, "SELECT reaction FROM todo_assessment_reactions WHERE assessment_id = ? ORDER BY seq DESC LIMIT 1", [assessmentId])[0]
+      if (!replayed && (latest?.reaction ?? null) !== reaction) {
+        execute(database, "INSERT INTO todo_assessment_reactions(id, list_id, assessment_id, reaction, actor, request_id, created_at) VALUES (?, ?, ?, ?, 'user', ?, ?)",
+          [randomUUID(), list.id, assessmentId, reaction, requestId, now()])
+        logger.info(`feedback.user_reaction task=${assessment.item_id} assessment=${assessmentId} reaction=${reaction ?? "cleared"} actor=user`)
+      }
+      return snapshotFor(database, list, request.includeCompleted, this.pendingObservations)
+    })
+  }
+
+  markObservationPending(itemId: string, requestId: string): void {
+    const requests = this.pendingObservations.get(itemId) ?? new Set<string>()
+    requests.add(requestId)
+    this.pendingObservations.set(itemId, requests)
+  }
+
+  clearObservationPending(itemId: string, requestId: string): void {
+    const requests = this.pendingObservations.get(itemId)
+    if (!requests) return
+    requests.delete(requestId)
+    if (requests.size === 0) this.pendingObservations.delete(itemId)
+  }
+
+  observationRecorded(request: TodoListRequest, itemId: string, requestId: string): Promise<boolean> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      return list !== undefined && rows<{ id: string }>(database,
+        "SELECT id FROM todo_assessments WHERE list_id = ? AND item_id = ? AND evaluation_request_id = ? LIMIT 1", [list.id, itemId, requestId]).length > 0
+    })
+  }
+
+  // Attaches an observation to the verdict it accompanies. Returns the stored observation, or undefined when this request was already recorded.
+  recordObservation(request: TodoWriteRequest, itemId: string, requestId: string, observation: TodoObservation): Promise<TodoObservation | undefined> {
+    assertWriter(request)
+    validateRequestId(requestId)
+    return this.sqlite.write((database) => {
+      const list = findList(database, request)
+      if (!list) throw new Error("TODO list was not found in the active conversation")
+      const evaluation = rows<{ id: string; task_version: number; evaluation_json: string }>(database,
+        "SELECT id, task_version, evaluation_json FROM todo_evaluations WHERE list_id = ? AND item_id = ? AND request_id = ?", [list.id, itemId, requestId])[0]
+      if (!evaluation) throw new Error("Evaluation was not found for the observation")
+      if (rows<{ id: string }>(database,
+        "SELECT id FROM todo_assessments WHERE list_id = ? AND item_id = ? AND evaluation_request_id = ? LIMIT 1", [list.id, itemId, requestId]).length > 0) return undefined
+      const { metadata } = JSON.parse(evaluation.evaluation_json) as TodoEvaluation
+      const stored = storableObservation(observation, itemId, evaluation.task_version, metadata.planRevision)
+      // A late observation for an older verdict is kept as history but must not displace the current assessment.
+      const [latest] = rows<{ id: string }>(database, "SELECT id FROM todo_evaluations WHERE item_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", [itemId])
+      // A verdict bumps the TODO version exactly once, so its observation's result version is one above the reviewed version.
+      recordAssessment(database, list.id, itemId, evaluation.id, requestId, stored, evaluation.task_version + 1, latest?.id === evaluation.id)
+      return stored
+    })
+  }
+
+  getAssessmentHistory(request: TodoListRequest, itemId: string): Promise<TodoAssessmentView[]> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      if (!list) return []
+      return rows<AssessmentRow>(database, `${assessmentSelect} WHERE assessments.item_id = ? AND assessments.list_id = ? ORDER BY assessments.created_at, assessments.rowid`, [itemId, list.id])
+        .map(assessmentViewOf)
+    })
+  }
+
   getEvaluationHistory(request: TodoListRequest, itemId: string): Promise<TodoEvaluation[]> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
@@ -1413,7 +1596,7 @@ export class TodoRepository {
   getList(request: TodoListRequest): Promise<TodoListSnapshot> {
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
-      return snapshotFor(database, list, request.includeCompleted)
+      return snapshotFor(database, list, request.includeCompleted, this.pendingObservations)
     })
   }
 
@@ -1424,7 +1607,7 @@ export class TodoRepository {
   readList(request: TodoListRequest): Promise<TodoListSnapshot | undefined> {
     return this.sqlite.read((database) => {
       const list = findList(database, request)
-      return list ? snapshotFor(database, list, request.includeCompleted) : undefined
+      return list ? snapshotFor(database, list, request.includeCompleted, this.pendingObservations) : undefined
     })
   }
 

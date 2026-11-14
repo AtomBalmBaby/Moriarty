@@ -2,7 +2,7 @@ import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPri
 
 import type { EvidenceHit, EvidenceSource } from "./evidence"
 
-export type { TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
+export type { TodoAssessmentReaction, TodoAssessmentScoreValue, TodoAssessmentView, TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoObservation, TodoObservationStatus, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
 
 export type { AnswerField, AnswerRequirement, CriterionVerification,IntentTaskDefinition, IntentTaskPlan, TypedCriterion } from "../../common/types"

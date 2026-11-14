@@ -77,6 +77,7 @@ export const TODO_EVENT_NAME = {
   completeItem: "twinny.todo.complete-item",
   renewRequirement: "twinny.todo.renew-requirement",
   evaluateItem: "twinny.todo.evaluate-item",
+  setAssessmentReaction: "twinny.todo.set-assessment-reaction",
   retryFeedback: "twinny.todo.retry-feedback",
   changed: "twinny.todo.changed",
   feedbackStatus: "twinny.todo.feedback-status"

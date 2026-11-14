@@ -68,7 +68,7 @@ import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
 import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
-import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
@@ -1404,9 +1404,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     for (const review of candidates) {
       if (await hostDecidesReview(review, readCurrentSource)) hostDecided.add(review.task.id)
     }
-    const { provider, error: providerError } = hostDecided.size === candidates.length
-      ? { provider: undefined, error: undefined }
-      : await this.roleProvider("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny")))
+    // Resolved even when every candidate is host-decided, so a deterministic verdict can still receive an observation.
+    const { provider, error: providerError } = await this.roleProvider("Feedback", feedbackProviderSelection(workspace.getConfiguration("twinny")))
     if (!provider && hostDecided.size < candidates.length) {
       const message = "Feedback evaluation is unavailable: " + (providerError ?? "no Feedback provider is configured.")
       logger.warn(message)
@@ -1414,51 +1413,65 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       this._bridge.emit(EVENT_NAME.twinnyNotification, message)
       return []
     }
+    const requestFeedback = async (activeProvider: NonNullable<typeof provider>, system: string, user: string, purpose: "evaluation" | "assessment", signal?: AbortSignal): Promise<string> => {
+      const controller = new AbortController()
+      let timeout: ReturnType<typeof setTimeout>
+      const abortFromExecution = () => controller.abort(signal?.reason)
+      if (signal?.aborted) abortFromExecution()
+      else signal?.addEventListener("abort", abortFromExecution, { once: true })
+      const timedOut = new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          const error = new Error("Feedback evaluator timed out after 30 seconds")
+          controller.abort(error)
+          reject(error)
+        }, 30_000)
+      })
+      const stopped = new Promise<never>((_, reject) => {
+        if (controller.signal.aborted) reject(controller.signal.reason)
+        else controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true })
+      })
+      try {
+        try {
+          return await Promise.race([readText(resolveInferenceProvider(activeProvider).chat({
+            model: activeProvider.modelName,
+            messages: [
+              { role: SYSTEM, content: system },
+              { role: USER, content: user }
+            ] as ChatCompletionMessage[]
+          }, { signal: controller.signal, trace: { operationId: `feedback-${purpose}-${randomUUID()}`, operationKind: "feedback", requestId: `request-${randomUUID()}`, provider: activeProvider.provider } })), timedOut, stopped])
+        } catch (error) {
+          throw new TodoEvaluationProviderError(redact(isCancelled(error) ? "Feedback evaluation was cancelled" : describeProviderError(error, activeProvider)))
+        }
+      } finally {
+        clearTimeout(timeout!)
+        signal?.removeEventListener("abort", abortFromExecution)
+      }
+    }
+    const publishSnapshot = async () => {
+      const snapshot = await this._todoRepository!.getList(scope)
+      this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
+    }
     let providerFailure: string | undefined
     const evaluations = await Promise.all(candidates.map(async (review) => {
       attempted.add(review.task.id + "@" + review.task.version)
       try {
         const evaluation = await evaluateTodoReview(this._todoRepository!, scope, review, async (correction, reconciliations) => {
           if (!provider) throw new Error("Host-decidable criteria must not be sent to Feedback")
-          const controller = new AbortController()
-          let timeout: ReturnType<typeof setTimeout>
-          const abortFromExecution = () => controller.abort(options.signal?.reason)
-          if (options.signal?.aborted) abortFromExecution()
-          else options.signal?.addEventListener("abort", abortFromExecution, { once: true })
-          const timedOut = new Promise<never>((_, reject) => {
-            timeout = setTimeout(() => {
-              const error = new Error("Feedback evaluator timed out after 30 seconds")
-              controller.abort(error)
-              reject(error)
-            }, 30_000)
-          })
-          const stopped = new Promise<never>((_, reject) => {
-            if (controller.signal.aborted) reject(controller.signal.reason)
-            else controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true })
-          })
-          try {
-            try {
-              return await Promise.race([readText(resolveInferenceProvider(provider).chat({
-              model: provider.modelName,
-              messages: [
-                { role: SYSTEM, content: todoReviewSystemPrompt },
-                { role: USER, content: todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse, reconciliations) + (correction ? "\n\nCorrection required: " + correction : "") }
-              ] as ChatCompletionMessage[]
-            }, { signal: controller.signal, trace: { operationId: `feedback-evaluation-${randomUUID()}`, operationKind: "feedback", requestId: `request-${randomUUID()}`, provider: provider.provider } })), timedOut, stopped])
-            } catch (error) {
-              throw new TodoEvaluationProviderError(redact(isCancelled(error) ? "Feedback evaluation was cancelled" : describeProviderError(error, provider)))
-            }
-          } finally {
-            clearTimeout(timeout!)
-            options.signal?.removeEventListener("abort", abortFromExecution)
-          }
+          return requestFeedback(provider, todoReviewSystemPrompt, todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse, reconciliations) + (correction ? "\n\nCorrection required: " + correction : ""), "evaluation", options.signal)
         }, provider?.modelName ?? "host", {
           hasVerifiedFileChanges: taskHasVerifiedMutation(review),
-          readCurrentSource
+          readCurrentSource,
+          observer: provider ? { provider: provider.provider, model: provider.modelName } : undefined,
+          observation: {
+            // Scoring is observational: it runs without the execution signal, so a Stop cannot leave a verdict half-scored.
+            request: (reconciliations) => provider
+              ? requestFeedback(provider, todoObservationSystemPrompt, todoReviewInput(review, candidates.length === 1 ? changes : undefined, options.finalResponse, reconciliations), "assessment")
+              : Promise.reject(new Error("No Feedback provider is configured.")),
+            publish: publishSnapshot
+          }
         })
         logger.debug("Feedback evaluation " + evaluation.decision + " for TODO " + review.task.id)
-        const snapshot = await this._todoRepository!.getList(scope)
-        this._bridge.emit(TODO_EVENT_NAME.changed, snapshot)
+        await publishSnapshot()
         return evaluation
       } catch (error) {
         logger.warn("Feedback evaluation failed for TODO " + review.task.id + " (" + (error instanceof TodoEvaluationProviderError ? "provider" : "validation/parsing") + "): " + redact(error instanceof Error ? error.message : String(error)))

@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
 import { logger, redact } from "../../common/logger"
-import type { CriterionFailureReason, ReplyChangesView, SourceIdentity, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TypedCriterion, WorkspaceMutationOperation } from "../../common/types"
+import type { CriterionFailureReason, ReplyChangesView, SourceIdentity, TodoAssessmentScore, TodoAssessmentScoreValue, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TodoObservation, TypedCriterion, WorkspaceMutationOperation } from "../../common/types"
 import { verifyContentFingerprint } from "../tools/fingerprint"
 
 import { codeIdentifiers, commandDigest, samePath } from "./evidence"
@@ -38,7 +38,7 @@ export class TodoEvaluationValidationError extends Error {
   }
 }
 
-const invalid = (code: EvaluationValidationCode, message: string, expected?: unknown, received?: unknown, field?: string): never => {
+const invalid: (code: EvaluationValidationCode, message: string, expected?: unknown, received?: unknown, field?: string) => never = (code, message, expected, received, field) => {
   throw new TodoEvaluationValidationError(code, message, expected, received, field)
 }
 
@@ -118,13 +118,14 @@ const preserveObservationSet = (review: TodoReviewPackage, reconciliations: Todo
       : 0
     return category
   }
+  // review.observations is newest-first, so on equal timestamps the lower index is the newer record.
   return unique
     .map((observation, index) => ({ observation, index, score: score(observation), cited: cited.has(observation.id), relevant: relevant(observation) }))
     .sort((left, right) => Number(right.cited) - Number(left.cited)
       || Number(right.relevant) - Number(left.relevant)
       || right.score - left.score
       || right.observation.createdAt.localeCompare(left.observation.createdAt)
-      || right.index - left.index)
+      || left.index - right.index)
     .slice(0, MAX_TASK_OBSERVATIONS)
     .map(({ observation }) => observation)
 }
@@ -1076,12 +1077,111 @@ export const deterministicTodoEvaluation = (
   }
 }
 
+/** Identity of the configured Feedback evaluator that produced an observation. */
+export interface TodoObserverIdentity {
+  provider: string
+  model: string
+}
+
+const ASSESSMENT_MODE = "observe-only"
+
+const assessmentScore = (value: unknown, field: string): TodoAssessmentScore => {
+  if (!isRecord(value)) invalid("invalid_shape", `${field} must be an object`, "object", typeof value, field)
+  exactKeys(value, ["score", "explanation"], field)
+  if (typeof value.score !== "number" || !Number.isInteger(value.score) || value.score < 1 || value.score > 5) {
+    invalid("invalid_shape", `${field}.score must be an integer from 1 to 5`, "integer in [1, 5]", value.score, `${field}.score`)
+  }
+  if (typeof value.explanation !== "string" || !value.explanation.trim() || value.explanation.length > 500) {
+    invalid("invalid_shape", `${field}.explanation must be a non-empty string of at most 500 characters`, "non-empty string, max 500 characters", typeof value.explanation, `${field}.explanation`)
+  }
+  return { score: value.score as TodoAssessmentScoreValue, explanation: value.explanation.trim() }
+}
+
+const assessmentFields = (value: unknown, review: TodoReviewPackage, knownRefs: Set<string>) => {
+  if (!isRecord(value)) invalid("invalid_shape", "assessment must be an object", "object", typeof value, "assessment")
+  exactKeys(value, ["schemaVersion", "taskId", "progress", "verification", "evidenceRefs"], "assessment")
+  if (value.schemaVersion !== 1) invalid("schema_version", "assessment has an unsupported schema version", 1, value.schemaVersion, "assessment.schemaVersion")
+  if (value.taskId !== review.planTaskId) invalid("task_id", "assessment taskId does not match the canonical plan task ID", review.planTaskId, value.taskId, "assessment.taskId")
+  const progress = assessmentScore(value.progress, "assessment.progress")
+  const verification = assessmentScore(value.verification, "assessment.verification")
+  const evidenceRefs = [...new Set(boundedStrings(value.evidenceRefs, 100, 20, "assessment.evidenceRefs"))]
+  const unknownRef = evidenceRefs.find((reference) => !knownRefs.has(reference))
+  if (unknownRef !== undefined) invalid("invalid_shape", "assessment cites evidence outside this task review package", [...knownRefs], unknownRef, "assessment.evidenceRefs")
+  return { progress, verification, evidenceRefs }
+}
+
+const observationIdentity = (review: TodoReviewPackage, observer: TodoObserverIdentity, createdAt: string) => ({
+  schemaVersion: 1 as const,
+  id: randomUUID(),
+  taskId: review.task.id,
+  taskVersion: review.task.version,
+  planRevision: review.planRevision,
+  runId: evaluationRequestId(review),
+  evaluator: observer,
+  createdAt
+})
+
+const unavailableObservation = (review: TodoReviewPackage, observer: TodoObserverIdentity, reason: string, createdAt = new Date().toISOString()): TodoObservation => ({
+  ...observationIdentity(review, observer, createdAt),
+  status: "unavailable",
+  reason: reason.slice(0, 300)
+})
+
+/**
+ * Host-owned observation for one review. The evaluator proposes only the scores, explanations, and evidence
+ * references; identity and timestamps come from the host. This never throws, so a bad assessment cannot change the review.
+ */
+const observationFor = (value: Record<string, unknown>, review: TodoReviewPackage, knownRefs: Set<string>, observer: TodoObserverIdentity, createdAt: string): TodoObservation => {
+  const identity = observationIdentity(review, observer, createdAt)
+  if (!("assessment" in value)) return { ...identity, status: "unavailable", reason: "evaluator returned no assessment" }
+  try {
+    return { ...identity, status: "assessed", ...assessmentFields(value.assessment, review, knownRefs) }
+  } catch (error) {
+    return { ...identity, status: "unavailable", reason: (error instanceof Error ? error.message : String(error)).slice(0, 300) }
+  }
+}
+
+const traceText = (text: string) => redact(text).replace(/\s+/g, " ").replace(/"/g, "'").slice(0, 300)
+
+/** One compact trace record per persisted observation. Explanations are free text and are redacted and clipped. */
+export const traceAssessment = (observation: TodoObservation): void => {
+  const head = `feedback.assessment task=${observation.taskId} assessment=${observation.id}`
+  const context = `version=${observation.taskVersion} plan_revision=${observation.planRevision} run=${observation.runId} evaluator=${observation.evaluator.provider}/${observation.evaluator.model}`
+  if (observation.status === "unavailable") {
+    logger.warn(`${head} status=unavailable mode=${ASSESSMENT_MODE} ${context} reason="${traceText(observation.reason)}"`)
+    return
+  }
+  logger.info(`${head} P=${observation.progress.score} V=${observation.verification.score} mode=${ASSESSMENT_MODE}\n  progress="${traceText(observation.progress.explanation)}"\n  verification="${traceText(observation.verification.explanation)}"\n  evidence=${observation.evidenceRefs.length} ${context}`)
+}
+
+const knownRefsFor = (review: TodoReviewPackage, trustedRecords: readonly { id: string }[]): Set<string> =>
+  new Set([...trustedRecords.map((observation) => observation.id), ...review.evidence.slice(0, 8).map((evidence) => evidence.id)])
+
+/** Parses the observational-only response. A malformed response becomes an unavailable observation and never throws. */
+export const parseTodoObservation = (
+  raw: string,
+  review: TodoReviewPackage,
+  reconciliations: TodoCriterionReconciliation[],
+  observer: TodoObserverIdentity
+): TodoObservation => {
+  let value: unknown
+  try {
+    value = JSON.parse(extractJsonObject(raw))
+  } catch {
+    return unavailableObservation(review, observer, "evaluator response is not valid JSON")
+  }
+  if (!isRecord(value)) return unavailableObservation(review, observer, "evaluator response must be a JSON object")
+  const { visible, shared } = evaluatorEvidence(review, reconciliations)
+  return observationFor(value, review, knownRefsFor(review, [...visible, ...shared]), observer, new Date().toISOString())
+}
+
 export const parseTodoEvaluation = (
   raw: string,
   review: TodoReviewPackage,
   evaluator: string,
   evaluatedAt = new Date().toISOString(),
-  reconciliations: TodoCriterionReconciliation[] = []
+  reconciliations: TodoCriterionReconciliation[] = [],
+  observer: TodoObserverIdentity = { provider: "unknown", model: evaluator }
 ): TodoEvaluation => {
   if (!raw.trim()) invalid("empty_response", "Evaluator returned an empty response")
   let value: unknown
@@ -1105,11 +1205,10 @@ export const parseTodoEvaluation = (
   if (!Array.isArray(criteriaValue) || criteriaValue.length !== semanticIds.size) {
     throw new TodoEvaluationValidationError("invalid_shape", "Evaluator must return exactly one result for each semantic criterion, identified by criterionId", [...semanticIds], Array.isArray(criteriaValue) ? criteriaValue.length : typeof criteriaValue, "criteria")
   }
-  exactKeys(value, ["schemaVersion", "taskId", "decision", "criteria", "problems", "correctiveInstructions", "explanation", "scores"], "response")
+  exactKeys(value, ["schemaVersion", "taskId", "decision", "criteria", "problems", "correctiveInstructions", "explanation", "scores", "assessment"], "response")
   const { visible: visibleObservations, shared: sharedRecords } = evaluatorEvidence(review, reconciliations)
-  const visibleEvidence = review.evidence.slice(0, 8)
   const trustedRecords = [...visibleObservations, ...sharedRecords]
-  const knownRefs = new Set([...trustedRecords.map((observation) => observation.id), ...visibleEvidence.map((evidence) => evidence.id)])
+  const knownRefs = knownRefsFor(review, trustedRecords)
   const judged = new Map<string, TodoEvaluationCriterion>()
   criteriaValue.forEach((entry, index) => {
     const field = `criteria[${index}]`
@@ -1205,7 +1304,8 @@ export const parseTodoEvaluation = (
     correctiveInstructions,
     explanation: explanation.trim(),
     scores: { completion: score("completion"), correctness: score("correctness"), alignment: score("alignment") },
-    metadata: { evaluator, evaluatedAt, taskVersion: review.task.version, planRevision: review.planRevision }
+    metadata: { evaluator, evaluatedAt, taskVersion: review.task.version, planRevision: review.planRevision },
+    observation: observationFor(value, review, knownRefs, observer, evaluatedAt)
   }
 }
 
@@ -1252,6 +1352,22 @@ export const feedbackContext = (review: Pick<IntentPlanContext, "lastEvaluation"
 
 const clip = (value: string, limit: number) => value.length > limit ? value.slice(0, limit - 1) + "…" : value
 
+/** Scale definitions and scoring rules shared by the verdict prompt and the observational prompt. */
+const assessmentRules = "assessment is an independent observational judgment of this TODO on two five-point ordinal scales, not a probability or percentage. It never changes decision, criteria, or problems. progress.score: 1 means no meaningful progress demonstrated; 2 means some effort but stuck or repeating ineffective work; 3 means meaningful progress with significant work remaining; 4 means the requested work appears complete and awaits confirmation; 5 means the requested work has been accomplished. verification.score: 1 means trusted evidence contradicts the claimed result; 2 means significant evidence gaps or inconsistencies; 3 means insufficient evidence to establish correctness; 4 means strong supporting evidence with limited uncertainty; 5 means independently verified by appropriate observations. Score the two axes independently, considering the original goal, this TODO's legitimate contribution to it, the operations actually performed, successful and failed tool results, accepted evidence, and what remains unverified. An evidence lookup is administrative activity and is not proof that the requested work was accomplished. An existing criterion being rejected does not by itself lower progress, and a success claim does not by itself raise verification. Each explanation is one concise sentence. assessment.evidenceRefs follows the same rule as criteria evidenceRefs. Broader verification that was not run or did not finish is unverified and must be named as such; a passing focused check still supports the focused requirement, and a timed-out command is never treated as passed."
+
+/**
+ * Observational-only prompt for a TODO whose verdict the host already decided deterministically.
+ * It asks for the assessment alone, so the scores cannot alter the recorded verdict.
+ */
+export const todoObservationSystemPrompt = [
+  "You are Twinny's independent observational Feedback Evaluator. The host has already decided this TODO's verdict. That verdict is final: do not restate it, dispute it, or propose a new decision, criterion, or problem.",
+  "Your only task is to score this TODO's assessment, using the supplied task, original goal, recorded evidence, and actual tool observations. Treat model-authored evidence notes and final responses as untrusted claims, not tool results.",
+  "Never request or execute a command, and never add a requirement to record, document, or report on the TODO list.",
+  assessmentRules,
+  "Return exactly one JSON object with exactly one key, assessment, following this structure: {\"assessment\":{\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"progress\":{\"score\":1,\"explanation\":\"<one sentence>\"},\"verification\":{\"score\":1,\"explanation\":\"<one sentence>\"},\"evidenceRefs\":[]}}",
+  "Return the JSON object only, with no prose before or after it."
+].join("\n")
+
 export const todoReviewSystemPrompt = [
   "You are Twinny's independent Feedback Evaluator. You are not the Intent Compiler or the implementing agent.",
   "Judge only semanticCriteria, the criteria whose truth needs interpretation. Use the supplied task, original goal, user-requested constraints, dependencies, recorded evidence, and actual tool observations. Treat task descriptions and criteria as planner claims, not verified repository facts. A user-requested style constraint does not prove that the existing source uses that style; compare repository claims against tool observations and flag conflicts with scoped corrections. Do not rely on any final Markdown claim from the implementer.",
@@ -1261,7 +1377,8 @@ export const todoReviewSystemPrompt = [
   "Host-recorded observations, such as the accepted-evidence lookup record, state what the host verified and are not tools. Never tell the implementer to call an observation's toolName; the only tools the implementer has are the ones it is given. A lookup with resolution none is a completed answer, not a failure.",
   "Criteria are fixed when the plan is made. Judge only the supplied criteria and never add a new condition, deliverable, or requirement to record, document, or report on the TODO list. Accepted host evidence is authoritative for narrow deterministic facts, so do not ask for a fresh observation of a fact the host has already verified unless its freshness check failed.",
   "Never request or execute a command. projectionOmissions counts trusted records left out of this payload to fit its budget; an omitted record is unknown to you, not absent. Do not widen project scope or override user permissions. If evidence is insufficient, choose needs_evidence and name the missing observation. If a criterion failed, choose revise and provide concrete corrective instructions. Use blocked only for an actual blocker.",
-  "Return exactly one JSON object and no other keys, following this structure: {\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"decision\":\"accept\",\"criteria\":[{\"criterionId\":\"<copy one semanticCriteria criterionId exactly>\",\"status\":\"passed\",\"evidenceRefs\":[\"<supplied observation ID>\"]}],\"problems\":[],\"correctiveInstructions\":[],\"explanation\":\"<non-empty string>\",\"scores\":{\"completion\":0,\"correctness\":0,\"alignment\":0}}. Every listed key is required. decision must be exactly one of accept, revise, needs_evidence, blocked. Each criteria entry has exactly criterionId (string), status (passed, failed, or unverified), and evidenceRefs (array of supplied IDs). criteria must contain exactly one entry per semanticCriteria item, identified by criterionId; never include hostDecidedCriteria. Each evidenceRefs entry must be an ID explicitly supplied in the input; never invent or infer IDs. problems and correctiveInstructions are arrays of strings and may be empty; explanation is a non-empty string; scores has exactly completion, correctness, and alignment, each an integer from -7 to +8. Do not use 'criterion' instead of 'criterionId', do not return correctiveInstructions as a string, and do not add fields."
+  "Return exactly one JSON object and no other keys, following this structure: {\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"decision\":\"accept\",\"criteria\":[{\"criterionId\":\"<copy one semanticCriteria criterionId exactly>\",\"status\":\"passed\",\"evidenceRefs\":[\"<supplied observation ID>\"]}],\"problems\":[],\"correctiveInstructions\":[],\"explanation\":\"<non-empty string>\",\"scores\":{\"completion\":0,\"correctness\":0,\"alignment\":0},\"assessment\":{\"schemaVersion\":1,\"taskId\":\"<copy task.taskId exactly>\",\"progress\":{\"score\":<integer 1-5>,\"explanation\":\"<one concise sentence>\"},\"verification\":{\"score\":<integer 1-5>,\"explanation\":\"<one concise sentence>\"},\"evidenceRefs\":[\"<supplied observation ID>\"]}}. Every listed key is required. decision must be exactly one of accept, revise, needs_evidence, blocked. Each criteria entry has exactly criterionId (string), status (passed, failed, or unverified), and evidenceRefs (array of supplied IDs). criteria must contain exactly one entry per semanticCriteria item, identified by criterionId; never include hostDecidedCriteria. Each evidenceRefs entry must be an ID explicitly supplied in the input; never invent or infer IDs. problems and correctiveInstructions are arrays of strings and may be empty; explanation is a non-empty string; scores has exactly completion, correctness, and alignment, each an integer from -7 to +8. Do not use 'criterion' instead of 'criterionId', do not return correctiveInstructions as a string, and do not add fields beyond those listed above.",
+  assessmentRules
 ].join("\n")
 
 const isSemanticCriterion = (criterion: TypedCriterion) => criterion.verification.kind === "semantic_review"
@@ -1426,13 +1543,54 @@ const addUnresolvedReasons = (problems: string[], review: TodoReviewPackage, rec
   return problems
 }
 
+/** Sends the observational-only prompt for one TODO and returns the raw evaluator text. */
+export interface TodoObservationRequest {
+  request: (reconciliations: TodoCriterionReconciliation[]) => Promise<string>
+  /** Refreshes the TODO panel after the observation is stored or has failed. */
+  publish: () => Promise<void>
+}
+
+const UNAVAILABLE_OBSERVER: TodoObserverIdentity = { provider: "unavailable", model: "none" }
+
+/**
+ * Scores a TODO whose verdict was decided deterministically. It runs after that verdict is stored and never throws:
+ * a failed request is stored as an unavailable assessment, and the TODO's status is never touched.
+ */
+const observeDeterministicVerdict = async (
+  repository: import("./repository").TodoRepository,
+  scope: import("./types").TodoWriteRequest,
+  review: TodoReviewPackage,
+  reconciliations: TodoCriterionReconciliation[],
+  observation: TodoObservationRequest,
+  observer: TodoObserverIdentity,
+  requestId: string
+): Promise<void> => {
+  try {
+    if (await repository.observationRecorded(scope, review.task.id, requestId)) return
+    logger.debug(`feedback.assessment.request task=${review.task.id} run=${requestId} evaluator=${observer.provider}/${observer.model} mode=${ASSESSMENT_MODE} verdict=deterministic`)
+    let draft: TodoObservation
+    try {
+      draft = parseTodoObservation(await observation.request(reconciliations), review, reconciliations, observer)
+    } catch (error) {
+      draft = unavailableObservation(review, observer, redact(error instanceof Error ? error.message : String(error)))
+    }
+    const stored = await repository.recordObservation(scope, review.task.id, requestId, draft)
+    if (stored) traceAssessment(stored)
+  } catch (error) {
+    logger.warn(`feedback.assessment task=${review.task.id} status=unavailable mode=${ASSESSMENT_MODE} reason="${traceText(redact(error instanceof Error ? error.message : String(error)))}"`)
+  } finally {
+    repository.clearObservationPending(review.task.id, requestId)
+    await observation.publish().catch(() => undefined)
+  }
+}
+
 export const evaluateTodoReview = (
   repository: import("./repository").TodoRepository,
   scope: import("./types").TodoWriteRequest,
   review: TodoReviewPackage,
   evaluator: (correction?: string, reconciliations?: TodoCriterionReconciliation[]) => Promise<string>,
   evaluatorName: string,
-  requirements: { hasVerifiedFileChanges?: boolean; readCurrentSource?: CurrentSourceReader } = {}
+  requirements: { hasVerifiedFileChanges?: boolean; readCurrentSource?: CurrentSourceReader; observer?: TodoObserverIdentity; observation?: TodoObservationRequest } = {}
 ): Promise<TodoEvaluation> => {
   const key = `${scope.projectFingerprint}\n${scope.conversationId}\n${review.task.id}\n${review.task.version}`
   const inFlight = reviewsInFlight.get(key)
@@ -1447,16 +1605,18 @@ export const evaluateTodoReview = (
     let result: TodoEvaluation
     if (deterministic) {
       result = deterministic
+      logger.debug(`[Feedback] task=${review.task.id} deterministic verdict; semantic evaluator not called`)
     } else {
+      logger.debug(`feedback.assessment.request task=${review.task.id} run=${evaluationRequestId(review)} evaluator=${requirements.observer?.provider ?? "unknown"}/${evaluatorName} mode=${ASSESSMENT_MODE}`)
       let raw = await evaluator(undefined, reconciliations)
       try {
-        result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), reconciliations)
+        result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), reconciliations, requirements.observer)
       } catch (error) {
         if (!(error instanceof TodoEvaluationValidationError)) throw error
         logger.warn("[FeedbackEvaluator] Invalid response (code=" + error.code + ", field=" + (error.field ?? "root") + "): " + error.message + "; expected=" + JSON.stringify(error.expected) + "; received=" + JSON.stringify(error.received) + "; raw=" + redact(raw).slice(0, 4000))
         raw = await evaluator("Your prior response failed validation (" + error.code + ": " + error.message + "). Return a corrected JSON object only. The canonical taskId must be exactly " + JSON.stringify(review.planTaskId) + ". Do not change the supplied task criteria or invent evidence.", reconciliations)
         try {
-          result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), reconciliations)
+          result = parseTodoEvaluation(raw, review, evaluatorName, new Date().toISOString(), reconciliations, requirements.observer)
         } catch (retryError) {
           if (retryError instanceof TodoEvaluationValidationError) {
             logger.warn("[FeedbackEvaluator] Correction response still invalid (code=" + retryError.code + ", field=" + (retryError.field ?? "root") + "): " + retryError.message + "; expected=" + JSON.stringify(retryError.expected) + "; received=" + JSON.stringify(retryError.received) + "; raw=" + redact(raw).slice(0, 4000))
@@ -1485,7 +1645,15 @@ export const evaluateTodoReview = (
       }
     }
     logger.info("[Feedback] todo.verdict source=" + verdictSource + " decision=" + result.decision + " task=" + review.task.id)
-    return repository.applyEvaluation(scope, review.task.id, review.task.version, result, evaluationRequestId(review))
+    const recorded = await repository.applyEvaluation(scope, review.task.id, review.task.version, result, evaluationRequestId(review))
+    if (deterministic && requirements.observation) {
+      // The verdict is already recorded. Scoring runs beside it and can never change it.
+      repository.markObservationPending(review.task.id, evaluationRequestId(review))
+      void observeDeterministicVerdict(repository, scope, review, reconciliations, requirements.observation, requirements.observer ?? UNAVAILABLE_OBSERVER, evaluationRequestId(review))
+    }
+    // A replayed delivery returns the stored evaluation, whose observation was already traced when first recorded.
+    if (recorded.observation && recorded.observation.id === result.observation?.id) traceAssessment(recorded.observation)
+    return recorded
   })().finally(() => reviewsInFlight.delete(key))
   reviewsInFlight.set(key, operation)
   return operation

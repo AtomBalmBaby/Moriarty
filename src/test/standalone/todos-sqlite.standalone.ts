@@ -761,7 +761,7 @@ test("a project creates .twinny/evidence.sqlite with the current schema and git-
     assert.equal(fs.existsSync(databasePath), true)
     const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
     try {
-      assert.equal(database.pragma("user_version", { simple: true }), 18)
+      assert.equal(database.pragma("user_version", { simple: true }), 19)
     } finally {
       database.close()
     }
@@ -977,7 +977,7 @@ test("a project database from a newer Twinny schema is refused and left untouche
     await projectRepository(root).initialize()
     const databasePath = path.join(root, ".twinny", "evidence.sqlite")
     const database = new BetterSqlite(databasePath)
-    database.pragma("user_version = 19")
+    database.pragma("user_version = 20")
     database.close()
     const before = fs.readFileSync(databasePath)
 

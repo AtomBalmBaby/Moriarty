@@ -1668,6 +1668,34 @@ suite("Read-file acceptance, production controller", function () {
     })
   })
 
+  test("an answer that also quotes a superseded fingerprint is delivered on the first reply, with the authoritative fingerprint", async () => {
+    const file = "src/extension/tools/workspace.ts"
+    const { source, start, end } = repositoryDeclaration(file)
+    const fingerprint = await contentHash(source)
+    const superseded = "xxh64:a55538019a50a692"
+    assert.notEqual(fingerprint, superseded, "the historical value is not the current fingerprint")
+
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-historical-fingerprint",
+        message: mycroftRequest,
+        planReply: readFilePlanReply("read-file-plan-historical", "source", file),
+        replies: [
+          "Checked accepted evidence: nothing is recorded for read_file yet.",
+          call("read_file", { path: file, start_line: String(start), end_line: String(end) }),
+          `read_file is implemented in ${file}, lines ${start} to ${end}, authoritative fingerprint ${fingerprint}. The earlier fingerprint ${superseded} is historical and superseded.`
+        ]
+      })
+
+      assert.equal(await statusOf(turn, lookupTitle), "completed")
+      assert.equal(await statusOf(turn, investigateTitle), "completed")
+      const reply = turn.reply ?? ""
+      assert.ok(reply.includes(fingerprint), "the authoritative fingerprint is delivered")
+      assert.ok(reply.includes(superseded), "the superseded value is quoted without blocking delivery")
+      assert.equal(turn.agent.requests.length, 3, "an extra fingerprint needs no correction request")
+    }, { [file]: source })
+  })
+
   test("a placeholder answer is not delivered after the tasks complete; the authoritative read_file fingerprint is delivered instead", async () => {
     const file = "src/extension/tools/workspace.ts"
     const source = fs.readFileSync(path.resolve(__dirname, "../../..", file), "utf8")

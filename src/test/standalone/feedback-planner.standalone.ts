@@ -1472,3 +1472,9 @@ test("a repaired answer identity is reported with the criterion repair", () => {
     "answer/range: implementation_symbol twinny_todo_update -> identity-free"
   ])
 })
+
+test("the planner protocol keeps TODO bookkeeping out of the plan and prefers the narrowest executable check", () => {
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /Recording, updating, or marking TODO entries complete is Twinny's own bookkeeping/)
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /narrowest executable check that exercises it/)
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /A command that times out or does not finish is unverified, not passed/)
+})

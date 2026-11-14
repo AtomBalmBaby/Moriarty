@@ -224,7 +224,7 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
     // full_line is still accepted for earlier calls but is not advertised: start_line and end_line set to the same number already read one line.
     parameters: [
       { name: "path", description: "The file." },
-      { name: "full_file", description: "true to read the whole file. Cannot be combined with start_line, end_line or full_line.", optional: true, type: "boolean" },
+      { name: "full_file", description: "true to read the whole file.", optional: true, type: "boolean" },
       { name: "start_line", description: "First line to read, from 1. Omit to start at the top of the file.", optional: true, type: "integer" },
       { name: "end_line", description: "Last line to read, inclusive. Omit to read to the end of the file. Must not be before start_line.", optional: true, type: "integer" }
     ],
@@ -234,13 +234,11 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
       const rel = view.relative(absolute)
       const text = (await sink?.read?.(absolute)) ?? await view.text(absolute)
       if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
-      const single = flagArgument(rel, "full_line", full_line)
       const fullFile = flagArgument(rel, "full_file", full_file)
-      const start = lineArgument(rel, "start_line", start_line)
-      const end = lineArgument(rel, "end_line", end_line)
-      if (fullFile && (single || start !== undefined || end !== undefined)) {
-        throw new ToolInputError(`${rel}: full_file reads the whole file, so it cannot be combined with start_line, end_line or full_line. Pass full_file alone for the whole file, or drop full_file and pass start_line and end_line for a range.`)
-      }
+      // full_file takes precedence: range and full_line arguments sent with it are ignored, not validated.
+      const single = fullFile ? false : flagArgument(rel, "full_line", full_line)
+      const start = fullFile ? undefined : lineArgument(rel, "start_line", start_line)
+      const end = fullFile ? undefined : lineArgument(rel, "end_line", end_line)
       const lines = linesOf(text)
       const metadata = `content_hash: ${await contentHash(text)}; total_lines: ${lines.length}`
       if (!lines.length) return { output: `${rel} (lines 0–0 of 0)\n${metadata}`, summary: `read \`${rel}\` · empty` }
