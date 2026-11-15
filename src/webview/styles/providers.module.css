@@ -637,7 +637,7 @@
   max-width: 34%;
 }
 
-/* The context size sits after the model, in the same quiet type. */
+/* The context size is quiet type in the line, in the same colour as the model's; its tooltip explains it. */
 .contextSize {
   flex: 0 0 auto;
   padding: 0 6px;

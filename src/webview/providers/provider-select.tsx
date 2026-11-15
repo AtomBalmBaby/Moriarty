@@ -96,6 +96,18 @@ export const ProviderSelect = ({ contextWindow }: { contextWindow?: ContextWindo
     })
   }
 
+  // The line shows the size itself; the tooltip explains what it means.
+  const contextSizeText = contextWindow
+    ? t(contextWindow.confirmed ? "context-size-value" : "context-size-approx-value", {
+        size: compactCount(contextWindow.tokens)
+      })
+    : undefined
+  const contextSizeTitle = contextWindow
+    ? contextWindow.confirmed
+      ? t("context-size-title", { size: compactCount(contextWindow.tokens) })
+      : t("context-size-unconfirmed-title", { size: compactCount(contextWindow.tokens) })
+    : undefined
+
   if (chatProviders.length === 0) {
     return (
       <div className={styles.noProviderNotice}>
@@ -177,11 +189,10 @@ export const ProviderSelect = ({ contextWindow }: { contextWindow?: ContextWindo
       {contextWindow && (
         <span
           className={styles.contextSize}
-          title={contextWindow.confirmed ? undefined : t("context-size-unconfirmed-title")}
+          title={contextSizeTitle}
+          aria-label={contextSizeTitle}
         >
-          {contextWindow.confirmed
-            ? t("context-size", { size: compactCount(contextWindow.tokens) })
-            : t("context-size-unconfirmed", { size: compactCount(contextWindow.tokens) })}
+          {contextSizeText}
         </span>
       )}
     </div>
