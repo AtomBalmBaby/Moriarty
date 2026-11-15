@@ -4,8 +4,8 @@ import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
 
-import { createSafeEditCheckpoints, editorEdits } from "../../extension/chat/tool-sinks"
-import { applyDocumentLineEdits } from "../../extension/edit/line-edit"
+import { createSafeEditCheckpoints, EditOperationLedger, editorEdits } from "../../extension/chat/tool-sinks"
+import { applyDocumentLineEdits, revealEditor } from "../../extension/edit/line-edit"
 import { contentHash, LineEditRequest } from "../../extension/tools/line-edit"
 import { WorkspaceView } from "../../extension/tools/view"
 import { workspaceTools } from "../../extension/tools/workspace"
@@ -13,11 +13,25 @@ import { workspaceTools } from "../../extension/tools/workspace"
 suite("Hash-verified native line edits", () => {
   let root: string
   let file: string
+  let originalFolders: { uri: vscode.Uri, name: string }[] = []
 
-  setup(() => {
+  const setWorkspaceFolders = (folders: { uri: vscode.Uri, name: string }[]) => new Promise<void>((resolve, reject) => {
+    const subscription = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      subscription.dispose()
+      resolve()
+    })
+    if (!vscode.workspace.updateWorkspaceFolders(0, vscode.workspace.workspaceFolders?.length ?? 0, ...folders)) {
+      subscription.dispose()
+      reject(new Error("Could not update VS Code test workspace folders."))
+    }
+  })
+
+  setup(async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-editor-lines-"))
     file = path.join(root, "source.txt")
     fs.writeFileSync(file, "first\nsecond\nthird\nfourth\n")
+    originalFolders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ uri: folder.uri, name: folder.name }))
+    await setWorkspaceFolders([{ uri: vscode.Uri.file(root), name: "line-edit-test" }])
   })
 
   teardown(async () => {
@@ -25,16 +39,16 @@ suite("Hash-verified native line edits", () => {
       await vscode.window.showTextDocument(document)
       await vscode.commands.executeCommand("workbench.action.revertAndCloseActiveEditor")
     }
+    await setWorkspaceFolders(originalFolders)
     fs.rmSync(root, { recursive: true, force: true })
   })
 
   const request = async (text: string, edits: unknown): Promise<LineEditRequest> => ({ expected_hash: await contentHash(text), edits })
 
-  test("real editor applies all operations once, preserves dirty text, and undo reverses the batch", async () => {
+  test("a closed document is revealed, edited and saved in one undoable transaction", async () => {
     const document = await vscode.workspace.openTextDocument(file)
-    const editor = await vscode.window.showTextDocument(document)
-    await editor.edit((builder) => builder.replace(new vscode.Range(0, 0, 0, 5), "dirty"))
     const original = document.getText()
+    assert.strictEqual(vscode.window.visibleTextEditors.some((editor) => editor.document === document), false)
     let events = 0
     const listener = vscode.workspace.onDidChangeTextDocument((event) => { if (event.document === document && event.contentChanges.length) events++ })
     try {
@@ -44,14 +58,290 @@ suite("Hash-verified native line edits", () => {
         { operation: "insert_after", line: 4, content: ["last"] }
       ]))
       assert.ok(result.ok, result.message)
-      assert.strictEqual(document.getText(), "dirty\nSECOND\nextra\nfourth\nlast\n")
-      assert.strictEqual(result.contentHash, await contentHash(document.getText()))
+      const expected = "first\nSECOND\nextra\nfourth\nlast\n"
+      assert.strictEqual(document.getText(), expected)
+      assert.strictEqual(fs.readFileSync(file, "utf8"), expected, "the successful edit is on disk")
+      assert.strictEqual(result.contentHash, await contentHash(expected))
+      assert.strictEqual(result.contentSource, "disk")
+      assert.strictEqual(result.persisted, true)
       assert.strictEqual(events, 1, "no intermediate document state")
-      assert.ok(document.isDirty)
-      assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nsecond\nthird\nfourth\n")
+      assert.strictEqual(document.isDirty, false)
+      assert.ok(vscode.window.visibleTextEditors.some((editor) => editor.document === document), "the document is shown for diagnostics")
+      await vscode.window.showTextDocument(document)
       await vscode.commands.executeCommand("undo")
-      assert.strictEqual(document.getText(), original, "one undo restores the entire batch but retains the prior user edit")
+      assert.strictEqual(document.getText(), original, "one undo restores the entire batch")
     } finally { listener.dispose() }
+  })
+
+  test("revealing a closed document opens no new editor group and keeps other open documents", async () => {
+    const other = path.join(root, "other.txt")
+    fs.writeFileSync(other, "keep\n")
+    const otherDocument = await vscode.workspace.openTextDocument(other)
+    await vscode.window.showTextDocument(otherDocument, { preview: false })
+    const groupsBefore = vscode.window.tabGroups.all.length
+    const document = await vscode.workspace.openTextDocument(file)
+    const result = await applyDocumentLineEdits(file, await request(document.getText(), [{ operation: "delete", start_line: 2, end_line: 2 }]))
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(vscode.window.tabGroups.all.length, groupsBefore, "no new editor group is created")
+    assert.ok(vscode.workspace.textDocuments.includes(otherDocument) && !otherDocument.isClosed, "the other document stays open")
+    assert.ok(vscode.window.visibleTextEditors.some((editor) => editor.document === document), "the edited document is shown for diagnostics")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nthird\nfourth\n")
+  })
+
+  test("an already open document is edited in place without a duplicate tab", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const editor = await vscode.window.showTextDocument(document, { preview: false })
+    const tabsBefore = vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === document.uri.toString()).length
+    const result = await applyDocumentLineEdits(file, await request(document.getText(), [{ operation: "delete", start_line: 2, end_line: 2 }]))
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(vscode.window.visibleTextEditors.find((entry) => entry.document === document), editor, "the same editor is edited")
+    assert.strictEqual(vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === document.uri.toString()).length, tabsBefore)
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nthird\nfourth\n")
+  })
+
+  test("a dirty document keeps the user's unsaved changes and saves the complete result", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const editor = await vscode.window.showTextDocument(document)
+    await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), "user: "))
+    const dirty = document.getText()
+    assert.ok(document.isDirty)
+    const result = await applyDocumentLineEdits(file, await request(dirty, [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }]))
+    assert.ok(result.ok, result.message)
+    const expected = "user: first\nSECOND\nthird\nfourth\n"
+    assert.strictEqual(document.getText(), expected)
+    assert.strictEqual(fs.readFileSync(file, "utf8"), expected, "the user's change is saved with the complete document")
+    assert.strictEqual(document.isDirty, false)
+    assert.strictEqual(result.contentSource, "disk")
+    assert.strictEqual(result.contentHash, await contentHash(expected))
+  })
+
+  test("save false leaves the edit unsaved for review and the disk file unchanged", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const result = await applyDocumentLineEdits(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]), { save: false, visibility: "visible" })
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(result.persisted, false)
+    assert.strictEqual(result.contentSource, "buffer")
+    assert.strictEqual(result.contentHash, await contentHash("first\nthird\nfourth\n"))
+    assert.strictEqual(document.getText(), "first\nthird\nfourth\n")
+    assert.ok(document.isDirty, "the edit is intentionally unsaved")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), original, "the file on disk is unchanged")
+    await vscode.window.showTextDocument(document)
+    await vscode.commands.executeCommand("undo")
+    assert.strictEqual(document.getText(), original, "the unsaved edit is undoable")
+  })
+
+  test("save false keeps the user's unsaved changes unsaved as well", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const editor = await vscode.window.showTextDocument(document)
+    await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), "user: "))
+    const dirty = document.getText()
+    const result = await applyDocumentLineEdits(file, await request(dirty, [{ operation: "delete", start_line: 2, end_line: 2 }]), { save: false, visibility: "visible" })
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(document.getText(), "user: first\nthird\nfourth\n")
+    assert.ok(document.isDirty)
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nsecond\nthird\nfourth\n")
+  })
+
+  const sinkFor = (visibility: "visible" | "background", ledger?: EditOperationLedger) => editorEdits(
+    new WorkspaceView(root), "apply", async () => true, undefined, { recordEditOperation: ledger }, visibility
+  )
+  const ledgerRecording = () => {
+    const recorded: { preDigest: string; settled: string[] }[] = []
+    const ledger: EditOperationLedger = async (operation) => {
+      const entry = { preDigest: operation.preDigest, settled: [] as string[] }
+      recorded.push(entry)
+      return { settle: async (status) => { entry.settled.push(status) } }
+    }
+    return { ledger, recorded }
+  }
+  const tabFor = (uri: vscode.Uri) => vscode.window.tabGroups.all
+    .flatMap((group) => group.tabs)
+    .find((tab) => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString())
+  const shownFor = (document: vscode.TextDocument) => vscode.window.visibleTextEditors.some((editor) => editor.document === document)
+
+  test("background mode refuses save false before anything changes, without opening a tab", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const { ledger, recorded } = ledgerRecording()
+    const outcome = await sinkFor("background", ledger).editLines!(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]), false)
+    assert.strictEqual(outcome.ok, false)
+    assert.strictEqual(outcome.error?.code, "permission_denied")
+    assert.strictEqual(document.getText(), original)
+    assert.strictEqual(document.isDirty, false)
+    assert.strictEqual(fs.readFileSync(file, "utf8"), original)
+    assert.strictEqual(recorded.length, 0, "a refused edit is not recorded in the ledger")
+    assert.strictEqual(shownFor(document), false, "no editor is opened for a refused edit")
+  })
+
+  test("visible save false is an intentionally unsaved success recorded as succeeded, not failed", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const { ledger, recorded } = ledgerRecording()
+    const outcome = await sinkFor("visible", ledger).editLines!(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]), false)
+    assert.strictEqual(outcome.ok, true, outcome.message)
+    assert.strictEqual(outcome.persisted, false)
+    assert.strictEqual(document.getText(), "first\nthird\nfourth\n")
+    assert.ok(document.isDirty, "the edit is intentionally unsaved")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), original, "the file on disk is unchanged")
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]])
+    await vscode.window.showTextDocument(document)
+    await vscode.commands.executeCommand("undo")
+    assert.strictEqual(document.getText(), original, "the unsaved edit is undoable")
+  })
+
+  for (const visibility of ["background", "visible"] as const) test(`${visibility} mode saves the edit, keeps undo and settles the ledger as succeeded`, async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const { ledger, recorded } = ledgerRecording()
+    const outcome = await sinkFor(visibility, ledger).editLines!(file, await request(original, [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }]), true)
+    assert.strictEqual(outcome.ok, true, outcome.message)
+    assert.strictEqual(outcome.persisted, true)
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nSECOND\nthird\nfourth\n", "the successful edit is on disk")
+    assert.strictEqual(document.isDirty, false)
+    assert.ok(shownFor(document), "the document is shown for diagnostics")
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]])
+    await vscode.window.showTextDocument(document)
+    await vscode.commands.executeCommand("undo")
+    assert.strictEqual(document.getText(), original, "one undo restores the buffer")
+  })
+
+  test("a save failure is never settled as a successful ledger operation", async function () {
+    if (process.getuid?.() === 0) this.skip()
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const { ledger, recorded } = ledgerRecording()
+    fs.chmodSync(file, 0o444)
+    try {
+      const outcome = await sinkFor("background", ledger).editLines!(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]), true)
+      assert.strictEqual(outcome.ok, false, outcome.message)
+      assert.strictEqual(outcome.error?.code, "save_failed", outcome.message)
+      assert.strictEqual(fs.readFileSync(file, "utf8"), original, "the file on disk is unchanged")
+      assert.strictEqual(recorded.length, 1)
+      assert.ok(!recorded[0].settled.includes("succeeded"), "a failed save is not a successful edit")
+    } finally {
+      fs.chmodSync(file, 0o644)
+    }
+  })
+
+  test("background mode edits a dirty open document in place and saves the user's changes with the edit", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const editor = await vscode.window.showTextDocument(document)
+    await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), "user: "))
+    const dirty = document.getText()
+    const outcome = await sinkFor("background").editLines!(file, await request(dirty, [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }]), true)
+    assert.strictEqual(outcome.ok, true, outcome.message)
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "user: first\nSECOND\nthird\nfourth\n")
+    assert.strictEqual(document.isDirty, false)
+    assert.strictEqual(vscode.window.visibleTextEditors.filter((entry) => entry.document === document).length, 1, "no duplicate editor")
+    assert.strictEqual(tabFor(document.uri)?.isPreview, false, "the already open tab is not replaced by a preview")
+  })
+
+  test("background mode edits a closed document without replacing the user's persistent tab", async () => {
+    const otherFile = path.join(root, "other.txt")
+    fs.writeFileSync(otherFile, "other\n")
+    const other = await vscode.workspace.openTextDocument(otherFile)
+    await vscode.window.showTextDocument(other, { preview: false })
+    const document = await vscode.workspace.openTextDocument(file)
+    const outcome = await sinkFor("background").editLines!(file, await request(document.getText(), [{ operation: "delete", start_line: 2, end_line: 2 }]), true)
+    assert.strictEqual(outcome.ok, true, outcome.message)
+    assert.ok(shownFor(document), "the document is shown for diagnostics")
+    assert.ok(tabFor(other.uri), "the document that had focus stays open in its tab")
+    assert.strictEqual(tabFor(other.uri)?.isPreview, false, "the user's persistent tab is not replaced")
+  })
+
+  test("background reveal shows a closed document as a preview tab without taking focus", async () => {
+    const otherFile = path.join(root, "other.txt")
+    fs.writeFileSync(otherFile, "other\n")
+    const other = await vscode.workspace.openTextDocument(otherFile)
+    await vscode.window.showTextDocument(other, { preview: false })
+    const document = await vscode.workspace.openTextDocument(file)
+    const editor = await revealEditor(document, "background")
+    assert.strictEqual(editor.document, document)
+    assert.strictEqual(tabFor(document.uri)?.isPreview, true, "shown as a preview tab")
+    assert.ok(tabFor(other.uri), "the document that had focus stays open in its tab")
+    assert.strictEqual(tabFor(other.uri)?.isPreview, false, "the user's persistent tab is not replaced")
+  })
+
+  test("visible mode reveals a closed document in a persistent tab and gives it focus", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const outcome = await sinkFor("visible").editLines!(file, await request(document.getText(), [{ operation: "delete", start_line: 2, end_line: 2 }]), true)
+    assert.strictEqual(outcome.ok, true, outcome.message)
+    assert.strictEqual(vscode.window.activeTextEditor?.document, document, "the document has focus")
+    assert.strictEqual(tabFor(document.uri)?.isPreview, false, "shown in a persistent tab")
+  })
+
+  test("visible mode pins an open preview tab and edits it in place", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    await vscode.window.showTextDocument(document, { preview: true })
+    const outcome = await sinkFor("visible").editLines!(file, await request(document.getText(), [{ operation: "delete", start_line: 2, end_line: 2 }]), true)
+    assert.strictEqual(outcome.ok, true, outcome.message)
+    assert.strictEqual(vscode.window.visibleTextEditors.filter((entry) => entry.document === document).length, 1, "no duplicate editor")
+    assert.strictEqual(tabFor(document.uri)?.isPreview, false, "the preview tab is pinned")
+  })
+
+  for (const visibility of ["background", "visible"] as const) test(`${visibility} mode reports a new diagnostic at the changed line of a closed document`, async function () {
+    this.timeout(20000)
+    file = path.join(root, `diagnostics-${visibility}.ts`)
+    const source = "export const value = 1\n"
+    fs.writeFileSync(file, source)
+    const diagnostics = vscode.languages.createDiagnosticCollection("line-edit-diagnostics-" + visibility)
+    const listener = vscode.workspace.onDidChangeTextDocument((event) => {
+      if (event.document.uri.fsPath !== file) return
+      diagnostics.set(event.document.uri, event.document.getText().includes("BROKEN") ? [
+        new vscode.Diagnostic(new vscode.Range(0, 0, 0, 6), "Synthetic type error", vscode.DiagnosticSeverity.Error)
+      ] : [])
+    })
+    try {
+      const outcome = await sinkFor(visibility).editLines!(file, await request(source, [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]), true)
+      assert.strictEqual(outcome.ok, true, outcome.message)
+      assert.match(outcome.message, new RegExp(`reports an error in diagnostics-${visibility}\\.ts that was not there before:\\n1: Synthetic type error`))
+    } finally {
+      listener.dispose()
+      diagnostics.dispose()
+    }
+  })
+
+  for (const visibility of ["background", "visible"] as const) test(`${visibility} mode reports a real TypeScript error introduced into a closed document`, async function () {
+    this.timeout(20000)
+    file = path.join(root, `typed-${visibility}.ts`)
+    const source = "export const value: number = 1\n"
+    fs.writeFileSync(file, source)
+    const outcome = await sinkFor(visibility).editLines!(file, await request(source, [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value: number = \"text\""] }]), true)
+    assert.strictEqual(outcome.ok, true, outcome.message)
+    assert.match(outcome.message, new RegExp(`reports an error in typed-${visibility}\\.ts (that was not there before|on the lines you changed):\\n1: Type 'string' is not assignable to type 'number'`))
+  })
+
+  test("a stale hash from before the user's unsaved change is refused and nothing is applied", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const clean = document.getText()
+    const editor = await vscode.window.showTextDocument(document)
+    await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), "user: "))
+    const dirty = document.getText()
+    const result = await applyDocumentLineEdits(file, await request(clean, [{ operation: "delete", start_line: 2, end_line: 2 }]))
+    assert.strictEqual(result.ok, false)
+    assert.strictEqual(result.error?.code, "hash_mismatch")
+    assert.strictEqual(result.error?.current_hash, await contentHash(dirty))
+    assert.strictEqual(document.getText(), dirty, "the user's change is kept and no edit was made")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), clean, "nothing was saved")
+  })
+
+  test("save failure is reported as save_failed and the edit stays unsaved", async function () {
+    if (process.getuid?.() === 0) this.skip()
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    fs.chmodSync(file, 0o444)
+    try {
+      const result = await applyDocumentLineEdits(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]))
+      assert.strictEqual(result.ok, false, result.message)
+      assert.strictEqual(result.error?.code, "save_failed", result.message)
+      assert.strictEqual(result.error?.current_hash, await contentHash(document.getText()))
+      assert.strictEqual(document.getText(), "first\nthird\nfourth\n", "the edit is in the buffer")
+      assert.ok(document.isDirty, "the edit is not saved")
+      assert.strictEqual(fs.readFileSync(file, "utf8"), original, "the file on disk is unchanged")
+    } finally {
+      fs.chmodSync(file, 0o644)
+    }
   })
 
   for (const eol of ["\n", "\r\n"]) test(`real editor retains ${eol === "\n" ? "LF" : "CRLF"} and unaffected lines`, async () => {
@@ -62,6 +352,7 @@ suite("Hash-verified native line edits", () => {
     ]))
     assert.ok(result.ok, result.message)
     assert.strictEqual(document.getText(), ["one", "TWO", "inserted", "three", ""].join(eol))
+    assert.strictEqual(fs.readFileSync(file, "utf8"), ["one", "TWO", "inserted", "three", ""].join(eol), "the persisted bytes keep the line endings")
   })
 
   test("real editor rejects stale hashes, invalid later edits and overlaps without any document event", async () => {
@@ -97,9 +388,10 @@ suite("Hash-verified native line edits", () => {
       const result = await applyDocumentLineEdits(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]))
       if (changed) await changed
       assert.strictEqual(result.ok, false, "a concurrent version change must not be overwritten")
-      assert.ok(result.error?.code === "hash_mismatch" || result.error?.code === "application_failed")
+      assert.strictEqual(result.error?.code, "hash_mismatch")
       assert.ok(document.getText().includes("second"))
       assert.ok(document.getText().includes("user: "))
+      assert.strictEqual(fs.readFileSync(file, "utf8"), original, "nothing was saved")
     } finally { listener.dispose() }
   })
 
@@ -109,6 +401,8 @@ suite("Hash-verified native line edits", () => {
     const editor = await vscode.window.showTextDocument(document)
     await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), "dirty: "))
     const original = document.getText()
+    assert.ok(document.isDirty)
+    await document.save()
     let approved = false
     const asked: string[] = []
     const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
@@ -130,8 +424,9 @@ suite("Hash-verified native line edits", () => {
     assert.ok(!result.failed, result.output)
     assert.strictEqual(JSON.parse(result.output).content_hash, await contentHash(document.getText()))
     assert.ok(document.getText().includes("approved"))
+    assert.strictEqual(fs.readFileSync(file, "utf8"), document.getText(), "the approved edit is persisted")
     assert.strictEqual(asked.length, 2)
-    assert.ok(document.isDirty)
+    assert.ok(!document.isDirty)
     assert.deepStrictEqual(captured, [file])
     assert.ok(fs.existsSync(path.join(root, "storage", "active-execution-edit-checkpoint.json")))
     await checkpoints.clear()
@@ -148,8 +443,8 @@ suite("Hash-verified native line edits", () => {
     assert.ok(read.output.includes(await contentHash(source)), read.output)
     const result = await tools.run({ name: "edit_lines", args: { path: "encoded.txt", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["after"] }]) } })
     assert.ok(!result.failed, result.output)
-    assert.ok(await document.save())
     assert.deepStrictEqual(fs.readFileSync(file), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("after\r\nuntouched\r\n", "utf16le")]))
+    assert.ok(!document.isDirty)
     await checkpoints.clear()
   })
 
@@ -214,7 +509,7 @@ suite("Hash-verified native line edits", () => {
   })
 
 
-  test("dirty UTF-16 checkpoint recovery preserves both buffer text and exact disk bytes", async () => {
+  test("a dirty UTF-16 document keeps the user's change and saves the complete result in its encoding", async () => {
     file = path.join(root, "dirty-encoded.txt")
     const source = "before \u00e9\r\nuntouched\r\n"
     const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(source, "utf16le")])
@@ -223,18 +518,14 @@ suite("Hash-verified native line edits", () => {
     const editor = await vscode.window.showTextDocument(document)
     await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), "user: "))
     const dirty = document.getText()
-    const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
-    try {
-      await checkpoints.capture([file])
-      const result = await applyDocumentLineEdits(file, await request(dirty, [{ operation: "replace", start_line: 2, end_line: 2, content: ["changed"] }]))
-      assert.ok(result.ok, result.message)
-      await checkpoints.markChanged([file])
-      const restored = await checkpoints.rollback()
-      assert.ok(restored.restored, restored.reason)
-      assert.strictEqual(document.getText(), dirty)
-      assert.ok(document.isDirty)
-      assert.deepStrictEqual(fs.readFileSync(file), bytes)
-    } finally { await checkpoints.clear() }
+    const result = await applyDocumentLineEdits(file, await request(dirty, [{ operation: "replace", start_line: 2, end_line: 2, content: ["changed"] }]))
+    assert.ok(result.ok, result.message)
+    const expected = "user: before \u00e9\r\nchanged\r\n"
+    assert.strictEqual(document.getText(), expected)
+    assert.strictEqual(document.isDirty, false)
+    const persisted = fs.readFileSync(file)
+    assert.deepStrictEqual(persisted.subarray(0, 2), Buffer.from([0xff, 0xfe]), "the BOM and UTF-16 encoding are kept")
+    assert.strictEqual(persisted.subarray(2).toString("utf16le"), expected)
   })
 
   test("a user change during approval is rejected by final hash revalidation", async () => {

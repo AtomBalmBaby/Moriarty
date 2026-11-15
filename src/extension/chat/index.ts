@@ -49,6 +49,7 @@ import { composeAgentPrompt } from "../agents/prompt"
 import type { LoadedAgent } from "../agents/registry"
 import { AgentRegistry } from "../agents/registry"
 import { agentToolSelectionDiagnostic, projectTaskRelevantTools, resolveAgentToolSelection } from "../agents/tool-selection"
+import type { EditorVisibility } from "../edit/line-edit"
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
@@ -2512,7 +2513,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     } : undefined
     let available = workspaceTools(view, [], {
       workspaceSearch: this._workspaceSearch,
-      edits: editorEdits(view, editMode, approveChange, changes, safety),
+      edits: editorEdits(view, editMode, approveChange, changes, safety, this.config.get<EditorVisibility>("chatToolsEditorVisibility", "background")),
       editor: editorKnowledge(view, editMode, approveChange, changes, safety),
       ...readFileSettings((key, fallback) => this.config.get(key, fallback)),
       todos: this._todoRepository && todoScope ? {

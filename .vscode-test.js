@@ -2,5 +2,6 @@ const { defineConfig } = require('@vscode/test-cli');
 module.exports = defineConfig({ files: [
   'out/test/suite/agent-reply.test.js',
   'out/test/suite/agents.test.js',
+  'out/test/suite/line-edit.test.js',
   'out/test/suite/workspace-index.test.js'
 ] });

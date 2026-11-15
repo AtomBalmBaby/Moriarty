@@ -115,7 +115,7 @@ suite("Persistent workspace intelligence index", () => {
         mode: "apply",
         read: async (file) => (await vscode.workspace.openTextDocument(vscode.Uri.file(file))).getText(),
         edit: async () => ({ ok: false, message: "Unused in this test." }),
-        editLines: applyDocumentLineEdits,
+        editLines: (file, request, save) => applyDocumentLineEdits(file, request, { save, visibility: "background" }),
         create: async () => ({ ok: false, message: "Unused in this test." })
       },
       git: false,

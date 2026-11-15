@@ -3,7 +3,10 @@ import { linesOf } from "./view"
 
 export const contentHash = fingerprintContent
 
-export type LineEditFailureCode = "hash_mismatch" | "invalid_range" | "overlapping_edits" | "document_unavailable" | "permission_denied" | "application_failed"
+export type LineEditFailureCode = "hash_mismatch" | "invalid_range" | "overlapping_edits" | "document_unavailable" | "permission_denied" | "application_failed" | "save_failed"
+
+/** `disk` when the saved file's bytes were read back and match; `buffer` when the text was not read from disk (left unsaved, or the bytes cannot be compared). */
+export type ContentSource = "disk" | "buffer"
 
 export interface LineEditFailure {
   code: LineEditFailureCode

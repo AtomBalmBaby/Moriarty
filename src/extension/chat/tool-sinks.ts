@@ -39,6 +39,7 @@ import {
   TWINNY_COMMAND_NAME
 } from "../../common/constants"
 import { logger } from "../../common/logger"
+import { EditorVisibility, revealEditor, UNSAVED_REQUIRES_VISIBLE } from "../edit/line-edit"
 import type { ChatEditMode, ChatEditOutcome } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { stripAnsi, tailOutput } from "../terminal/output"
@@ -311,7 +312,7 @@ const withNewErrors = async (
 ): Promise<EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean; diagnosticsObserved?: boolean; diagnosticFailure?: DiagnosticObservation }> => {
   const applyChange = async () => {
     const outcome = await change()
-    if (outcome.ok && !outcome.pending) await onApplied?.()
+    if (editedBuffer(outcome)) await onApplied?.()
     return outcome
   }
   if (mode !== "apply" || UNCHECKED_FILES.test(file)) return applyChange()
@@ -331,11 +332,15 @@ const withNewErrors = async (
   }
   const watcher = diagnosticObserver(uri)
   const outcome = await change()
-  if (!outcome.ok || outcome.pending) {
+  if (!editedBuffer(outcome)) {
     watcher.dispose()
     return outcome
   }
   await onApplied?.()
+  if (!outcome.ok) {
+    watcher.dispose()
+    return outcome
+  }
   const document = workspace.textDocuments.find((entry) => entry.uri.toString() === uri.toString())
   const after = document
     ? await watcher.wait(document.version, true)
@@ -344,6 +349,7 @@ const withNewErrors = async (
   if ("status" in after) {
     return {
       ...outcome,
+      message: `${outcome.message}\nThe editor reported no diagnostics for ${view.relative(file)} after the edit, so its errors were not checked: ${after.reason}`,
       recoveryBaseline: baseline,
       diagnosticCheckAvailable: baseline !== undefined,
       diagnosticsObserved: false,
@@ -411,6 +417,11 @@ const withNewErrors = async (
 }
 
 /**
+ * Whether the change left the editor buffer different: applied, or applied but not saved (the buffer keeps the edit).
+ */
+const editedBuffer = (outcome: ChatEditOutcome) => !outcome.pending && (outcome.ok || outcome.error?.code === "save_failed")
+
+/**
  * Edits and new files applied and saved, or shown for review, as
  * `twinny.chatToolsEdits` says; deletes and moves likewise, asked in the
  * chat when reviewing since they have no diff.
@@ -420,7 +431,8 @@ export const editorEdits = (
   mode: ChatEditMode,
   approve: ApproveChange,
   changes?: Pick<ReplyChanges, "touch" | "hold">,
-  safety: EditSafetyOptions = {}
+  safety: EditSafetyOptions = {},
+  visibility: EditorVisibility = "background"
 ): EditSink & FileOpsSink => {
   const isProtected = (file: string) => isProtectedPath(view.relative(file)) || isProtectedPath(view.realRelative(file))
   const modeFor = (file: string): ChatEditMode => (isProtected(file) ? "review" : mode)
@@ -514,9 +526,13 @@ export const editorEdits = (
     async read(file) {
       return (await workspace.openTextDocument(Uri.file(file))).getText()
     },
-    async editLines(file, request) {
+    async editLines(file, request, save) {
       const denied = blocked()
       if (denied) return { ...denied, error: lineEditFailure("permission_denied", denied.message) }
+      if (!save && visibility !== "visible") {
+        const error = lineEditFailure("permission_denied", UNSAVED_REQUIRES_VISIBLE)
+        return { ok: false, message: error.message, error }
+      }
       let document
       try {
         document = await workspace.openTextDocument(Uri.file(file))
@@ -539,6 +555,13 @@ export const editorEdits = (
       }
       const deniedAfterApproval = blocked()
       if (deniedAfterApproval) return { ...deniedAfterApproval, error: lineEditFailure("permission_denied", deniedAfterApproval.message) }
+      try {
+        await revealEditor(document, visibility)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        const failure = lineEditFailure("document_unavailable", message)
+        return { ok: false, message: failure.message, error: failure }
+      }
       await safety.checkpoints?.capture([file])
       const changed = {
         start: document.positionAt(patches[0].start).line,
@@ -556,7 +579,7 @@ export const editorEdits = (
         const outcome = await withNewErrors(view, file, "apply", changed, () => held(async () => {
           await changes?.touch(file)
           return (await runCommand<ChatEditOutcome>(
-            TWINNY_COMMAND_NAME.chatFileEdit, { file, lineEdits: request }, "apply"
+            TWINNY_COMMAND_NAME.chatFileEdit, { file, lineEdits: request, save, visibility }, "apply"
           )) ?? { ok: false, message: "Not changed: the editor did not answer.", error: lineEditFailure("application_failed", "The editor did not answer.") }
         }), async () => { await safety.checkpoints?.markChanged([file]) })
         command = outcome

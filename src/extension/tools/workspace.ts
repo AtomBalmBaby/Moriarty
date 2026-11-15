@@ -14,7 +14,7 @@ import { TodoWriteRequest } from "../todos/types"
 
 import { planReplacement, Replacement } from "./edit"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
-import { contentHash, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
+import { contentHash, ContentSource, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
 import { coerceArguments, JsonSchema, McpToolSpec } from "./mcp"
 import {
   deleteFile,
@@ -92,7 +92,7 @@ export interface EditSink {
   read?(file: string): Promise<string | undefined>
   /** Make or show the change; resolves to what the model is told. */
   edit(file: string, replacement: Replacement): Promise<EditOutcome>
-  editLines?(file: string, request: LineEditRequest): Promise<EditOutcome>
+  editLines?(file: string, request: LineEditRequest, save: boolean): Promise<EditOutcome>
   /** Make or show a new file; resolves to what the model is told. */
   create(file: string, content: string): Promise<EditOutcome>
 }
@@ -101,8 +101,11 @@ export interface EditOutcome {
   ok: boolean
   error?: LineEditFailure
   contentHash?: string
+  /** `disk` when the saved file was read back to produce contentHash. */
+  contentSource?: ContentSource
+  /** Whether the edit is saved to disk; `false` when it was left unsaved on purpose. */
+  persisted?: boolean
   message: string
-  /** Waiting for the user's review rather than made. */
   pending?: boolean
   /** Errors the editor reports in the file since the change; the message names them. */
   newErrors?: number
@@ -515,14 +518,15 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     "content is an array of complete lines without newline characters (use [''] for a blank line). " +
     "Overlaps, same-boundary insertions and insertions touching a replaced/deleted boundary are rejected. " +
     "Hash mismatch leaves everything unchanged and returns current_hash; reread, never retry blindly. " +
-    "Uses existing edit permissions; review/protected files require approval. Changes remain unsaved in the editor buffer. Returns the resulting content_hash, which is the expected_hash for the next edit to the same file.",
+    "Uses existing edit permissions; review/protected files require approval. Edits apply to the editor buffer, so the user's unsaved changes in the file are kept (and saved with it when save is true). The document is shown in an editor so diagnostics are checked: in background mode (the default) it is used in place if already open, otherwise shown as a preview tab without taking focus; in visible mode it is shown in a persistent tab that takes focus. By default (save true) the complete document is saved and read back: persisted is true, content_source is disk, and content_hash is the saved file's fingerprint, the expected_hash for the next edit to the same file. save false is only for when the task instructions ask for it and the editor mode is visible; otherwise it is refused with permission_denied and nothing changes. A save false edit is left unsaved for review: persisted is false, the file on disk is unchanged, and a build from disk does not include it. If saving fails the error code is save_failed: the edit stays in the unsaved editor buffer, the file on disk may not have it, and current_hash is the buffer's fingerprint.",
   guidance:
     "To change existing source: read_file for its numbered lines and content_hash, then call edit_lines with that expected_hash and the line operations. " +
     "Use the content_hash it returns for the next edit to the same file. Reread only after a hash_mismatch, or when the lines you need were not in the last read.",
   parameters: [
     { name: "path", description: "Workspace-relative file path." },
     { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted." },
-    { name: "edits", description: "Array of replace/delete {start_line,end_line,content?} or insert_before/insert_after {line,content} operations, all against the original snapshot." }
+    { name: "edits", description: "Array of replace/delete {start_line,end_line,content?} or insert_before/insert_after {line,content} operations, all against the original snapshot." },
+    { name: "save", description: "Optional, default true. false leaves the edit unsaved for review; only allowed when the editor mode is visible and the task instructions say so." }
   ],
   schema: {
     type: "object",
@@ -531,6 +535,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     properties: {
       path: { type: "string" },
       expected_hash: { type: "string", pattern: "^(xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}|[a-f0-9]{64})$", description: "Full-document content_hash from read_file." },
+      save: { type: "boolean", description: "Default true: save the complete document to disk. false: leave the edit unsaved in the editor; only allowed when the editor mode is visible and the task instructions ask for it." },
       edits: {
         type: "array", minItems: 1,
         items: {
@@ -552,9 +557,12 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       }
     }
   },
-  async run({ path: file, expected_hash, edits }) {
+  async run({ path: file, expected_hash, edits, save }) {
     if (!file || !/^(?:xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}|[a-f0-9]{64})$/.test(expected_hash ?? "")) {
       return lineEditErrorResult(lineEditFailure("invalid_range", "path and a valid content fingerprint from read_file are required."))
+    }
+    if (save !== undefined && typeof save !== "boolean") {
+      return lineEditErrorResult(lineEditFailure("invalid_range", "save must be true or false."))
     }
     let absolute: string
     try {
@@ -567,11 +575,11 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     try { operations = JSON.parse(edits) } catch {
       return lineEditErrorResult(lineEditFailure("invalid_range", "edits must be a JSON array of line operations."))
     }
-    const outcome = await apply(absolute, { expected_hash, edits: operations })
+    const outcome = await apply(absolute, { expected_hash, edits: operations }, save !== false)
     if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
     if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))
     return {
-      output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: outcome.contentHash.split(":")[0], message: outcome.message }),
+      output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: outcome.contentHash.split(":")[0], content_source: outcome.contentSource, persisted: outcome.persisted ?? false, message: outcome.message }),
       summary: `edited \`${view.relative(absolute)}\` by lines${errorsNote(outcome)}`
     }
   }

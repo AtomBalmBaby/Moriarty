@@ -968,6 +968,21 @@
           "markdownDescription": "What happens when the chat model changes a file (with `#twinny.chatTools#` on).",
           "scope": "machine"
         },
+        "twinny.chatToolsEditorVisibility": {
+          "order": 20,
+          "type": "string",
+          "enum": [
+            "background",
+            "visible"
+          ],
+          "enumDescriptions": [
+            "Edits are applied without taking focus. A document already open in an editor is edited in place; otherwise it is shown as a preview tab. Diagnostics are still checked.",
+            "Edited documents are shown in a persistent tab that takes focus. The model may also ask to leave an edit unsaved for your review in this mode."
+          ],
+          "default": "background",
+          "markdownDescription": "Where the chat model's file edits are shown in the IDE (with `#twinny.chatTools#` on). Both modes save the edit and check diagnostics.",
+          "scope": "machine"
+        },
         "twinny.chatToolsCommands": {
           "order": 20,
           "type": "string",

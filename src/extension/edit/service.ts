@@ -9,10 +9,10 @@ import { GenerationRun, GenerationTracker } from "../generations"
 import { isCancelled, resolveInferenceProvider } from "../inference"
 import { Base } from "../providers/base"
 import { describeProviderErrorPlain, isAbortError } from "../providers/errors"
-import { LineEditFailure, lineEditFailure, LineEditRequest } from "../tools/line-edit"
+import { ContentSource, LineEditFailure, lineEditFailure, LineEditRequest } from "../tools/line-edit"
 
 import { DiffLayout, layoutDiff, locateSnippet } from "./diff"
-import { applyDocumentLineEdits } from "./line-edit"
+import { applyDocumentLineEdits, EditorVisibility } from "./line-edit"
 import {
   buildEditMessages,
   clampContext,
@@ -56,12 +56,16 @@ export interface ChatEditOutcome {
   ok: boolean
   error?: LineEditFailure
   contentHash?: string
+  /** Where `contentHash` was read back from: the saved file, or the buffer when the file's bytes could not be compared or the edit was left unsaved. */
+  contentSource?: ContentSource
+  /** Whether the edit is saved to disk. `false` when it was left unsaved for review on purpose. */
+  persisted?: boolean
   message: string
   pending?: boolean
 }
 
 /** Both native editing tools use the existing chat edit command. */
-export type FileEditProposal = { file: string; lineEdits: LineEditRequest } | FileTextEditProposal
+export type FileEditProposal = { file: string; lineEdits: LineEditRequest; save?: boolean; visibility?: EditorVisibility } | FileTextEditProposal
 
 export interface FileTextEditProposal {
   file: string
@@ -307,7 +311,7 @@ export class InlineEditService extends Base {
     }
     if ("lineEdits" in proposal) {
       if (mode !== "apply") return { ok: false, message: "Line edits require approval before application.", error: lineEditFailure("permission_denied", "Line edits require approval before application.") }
-      return applyDocumentLineEdits(proposal.file, proposal.lineEdits)
+      return applyDocumentLineEdits(proposal.file, proposal.lineEdits, { save: proposal.save !== false, visibility: proposal.visibility ?? "background" })
     }
     const document = await vscode.workspace.openTextDocument(uri)
     const last = document.lineAt(Math.min(proposal.endLine, document.lineCount - 1))

@@ -36,7 +36,7 @@ const fixture = (initial: string) => {
       await Promise.resolve()
       for (const patch of [...patches].reverse()) text = text.slice(0, patch.start) + patch.text + text.slice(patch.end)
       transactions++
-      return { ok: true, message: "applied", contentHash: await contentHash(text) }
+      return { ok: true, message: "applied", contentHash: await contentHash(text), persisted: true }
     }
   }
   const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
@@ -97,7 +97,7 @@ for (const [name, before, edits, after] of cases) test(name, async () => {
   assert.equal(result.failed, undefined, result.output)
   assert.equal(f.text(), after)
   assert.equal(f.transactions(), 1)
-  assert.deepEqual(JSON.parse(result.output), { ok: true, path: "panel.tsx", content_hash: await contentHash(after), hash_algorithm: "xxh64", message: "applied" })
+  assert.deepEqual(JSON.parse(result.output), { ok: true, path: "panel.tsx", content_hash: await contentHash(after), hash_algorithm: "xxh64", persisted: true, message: "applied" })
 })
 
 const rejected: [string, unknown, string][] = [
