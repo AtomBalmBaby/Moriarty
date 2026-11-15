@@ -36,6 +36,7 @@ import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
 import { ContextCapacity, ContextDiagnostics, ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
 import { buildBreakdown, RequestBreakdown, RowChars } from "./context-breakdown"
+import { logToolFailure } from "./failure-log"
 import { instructionsSection } from "./instructions"
 import {
   displayableLength,
@@ -217,6 +218,8 @@ export interface ToolLoopUsage {
 
 export interface ToolLoopOptions {
   mode?: ToolMode
+  /** The provider kind the calls go to; named in the log of a failed call. */
+  provider?: string
   maxSteps?: number
   /** Upper ceiling for one tool result kept in the model's context, after scaling by the context window. */
   maxResultChars?: number
@@ -510,8 +513,9 @@ interface PendingCall {
   raw?: ChatToolCall
   call?: ToolCall
   error?: string
-  /** What the parser said, and what the model wrote, when the call could not be read. */
+  /** What the parser said about the call's arguments, when they could not be read. */
   detail?: string
+  /** The call exactly as the model wrote it, kept whether or not it could be read. */
   written?: string
 }
 
@@ -997,6 +1001,20 @@ class ToolLoop {
           ...ran,
           output: fitted + note || "(no output)"
         }
+        if (ran.failed) {
+          logToolFailure({
+            name,
+            callId: pending.raw?.id,
+            id,
+            mode: this._mode,
+            provider: this._options.provider,
+            summary: ran.summary,
+            output: ran.output,
+            sent: pending.written,
+            detail: pending.detail,
+            received: pending.call?.args
+          })
+        }
         this._options.onBudget?.({
           id,
           name,
@@ -1305,14 +1323,15 @@ class ToolLoop {
       if ("error" in call) {
         return { raw: { ...raw, arguments: "{}" }, error: call.error, detail: call.detail, written: raw.arguments }
       }
-      return { raw: strictJson(raw.arguments) ? raw : { ...raw, arguments: JSON.stringify(call.args) }, call }
+      return { raw: strictJson(raw.arguments) ? raw : { ...raw, arguments: JSON.stringify(call.args) }, call, written: raw.arguments }
     })
   }
 
   private textCall(found: FoundCall | undefined, reply: { text: string }, step: number): PendingCall[] {
     if (!found) return []
     if (found.call) found.call = nameArguments(found.call, this._workspace.tools)
-    const unread = found.call ? {} : { detail: found.detail, written: reply.text.slice(found.start, found.end) }
+    const written = reply.text.slice(found.start, found.end)
+    const unread = found.call ? {} : { detail: found.detail }
     if (this._mode === "native") {
       // Carried on as a native call, so the conversation stays in one form.
       reply.text = reply.text.slice(0, found.start).trimEnd()
@@ -1321,11 +1340,11 @@ class ToolLoop {
         name: found.call?.name ?? "unknown",
         arguments: JSON.stringify(found.call?.args ?? {})
       }
-      return [{ raw, call: found.call, error: found.error, ...unread }]
+      return [{ raw, call: found.call, error: found.error, written, ...unread }]
     }
     // Only what the model wrote up to the end of its call goes back to it.
     reply.text = reply.text.slice(0, found.end)
-    return [{ call: found.call, error: found.error, ...unread }]
+    return [{ call: found.call, error: found.error, written, ...unread }]
   }
 
   /** The reply that made the calls, and their results, join the conversation. */

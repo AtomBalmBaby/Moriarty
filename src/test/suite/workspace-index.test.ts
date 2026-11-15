@@ -130,11 +130,11 @@ suite("Persistent workspace intelligence index", () => {
     const pathOnly = await tools.run({ name: "find_files", args: { pattern: "read_file", mode: "path" } })
     assert.equal(pathOnly.output, "No files match.")
     const sourcePath = "src/extension/tools/workspace.ts"
-    const source = await tools.run({ name: "read_file", args: { path: sourcePath } })
-    const expectedHash = source.output.match(/content_hash: ([^;]+);/)?.[1]
-    assert.ok(expectedHash)
     const sourceText = fs.readFileSync(path.join(root, sourcePath), "utf8")
     const markerLine = sourceText.split(/\r?\n/).findIndex((line) => line.includes("workspaceSearchAcceptanceMarker")) + 1
+    const source = await tools.run({ name: "read_file", args: { path: sourcePath, start_line: String(markerLine), end_line: String(markerLine) } })
+    const expectedHash = source.output.match(/content_hash: ([^;]+);/)?.[1]
+    assert.ok(expectedHash)
     const edit = await tools.run({ name: "edit_lines", args: {
       path: sourcePath,
       expected_hash: expectedHash,

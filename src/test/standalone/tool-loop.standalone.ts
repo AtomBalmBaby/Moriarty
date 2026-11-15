@@ -24,7 +24,8 @@ import {
   TokenEstimator,
   trimmedResult
 } from "../../extension/tools/budget"
-import { contentHash } from "../../extension/tools/line-edit"
+import { describeMismatch, shapeOf } from "../../extension/tools/failure-log"
+import { contentHash, planLineEdits } from "../../extension/tools/line-edit"
 import {
   flattenToolHistory,
   GENERATION_LIMIT_DEFAULTS,
@@ -36,7 +37,7 @@ import {
   ToolStep,
   withTools
 } from "../../extension/tools/loop"
-import { ToolResult, WorkspaceTools, workspaceTools } from "../../extension/tools/workspace"
+import { EditSink,ToolResult, WorkspaceTools, workspaceTools } from "../../extension/tools/workspace"
 import { parsePeerFrame } from "../../protocol/peer"
 
 type Call = { id: string; name: string; arguments: string }
@@ -1405,4 +1406,161 @@ test("a continued Markdown question keeps its Markdown, after the previous reply
     context
   )
   assert.ok(turnText(turn[turn.length - 1]).endsWith("1. **go on**"), "the question is the Markdown the user wrote")
+})
+
+test("the logged llama.cpp edit_lines call is refused by name, then a replace through the native loop is saved to disk", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-native-edit-"))
+  try {
+    const original = "{\n  \"a\": 1,\n  \"empty-chat-title\": \"Old\",\n  \"c\": 3\n}\n"
+    const updated = "{\n  \"a\": 1,\n  \"empty-chat-title\": \"Ask Moriarty anything\",\n  \"c\": 3\n}\n"
+    const file = path.join(root, "en.json")
+    fs.writeFileSync(file, original)
+    const expected = await contentHash(original)
+    const content = ["  \"empty-chat-title\": \"Ask Moriarty anything\","]
+    let writes = 0
+    const sink: EditSink = {
+      mode: "apply",
+      read: async () => undefined,
+      edit: async () => ({ ok: false, message: "unused" }),
+      create: async () => ({ ok: false, message: "unused" }),
+      async editLines(absolute, request) {
+        const text = fs.readFileSync(absolute, "utf8")
+        const patches = await planLineEdits(text, request)
+        let next = text
+        for (const patch of [...patches].reverse()) next = next.slice(0, patch.start) + patch.text + next.slice(patch.end)
+        fs.writeFileSync(absolute, next)
+        writes++
+        return { ok: true, message: "saved", contentHash: await contentHash(next), persisted: true }
+      }
+    }
+    const { client, requests } = scripted([
+      { calls: [read("1", "en.json")] },
+      { calls: [{ id: "2", name: "edit_lines", arguments: JSON.stringify({ path: "en.json", expected_hash: expected, edits: [{ type: "replace", start_line: 3, end_line: 3, content }] }) }] },
+      { calls: [{ id: "3", name: "edit_lines", arguments: JSON.stringify({ path: "en.json", expected_hash: expected, edits: [{ operation: "replace", start_line: 3, end_line: 3, content }] }) }] },
+      "Done."
+    ])
+    const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
+    await collect(withTools(client, tools, { mode: "native" }).chat(ask("Change the title.")))
+    const lastToolResult = (request: ChatRequest) => String(request.messages.filter((m) => m.role === "tool").at(-1)?.content)
+    const refused = lastToolResult(requests[2])
+    assert.match(refused, /invalid_range/)
+    assert.match(refused, /operation/)
+    assert.match(refused, /type/)
+    assert.equal(writes, 1, "only the corrected call writes")
+    const applied = lastToolResult(requests[3])
+    assert.match(applied, /"ok":true/)
+    assert.ok(applied.includes(await contentHash(updated)), "the result reports the saved document's hash")
+    assert.equal(fs.readFileSync(file, "utf8"), updated)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** What the logger writes to stderr while `run` executes. Headless here, so stderr is its channel. */
+const captureStderr = async (run: () => Promise<unknown>): Promise<string> => {
+  const written: string[] = []
+  const write = process.stderr.write
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    written.push(String(chunk))
+    return true
+  }) as typeof process.stderr.write
+  try {
+    await run()
+  } finally {
+    process.stderr.write = write
+  }
+  return written.join("")
+}
+
+const editSink = (): EditSink => ({
+  mode: "apply",
+  read: async () => undefined,
+  edit: async () => ({ ok: false, message: "unused" }),
+  create: async () => ({ ok: false, message: "unused" }),
+  async editLines(absolute, request) {
+    await planLineEdits(fs.readFileSync(absolute, "utf8"), request)
+    return { ok: false, message: "unused" }
+  }
+})
+
+test("a native edit_lines call the tool refuses is logged as a warning, with what was sent and received, and no source text", async () => {
+  const original = "{\n  \"a\": 1\n}\n"
+  const root = workspace({ "en.json": original })
+  const content = ["  \"SECRET_SOURCE_LINE\": 2,"]
+  const { client } = scripted([
+    { calls: [{ id: "2", name: "edit_lines", arguments: JSON.stringify({ path: "en.json", expected_hash: await contentHash(original), edits: [{ type: "replace", start_line: 2, end_line: 2, content }] }) }] },
+    "Sorry."
+  ])
+  const tools = workspaceTools(root, [], { edits: editSink(), git: false, instructions: false })
+  const log = await captureStderr(() => collect(withTools(client, tools, { mode: "native", provider: "llamacpp" }).chat(ask("Edit."))))
+  assert.match(log, /\[twinny\] warn tool failed · edit_lines \(native, llamacpp\) · call 2, step 0\.0 · edit_lines failed · /)
+  assert.match(log, /sent: \{"path":"<7 chars>","expected_hash":"<\d+ chars>","edits":\[\{"type":"replace","start_line":2,"end_line":2,"content":\["<\d+ chars>"\]\}\]\}/)
+  assert.match(log, /received: \{"path":"<7 chars>","expected_hash":"<\d+ chars>","edits":\[\{"type":"replace"/)
+  assert.doesNotMatch(log, /mismatch:/, "what was sent and what was received agree")
+  assert.match(log, /output: \{"ok":false,"error":\{"code":"invalid_range"/)
+  assert.doesNotMatch(log, /SECRET_SOURCE_LINE/)
+})
+
+test("a call whose arguments were dropped or changed on the way is logged with each mismatch named", async () => {
+  const root = workspace({ "a.ts": "x\n" })
+  const { client } = scripted([
+    { calls: [{ id: "1", name: "read_file", arguments: JSON.stringify({ path: "missing.ts", start_line: null }) }] },
+    "Not there."
+  ])
+  const log = await captureStderr(() => collect(withTools(client, workspaceTools(root), { mode: "native", provider: "llamacpp" }).chat(ask("Read."))))
+  assert.match(log, /\[twinny\] warn tool failed · read_file \(native, llamacpp\) · call 1, step 0\.0/)
+  assert.match(log, /received: \{"path":"<10 chars>"\}/)
+  assert.match(log, /mismatch: start_line: sent as null, not received/)
+})
+
+test("a call the model wrote that could not be read is logged with its raw text described and the parser's reason", async () => {
+  const root = workspace({ "a.ts": "x\n" })
+  const { client } = scripted([{ calls: [{ id: "1", name: "read_file", arguments: "{path: a.ts" }] }, "Sorry."])
+  const log = await captureStderr(() => collect(withTools(client, workspaceTools(root), { mode: "native", provider: "llamacpp" }).chat(ask("Read."))))
+  assert.match(log, /\[twinny\] warn tool failed · read_file \(native, llamacpp\) · call 1, step 0\.0 · tool call not understood · /)
+  assert.match(log, /sent: not JSON \(11 chars; /)
+  assert.match(log, /received: not read as a call/)
+})
+
+test("a text-mode call that fails is logged with the arguments it was written with", async () => {
+  const root = workspace({})
+  const { client } = scripted([
+    { text: "Checking.\n```tool\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"missing.ts\"}}\n```" },
+    "Not there."
+  ])
+  const log = await captureStderr(() => collect(withTools(client, workspaceTools(root), { mode: "text", provider: "ollama" }).chat(ask("Read."))))
+  assert.match(log, /\[twinny\] warn tool failed · read_file \(text, ollama\) · call none, step 0\.0/)
+  assert.match(log, /sent: \{"path":"<10 chars>"\}/)
+  assert.match(log, /received: \{"path":"<10 chars>"\}/)
+})
+
+test("a shape keeps keys, control values and counts, and never the text of a value", () => {
+  assert.deepStrictEqual(shapeOf("", { op: "replace", line: 3, note: "secret", items: ["a", "bc"], gone: null }), {
+    op: "replace",
+    line: 3,
+    note: "<6 chars>",
+    items: ["<1 chars>", "<2 chars>"],
+    gone: null
+  })
+  assert.deepStrictEqual(shapeOf("", { edits: "[{\"type\":\"delete\",\"text\":\"x\"}]" }), { edits: [{ type: "delete", text: "<1 chars>" }] })
+})
+
+test("a mismatch names dropped nulls, keys lost either way, and values changed in transit", () => {
+  const notes = describeMismatch(
+    { path: "a.ts", start_line: null, line: "2", content: "x", extra: 1 },
+    { path: "a.ts", line: "2", content: "y", stray: "z" }
+  )
+  assert.deepStrictEqual(notes, [
+    "start_line: sent as null, not received",
+    "content: changed between sent and received",
+    "extra: sent, not received",
+    "stray: received, not sent"
+  ])
+})
+
+test("a call that succeeds writes no failure warning", async () => {
+  const root = workspace({ "a.ts": "x\n" })
+  const { client } = scripted([{ calls: [read("1", "a.ts")] }, "Read it."])
+  const log = await captureStderr(() => collect(withTools(client, workspaceTools(root), { mode: "native", provider: "llamacpp" }).chat(ask("Read."))))
+  assert.doesNotMatch(log, /tool failed/)
 })

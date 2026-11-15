@@ -502,6 +502,7 @@ const serializeMutation = <T>(run: () => Promise<T>): Promise<T> => {
   return result
 }
 
+/** The one-line result for an edit_lines refusal: the error as JSON, for the model to read. Failed calls are logged by the loop. */
 const lineEditErrorResult = (error: LineEditFailure): ToolResult => ({
   output: JSON.stringify({ ok: false, error, ...(error.current_hash ? { hash_algorithm: error.current_hash.split(":")[0] } : {}) }),
   summary: `edit_lines failed · ${error.message}`,
@@ -525,7 +526,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
   parameters: [
     { name: "path", description: "Workspace-relative file path." },
     { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted." },
-    { name: "edits", description: "Array of replace/delete {start_line,end_line,content?} or insert_before/insert_after {line,content} operations, all against the original snapshot." },
+    { name: "edits", description: "Array of line operations, all against the original snapshot. Each has operation: replace {operation,start_line,end_line,content} or delete {operation,start_line,end_line}, or insert_before/insert_after {operation,line,content}." },
     { name: "save", description: "Optional, default true. false leaves the edit unsaved for review; only allowed when the editor mode is visible and the task instructions say so." }
   ],
   schema: {
@@ -538,7 +539,18 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       save: { type: "boolean", description: "Default true: save the complete document to disk. false: leave the edit unsaved in the editor; only allowed when the editor mode is visible and the task instructions ask for it." },
       edits: {
         type: "array", minItems: 1,
+        description: "Line operations, all against the original snapshot. Each object's key is operation, set to replace, delete, insert_before or insert_after; not type, op or action.",
         items: {
+          type: "object",
+          description: "replace and delete use start_line and end_line (inclusive, 1-based). insert_before and insert_after use line. replace and inserts require content, an array of complete lines.",
+          required: ["operation"],
+          properties: {
+            operation: { type: "string", enum: ["replace", "delete", "insert_before", "insert_after"], description: "The change to make; this key is required." },
+            start_line: { type: "integer", minimum: 1, description: "replace or delete: first line, 1-based." },
+            end_line: { type: "integer", minimum: 1, description: "replace or delete: last line, 1-based, inclusive." },
+            line: { type: "integer", minimum: 0, description: "insert_before: insert before this line (1 or more). insert_after: insert after this line (0 inserts at the top)." },
+            content: { type: "array", minItems: 1, items: { type: "string" }, description: "replace or insert: the new complete lines, without newline characters." }
+          },
           oneOf: ["replace", "delete", "insert_before", "insert_after"].map((operation) => {
             const insertion = operation.startsWith("insert_")
             return {
@@ -557,7 +569,8 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       }
     }
   },
-  async run({ path: file, expected_hash, edits, save }) {
+  async run(args) {
+    const { path: file, expected_hash, edits, save } = args
     if (!file || !/^(?:xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}|[a-f0-9]{64})$/.test(expected_hash ?? "")) {
       return lineEditErrorResult(lineEditFailure("invalid_range", "path and a valid content fingerprint from read_file are required."))
     }

@@ -54,10 +54,15 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) invalid("Each edit must be an operation object.")
     const edit = raw as Record<string, unknown>
     const operation = edit.operation
-    if (typeof operation !== "string" || !["replace", "delete", "insert_before", "insert_after"].includes(operation)) invalid("Unknown line operation.")
+    const operations = ["replace", "delete", "insert_before", "insert_after"]
+    if (typeof operation !== "string" || !operations.includes(operation)) {
+      const received = operation === undefined ? "no \"operation\" field" : `"operation": ${JSON.stringify(operation)}`
+      invalid(`Unknown line operation (${received}). Set "operation" to one of ${operations.join(", ")}. Received fields: ${Object.keys(edit).join(", ") || "none"}.`)
+    }
     const insertion = operation === "insert_before" || operation === "insert_after"
     const allowed = new Set(["operation", ...(insertion ? ["line"] : ["start_line", "end_line"]), ...(operation === "delete" ? [] : ["content"])])
-    if (Object.keys(edit).some((key) => !allowed.has(key))) invalid("Unexpected fields in line operation.")
+    const unexpected = Object.keys(edit).filter((key) => !allowed.has(key))
+    if (unexpected.length) invalid(`Unexpected field${unexpected.length > 1 ? "s" : ""} for ${operation} operation: ${unexpected.join(", ")}. Allowed fields: ${[...allowed].join(", ")}.`)
     let content = ""
     if (operation !== "delete") {
       if (!Array.isArray(edit.content) || !edit.content.length || edit.content.some((line: unknown) => typeof line !== "string" || /[\r\n]/.test(line))) {

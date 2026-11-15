@@ -2430,6 +2430,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     )
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
+      provider: provider.provider,
       maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
       ...this.generationOptions(),
       maxResultChars,
@@ -2443,7 +2444,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,
       onRequest: (chars, step, mode, tokens, breakdown) => {
-        logger.debug(`Chat TODO tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
+        logger.debug(`Chat TODO tools · request ${step + 1} (${mode}, ${provider.provider}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
         logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
       },
       onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
@@ -2627,6 +2628,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
+      provider: provider.provider,
       maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
       ...this.generationOptions(),
       maxResultChars,
@@ -2642,7 +2644,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onNotes: hooks.onNotes,
       onUsage: hooks.onUsage,
       onRequest: (chars, step, mode, tokens, breakdown) => {
-        logger.debug(`Chat tools · request ${step + 1} (${mode}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
+        logger.debug(`Chat tools · request ${step + 1} (${mode}, ${provider.provider}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
         logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
       },
       onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),

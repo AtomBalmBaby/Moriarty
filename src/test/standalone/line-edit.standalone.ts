@@ -7,6 +7,7 @@ import { test } from "node:test"
 
 import { parseReadFile } from "../../common/tool-output"
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
+import { buildStreamingRequest } from "../../extension/inference/adapters/fluency"
 import { contentHash, planLineEdits } from "../../extension/tools/line-edit"
 import { findToolCall, toolDefinition } from "../../extension/tools/protocol"
 import { EditSink, workspaceTools } from "../../extension/tools/workspace"
@@ -149,6 +150,56 @@ test("native schema, text dispatch, inventory and explicit tool selection expose
   assert.equal((await f.tools.run(call)).failed, undefined)
   assert.equal(f.text(), "new\n")
   assert.equal(workspaceTools(f.root).tools.some((entry) => entry.name === "edit_lines"), false)
+})
+
+test("llama.cpp is told the operation key, the operations and their fields for edit_lines", () => {
+  const f = fixture("a\n")
+  const tool = f.tools.tools.find((entry) => entry.name === "edit_lines")!
+  const request = buildStreamingRequest({ id: "llamacpp", label: "llama.cpp", provider: "llamacpp", type: "chat", modelName: "m" } as never, [{ role: "user", content: "Edit." }], { tools: [toolDefinition(tool)] }) as unknown as {
+    tools: Array<{ function: { parameters: { properties: { edits: { items: { required?: string[]; properties?: Record<string, { description?: string }> } } } } } }>
+  }
+  const items = request.tools[0].function.parameters.properties.edits.items
+  assert.deepEqual(items.required, ["operation"])
+  for (const name of ["replace", "delete", "insert_before", "insert_after"]) assert.match(items.properties!.operation.description!, new RegExp(name))
+  for (const field of ["start_line", "end_line", "line", "content"]) assert.ok(items.properties![field], field)
+})
+
+test("the logged type-keyed request is rejected through native dispatch, naming the operation key", async () => {
+  const f = fixture("a\nb\n")
+  const result = await f.edit([{ type: "replace", start_line: 2, end_line: 2, content: ["B"] }])
+  assert.equal(result.failed, true)
+  const error = JSON.parse(result.output).error
+  assert.equal(error.code, "invalid_range")
+  assert.match(error.message, /"operation"/)
+  assert.match(error.message, /type/)
+  assert.equal(f.text(), "a\nb\n")
+  assert.equal(f.transactions(), 0)
+})
+
+test("a legitimate replace through native dispatch is applied and returns the resulting hash", async () => {
+  const f = fixture("a\nb\nc\n")
+  const result = await f.edit([{ operation: "replace", start_line: 2, end_line: 2, content: ["B"] }])
+  assert.equal(result.failed, undefined)
+  const output = JSON.parse(result.output)
+  assert.equal(output.ok, true)
+  assert.equal(output.persisted, true)
+  assert.equal(f.text(), "a\nB\nc\n")
+  assert.equal(output.content_hash, await contentHash("a\nB\nc\n"))
+})
+
+test("invalid operations name the unsupported field or value", async () => {
+  const cases: [string, unknown, RegExp][] = [
+    ["a missing operation key", [{ type: "replace", start_line: 1, end_line: 1, content: ["x"] }], /"operation".*type|type.*"operation"/],
+    ["an unknown operation value", [{ operation: "append", line: 1, content: ["x"] }], /"append"/],
+    ["an extra field", [{ operation: "delete", start_line: 1, end_line: 1, content: ["x"] }], /content/]
+  ]
+  for (const [name, edits, pattern] of cases) {
+    const f = fixture("a\n")
+    const result = await f.edit(edits)
+    assert.equal(result.failed, true, name)
+    assert.match(JSON.parse(result.output).error.message, pattern, name)
+    assert.equal(f.transactions(), 0, name)
+  }
 })
 
 test("concurrent Twinny requests serialize and revalidate instead of racing", async () => {
