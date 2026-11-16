@@ -13,7 +13,8 @@
 | Stage | Title | Status | Date | Verification (command → actual counts) | Notes / deviations |
 |---|---|---|---|---|---|
 | 0 | Baseline, branch, progress log | done | 2026-11-16 | clean exit 0; build-tests exit 0; build exit 0; eslint --quiet 0 findings; tsc type check exit 0 (0 findings); git diff --check no output; test:sqlite 966 tests / 966 pass / 0 fail / 0 skipped (4761 ms). VS Code suite NOT RUN to completion: the full gate run was cut by the 120 s tool window (timeout exit 124, no Mocha summary printed); per-suite runs of the four configured files each exit 0 - Agent reply, end to end 16 passing (10 s); Read-file acceptance, production controller 51 passing (60 s, includes nested edit operation recovery 17); custom agent registry 2 passing (1 s); Hash-verified native line edits 32 passing (15 s); Persistent workspace intelligence index 1 passing (12 s) = 102 passing, 0 failing, 0 pending | Branch feature/unified-project-db, HEAD 9205cc4 (not base 0ca082a); only this plan file differs from base, so Appendix B was spot-checked, not re-verified: fingerprintContent 23, CURRENT_SCHEMA_VERSION 214, resolveProjectTodoStorage 562, prepareProjectTodoStorage 591, ensureProjectGitignore 601, retireLegacyTodoDatabase 660, WorkspaceIntelligenceIndex 245 - all as recorded. Suites that did not run: Chat edit_file and the prompt-compiler suite (.vscode-test.js lists only agent-reply, agents, line-edit, workspace-index). No source changed, nothing committed. |
-| 1 | External path authorization in the native tools | todo | | | |
+| 1 | Static outside-workspace path authorization | todo | | | |
+| 1a | Interactive outside-workspace native file approval | todo | | | |
 | 2 | Remove evidence handoff and owner gating (revised above) | todo | | | |
 | 3 | `SourceRoots` (resource identity + path normalization) | todo | | | |
 | 4 | Unified project DB, stable multi-root home (revised above) | todo | | | |
@@ -47,7 +48,8 @@ Status values: `todo` · `in-progress` · `done` · `blocked`. A stage is `done`
 4. **One automatic evidence-integrity boundary:** the repository validates every file-backed observation/fact on both storage and retrieval, including retained outputs, project lookup, preflight, review and multi-source records. Per-source and aggregate flags must be returned; no optional consumer-side validator determines correctness. Existing equal hash = `valid`, changed hash = `stale`, deleted source = `invalid`, restored matching content = `valid` again. I/O errors use existing error handling.
 5. **Buffer versus disk is explicit:** file-read observations carry `observed_version: "buffer" | "disk"` and optionally the editor version. A buffer observation checks the current buffer while open and disk after close, while a persisted-file observation checks disk. The index describes disk. A buffer-only read never proves a persisted write.
 6. **Multi-root search tool interoperability is mandatory**, not an optional polish stage. Any indexed hit in any root must provide a path that the native read/edit tools can resolve without guessing. Preserve existing permissions.
-7. **Everything else stays:** one project-local SQLite database; reuse existing fingerprints; opaque model-carried expected hashes; synchronous index refresh only for dedicated file mutations; `run_command` and other external modifications use existing asynchronous watchers; Remote-SSH extension host paths like `/etc` remain accessible when authorized; LanceDB stays separate. No general SSH provider framework, command-side-effect scan, evidence dependency graph or automatic relocation rewrite.
+7. **Runtime approval for native outside-workspace file tools:** allow file/folder once, session or always, or deny. Grants are scoped by actual extension host and operation (read/write); user approval resumes the exact pending tool call once. Static allowlists remain optional preauthorization; approval never expands index scope.
+8. **Everything else stays:** one project-local SQLite database; reuse existing fingerprints; opaque model-carried expected hashes; synchronous index refresh only for dedicated file mutations; `run_command` and other external modifications use existing asynchronous watchers; Remote-SSH extension host paths like `/etc` remain accessible when authorized; LanceDB stays separate. No general SSH provider framework, command-side-effect scan, evidence dependency graph or automatic relocation rewrite.
 
 ### Required schema corrections to Appendix A (Stage 4)
 
@@ -79,6 +81,10 @@ Centralize file-backed evidence validation on **every storage and retrieval path
 ### Revised Stage 15: mandatory multi-root search paths
 
 Stage 15 is **not optional**. Use the stable project home/source-root identity to generate canonical search hit paths: relative inside home, absolute and unambiguous in other roots. Every returned path must round-trip to native `read_file` and permitted edits. Reversing the workspace folder order must not change project DB identity or projected paths. Update the Stage 15 handoff prompt, Progress Log and regression expectations accordingly.
+
+### Runtime permission amendment (2026-11-16)
+
+An agent can redirect large test results to `/tmp/test.log` but cannot inspect it through `read_file` when it lies outside the workspace. Stage 1's static allowed-paths setting is insufficient for this recovery flow. **Stage 1a is mandatory:** native tools prompt for file/folder approval at the point of access and resume the pending call with its normal hash-backed result. No arbitrary `/tmp` indexing, no shell workaround and no model-side permission tool. Do **not** implement item 1 (command timeout/output-size overrides) in this change.
 
 ### Handoff gate for Haiku
 
@@ -269,6 +275,7 @@ LanceDB and `src/extension/embeddings`; `run_command` semantics and working dire
 |---|---|---|
 | 0 | — | no |
 | 1 | 0 | `chat/index.ts`, `edit/service.ts` → **[VS Code suite]** |
+| 1a | 1 | Native tool preflight and approval UI → **[VS Code suite]** |
 | 2 | 0 | no |
 | 3 | 0 | no |
 | 4 | 3 | `webview/base.ts`, `chat/index.ts` → **[VS Code suite]** |
@@ -278,10 +285,10 @@ LanceDB and `src/extension/embeddings`; `run_command` semantics and working dire
 | 8 | 7 | **[VS Code suite]** |
 | 9 | 8 | **[VS Code suite]** |
 | 10 | 8 | **[VS Code suite]** |
-| 11 | 4, 8, 9, 10 | `chat/index.ts` → **[VS Code suite]** |
-| 12 | 1, 4, 11 | `chat/index.ts` (`currentSourceReader`) → **[VS Code suite]** |
+| 11 | 1a, 4, 8, 9, 10 | `chat/index.ts` → **[VS Code suite]** |
+| 12 | 1, 1a, 4, 11 | `chat/index.ts` (`currentSourceReader`) → **[VS Code suite]** |
 | 13 | 6, 11, 12 | no |
-| 14 | 1 | no |
+| 14 | 1, 1a | no |
 | 15 | 4, 6 | **[VS Code suite]** |
 | 16 | 6 (do it after 7–15 are done) | no |
 | 17 | all | **[VS Code suite]** |
@@ -295,10 +302,13 @@ LanceDB and `src/extension/embeddings`; `run_command` semantics and working dire
 | Deletions | Stage 9 (active entry gone at once), Stage 12 (evidence retained, `invalid`) |
 | Source-hash conflicts | Stage 8 (stale `expected_hash` leaves file and index unchanged; two edits from the same hash — second conflicts) |
 | Rollback validity | Stage 8 (catastrophic-edit rollback re-syncs the index to the restored content), Stage 12 (restored contents → `valid` again) |
+| Outside-workspace approvals and evidence | Stage 1a (permission-scoped /tmp log read, same-call continuation, full-file hash); Stages 11–12 (project evidence and automatic validity for approved files outside index) |
 | Cross-TODO evidence reuse | Stage 2 (relevance without task ancestry), Stage 11 (project-owned evidence and deletion survival), existing accepted-fact reuse test kept |
 | Database lifecycle | Stage 4 (create/reopen/refuse old and newer/reset/two connections/multi-root home), Stage 6 (index and TODO share one file; reset recreates both; project-folder move rebinds home), Stage 16 (no `sqlite3` left) |
 
 ## 4. Stages
+
+> **Stage 1a** is mandatory immediately after Stage 1, before Stages 11, 12 and 14. It does not renumber Stages 0–17. Record it separately in the Progress Log; Stage 17's full verification includes it.
 
 ### Stage 0 — Baseline, branch, progress log
 
@@ -384,6 +394,48 @@ Read §0 and Stage 0 only. Create branch feature/unified-project-db, run the bas
 You are implementing Stage 1 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md in /home/stark/source/twinny (branch feature/unified-project-db, base 0ca082a). Do not commit.
 Read first: §0, §1, §2.3, the Progress Log, Stage 1. Confirm Stage 0 is done.
 Do only Stage 1. Satisfy its acceptance criteria, run its gates (including the VS Code suite or record NOT RUN with the error), update the Progress Log, and finish with the §0.5 report.
+```
+
+---
+
+### Stage 1a — Interactive approval for native tools outside the workspace
+
+**Depends on:** Stage 1. **[VS Code suite].** **Goal:** permit the model to use native file tools on otherwise permissible outside-workspace paths by asking the user and then resuming the *same pending tool call*. A typical example is `read_file("/tmp/test.log")` following redirected test output. Do not make the model retry, use `cat`/`tail`, or enlarge index scope.
+
+**Read first:** `src/extension/tools/authorized-paths.ts` and `view.ts` from Stage 1; `workspaceTools` and `run` in `tools/workspace.ts`; `Chat.workspaceView` in `chat/index.ts`; `outsideWorkspace` and mutation sinks in `edit/service.ts`; existing VS Code approval flows, extension-host machine storage, the native tool dispatcher and the exact protected-path checks. Verify these interfaces in the current code, not only the line hints.
+
+**Contract**
+
+- **Prompt choices:** Allow file once; Allow folder once; Allow file for session; Allow folder for session; Always allow file; Always allow folder; Deny. A directory-targeted operation uses “this directory” for the exact-target choice. Show the requested path, operation/tool, and **read or write** access. Default to the narrowest scope, not an always grant.
+- **Operation class:** read covers `read_file`, `list_dir`, file-directed `grep` and other nonmutating native tools; write covers `edit_lines`, `edit_file`, `create_file`, `delete_file`, `move_file`, `rename_symbol` and other dedicated file mutations. Read grants do not grant write. Existing edit approvals, modes and protected paths still apply.
+- **Lifetime and storage:** once is valid only for the pending operation; session exists only while the extension-host session lives; always grants persist in machine/extension-host scope with a discoverable view/revoke action. Do not persist session grants or make repository/workspace settings silently widen host access. The existing static machine-scoped allowlist is a separate explicit preauthorization option.
+- **Host:** isolate grants by actual local or Remote-SSH extension host so a grant on Jarvis does not automatically apply to a server, or to another server. Do not introduce an SSH filesystem client.
+- **Path security:** whole path-segment matching, canonical real paths and symlink checks. For nonexistent write targets, validate the nearest existing ancestor. Revalidate immediately before executing to prevent swapped symlinks. Refuse `/` and drive-root grants, protected/team-blocked/ignored files, and unauthorized traversal. Hard denials are not converted into approval prompts. File grants never cover siblings; folder grants never cover similarly-prefixed sibling directories.
+- **Prompt outcomes:** cancel, deny, dismiss, unavailable UI and host shutdown fail closed with an explicit tool denial and no mutation. Any multi-path operation must verify grants on **all** affected paths before changing any file.
+- **Index versus evidence:** after permission, native reads still return normal `content_hash` (whole file, even for partial reads) and `total_lines`. Approved outside-workspace files are eligible for Stage 11 source-backed project evidence and Stage 12 validity checks **without** being added to FTS/index. A permission is not index enrollment.
+
+**Implementation steps**
+
+1. Add a small testable permission matcher and injected prompt adapter, using existing authorization helpers rather than a second security engine. Keep grant state scoped by file/folder, read/write, duration and actual extension host. Persist always-grants in machine-scoped extension storage and implement a straightforward way to revoke them.
+2. Add a shared **asynchronous preflight** to actual native tool dispatch, before synchronous `WorkspaceView.resolve`/`resolveNew` or edit sink invocation. This is necessary because the existing path resolver is synchronous and must not create UI itself. Detect already-allowed workspace/static paths and proceed without prompts.
+3. For an outside path without a grant, display the permission prompt; on allow, continue **the original pending native tool call exactly once** under the granted scope. On deny, return a single clear denied result. Do not route approval through another agent step or repeat file mutations.
+4. Integrate across reads, list/grep, creates, edits, deletes, moves and renames; require all source/destination permissions before multi-path mutations. Re-check actual resolved paths and existing hard safety rules immediately before execution. Preserve the current protected-file approval mechanism.
+5. Keep `run_command` unchanged. Command time limits and output-size overrides are **not part of this stage**.
+
+**Required tests and acceptance criteria**
+
+- Real tool path: `read_file` on an unapproved external `/tmp/test.log` prompts once. Choosing Allow file once resumes the original read, returns original path and correct whole-file hash, and **does not re-invoke the model or add an index entry**.
+- Denial/dismissal, missing UI/headless mode and cancellation return clear denied results, never hang or perform a mutation.
+- Read-only allowance does not permit write; file scope does not cover neighbors; directory scope covers descendants only; once/session/always expirations and persistent revocation work.
+- Grants do not cross host identities or bypass a protected/team-blocked path. Symlink escapes and symlink retargeting between approval and execution are rejected.
+- Moves and multi-file renames check every destination/source and never partially mutate after a denial.
+- No new prompt for in-workspace files or explicit Stage 1 allowlist entries. A nonindexed approved file can be observed with its actual source hash for Stages 11–12.
+- Run production-path tests with an injected prompt adapter, standalone grant-matcher tests and VS Code integration tests covering UI + same-call continuation. Pass all §0.3 gates or record exact test failures/NOT RUN. Update the Progress Log.
+
+**Do not:** add a new remote filesystem provider, grant write on a read approval, index arbitrary external paths, or modify `run_command` timeout/size policies.
+
+```
+Implement Stage 1a of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md. Read §0, the maintainer correction and runtime permission amendment, the Progress Log, Stages 1 and 1a. Confirm Stage 1 is done. Implement permission prompts and operation/host-scoped file/folder once/session/always grants; resume the pending tool call once; test nonindexed /tmp log read returning whole-file hash. Run gates, update Progress Log, report results. Do not change run_command limits.
 ```
 
 ---
@@ -715,7 +767,7 @@ Do only Stage 10. Satisfy its acceptance criteria, run its gates (including the 
 
 ### Stage 11 — Independent project observations and source references
 
-**Depends on:** Stages 4, 8, 9, 10. **[VS Code suite].** **Goal:** retain project evidence regardless of conversation/TODO plan existence, including actual file source references and disk/buffer origin.
+**Depends on:** Stages 1a, 4, 8, 9, 10. **[VS Code suite].** **Goal:** retain project evidence regardless of conversation/TODO plan existence, including actual file source references and disk/buffer origin.
 
 **Read first:** `recordToolObservation`, `TodoToolObservationInput`/`TodoToolObservation`, `preserveEvidence`, `getReviewPackages`, `listIntentEvidence`, `SourceRoots`, and `onToolResult` in `chat/index.ts`.
 
@@ -738,7 +790,7 @@ Implement Stage 11 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.m
 
 ### Stage 12 — Automatic validity on every file-backed evidence boundary
 
-**Depends on:** Stages 1, 4, 11. **[VS Code suite].** **Goal:** file source validity checked centrally whenever evidence is stored or retrieved.
+**Depends on:** Stages 1, 1a, 4, 11. **[VS Code suite].** **Goal:** file source validity checked centrally whenever evidence is stored or retrieved.
 
 **Read first:** `CurrentSourceReader`, `assessAcceptedFacts`, `evidencePreflight`, `twinny_evidence_lookup`, `WorkspaceView` file reads, Stage 11 observation/source repository APIs and existing freshness tests.
 
@@ -791,7 +843,7 @@ Do only Stage 13. Satisfy its acceptance criteria, run its gates, update the Pro
 
 ### Stage 14 — `grep` under authorized external directories
 
-**Depends on:** 1. **Goal:** `grep` with a `path` under an authorized external directory (or a single external file) searches it instead of silently returning nothing. `list_dir` already works through `entries()`; `search_workspace`, `find`-style tools and `files()` stay workspace/index-only.
+**Depends on:** 1, 1a. **Goal:** `grep` with a `path` under an authorized external directory (or a single external file) searches it instead of silently returning nothing. `list_dir` already works through `entries()`; `search_workspace`, `find`-style tools and `files()` stay workspace/index-only.
 
 **Read first:** the `grep` tool in `tools/workspace.ts` (`scope = view.relative(view.resolve(dir, "any"))`, the `view.files()` loop), `WorkspaceView.walk()`/`entries()`/`ignoredAt()` (Stage 1).
 
@@ -1264,7 +1316,7 @@ Environment: VSCodium connected with Remote-SSH to a Linux host; the project in 
 - **JC-1 (superseded)** Task ancestry does not govern evidence eligibility. See maintainer corrections.
 - **JC-2** Index-refresh failure after a successful change: the tool reports success plus an explicit `index_refresh` failure and a "do not repeat" sentence. Reporting it as a failed call would make the model retry a completed change.
 - **JC-3 (superseded)** Project-home identity is stable under folder reordering. See maintainer corrections.
-- **JC-4** Authorization = other workspace folders + `twinny.chatToolsAllowedPaths` (machine scope, so a cloned repository cannot widen access).
+- **JC-4 (expanded)** Authorization = workspace paths + static machine-scoped `twinny.chatToolsAllowedPaths` + user-approved, operation/host/scoped, time-limited or persistent runtime grants (Stage 1a). Runtime grants are revocable and do not affect indexing scope.
 - **JC-5** New file name `project.sqlite`; old `.twinny/evidence.sqlite` and `<globalStorage>/workspace-index.sqlite` are left untouched and unused (the old data is abandoned by the dev reset).
 - **JC-6 (superseded)** Eligible observations can be captured without a TODO plan. See maintainer corrections.
 
@@ -1300,6 +1352,8 @@ Environment: VSCodium connected with Remote-SSH to a Linux host; the project in 
 **Updated in place:** `workspace-index.test.ts` constructor calls (Stage 6) and the `index-main/src/extension/**/*.ts` path assertion (Stage 15, optional).
 
 **Must preserve as safety guards:** the `/etc/passwd`, `../escape.ts` and `/packages/web/…` unauthorized-path refusal tests (`tool-safety`, `chat-tools`); a *failed or wrong-target* edit must not satisfy another task's workspace mutation criterion (matching evidence from any task may); every existing `freshness` / `unverifiable` test; the legacy-retirement tests in `todos-sqlite.standalone.ts`; *accepted evidence is shared across conversations of the same project while TODO lists stay conversation-scoped*; the whole `agent-reply` suite.
+
+**Stage 1a regressions:** file/folder scopes, read/write separation, once/session/always persistence and revocation, host isolation, prompts and denial, symlink safety, same-call continuation, hash-backed `/tmp` reads with no index expansion.
 
 **New test files:** `authorized-paths.standalone.ts` (Stage 1), `source-roots.standalone.ts` (Stage 3), `index-sql.standalone.ts` (Stage 5). All other new tests are additions to existing files, named in their stage. The regression-to-stage mapping is §3.2.
 
