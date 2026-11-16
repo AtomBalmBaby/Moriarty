@@ -69,6 +69,25 @@ test("the Feedback plan response is validated before it can write TODOs", () => 
   assert.ok("error" in parseFeedbackPlanResponse("nope"))
 })
 
+test("a one-line rename is planned as one task whose criteria include the edit and its check, and the planner is told not to split out a verification task", () => {
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /as a criterion of the task that makes the change/)
+  assert.match(FEEDBACK_PLAN_PROTOCOL, /never create one to re-check a change that its own task's criteria already verify/)
+  const renameOnly = plan({
+    tasks: [{
+      id: "rename",
+      title: "Rename parseItem",
+      description: "Rename parseItem to parseTodo in the parser",
+      criteria: [
+        { id: "edit", description: "parseItem is renamed to parseTodo in the parser", verification: { kind: "workspace_mutation" } },
+        { id: "check", description: "The parser still exposes parseTodo", verification: { kind: "semantic_review" } }
+      ],
+      dependencies: []
+    }]
+  })
+  const parsed = parseFeedbackPlanResponse(JSON.stringify({ track: true, plan: renameOnly }))
+  assert.ok("plan" in parsed && parsed.plan.tasks.length === 1)
+})
+
 test("an administrative plan gets one corrective retry that names the offending criterion, and is never synced if it stays invalid", async () => {
   const administrative = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", criteria: [{ id: "criterion-1", description: "Create a TODO entry documenting this location.", verification: { kind: "semantic_review" } }], dependencies: [] }] })
   const clean = plan({ goal: "Locate read_file.", tasks: [{ id: "locate", title: "Locate read_file", description: "Find it.", criteria: [{ id: "criterion-1", description: "The path and line numbers of readFile are cited.", verification: { kind: "semantic_review" } }], dependencies: [] }] })

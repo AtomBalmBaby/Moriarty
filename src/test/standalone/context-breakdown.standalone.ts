@@ -14,6 +14,7 @@ import {
   BreakdownRow,
   buildBreakdown,
   formatCountedTokens,
+  formatFullRequestTrace,
   formatRequestBreakdown,
   groupDigits,
   RequestBreakdown,
@@ -209,6 +210,18 @@ test("each row rounds up to tokens, and the total is the sum of the rows", () =>
   assert.strictEqual(breakdown.tokens, 7)
   assert.strictEqual(breakdown.chars, 17)
   assert.strictEqual(breakdown.charsPerToken, 3)
+})
+
+test("the full request trace is the whole request, and says when it was cut", () => {
+  const payload = { mode: "native", messages: [{ role: "user", content: "Read a.ts." }], tools: [{ name: "read_file" }] }
+  const text = formatFullRequestTrace(0, payload)
+  assert.match(text, /^\[Context\] tool-loop request 1 full payload \(native; Twinny-side, not provider-serialized; \d+ chars\)$/m)
+  assert.deepEqual(JSON.parse(text.split("\n").slice(1).join("\n")), { messages: payload.messages, tools: payload.tools })
+  const long = { mode: "text", messages: [{ role: "user", content: "x".repeat(500) }], tools: [] }
+  const cut = formatFullRequestTrace(2, long, 100)
+  assert.match(cut, /^\[Context\] tool-loop request 3 /)
+  assert.match(cut, /… truncated at 100 of [\d,]+ chars$/)
+  assert.ok(cut.length < 300, "the cut keeps the log bounded")
 })
 
 test("the trace block lists each part with tokens and characters, then a total", () => {

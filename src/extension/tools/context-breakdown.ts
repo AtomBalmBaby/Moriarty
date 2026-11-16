@@ -68,3 +68,23 @@ export const formatCountedTokens = (request: number, breakdown: RequestBreakdown
   const off = counted ? ((breakdown.tokens - counted) / counted) * 100 : 0
   return `[Context] tool-loop request ${request} · server counted ${groupDigits(counted)} prompt tokens; breakdown estimated ${groupDigits(breakdown.tokens)} (${off >= 0 ? "+" : ""}${off.toFixed(1)}%)`
 }
+
+/** A request as Twinny built it, before any provider adapter serializes or transforms it. */
+export interface FullRequestPayload {
+  mode: string
+  messages: unknown[]
+  /** The tool definitions offered with this request; empty when none are offered. */
+  tools: unknown[]
+}
+
+/**
+ * The whole request for the trace log. Capped at `limit` characters so one
+ * large request cannot flood the log. The output is what Twinny sent to the
+ * adapter, not the bytes a provider receives.
+ */
+export const formatFullRequestTrace = (step: number, payload: FullRequestPayload, limit = 200_000): string => {
+  const body = JSON.stringify({ messages: payload.messages, tools: payload.tools }, null, 2)
+  const header = `[Context] tool-loop request ${step + 1} full payload (${payload.mode}; Twinny-side, not provider-serialized; ${groupDigits(body.length)} chars)`
+  if (body.length <= limit) return `${header}\n${body}`
+  return `${header}\n${body.slice(0, limit)}\n… truncated at ${groupDigits(limit)} of ${groupDigits(body.length)} chars`
+}

@@ -9,6 +9,7 @@ import {
   findProviderBySelection,
   isFeedbackEnabled,
   isPromptCompilerEnabled,
+  isToolRequestTraceEnabled,
   LEGACY_SETTING_KEYS,
   planSettingMigrations,
   PROMPT_COMPILER_ENABLED_KEY,
@@ -17,7 +18,8 @@ import {
   promptCompilerMaxTurns,
   readSettingWithLegacy,
   RETIRED_SETTING_KEYS,
-  SettingInspection
+  SettingInspection,
+  TOOL_REQUEST_TRACE_KEY
 } from "../../common/feedback-settings"
 
 type Scoped = Record<string, SettingInspection<unknown>>
@@ -91,6 +93,11 @@ test("role providers are found by ID, then by label, and never guessed", () => {
   assert.equal(findProviderBySelection(providers, ""), undefined)
 })
 
+test("the full request trace is off unless twinny.toolTrace.fullRequests is set", () => {
+  assert.equal(isToolRequestTraceEnabled(config({})), false)
+  assert.equal(isToolRequestTraceEnabled(config({ [TOOL_REQUEST_TRACE_KEY]: { globalValue: true } })), true)
+})
+
 test("Feedback and Prompt Compiler settings are contributed to the VS Code Settings UI", () => {
   const expected: Record<string, { type: string; default: unknown }> = {
     "twinny.feedback.enabled": { type: "boolean", default: true },
@@ -100,7 +107,8 @@ test("Feedback and Prompt Compiler settings are contributed to the VS Code Setti
     "twinny.promptCompiler.provider": { type: "string", default: "" },
     "twinny.promptCompiler.model": { type: "string", default: "" },
     "twinny.promptCompiler.maxTurns": { type: "integer", default: 3 },
-    "twinny.promptCompiler.trace": { type: "boolean", default: false }
+    "twinny.promptCompiler.trace": { type: "boolean", default: false },
+    "twinny.toolTrace.fullRequests": { type: "boolean", default: false }
   }
   for (const [key, { type, default: fallback }] of Object.entries(expected)) {
     const property = properties[key]

@@ -52,6 +52,8 @@ export interface ToolResult {
    */
   preface?: string
   execution?: { command: string; exitCode?: number; output: string }
+  /** Structured fields the host records with this observation. Verification reads them; the model does not see them. */
+  observation?: { arguments: Record<string, string> }
 }
 
 /** What a running tool is told: when the user has stopped the reply. */

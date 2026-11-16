@@ -54,7 +54,9 @@ export const FEEDBACK_PLAN_PROTOCOL =
   "Planning workflow is not a user deliverable. Twinny creates and updates the TODO list itself, so no title, description, or criterion may ask Mycroft to create, update, verify, or report on TODO entries, statuses, or the list, even when the user says to use TODOs. " +
   "Do not add reporting, documentation, or administrative deliverables that the user did not request. " +
   "Recording, updating, or marking TODO entries complete is Twinny's own bookkeeping, even as a final step; it is never a task or criterion. " +
-  "Verify each requested change with the narrowest executable check that exercises it, such as a focused test file or test-name filter. Use a full-repository suite as a criterion only when the user asks for it or the change is cross-cutting. " +
+  "Verify each requested change with the narrowest executable check that exercises it, such as a focused test file or test-name filter, as a criterion of the task that makes the change. " +
+  "A separate verification task is only for independent work the user asked for, such as a test run or review; never create one to re-check a change that its own task's criteria already verify. A trivial single change, such as a one-line rename, is one task whose criteria include the edit and the check that confirms it. " +
+  "Use a full-repository suite as a criterion only when the user asks for it or the change is cross-cutting. " +
   "A command that times out or does not finish is unverified, not passed, and a broader command that cannot finish does not invalidate a focused check that passed. " +
   "A locate or lookup task needs only the facts that answer it, such as the file, symbol, and line range, not logging, documentation, or a record of the finding. " +
   "Criteria are fixed when the plan is made, so do not plan conditions that only verification would add. " +

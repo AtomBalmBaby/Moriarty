@@ -257,6 +257,11 @@ export interface TodoReviewPackage {
   acceptedEvidence: AcceptedFact[]
   /** Proven tool-name to implementation relationships in this project. */
   symbolAliases: SymbolAlias[]
+  /**
+   * Prerequisite TODOs whose recorded work this task explicitly declared as its evidence. Their observations are referenced,
+   * never copied, and count for this task's file-mutation and command criteria. Undeclared siblings never count.
+   */
+  evidenceSources?: string[]
   /** The latest requirement activation or renewal for this task, if any. */
   requirementActivation?: RequirementActivation
   lastEvaluation?: TodoEvaluation

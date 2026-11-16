@@ -101,6 +101,12 @@ export const promptCompilerMaxTurns = (config: ConfigurationReader, fallback = 3
 export const isPromptCompilerTraceEnabled = (config: ConfigurationReader): boolean =>
   readCompatibleSetting(config, PROMPT_COMPILER_TRACE_KEY, false, isBoolean)
 
+/** Opt-in: writes each tool-loop request, as Twinny builds it, to the trace log. Off unless set. */
+export const TOOL_REQUEST_TRACE_KEY = "toolTrace.fullRequests"
+
+export const isToolRequestTraceEnabled = (config: ConfigurationReader): boolean =>
+  readCompatibleSetting(config, TOOL_REQUEST_TRACE_KEY, false, isBoolean)
+
 export const promptCompilerInstructionsMode = (config: ConfigurationReader): unknown =>
   readCompatibleSetting<unknown>(config, PROMPT_COMPILER_INSTRUCTIONS_MODE_KEY, "default", isString)
 

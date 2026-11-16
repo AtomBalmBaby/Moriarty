@@ -172,6 +172,28 @@ test("old results are trimmed, oldest first, when the next request would not fit
   assert.ok(results(untrimmed.requests[2]).every((content) => content.includes("const value59")))
 })
 
+test("the full request reaches onRequestPayload as sent, with the tools offered", async () => {
+  const root = workspace({ "a.ts": "const value = 1\n" })
+  const { client, requests } = scripted([{ calls: [read("1", "a.ts")] }, "Done."])
+  const payloads: { step: number; mode: string; messages: unknown[]; tools: unknown[] }[] = []
+  const summaries: number[] = []
+  await collect(
+    withTools(client, workspaceTools(root), {
+      mode: "native",
+      onRequest: (_chars, step) => summaries.push(step),
+      onRequestPayload: (step, payload) => payloads.push(structuredClone({ step, ...payload }))
+    }).chat(ask("Read a.ts."))
+  )
+  assert.deepEqual(summaries, [0, 1], "the summary is still reported for every request")
+  assert.deepEqual(payloads.map((payload) => payload.step), [0, 1])
+  assert.ok(payloads.every((payload) => payload.mode === "native"))
+  assert.deepEqual(payloads[0].messages, requests[0].messages, "the messages are the ones sent")
+  assert.deepEqual(payloads[1].messages, requests[1].messages, "and so are the second request's")
+  for (const payload of payloads) {
+    assert.ok(payload.tools.some((tool) => (tool as { name: string }).name === "read_file"), "the offered tools are named")
+  }
+})
+
 /** Earlier turns long enough that the conversation itself, not the tool results, fills most of the window. */
 const longHistory = (turns: number): ChatRequest["messages"] =>
   Array.from({ length: turns }, (_, i) => [

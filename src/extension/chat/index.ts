@@ -26,6 +26,7 @@ import {
   isFeedbackEnabled,
   isPromptCompilerEnabled,
   isPromptCompilerTraceEnabled,
+  isToolRequestTraceEnabled,
   promptCompilerMaxTurns,
   promptCompilerProviderSelection,
   RoleSelection
@@ -67,14 +68,14 @@ import { describeProviderError, describeProviderErrorPlain, stripThinking } from
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
-import { compactArguments, compactEvidenceText, compactToolEvidence } from "../todos/evidence"
+import { compactEvidenceText, compactToolEvidence, observationArguments } from "../todos/evidence"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
 import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
 import { type ContextCapacity, type ContextDiagnostics, type ContextUsage, ContextUsageStore, FALLBACK_CONTEXT_TOKENS } from "../tools/budget"
-import { formatCountedTokens, formatRequestBreakdown, type RequestBreakdown } from "../tools/context-breakdown"
+import { formatCountedTokens, formatFullRequestTrace, formatRequestBreakdown, type FullRequestPayload, type RequestBreakdown } from "../tools/context-breakdown"
 import { DEFAULT_MAX_STEPS, describeResultBudget, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import { type ToolCall, toolDefinition } from "../tools/protocol"
@@ -1337,6 +1338,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     this._contextUsage.record(conversationId, { tokens: promptTokens, counted: true })
   }
 
+  /** The full request for the trace log, only when `twinny.toolTrace.fullRequests` is on. */
+  private fullRequestTrace(): ((step: number, payload: FullRequestPayload) => void) | undefined {
+    if (!isToolRequestTraceEnabled(workspace.getConfiguration("twinny"))) return undefined
+    return (step, payload) => {
+      try {
+        logger.trace(formatFullRequestTrace(step, payload))
+      } catch (error) {
+        logger.warn(`[ToolTrace] full request not written: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
+
   /** Counts only; no prompt or tool content is logged. */
   private logContext(provider: TwinnyProvider, entry: ContextDiagnostics) {
     const { capacity, fresh, removed } = entry
@@ -2227,7 +2240,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           await this._todoRepository.recordToolObservation(scope, {
             itemId,
             toolName: call.name,
-            arguments: compactArguments(evidence),
+            arguments: observationArguments(evidence, result.observation?.arguments),
             output: compactEvidenceText(evidence),
             evidenceOutput: evidence.failed ? undefined : rawOutput,
             failed: evidence.failed,
@@ -2447,6 +2460,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.debug(`Chat TODO tools · request ${step + 1} (${mode}, ${provider.provider}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
         logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
       },
+      onRequestPayload: this.fullRequestTrace(),
       onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
@@ -2647,6 +2661,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.debug(`Chat tools · request ${step + 1} (${mode}, ${provider.provider}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
         logger.trace(formatRequestBreakdown(step + 1, mode, breakdown))
       },
+      onRequestPayload: this.fullRequestTrace(),
       onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,

@@ -44,6 +44,7 @@ const AssessmentSummary = ({ assessment, pending }: { assessment?: TodoAssessmen
       <span className={styles.score} title={`${t("todo-assessment-verification-full")}: ${assessment.verification.explanation}`}>
         {t("todo-assessment-verification-short")}: {assessment.verification.score}/5
       </span>
+      <span className={styles.note}>{t("todo-assessment-not-verification")}</span>
       {assessment.stale && <span className={styles.note} title={t("todo-assessment-stale-hint")}>{t("todo-assessment-stale")}</span>}
     </>
   )

@@ -35,7 +35,7 @@ import { isRetryableProviderFailure } from "../inference/errors"
 import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
 import { ContextCapacity, ContextDiagnostics, ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
-import { buildBreakdown, RequestBreakdown, RowChars } from "./context-breakdown"
+import { buildBreakdown, FullRequestPayload, RequestBreakdown, RowChars } from "./context-breakdown"
 import { logToolFailure } from "./failure-log"
 import { instructionsSection } from "./instructions"
 import {
@@ -256,6 +256,11 @@ export interface ToolLoopOptions {
    * and what each part of it is made of.
    */
   onRequest?(promptChars: number, step: number, mode: ToolMode, estimatedTokens: number, breakdown: RequestBreakdown): void
+  /**
+   * Called before each request with the messages and tool definitions it carries, as Twinny built them.
+   * Only set when the host wants the full request, since it can be large.
+   */
+  onRequestPayload?(step: number, payload: FullRequestPayload): void
   /** Called after each request the server counted, with the breakdown it was sent with. */
   onRequestCounted?(step: number, breakdown: RequestBreakdown, promptTokens: number): void
   /** Called after each request the server counted. */
@@ -720,6 +725,7 @@ class ToolLoop {
       const promptChars = charsOf(sent) + (tools ? definitionChars : 0)
       const breakdown = this.measure(sent, context, closing, tools ? definitionChars : 0)
       this._options.onRequest?.(promptChars, step, this._mode, this._estimator.tokens(promptChars), breakdown)
+      this._options.onRequestPayload?.(step, { mode: this._mode, messages: sent, tools: tools ?? [] })
 
       // A step of our own to cut short when a text call closes, without it
       // looking like the user pressed stop.

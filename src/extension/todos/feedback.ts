@@ -403,6 +403,21 @@ export const renderEvidencePreflight = (preflight: EvidencePreflight): string =>
  */
 export const EVIDENCE_CHECK_TOOL = "host_evidence_check"
 
+/** Tool name of the model-callable accepted-evidence lookup. Its successful results are observations Feedback can verify. */
+export const EVIDENCE_LOOKUP_TOOL = "twinny_evidence_lookup"
+
+/**
+ * The structured fields the host records for a successful lookup. The lookup is always project-scoped: a symbol or path
+ * narrows which facts it returns and is recorded as such, so only an unnarrowed lookup can speak for the whole project.
+ */
+export const evidenceLookupArguments = (lookup: { symbol?: string; path?: string; resolution: string; factCount: number }): Record<string, string> => ({
+  scope: "project",
+  ...(lookup.symbol === undefined ? {} : { symbol: lookup.symbol }),
+  ...(lookup.path === undefined ? {} : { path: lookup.path }),
+  resolution: lookup.resolution,
+  factCount: String(lookup.factCount)
+})
+
 /** The arguments and output of the host's project-wide accepted-evidence lookup, built from the live facts it found. */
 export const evidenceCheckRecord = (live: AcceptedFact[]): { arguments: Record<string, string>; output: string } => {
   const resolution = live.length ? "found" : "none"
@@ -644,13 +659,38 @@ const describeImplementation = (implementation: RegistrationImplementation): str
       ? `its implementation is inline at lines ${implementation.startLine}-${implementation.endLine} and has no declared name`
       : `its implementation cannot be resolved: ${implementation.reason}`
 
-/** The latest successful project-wide lookup whose recorded resolution and count agree. Failed, partial, and subject-scoped lookups prove nothing. */
-const latestProjectLookup = (records: RetainedObservationEvidence[]): RetainedObservationEvidence | undefined => {
-  const valid = records.filter((record) => {
-    if (record.toolName !== EVIDENCE_CHECK_TOOL || record.failed || record.arguments.scope !== "project") return false
-    const count = Number(record.arguments.factCount)
-    return Number.isInteger(count) && count >= 0 && record.arguments.resolution === (count > 0 ? "found" : "none")
-  })
+/** Resolutions the native lookup reports for the facts it matched. The host check reports only found or none. */
+const NATIVE_RESOLUTIONS = ["unique", "ambiguous", "historical", "none"]
+
+/**
+ * Whether a record is a successful project-scoped lookup whose resolution agrees with its count. Failed and subject-scoped
+ * lookups are never project lookups. The host check derives found or none from its live count. The native lookup reports
+ * the resolution of the facts it matched, so a lookup that matched no facts is always none.
+ */
+const projectLookupRecord = (record: RetainedObservationEvidence): boolean => {
+  if (record.failed || record.arguments.scope !== "project") return false
+  const count = Number(record.arguments.factCount)
+  if (!Number.isInteger(count) || count < 0) return false
+  if (record.toolName === EVIDENCE_CHECK_TOOL) return record.arguments.resolution === (count > 0 ? "found" : "none")
+  if (record.toolName === EVIDENCE_LOOKUP_TOOL) return count === 0 ? record.arguments.resolution === "none" : NATIVE_RESOLUTIONS.includes(record.arguments.resolution)
+  return false
+}
+
+/**
+ * The latest completed project-scoped lookup. Completing a lookup proves only that it ran: a lookup that matched no facts
+ * completes it just as a lookup that matched some, and a symbol or path narrows which facts it returns, not whether it ran.
+ */
+const completedProjectLookup = (records: RetainedObservationEvidence[]): RetainedObservationEvidence | undefined => {
+  const valid = records.filter(projectLookupRecord)
+  return valid[valid.length - 1]
+}
+
+/**
+ * The latest host check of every live accepted fact in the project. Only it can prove absence: a lookup narrowed by a symbol
+ * or path cannot establish that no fact exists anywhere.
+ */
+const absenceCheck = (records: RetainedObservationEvidence[]): RetainedObservationEvidence | undefined => {
+  const valid = records.filter((record) => record.toolName === EVIDENCE_CHECK_TOOL && record.arguments.symbol === undefined && record.arguments.path === undefined && projectLookupRecord(record))
   return valid[valid.length - 1]
 }
 
@@ -667,8 +707,8 @@ export const factNamedBy = (identity: SourceIdentity | undefined, name: string, 
 }
 
 /**
- * `accepted_fact_exists` is proven by a current accepted fact. A completed project-wide lookup that found no facts, with no
- * fact accepted since, is an authoritative counterexample. A subject-scoped or failed lookup decides nothing.
+ * `accepted_fact_exists` is proven by a current accepted fact. A host check of the whole project that found no facts, with no
+ * fact accepted since, is an authoritative counterexample. A narrowed, subject-scoped, or failed lookup decides nothing.
  */
 const acceptedFactOutcome = async (
   subject: { identity?: SourceIdentity; symbol: string; path?: string },
@@ -695,7 +735,7 @@ const acceptedFactOutcome = async (
     if (located.length === 1) return located[0]
     if (located.length > 1) return reconciled("unknown", located.flatMap((outcome) => outcome.supportingObservationIds), [`${subject.symbol} is declared in ${located.length} files; the criterion must name the file`], "invalid_identity")
   }
-  const check = latestProjectLookup(records)
+  const check = absenceCheck(records)
   if (check?.arguments.resolution === "none" && !accepted.some((fact) => fact.acceptedAt > check.observedAt)) {
     return reconciled("disproven", [check.observationId], [`no accepted fact for ${subject.symbol} existed at the project-wide check`], "contradicted_evidence")
   }
@@ -929,9 +969,15 @@ const sourceOutcome = async (
   return reconciled("unknown", [], missing.length ? missing : [gap], stale ? "stale_evidence" : "missing_evidence")
 }
 
+/**
+ * The items whose recorded work counts for this task's criteria: the task itself and the prerequisites it declared as
+ * evidence. Records are referenced, not copied, so each observation keeps the item it was recorded under.
+ */
+const criterionOwners = (review: { task: Pick<TodoReviewPackage["task"], "id">; evidenceSources?: string[] }): ReadonlySet<string> => new Set([review.task.id, ...(review.evidenceSources ?? [])])
+
 const typedOutcome = async (
   verification: CriterionVerification,
-  taskId: string,
+  owners: ReadonlySet<string>,
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
   current: (path: string) => Promise<string | undefined>,
@@ -948,13 +994,13 @@ const typedOutcome = async (
     case "execution_invariant":
       return prohibitionOutcome(records)
     case "workspace_mutation":
-      return mutationOutcome(verification, records.filter((record) => record.itemId === taskId))
+      return mutationOutcome(verification, records.filter((record) => owners.has(record.itemId)))
     case "command_exit_status":
-      return commandOutcome(verification, records.filter((record) => record.itemId === taskId), records, activation)
+      return commandOutcome(verification, records.filter((record) => owners.has(record.itemId)), records, activation)
     case "evidence_lookup_completed": {
-      const check = latestProjectLookup(records)
+      const check = completedProjectLookup(records)
       return check
-        ? { ...reconciled("proven", [check.observationId], []), scope: `the completed project-wide lookup of accepted facts (resolution: ${check.arguments.resolution})` }
+        ? { ...reconciled("proven", [check.observationId], []), scope: `the completed project-scoped lookup of accepted facts (resolution: ${check.arguments.resolution})` }
         : reconciled("unknown", [], ["no completed project-wide lookup of accepted facts is recorded in this plan"])
     }
     case "accepted_fact_exists":
@@ -974,7 +1020,7 @@ export const reviewReconciliations = async (
   const current = cachedCurrentReader(readCurrentSource)
   const outcomes: TodoCriterionReconciliation[] = []
   for (const criterion of review.criteria) {
-    const outcome = await typedOutcome(criterion.verification, review.task.id, review.retainedEvidence, review.acceptedEvidence, current, review.requirementActivation).catch((error: unknown) => {
+    const outcome = await typedOutcome(criterion.verification, criterionOwners(review), review.retainedEvidence, review.acceptedEvidence, current, review.requirementActivation).catch((error: unknown) => {
       logger.error("[Feedback] verifier.criterion_failed criterion=" + criterion.id + " error=" + String(error))
       return reconciled("unknown", [], ["the verifier could not evaluate this criterion; the fault was logged"], "internal_error")
     })
@@ -1458,8 +1504,10 @@ export const dependenciesComplete = (review: TodoReviewPackage): boolean =>
  * Whether this task itself has a successful, host-recorded file mutation. Edits recorded for other tasks, and a
  * request-level changes view, do not satisfy this task's workspace requirement.
  */
-export const taskHasVerifiedMutation = (review: TodoReviewPackage): boolean =>
-  review.observations.some((record) => record.itemId === review.task.id && !record.failed && MUTATING_TOOLS.includes(record.toolName))
+export const taskHasVerifiedMutation = (review: TodoReviewPackage): boolean => {
+  const owners = criterionOwners(review)
+  return review.observations.some((record) => owners.has(record.itemId) && !record.failed && MUTATING_TOOLS.includes(record.toolName))
+}
 
 /**
  * A verdict that keeps the task in review (needs_evidence) bumps its version once, so the version alone looks like a

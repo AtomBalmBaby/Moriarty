@@ -867,6 +867,12 @@
           "default": false,
           "markdownDescription": "Write the raw Prompt Compiler request and provider response to a local trace file under the extension storage folder for debugging. Disabled by default; the file may contain workspace or conversation content."
         },
+        "twinny.toolTrace.fullRequests": {
+          "order": 21,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Write each tool-loop request, as Twinny builds it (messages, system prompt, and tool definitions before provider serialization), to the Twinny trace log. Disabled by default. The output contains your code, conversation, and tool schemas; secrets are redacted only on a best-effort basis. Enable it only while debugging, and set the Twinny log level to trace."
+        },
         "twinny.promptCompiler.baseInstructionsMode": {
           "order": 20,
           "type": "string",

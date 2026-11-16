@@ -125,6 +125,12 @@ export const compactArguments = (evidence: CompactToolEvidence): Record<string, 
   return Object.fromEntries(pairs.filter((pair): pair is [string, string | number] => pair[1] !== undefined).map(([key, value]) => [key, String(value)]))
 }
 
+/** The stored arguments of an observation: its compact evidence, plus any structured fields the tool declared for verification. */
+export const observationArguments = (evidence: CompactToolEvidence, declared?: Record<string, string>): Record<string, string> => ({
+  ...compactArguments(evidence),
+  ...declared
+})
+
 /** The stored form of the evidence: JSON that never exceeds the evidence bound. */
 export const compactEvidenceText = (evidence: CompactToolEvidence): string => {
   const text = JSON.stringify(evidence)
