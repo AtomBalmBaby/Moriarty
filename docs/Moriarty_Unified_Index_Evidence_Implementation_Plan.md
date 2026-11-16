@@ -14,24 +14,75 @@
 |---|---|---|---|---|---|
 | 0 | Baseline, branch, progress log | todo | | | |
 | 1 | External path authorization in the native tools | todo | | | |
-| 2 | Remove `evidence_from` (derive prerequisite evidence) | todo | | | |
+| 2 | Remove evidence handoff and owner gating (revised above) | todo | | | |
 | 3 | `SourceRoots` (resource identity + path normalization) | todo | | | |
-| 4 | Unified database v20 (`project.sqlite`), multi-root home | todo | | | |
+| 4 | Unified project DB, stable multi-root home (revised above) | todo | | | |
 | 5 | Synchronous SQL facade for the index | todo | | | |
 | 6 | Port the workspace index onto the project database | todo | | | |
 | 7 | Index `refresh()` API and index fixes | todo | | | |
 | 8 | Synchronous refresh: `edit_lines` and `edit_file` | todo | | | |
 | 9 | Synchronous refresh: `create_file`, `delete_file`, `move_file` | todo | | | |
 | 10 | Synchronous refresh: `rename_symbol` | todo | | | |
-| 11 | Observation sources and project-scoped recording | todo | | | |
-| 12 | Automatic evidence validity | todo | | | |
+| 11 | Independent project observations, including no-TODO chats (revised above) | todo | | | |
+| 12 | Centralized validity on all evidence paths (revised above) | todo | | | |
 | 13 | Moves, renames and relocation candidates | todo | | | |
 | 14 | `grep` under authorized external directories | todo | | | |
-| 15 | Canonical paths in search results (optional) | todo | | | |
+| 15 | Canonical multi-root search paths (required) | todo | | | |
 | 16 | Cleanup: drop `sqlite3`, documentation, changelog | todo | | | |
 | 17 | Final verification and manual Remote-SSH checklist | todo | | | |
 
 Status values: `todo` · `in-progress` · `done` · `blocked`. A stage is `done` only when every acceptance criterion in its section is met **and** its verification numbers are recorded here.
+
+---
+
+## Maintainer-reviewed architecture corrections (2026-11-16)
+
+**This section is authoritative over conflicting text elsewhere in this document, including old test descriptions and Appendix A's explanatory inventory. The revised Stage 2, 4, 11, 12 and 15 specifications below replace their original stage requirements. Do not implement the superseded rules.** Keep the existing code maps and tests not affected by these corrections.
+
+### Binding decisions
+
+1. **Evidence has no exclusive TODO, list or conversation owner.** A task/list ID is optional historical provenance, not an eligibility gate. `evidence_from` is removed and **must not be replaced with transitive prerequisite inheritance**. All tasks may use relevant project observations; deterministic verification must still match operation outcome, target, criterion, and current source validity. A relevant observation from a sibling or unrelated task is acceptable; an irrelevant observation from a prerequisite is not.
+2. **Historical observations, retained tool outputs, source references and reusable accepted facts must survive deletion of TODOs, lists and conversations.** Database foreign keys and repository APIs must enforce this, not just a comment. TODO-specific assessment/association rows can be deleted without cascading into project evidence.
+3. **Project identity is stable under reordering workspace folders.** Resolve the project home independently of array position: single root defaults to that root; saved multi-root defaults to the directory containing the `.code-workspace` file; explicit machine-scoped `twinny.projectHome` overrides; unsaved multi-root without an override uses the path-sorted first normalized root as a documented deterministic fallback (changing membership can still change this fallback). Register *every* workspace root in the database. Database location is not an access permission.
+4. **One automatic evidence-integrity boundary:** the repository validates every file-backed observation/fact on both storage and retrieval, including retained outputs, project lookup, preflight, review and multi-source records. Per-source and aggregate flags must be returned; no optional consumer-side validator determines correctness. Existing equal hash = `valid`, changed hash = `stale`, deleted source = `invalid`, restored matching content = `valid` again. I/O errors use existing error handling.
+5. **Buffer versus disk is explicit:** file-read observations carry `observed_version: "buffer" | "disk"` and optionally the editor version. A buffer observation checks the current buffer while open and disk after close, while a persisted-file observation checks disk. The index describes disk. A buffer-only read never proves a persisted write.
+6. **Multi-root search tool interoperability is mandatory**, not an optional polish stage. Any indexed hit in any root must provide a path that the native read/edit tools can resolve without guessing. Preserve existing permissions.
+7. **Everything else stays:** one project-local SQLite database; reuse existing fingerprints; opaque model-carried expected hashes; synchronous index refresh only for dedicated file mutations; `run_command` and other external modifications use existing asynchronous watchers; Remote-SSH extension host paths like `/etc` remain accessible when authorized; LanceDB stays separate. No general SSH provider framework, command-side-effect scan, evidence dependency graph or automatic relocation rewrite.
+
+### Required schema corrections to Appendix A (Stage 4)
+
+Apply these changes to the Appendix A DDL **before treating it as paste-ready**:
+
+- `todo_tool_observations`: add `project_id TEXT NOT NULL REFERENCES todo_projects(id)`; make `list_id` and `item_id` nullable provenance values, **not** cascading `REFERENCES todo_lists` or `REFERENCES todo_items`. Preserve tool name, request, output, outcome and execution metadata; scope uniqueness by project and request/execution when list is absent.
+- `todo_tool_evidence`: preserve `observation_id` FK to the project observation, but make `list_id` nullable provenance without list-delete cascade.
+- `todo_accepted_evidence`: add `project_id TEXT NOT NULL REFERENCES todo_projects(id)`; originating `list_id` and `item_id` are nullable provenance, with no ownership cascade. Keep reusable facts, source hashes, and their observation links. A task-specific acceptance link may be represented separately but cannot own or delete the fact.
+- `observation_source`: add `observed_version TEXT NOT NULL DEFAULT 'disk' CHECK(observed_version IN ('disk','buffer'))` and `editor_version INTEGER`, retaining each file's root, path, hash, role and range.
+- Add project-query indexes to observations and accepted facts. **Regenerate** the schema object counts and exact-index tests from the corrected DDL. The old Appendix A count of 27 named indexes is no longer authoritative.
+- Test deletion of a task, a list and a conversation, verifying that relevant observations, retained output, accepted facts and source records still exist and are independently searchable.
+
+### Revised Stage 2: remove the evidence handoff without inventing ownership by ancestry
+
+Remove `evidence_from` from `twinny_todo_update`, parsing, claims and events. Do **not** set `evidenceSources` to `prerequisiteIdsOf(...)` as a new proof rule. Refactor `getReviewPackages`, `criterionOwners`, and Feedback to find relevant candidate observations through project evidence and then verify actual success/target/criterion. Stage 2 may temporarily use existing repository queries; Stage 11 completes project-wide queries. A valid unrelated-task mutation can prove a matching criterion, but a failed mutation, wrong-target edit or model assertion cannot. Rewrite the old handoff/sibling tests to assert relevance and sufficiency rather than owner identity.
+
+### Revised Stage 4: stable project home and independent project schema
+
+Use the §2.1 project-home precedence above, not `workspaceFolders[0]`. Introduce a shared `resolveProjectHome` and reuse it at all repository and index construction sites. Register all workspace roots. Keep a stable project ID within the selected database. Replace the dev schema with the corrected Appendix A DDL. Explicitly test that reordering roots yields the identical database path, project ID, registered roots and search identity; verify evidence survives task/list deletion. Keep old databases untouched unless a separately controlled dev reset is requested. Do not accidentally broaden tool permissions with the project-home setting.
+
+### Revised Stage 11: project-level observation recording, including no-TODO chats
+
+Make observation recording independent of an active TODO or even the presence of a TODO plan. With an available project database, eligible native tool results are recorded as project observations with optional provenance. Capture each file reference (read, edit, create, delete, move, rename) with actual resource/path/hash and observed disk/buffer version; never make up a hash for arbitrary `run_command` results. Reuse the existing observation hook and persistence machinery, but remove list/task lifetime constraints. Queries find relevant observations across tasks/conversations, while Feedback still determines sufficiency. Add tests for no-plan recording, deletion survival, cross-conversation reuse, actual source references and repeated request idempotency.
+
+### Revised Stage 12: validity belongs to the repository boundary
+
+Centralize file-backed evidence validation on **every storage and retrieval path**. Use authoritative current source and original observed-version semantics; never use a possibly stale search-index hit as proof of current content. Return per-reference and aggregate validity with observations, retained evidence, accepted facts, lookup, preflight and Feedback packages. Validate every source for multi-file observations. Preserve old `freshness` fields when useful for compatibility, but do not make correctness depend on a caller supplying `readCurrentSource`. Confirm that deletion and rollback validity are observed on successive retrievals. File-free historical command results have no fabricated file validity.
+
+### Revised Stage 15: mandatory multi-root search paths
+
+Stage 15 is **not optional**. Use the stable project home/source-root identity to generate canonical search hit paths: relative inside home, absolute and unambiguous in other roots. Every returned path must round-trip to native `read_file` and permitted edits. Reversing the workspace folder order must not change project DB identity or projected paths. Update the Stage 15 handoff prompt, Progress Log and regression expectations accordingly.
+
+### Handoff gate for Haiku
+
+Before a stage is marked complete, reconcile its old source-line/test hints against these corrections, update the original Progress Log, and run the actual build/typecheck/lint and stage tests. **Do not silently implement an older contradictory stage instruction.** If an unexpectedly large refactor is needed, report the concrete conflict instead of reintroducing task-owned evidence or a first-root storage dependency.
 
 ---
 
@@ -836,9 +887,9 @@ Do only Stage 14. Satisfy its acceptance criteria, run its gates, update the Pro
 
 ---
 
-### Stage 15 — Canonical paths in search results (optional)
+### Stage 15 — Canonical paths in search results (required)
 
-**Depends on:** 6. **[VS Code suite].** Optional: skip it (mark `done — skipped by decision` with the maintainer's name) unless multi-root search results must be openable with `read_file`. Today a multi-root hit is displayed as `<folderName>/<relative>`, which `read_file` cannot resolve.
+**Depends on:** 4, 6. **[VS Code suite].** Required. Multi-root search hits must be usable directly by native read/edit tools. Today a multi-root hit may be displayed as `<folderName>/<relative>`, which `read_file` cannot resolve.
 
 **Changes (`workspace-index/index.ts`)**: replace the two display-path computations (`folders.length > 1 ? \`${folder.name}/${relative}\` : relative`, one in the scan loop and one in `indexFile`) with one helper `canonicalDisplayPath(uri)`: home = the first workspace folder; a file under home → home-relative POSIX path; any other file → its absolute POSIX path. `documents.relative_path`, the FTS column and every search hit use it. Do not touch `workspace_uri` or the scope filters.
 
@@ -850,7 +901,7 @@ Do only Stage 14. Satisfy its acceptance criteria, run its gates, update the Pro
 
 ```
 You are implementing Stage 15 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md in /home/stark/source/twinny (branch feature/unified-project-db, base 0ca082a). Do not commit.
-Read first: §0, §2.2, the Progress Log, Stage 15. Confirm Stage 6 is done and the maintainer wants this optional stage.
+Read first: §0, §2.2, the Progress Log, Stage 15. Confirm Stages 4 and 6 are done. Stage 15 is mandatory.
 Do only Stage 15. Satisfy its acceptance criteria, run its gates (including the VS Code suite or record NOT RUN with the error), update the Progress Log, and finish with the §0.5 report.
 ```
 
@@ -863,7 +914,7 @@ Do only Stage 15. Satisfy its acceptance criteria, run its gates (including the 
 **Changes**
 
 1. `npm uninstall sqlite3` (updates `package.json` and `package-lock.json`). Then `grep -rn "sqlite3" package.json scripts .vscodeignore src` and remove the remaining references that are **only** about the `sqlite3` package: the `sqlite3` entry in `scripts/build.mjs`' externals and the `!node_modules/sqlite3/**` line in `.vscodeignore`. Leave `better-sqlite3` and `node:sqlite` (the gateway) alone.
-2. `CHANGELOG.md`: add one entry in the format of the newest section: the workspace search index now lives in `.twinny/project.sqlite` together with TODO and evidence records (the old `.twinny/evidence.sqlite` and the global `workspace-index.sqlite` are no longer used and can be deleted); native edits refresh the search index before they return; accepted evidence is checked against the current file and reported as valid, stale or invalid; `evidence_from` is gone because a task's prerequisites' work counts automatically; new machine-scoped setting `twinny.chatToolsAllowedPaths` lets the chat tools work in folders outside the workspace, for example on a Remote-SSH host; the project database is shared by all folders of a multi-root window and lives in the first folder.
+2. `CHANGELOG.md`: add one entry in the format of the newest section: the workspace search index now lives in `.twinny/project.sqlite` together with TODO and evidence records (the old `.twinny/evidence.sqlite` and the global `workspace-index.sqlite` are no longer used and can be deleted); native edits refresh the search index before they return; accepted evidence is checked against the current file and reported as valid, stale or invalid; `evidence_from` is gone because relevant project-wide evidence can be reused without TODO ownership; new machine-scoped setting `twinny.chatToolsAllowedPaths` lets the chat tools work in folders outside the workspace, for example on a Remote-SSH host; the project database is shared by all folders of a multi-root window and lives in the first folder.
 
 **Acceptance criteria**
 
@@ -994,8 +1045,9 @@ CREATE TABLE todo_intent_tasks (
 );
 CREATE TABLE todo_tool_observations (
   id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  item_id TEXT REFERENCES todo_items(id) ON DELETE SET NULL,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  list_id TEXT,
+  item_id TEXT,
   request_id TEXT NOT NULL,
   tool_name TEXT NOT NULL,
   arguments_json TEXT NOT NULL,
@@ -1010,6 +1062,7 @@ CREATE TABLE todo_tool_observations (
 CREATE INDEX todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision);
 CREATE INDEX todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id);
 CREATE INDEX todo_tool_observations_item ON todo_tool_observations(item_id);
+CREATE INDEX todo_tool_observations_project ON todo_tool_observations(project_id, created_at);
 CREATE TABLE todo_evaluations (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
@@ -1024,7 +1077,7 @@ CREATE TABLE todo_evaluations (
 CREATE INDEX todo_evaluations_item ON todo_evaluations(item_id, created_at);
 CREATE TABLE todo_tool_evidence (
   observation_id TEXT PRIMARY KEY REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  list_id TEXT,
   content TEXT,
   retained INTEGER NOT NULL DEFAULT 1,
   complete INTEGER NOT NULL,
@@ -1049,10 +1102,11 @@ CREATE TABLE todo_child_proposals (
 CREATE INDEX todo_child_proposals_fingerprint ON todo_child_proposals(list_id, fingerprint, created_at);
 CREATE TABLE todo_accepted_evidence (
   id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  plan_id TEXT NOT NULL,
-  plan_revision INTEGER NOT NULL,
-  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  list_id TEXT,
+  plan_id TEXT,
+  plan_revision INTEGER,
+  item_id TEXT,
   criterion_index INTEGER NOT NULL,
   criterion TEXT NOT NULL,
   observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
@@ -1068,6 +1122,7 @@ CREATE TABLE todo_accepted_evidence (
 );
 CREATE INDEX todo_accepted_evidence_lookup ON todo_accepted_evidence(list_id, symbol, path, superseded_by);
 CREATE INDEX todo_accepted_evidence_item ON todo_accepted_evidence(item_id, criterion_index);
+CREATE INDEX todo_accepted_evidence_project ON todo_accepted_evidence(project_id, symbol, path);
 CREATE INDEX todo_accepted_evidence_observation ON todo_accepted_evidence(observation_id);
 CREATE INDEX todo_accepted_evidence_revision ON todo_accepted_evidence(list_id, plan_id, plan_revision);
 CREATE TABLE todo_symbol_aliases (
@@ -1192,6 +1247,8 @@ CREATE TABLE observation_source (
   end_line INTEGER,
   total_lines INTEGER,
   content_hash TEXT,
+  observed_version TEXT NOT NULL DEFAULT 'disk' CHECK(observed_version IN ('disk','buffer')),
+  editor_version INTEGER,
   created_at TEXT NOT NULL,
   PRIMARY KEY(observation_id, ordinal)
 );
@@ -1222,7 +1279,7 @@ PRAGMA user_version = 20;
 **Expected objects of a fresh database** (Stage 4's schema test; shadow tables of `documents_fts` and `sqlite_sequence` are not counted):
 
 - **Tables (27):** `todo_accepted_evidence`, `todo_assessment_current`, `todo_assessment_reactions`, `todo_assessments`, `todo_child_proposals`, `todo_dependencies`, `todo_edit_operations`, `todo_evaluations`, `todo_events`, `todo_evidence`, `todo_evidence_usage`, `todo_intent_plans`, `todo_intent_tasks`, `todo_items`, `todo_lists`, `todo_projects`, `todo_requests`, `todo_requirement_activations`, `todo_symbol_aliases`, `todo_tool_evidence`, `todo_tool_observations`, `source_root`, `observation_source`, `index_meta`, `documents`, `symbols`, and the virtual table `documents_fts`.
-- **Named indexes (27):** the 19 of v19 (`todo_accepted_evidence_item|lookup|observation|revision`, `todo_assessment_current_list`, `todo_assessment_reactions_assessment`, `todo_assessments_item`, `todo_child_proposals_fingerprint`, `todo_edit_operations_target`, `todo_evaluations_item`, `todo_events_list_revision`, `todo_evidence_usage_project`, `todo_items_list_status`, `todo_requirement_activations_item`, `todo_symbol_aliases_list|tool`, `todo_tool_evidence_list`, `todo_tool_observations_execution|list_revision`) plus `todo_tool_observations_item`, `source_root_one_home`, `observation_source_location`, `observation_source_hash`, `documents_workspace`, `documents_path`, `documents_fingerprint`, `symbols_name`.
+- **Named indexes (29, revised):** the 19 of v19 (`todo_accepted_evidence_item|lookup|observation|revision`, `todo_assessment_current_list`, `todo_assessment_reactions_assessment`, `todo_assessments_item`, `todo_child_proposals_fingerprint`, `todo_edit_operations_target`, `todo_evaluations_item`, `todo_events_list_revision`, `todo_evidence_usage_project`, `todo_items_list_status`, `todo_requirement_activations_item`, `todo_symbol_aliases_list|tool`, `todo_tool_evidence_list`, `todo_tool_observations_execution|list_revision`) plus `todo_tool_observations_item`, `todo_tool_observations_project`, `todo_accepted_evidence_project`, `source_root_one_home`, `observation_source_location`, `observation_source_hash`, `documents_workspace`, `documents_path`, `documents_fingerprint`, `symbols_name`.
 - **Triggers (2):** `todo_assessments_immutable`, `todo_assessment_reactions_append_only`.
 
 ## Appendix B — Verified code map (base commit `0ca082a`; line numbers are hints, search by symbol)
@@ -1275,12 +1332,12 @@ Environment: VSCodium connected with Remote-SSH to a Linux host; the project in 
 
 **Judgment calls to confirm (implemented as written unless the maintainer says otherwise)**
 
-- **JC-1** Dependents inherit their transitive prerequisites' recorded mutations/commands (replaces `evidence_from`). Siblings and unrelated tasks still never count. The old test that asserted an undeclared dependent gains nothing flips (Stage 2).
+- **JC-1 (superseded)** Task ancestry does not govern evidence eligibility. See maintainer corrections.
 - **JC-2** Index-refresh failure after a successful change: the tool reports success plus an explicit `index_refresh` failure and a "do not repeat" sentence. Reporting it as a failed call would make the model retry a completed change.
-- **JC-3** Home root = first workspace folder; the database is resolved once per session; changing the first folder needs a window reload; reordering folders selects another database.
+- **JC-3 (superseded)** Project-home identity is stable under folder reordering. See maintainer corrections.
 - **JC-4** Authorization = other workspace folders + `twinny.chatToolsAllowedPaths` (machine scope, so a cloned repository cannot widen access).
 - **JC-5** New file name `project.sqlite`; old `.twinny/evidence.sqlite` and `<globalStorage>/workspace-index.sqlite` are left untouched and unused (the old data is abandoned by the dev reset).
-- **JC-6** In a conversation with a TODO plan, every tool result is recorded as project evidence (no active task ⇒ `item_id NULL`).
+- **JC-6 (superseded)** Eligible observations can be captured without a TODO plan. See maintainer corrections.
 
 **Known limitations**
 
@@ -1299,7 +1356,7 @@ Environment: VSCodium connected with Remote-SSH to a Linux host; the project in 
 - L-13 The status bar's `storageBytes` now measures the whole project database (index plus TODO data).
 - L-14 Chats without a TODO plan record no evidence.
 
-**Defects at the base commit that this plan fixes:** skip rows swept by the scan sweep (Stage 7); multi-root windows refuse the edit tools because `resolveProjectTodoStorage` throws (Stage 4); search can be stale after native edits (Stages 8–10); a deleted file and an unreadable file are indistinguishable (Stage 12); observations are owned by one task and evidence needs a declared handoff (Stages 2 and 11); the project key changes with the folder set (Stage 4); multi-root search hits cannot be opened with `read_file` (Stage 15, optional).
+**Defects at the base commit that this plan fixes:** skip rows swept by the scan sweep (Stage 7); multi-root windows refuse the edit tools because `resolveProjectTodoStorage` throws (Stage 4); search can be stale after native edits (Stages 8–10); a deleted file and an unreadable file are indistinguishable (Stage 12); observations are owned by one task and evidence needs a declared handoff (Stages 2 and 11); the project key changes with the folder set (Stage 4); multi-root search hits cannot be opened with `read_file` (Stage 15, required).
 
 **Out of scope:** see §1 "Non-goals".
 
