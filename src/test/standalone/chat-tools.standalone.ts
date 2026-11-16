@@ -14,8 +14,10 @@ import { ToolStepView } from "../../common/types"
 import { ToolSteps } from "../../extension/chat/tool-steps"
 import { ChatChunk, ChatRequest, InferenceClient } from "../../extension/inference"
 import { planReplacement } from "../../extension/tools/edit"
+import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { toolModeFor, withTools } from "../../extension/tools/loop"
 import { displayableLength, findToolCall, nameArguments, repairJson } from "../../extension/tools/protocol"
+import { WorkspaceView } from "../../extension/tools/view"
 import { workspaceTools } from "../../extension/tools/workspace"
 
 test("reads the JSON form as soon as its object closes, and not before", () => {
@@ -161,6 +163,38 @@ test("tools find, read and search, and stay inside the workspace", async () => {
 })
 
 type Reply = string | { text?: string; calls?: ChatChunk["toolCalls"]; refuse?: string }
+test("a folder the user granted outside the workspace is read and listed by its own name, and nothing else is", async () => {
+  const root = makeWorkspace()
+  const allowed = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-allowed-"))
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-elsewhere-"))
+  const text = "one\n  two\n"
+  fs.writeFileSync(path.join(allowed, "notes.md"), text)
+  fs.mkdirSync(path.join(allowed, ".git"))
+  fs.writeFileSync(path.join(elsewhere, "private.txt"), "nope\n")
+  const tools = workspaceTools(new WorkspaceView(root, [], undefined, [], [allowed]))
+  const shown = path.resolve(allowed, "notes.md").split(path.sep).join("/")
+
+  const read = await tools.run({ name: "read_file", args: { path: shown } })
+  const lines = read.output.split("\n")
+  assert.strictEqual(lines[0], `${shown} (lines 1–2 of 2)`, "the header names the granted folder, not a path under the root")
+  const token = lines[1].match(/content_hash: ([^;]+); total_lines: 2/)
+  assert.ok(token, `the header still carries the fingerprint: ${lines[1]}`)
+  assert.strictEqual(token[1], await fingerprintContent(text))
+  assert.strictEqual(lines.slice(2).join("\n"), "1: one\n2:   two")
+
+  const granted = path.resolve(allowed).split(path.sep).join("/")
+  const listed = await tools.run({ name: "list_dir", args: { path: path.resolve(allowed) } })
+  assert.strictEqual(listed.output, "notes.md", ".git is kept out of the listing there as it is anywhere else")
+  assert.strictEqual(listed.summary, `listed \`${granted}\` · 1 entry`, "the listing names the granted folder, not a path under the root")
+
+  assert.match(
+    (await tools.run({ name: "read_file", args: { path: path.join(elsewhere, "private.txt") } })).output,
+    /outside the workspace/,
+    "a folder nobody granted is still refused"
+  )
+  assert.match((await tools.run({ name: "read_file", args: { path: ".env" } })).output, /ignored by \.gitignore/, "the old refusals still hold")
+})
+
 
 /** A client that replies with the scripted texts in turn, in small chunks, and records what it was sent. */
 const scripted = (replies: Reply[]) => {

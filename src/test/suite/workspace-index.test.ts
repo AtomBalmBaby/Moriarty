@@ -5,9 +5,11 @@ import * as path from "path"
 import * as vscode from "vscode"
 
 import { TWINNY_COMMAND_NAME } from "../../common/constants"
+import { editorEdits } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits } from "../../extension/edit/line-edit"
 import { GenerationTracker } from "../../extension/generations"
 import { TwinnyStatusBar } from "../../extension/status-bar"
+import { WorkspaceView } from "../../extension/tools/view"
 import { workspaceTools } from "../../extension/tools/workspace"
 import { WorkspaceIntelligenceIndex } from "../../extension/workspace-index"
 
@@ -264,6 +266,26 @@ suite("Persistent workspace intelligence index", () => {
     await resumed
     } finally {
       statusBar.dispose()
+    }
+  })
+
+  test("a file outside the workspace folders is refused until its folder is allowed", async function () {
+    this.timeout(120000)
+    const target = path.join(storage, "outside.ts")
+    const apply = editorEdits(new WorkspaceView(root), "apply", async () => true)
+
+    const refused = await apply.create(target, "export const x = 1\n")
+    assert.equal(refused.ok, false, "the storage folder is outside every one of the three")
+    assert.match(refused.message, /outside the workspace/)
+
+    const previous = vscode.workspace.getConfiguration("twinny").get<string[]>("chatToolsAllowedPaths", [])
+    try {
+      await vscode.workspace.getConfiguration("twinny").update("chatToolsAllowedPaths", [storage], vscode.ConfigurationTarget.Global)
+      const created = await apply.create(target, "export const x = 1\n")
+      assert.ok(created.ok, created.message)
+      assert.equal(fs.readFileSync(target, "utf8"), "export const x = 1\n")
+    } finally {
+      await vscode.workspace.getConfiguration("twinny").update("chatToolsAllowedPaths", previous, vscode.ConfigurationTarget.Global)
     }
   })
 })

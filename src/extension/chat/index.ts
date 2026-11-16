@@ -1278,7 +1278,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       root,
       this.config.get<string[]>("embeddingIgnoredGlobs", []),
       openDocumentText,
-      currentTeamPolicy()?.agent?.blockedPaths ?? []
+      currentTeamPolicy()?.agent?.blockedPaths ?? [],
+      // The other folders of the window, and the ones the user granted. The
+      // setting is machine scope, so the user's own settings are the only place
+      // it can be set.
+      (workspace.workspaceFolders?.slice(1).filter((folder) => folder.uri.scheme === "file").map((folder) => folder.uri.fsPath) ?? []).concat(
+        this.config.get<string[]>("chatToolsAllowedPaths", [])
+      )
     )
   }
 

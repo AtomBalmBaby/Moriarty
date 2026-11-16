@@ -9,6 +9,7 @@ import { GenerationRun, GenerationTracker } from "../generations"
 import { isCancelled, resolveInferenceProvider } from "../inference"
 import { Base } from "../providers/base"
 import { describeProviderErrorPlain, isAbortError } from "../providers/errors"
+import { authorizedRootOf, normalizeAuthorizedRoots } from "../tools/authorized-paths"
 import { ContentSource, LineEditFailure, lineEditFailure, LineEditRequest } from "../tools/line-edit"
 
 import { DiffLayout, layoutDiff, locateSnippet } from "./diff"
@@ -89,9 +90,17 @@ const removedLines = (document: vscode.TextDocument, lines: vscode.Range): vscod
   return lines
 }
 
-const outsideWorkspace = (uri: vscode.Uri) =>
-  !!vscode.workspace.workspaceFolders?.length && !vscode.workspace.getWorkspaceFolder(uri)
+/** The folders `twinny.chatToolsAllowedPaths` grants. The setting is machine scope, so only the user's own settings can hold it; nothing reads it per folder. */
+const allowedChatPaths = (): string[] =>
+  normalizeAuthorizedRoots(vscode.workspace.getConfiguration("twinny").get<string[]>("chatToolsAllowedPaths", []))
 
+/** With a folder open, a chat edit stays inside it, or inside a folder the setting granted. */
+const outsideWorkspace = (uri: vscode.Uri) => {
+  if (!vscode.workspace.workspaceFolders?.length) return false
+  if (vscode.workspace.getWorkspaceFolder(uri)) return false
+  if (uri.scheme === "file" && authorizedRootOf(uri.fsPath, allowedChatPaths())) return false
+  return true
+}
 export interface PendingEditInfo {
   line: number
   streaming: boolean

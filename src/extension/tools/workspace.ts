@@ -475,7 +475,7 @@ const createFile = (view: WorkspaceView, sink: EditSink): Tool => ({
       : "Propose a new file with the given content. The user reviews it before it is saved.") +
     " The file must not exist yet; to change an existing file, read it and use edit_lines.",
   parameters: [
-    { name: "path", description: "Where the new file goes, relative to the workspace root." },
+    { name: "path", description: "Where the new file goes, relative to the workspace root, or an absolute path inside an allowed folder." },
     { name: "content", description: "The whole file." }
   ],
   async run({ path: file, content }) {

@@ -1,6 +1,7 @@
 /**
  * The workspace as the tools see it: one root folder, its ignore rules,
- * and the checks that keep every tool inside it.
+ * and the checks that keep every tool inside it, or inside a folder the
+ * user named in `twinny.chatToolsAllowedPaths`.
  *
  * Paths are resolved and their real location checked, so `..` and
  * symlinks cannot leave the root. Whatever a `.gitignore` ignores (where
@@ -15,6 +16,8 @@ import ignore, { Ignore } from "ignore"
 import path from "path"
 
 import { isIndexablePath, looksBinary } from "../embeddings/indexable"
+
+import { authorizedRootOf, normalizeAuthorizedRoots } from "./authorized-paths"
 
 export const MAX_LINE_CHARS = 200
 const MAX_FILE_BYTES = 512 * 1024
@@ -44,6 +47,23 @@ const present = (file: string) => {
 /** A tool's input was wrong; the message goes back to the model to fix its call. */
 export class ToolInputError extends Error {}
 
+/** A folder outside the root the tools were allowed in: as it was written, and as it really is. */
+export interface AuthorizedRoot {
+  /** The folder, absolute, normalized and deduplicated. */
+  root: string
+  /** Its path with links resolved, so a link inside it cannot lead out of it. */
+  real: string
+}
+
+/** A granted folder as it really is, or the folder itself where it does not exist yet. */
+const realPathOf = (dir: string): string => {
+  try {
+    return fs.realpathSync(dir)
+  } catch {
+    return dir
+  }
+}
+
 /** The workspace as the tools see it: a root, its ignore rules, its files. */
 export class WorkspaceView {
   private readonly _realRoot: string
@@ -57,15 +77,22 @@ export class WorkspaceView {
   /** Paths the team's rules keep from the agent, said so when one is asked for. */
   private readonly _blocked?: Ignore
 
+  /** Folders the tools were granted outside the root, never inside it. */
+  private readonly _authorized: AuthorizedRoot[]
+
   constructor(
     readonly root: string,
     ignoredGlobs: string[] = [],
     private readonly _read?: (file: string) => Promise<string | undefined>,
-    blockedGlobs: string[] = []
+    blockedGlobs: string[] = [],
+    authorizedRoots: readonly string[] = []
   ) {
     this._realRoot = fs.realpathSync(root)
     this._base = ignore().add([".git", "node_modules", ...ignoredGlobs])
     if (blockedGlobs.length) this._blocked = ignore().add(blockedGlobs)
+    this._authorized = normalizeAuthorizedRoots(authorizedRoots)
+      .filter((entry) => !this.inside(entry))
+      .map((entry) => ({ root: entry, real: realPathOf(entry) }))
   }
 
   /** Whether the team's rules keep a path under the root from the agent. */
@@ -105,12 +132,55 @@ export class WorkspaceView {
     return false
   }
 
-  private inside(real: string) {
-    return real === this._realRoot || real.startsWith(this._realRoot + path.sep)
+  /** Whether `real` is `root` itself or a folder under it, by whole segments. */
+  private inside(real: string, root = this._realRoot) {
+    return real === root || real.startsWith(root + path.sep)
   }
 
-  /** Whether an absolute path is one the tools may show: inside the root and not ignored. */
+  /** The granted folder `absolute` sits in, when it is outside the root itself. */
+  private externalRoot(absolute: string): AuthorizedRoot | undefined {
+    const target = path.resolve(absolute)
+    const granted = authorizedRootOf(target, this._authorized.map((entry) => entry.root))
+    if (!granted) return undefined
+    // A path inside the root is the root's own, with the root's own rules.
+    const relative = path.relative(this.root, target)
+    if (relative === "" || (!path.isAbsolute(relative) && !relative.startsWith(".."))) return undefined
+    return this._authorized.find((entry) => entry.root === granted)
+  }
+
+  /** Whether the path is outside the root but inside a folder the user granted. */
+  isExternal(absolute: string): boolean {
+    return this.externalRoot(absolute) !== undefined
+  }
+
+  /**
+   * What keeps a path in a granted folder from the agent: the team's rules
+   * matching it without its leading separator or drive prefix, or the rules
+   * that hold everywhere matching it against that folder. A `.gitignore` file
+   * is not read there, since it is not the project's own.
+   */
+  private externalDenied(external: AuthorizedRoot, absolute: string, isDirectory = false): "blocked" | "ignored" | undefined {
+    const target = path.resolve(absolute)
+    if (this._blocked && path.isAbsolute(target)) {
+      const whole = target.slice(path.parse(target).root.length).split(path.sep).join("/")
+      if (whole && this._blocked.ignores(whole + (isDirectory ? "/" : ""))) return "blocked"
+    }
+    const within = path.relative(external.real, target).split(path.sep).join("/")
+    if (within && this._base.ignores(within + (isDirectory ? "/" : ""))) return "ignored"
+    return undefined
+  }
+
+  /** Whether a path is kept from the agent, wherever it is: the project's own rules inside the root, the rules that hold everywhere in a granted folder. */
+  private ignoredAt(absolute: string, isDirectory = false): boolean {
+    const external = this.externalRoot(absolute)
+    if (external) return this.externalDenied(external, absolute, isDirectory) !== undefined
+    return this.ignored(path.relative(this.root, absolute), isDirectory)
+  }
+
+  /** Whether an absolute path is one the tools may show: inside the root and not ignored, or in a granted folder and not kept. */
   visible(absolute: string): boolean {
+    const external = this.externalRoot(absolute)
+    if (external) return this.externalDenied(external, absolute, false) === undefined
     const relative = path.relative(this.root, absolute)
     if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false
     return !this.ignored(relative)
@@ -129,6 +199,25 @@ export class WorkspaceView {
       real = fs.realpathSync(absolute)
     } catch {
       throw new ToolInputError(`${cleaned} does not exist.`)
+    }
+    // A granted folder is checked by where the path really is, not only by
+    // where it was written: a link inside it could lead out of it.
+    const external = this.externalRoot(absolute)
+    if (external) {
+      if (!this.inside(real, external.real)) {
+        throw new ToolInputError(`${cleaned} is outside the workspace.`)
+      }
+      const stat = fs.statSync(real)
+      const denied = this.externalDenied(external, real, stat.isDirectory())
+      if (denied === "blocked") {
+        throw new ToolInputError(`${cleaned} is kept from the agent by the team's rules and cannot be read.`)
+      }
+      if (denied === "ignored") {
+        throw new ToolInputError(`${cleaned} is ignored and cannot be read.`)
+      }
+      if (kind === "file" && !stat.isFile()) throw new ToolInputError(`${cleaned} is not a file.`)
+      if (kind === "dir" && !stat.isDirectory()) throw new ToolInputError(`${cleaned} is not a directory.`)
+      return absolute
     }
     const rel = path.relative(this.root, absolute)
     if (!this.inside(real) || rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -163,7 +252,8 @@ export class WorkspaceView {
     if (!cleaned || /[\\/]$/.test(cleaned)) throw new ToolInputError("A file path is needed, not a folder.")
     const absolute = path.resolve(this.root, cleaned)
     const rel = path.relative(this.root, absolute)
-    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    const external = this.externalRoot(absolute)
+    if (!external && (!rel || rel.startsWith("..") || path.isAbsolute(rel))) {
       throw new ToolInputError(`${cleaned} is outside the workspace.`)
     }
     // Anything at the path counts, a link that leads nowhere included:
@@ -178,6 +268,21 @@ export class WorkspaceView {
       realParent = fs.realpathSync(parent)
     } catch {
       throw new ToolInputError(`${cleaned} is outside the workspace.`)
+    }
+    if (external) {
+      // A new file is judged by where its folder really is, since a link
+      // inside a granted folder could put it somewhere never granted.
+      if (!this.inside(realParent, external.real)) {
+        throw new ToolInputError(`${cleaned} is outside the workspace.`)
+      }
+      const denied = this.externalDenied(external, path.join(realParent, path.relative(parent, absolute)), false)
+      if (denied === "blocked") {
+        throw new ToolInputError(`${cleaned} is kept from the agent by the team's rules; twinny does not write there.`)
+      }
+      if (denied === "ignored") {
+        throw new ToolInputError(`${cleaned} is ignored; twinny does not write there.`)
+      }
+      return absolute
     }
     if (!this.inside(realParent)) {
       throw new ToolInputError(`${cleaned} is outside the workspace.`)
@@ -198,8 +303,11 @@ export class WorkspaceView {
     this._tree = undefined
   }
 
+  /** The path as a tool shows it: relative to the root, or absolute in a granted folder, always with `/` separators. */
   relative(absolute: string) {
-    return path.relative(this.root, absolute).split(path.sep).join("/") || "."
+    const target = path.resolve(absolute)
+    if (this.isExternal(target)) return target.split(path.sep).join("/")
+    return path.relative(this.root, target).split(path.sep).join("/") || "."
   }
 
   /** Where `absolute` really is, relative to the root, links followed as far as they exist; `/` separators. */
@@ -212,6 +320,10 @@ export class WorkspaceView {
     }
     try {
       const real = path.join(fs.realpathSync(existing), ...rest)
+      if (!this.inside(real)) {
+        const granted = authorizedRootOf(real, this._authorized.map((entry) => entry.real))
+        if (granted) return real.split(path.sep).join("/")
+      }
       return path.relative(this._realRoot, real).split(path.sep).join("/") || "."
     } catch {
       return this.relative(absolute)
@@ -222,7 +334,7 @@ export class WorkspaceView {
   entries(dir: string): { name: string; dir: boolean }[] {
     return fs
       .readdirSync(dir, { withFileTypes: true })
-      .filter((dirent) => !this.ignored(path.relative(this.root, path.join(dir, dirent.name)), dirent.isDirectory()))
+      .filter((dirent) => !this.ignoredAt(path.join(dir, dirent.name), dirent.isDirectory()))
       .map((dirent) => ({ name: dirent.name, dir: dirent.isDirectory() }))
       .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name))
   }

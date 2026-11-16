@@ -86,6 +86,49 @@ test("paths resolve inside the workspace only, with a root-relative /path read a
   assert.throws(() => view.resolveNew("packages/api/"), /file path is needed/)
 })
 
+test("a folder granted outside the workspace can be read, listed and written into, but not escaped from", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-granted-"))
+  const allowed = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-allowed-"))
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-elsewhere-"))
+  write(root, "src/main.ts", "export const main = 1\n")
+  write(allowed, "notes.md", "notes\n")
+  write(allowed, "secret.txt", "TOPSECRET\n")
+  write(allowed, ".git/config", "[core]\n")
+  write(allowed, "node_modules/dep.js", "export const dep = 1\n")
+  write(elsewhere, "private.txt", "nope\n")
+  fs.symlinkSync(path.join(elsewhere, "private.txt"), path.join(allowed, "link"))
+  const view = new WorkspaceView(root, [], undefined, ["secret.txt"], [allowed])
+
+  assert.strictEqual(view.resolve(path.join(allowed, "notes.md"), "file"), path.resolve(allowed, "notes.md"))
+  assert.throws(() => view.resolve(path.join(elsewhere, "private.txt"), "file"), /outside the workspace/, "a folder nobody granted")
+  assert.throws(() => view.resolve("/etc/passwd", "file"), /outside the workspace/, "with nothing granted an absolute path is refused as it always was")
+  assert.throws(() => view.resolve(path.join(allowed, "link"), "file"), /outside the workspace/, "a link inside the granted folder cannot lead out of it")
+  assert.throws(() => view.resolve(path.join(allowed, ".git", "config"), "file"), /ignored and cannot be read/, ".git is read there as it is anywhere else")
+  assert.throws(() => view.resolve(path.join(allowed, "node_modules", "dep.js"), "file"), /ignored and cannot be read/)
+  assert.throws(() => view.resolve(path.join(allowed, "secret.txt"), "file"), /kept from the agent by the team's rules/)
+
+  assert.strictEqual(view.resolveNew(path.join(allowed, "new.txt")), path.resolve(allowed, "new.txt"))
+  assert.throws(() => view.resolveNew(path.join(allowed, "..", "escape.txt")), /outside the workspace/)
+
+  assert.ok(view.visible(path.join(allowed, "notes.md")), "the granted folder is visible")
+  assert.ok(!view.visible(path.join(allowed, ".git")), "the rules that hold everywhere hold there too")
+  assert.ok(!view.visible(path.join(elsewhere, "private.txt")), "what was not granted stays hidden")
+  assert.ok(view.visible(path.join(root, "src/main.ts")), "inside the root nothing changed")
+
+  const shown = path.resolve(allowed, "notes.md").split(path.sep).join("/")
+  assert.strictEqual(view.relative(path.join(allowed, "notes.md")), shown, "a granted path is named by where it is, not by a path under the root")
+  assert.strictEqual(view.relative(path.join(root, "src/main.ts")), "src/main.ts")
+  assert.strictEqual(view.realRelative(path.join(allowed, "notes.md")), path.resolve(fs.realpathSync(allowed), "notes.md").split(path.sep).join("/"))
+  assert.strictEqual(view.realRelative(path.join(root, "src/main.ts")), "src/main.ts")
+
+  assert.deepStrictEqual(
+    view.entries(allowed).map((entry) => entry.name),
+    ["link", "notes.md"],
+    "the rules that hold everywhere and the team's rules keep their files out of the listing"
+  )
+})
+
+
 test("read_file counts lines as an editor does and never shows a byte-order mark", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-read-"))
   write(root, "three.ts", "a\nb\nc\n")

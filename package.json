@@ -974,6 +974,16 @@
           "markdownDescription": "What happens when the chat model changes a file (with `#twinny.chatTools#` on).",
           "scope": "machine"
         },
+        "twinny.chatToolsAllowedPaths": {
+          "order": 20,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Folders outside the workspace folder the chat's tools may read, list and write in: one path per line, absolute, or starting with `~` for your home folder. A relative path, a blank line or the root of the disk does not grant anything. Only your own settings can hold this: a workspace or folder setting is not read, and a team policy cannot grant it. The rules that hold everywhere - `.git`, `node_modules` and `twinny.embeddingIgnoredGlobs` - and the team's blocked paths still hold there. These folders are not searched by meaning and never written into the project's index.",
+          "scope": "machine"
+        },
         "twinny.chatToolsEditorVisibility": {
           "order": 20,
           "type": "string",
