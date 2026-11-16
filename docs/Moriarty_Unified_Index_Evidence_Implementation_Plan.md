@@ -279,10 +279,10 @@ LanceDB and `src/extension/embeddings`; `run_command` semantics and working dire
 | 9 | 8 | **[VS Code suite]** |
 | 10 | 8 | **[VS Code suite]** |
 | 11 | 4, 8, 9, 10 | `chat/index.ts` → **[VS Code suite]** |
-| 12 | 1, 4 | `chat/index.ts` (`currentSourceReader`) → **[VS Code suite]** |
+| 12 | 1, 4, 11 | `chat/index.ts` (`currentSourceReader`) → **[VS Code suite]** |
 | 13 | 6, 11, 12 | no |
 | 14 | 1 | no |
-| 15 | 6 | **[VS Code suite]** |
+| 15 | 4, 6 | **[VS Code suite]** |
 | 16 | 6 (do it after 7–15 are done) | no |
 | 17 | all | **[VS Code suite]** |
 
@@ -295,7 +295,7 @@ LanceDB and `src/extension/embeddings`; `run_command` semantics and working dire
 | Deletions | Stage 9 (active entry gone at once), Stage 12 (evidence retained, `invalid`) |
 | Source-hash conflicts | Stage 8 (stale `expected_hash` leaves file and index unchanged; two edits from the same hash — second conflicts) |
 | Rollback validity | Stage 8 (catastrophic-edit rollback re-syncs the index to the restored content), Stage 12 (restored contents → `valid` again) |
-| Cross-TODO evidence reuse | Stage 2 (dependents), Stage 11 (project-wide observation visible to another task and conversation), existing accepted-fact reuse test kept |
+| Cross-TODO evidence reuse | Stage 2 (relevance without task ancestry), Stage 11 (project-owned evidence and deletion survival), existing accepted-fact reuse test kept |
 | Database lifecycle | Stage 4 (create/reopen/refuse old and newer/reset/two connections/multi-root home), Stage 6 (index and TODO share one file; reset recreates both; project-folder move rebinds home), Stage 16 (no `sqlite3` left) |
 
 ## 4. Stages
@@ -388,38 +388,27 @@ Do only Stage 1. Satisfy its acceptance criteria, run its gates (including the V
 
 ---
 
-### Stage 2 — Remove `evidence_from` (derive prerequisite evidence)
+### Stage 2 — Remove `evidence_from` and task-owned eligibility
 
-**Depends on:** 0. **Goal:** delete the declared-handoff mechanism. A task's recorded work counts for its criteria = its own observations + those of its **transitive prerequisites** (from the plan's dependency edges). Siblings and unrelated TODOs still never count. (JC-1.)
+**Depends on:** Stage 0. **Goal:** no model-side handoff and no proof eligibility determined by task ancestry. This stage refactors existing proof logic; Stage 11 broadens project observation storage and queries.
 
-**Read first:** `twinny_todo_update` in `src/extension/tools/todos.ts`; in `src/extension/todos/repository.ts`: `prerequisiteIdsOf`, `declaredEvidenceSourcesOf`, `getReviewPackages` (the `evidenceSources:` line), `claimCompletion`; `criterionOwners` and `taskHasVerifiedMutation` in `todos/feedback.ts`; `evidenceSources` in `todos/types.ts`; tests in `todo-feedback.standalone.ts` titled *"the live Locate, Replace, Verify sequence…"*, *"a handoff is accepted only from a prerequisite…"* and *"a file change recorded for a sibling task, or a failed edit, cannot satisfy another task's workspace mutation"*.
+**Read first:** `src/extension/tools/todos.ts` (`twinny_todo_update`); `src/extension/todos/repository.ts` (`prerequisiteIdsOf`, `declaredEvidenceSourcesOf`, `getReviewPackages`, `claimCompletion`); `src/extension/todos/feedback.ts` (`criterionOwners`, `taskHasVerifiedMutation`); the existing handoff/sibling/failure tests.
 
 **Changes**
+1. Remove `evidence_from` from the model-facing schema, argument parsing, `claimCompletion` inputs, validation and `evidence_linked` event. Ignore a stray legacy argument instead of rejecting a valid completion.
+2. Do **not** replace declared handoffs with transitive prerequisite inheritance. Use existing repository observations as candidate proof, without task ownership as an eligibility gate. A matching successful mutation can support a criterion regardless of its original task; an unrelated successful edit or failed mutation cannot.
+3. Keep deterministic verification of source target, tool result, successful persisted mutation, and criterion relevance. Do not count mere task proximity or the model's narrative.
+4. Stage 11 extends the candidate pool to all project observations, including other conversations and sessions without a TODO plan; do not invent a temporary second evidence cache.
 
-1. `tools/todos.ts`: remove the `evidence_from` entry from `parameters` and from `schema.properties`; in `run()` delete the `evidenceFrom` parsing, its pass-through to `claimCompletion`, and the `if (args.evidence_from !== undefined) throw …` line. A stray `evidence_from` sent by a model with an old tool list is **ignored**, never an error.
-2. `todos/repository.ts`: delete `declaredEvidenceSourcesOf`; remove `evidenceFrom` from `claimCompletion`'s input type; delete the `evidenceSourceIds` validation block and the `bumpList(… "evidence_linked" …)` call; in `getReviewPackages` set `evidenceSources: [...prerequisiteIdsOf(database, row.id)]`; reword the `prerequisiteIdsOf` comment to "Every TODO the item transitively depends on; their recorded work counts for the item."
-3. `todos/types.ts`: reword the `evidenceSources` doc comment to: transitive prerequisite TODOs whose recorded work counts for this task's file-mutation and command criteria; observations are referenced, never copied; siblings and unrelated TODOs never count.
-4. `todos/feedback.ts`: reword the `criterionOwners` comment (the task itself and its transitive prerequisites). No logic change.
+**Tests:** rewrite the Locate/Replace/Verify and declared-handoff tests to prove relevant evidence reuses without dependency edges or `evidence_from`. A sibling/other-task observation with the **correct target and successful outcome** may count; a wrong-target or failed observation must not, even when recorded under a prerequisite. Assert the tool no longer advertises `evidence_from`. Preserve all unrelated tests.
 
-**Tests (all in `todo-feedback.standalone.ts`)**
-
-- Rename and update *"the live Locate, Replace, Verify sequence…"* → *"the live Locate, Replace, Verify sequence: an edit recorded under Locate counts for Replace, and its read-back and check count for Verify, with no handoff declared, and the chain completes"*: remove the two `{ evidence_from: locate.id }` arguments and update the two assertion messages. All other assertions stay.
-- Rename and rewrite *"a handoff is accepted only from a prerequisite…"* → *"a task counts its transitive prerequisites' recorded work automatically, never a sibling's or an unrelated TODO's, and ignores a stray evidence_from argument"*: delete the `notPrerequisite` and `wrongStatus` cases; add a completion claim for `unrelated` **with** `evidence_from: locate.id` that must succeed (`failed === undefined`); assertions: `replace` → `true`, **`docs` → `true`** (a dependent inherits its prerequisite's edit — this flips the old `false`, JC-1), `unrelated` → `false`.
-- Add: *"the twinny_todo_update tool no longer advertises evidence_from"* — `todoWorkspaceTools(...).tools.find(name === "twinny_todo_update")` has no `evidence_from` parameter and no `schema.properties.evidence_from`.
-- *"a file change recorded for a sibling task, or a failed edit, cannot satisfy another task's workspace mutation"* must pass **unchanged**.
-
-**Acceptance criteria**
-
-- `grep -rn "evidence_from\|evidenceFrom\|evidence_linked\|declaredEvidenceSourcesOf" src` matches only the stray-argument test and the "no longer advertises" test.
-- All gates pass; only the tests named above changed.
-
-**Do not:** touch observation recording, accepted facts or the database schema in this stage.
+**Acceptance:** no owner/ancestor rule for candidate evidence; deterministic proof remains strict. Run the §0.3 gates, record actual results, update the Progress Log. Do only Stage 2.
 
 ```
-You are implementing Stage 2 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md in /home/stark/source/twinny (branch feature/unified-project-db, base 0ca082a). Do not commit.
-Read first: §0, §1 (JC-1), §2.6, the Progress Log, Stage 2. Confirm Stage 0 is done.
-Do only Stage 2. Satisfy its acceptance criteria, run its gates, update the Progress Log, and finish with the §0.5 report.
+Implement Stage 2 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md. Read §0, the maintainer-reviewed corrections, §2, the Progress Log and Stage 2. Do only this stage. Remove evidence_from and owner-gated proof, preserve deterministic verification, run all gates, update the log and report results.
 ```
+
+---
 
 ### Stage 3 — `SourceRoots` (resource identity and path normalization)
 
@@ -476,49 +465,25 @@ Do only Stage 3. Satisfy its acceptance criteria, run its gates, update the Prog
 
 ---
 
-### Stage 4 — Unified database v20 (`project.sqlite`), multi-root home
+### Stage 4 — Unified project database v20, stable multi-root home and independent evidence
 
-**Depends on:** 3. **[VS Code suite]** (touches `chat/index.ts`, `webview/base.ts`).
-**Goal:** replace the v19 schema and migration ladder with the fresh **v20** schema (Appendix A) in `<home>/.twinny/project.sqlite`; make the first workspace folder the home so multi-root windows work; stop splitting projects by folder-set hash. The index tables exist in the schema but nothing uses them until Stage 6.
+**Depends on:** Stage 3. **[VS Code suite].** **Goal:** one project-local database selected independently of workspace folder order, with evidence that survives TODO/list deletion.
 
-**Read first:** `src/extension/todos/sqlite.ts` (all of it: `SCHEMA`, `SqliteFile`, constants, `resolveProjectTodoStorage`, `prepareProjectTodoStorage`, `retireLegacyTodoDatabase`), `workspaceProjectFingerprint` in `repository.ts`, `webview/base.ts` (`currentProjectTodoStorage`, repository construction), the five production call sites (`grep -rn workspaceProjectFingerprint src/extension`), and the tests listed below.
+**Read first:** `src/extension/todos/sqlite.ts` (`SCHEMA`, `SqliteFile`, `resolveProjectTodoStorage`, `prepareProjectTodoStorage`, `retireLegacyTodoDatabase`); `SourceRoots`; `workspaceProjectFingerprint` and its production call sites in `chat/index.ts` and `webview/base.ts`; Appendix A as **corrected** by the maintainer-reviewed schema section.
 
 **Changes**
+1. Replace the private-development schema/migration ladder with revised v20 DDL, retaining existing transaction/connection helpers. Version 0 initializes, v20 reopens; another version is refused with a safe reset message. No automatic deletion, migrations or unrelated file changes.
+2. Implement a shared `resolveProjectHome`: explicit validated machine-scoped `twinny.projectHome` if configured; otherwise saved multi-root `.code-workspace` file directory; single-root folder; otherwise lexicographically smallest normalized local root for unsaved multi-root. Document the unsaved-root membership caveat. Use the same resolver everywhere that opens the project database; do **not** choose `workspaceFolders[0]` in multi-root windows.
+3. Register home and all local workspace roots, idempotently, in `source_root`. Use one project key per database, not folder-set hash. Preserve source-root identity when moving an entire project home, without silently merging two distinct databases.
+4. Ensure observations, retained tool content, accepted facts and source references have project lifetime. Originating task and list IDs are optional provenance, not deleting FKs. The source records' observation FK remains intact.
+5. Keep `prepareProjectTodoStorage`, `.gitignore`, existing unrelated legacy retirement safety and guarded database reset. The storage-location setting must not widen native-tool filesystem permissions.
 
-1. `todos/sqlite.ts`
-   - Replace `SCHEMA` with the Appendix A DDL verbatim (the `source_root` table and `source_root_one_home` index come from `${SOURCE_ROOT_SCHEMA}`). `CURRENT_SCHEMA_VERSION = 20`. **Delete** the migration ladder (`applyMigrations`), `backup()` (the `VACUUM INTO` backups) and `tableColumns` if nothing else uses it (`grep` first).
-   - Replace `migrate()` with `prepareSchema(database)`: version `> 20` → throw `"TODO database version <v> is newer than this Twinny version"` (keep this wording: an existing test matches `/newer than this Twinny version/`); version not `0` and not `20` → throw `"TODO database version <v> predates the unified project schema (version 20). Development databases are reset, not migrated: move or delete <path> (and its -wal and -shm files) and reopen the project."`; otherwise, in **one** `database.transaction(...).immediate()`: if `user_version` is still `0` run `database.exec(SCHEMA)` (so two connections racing on a new file create it once), then `new SourceRoots(database, homePathOfDatabase(this.databasePath)).home()` (creates or rebinds the home root on every open). Refusals must happen before any write.
-   - Replace the per-open `verifyIntegrity` (`integrity_check`) by `PRAGMA quick_check` run **once per resolved database path per process** (module-level `Set<string>`); failure message `"quick_check failed: …"`.
-   - `PROJECT_TODO_DATABASE_NAME = "project.sqlite"`. `resolveProjectTodoStorage` now uses **the first folder**: zero folders → throw (message mentions `.twinny/project.sqlite`); first folder not `file` scheme → existing `not a "<scheme>" folder` error; **additional folders no longer throw** and are ignored. Update its JSDoc ("the first workspace folder is the project's home root").
-   - Keep `SqliteFile`'s public API, `closeTodoDatabases`, `prepareProjectTodoStorage`, `ensureProjectGitignore`, `retireLegacyTodoDatabase` (and their legacy-name constants) unchanged.
-2. `todos/repository.ts`: add `export const PROJECT_FINGERPRINT = "project"`. Keep `workspaceProjectFingerprint` exported (tests use it for distinct project keys) and say so in its comment.
-3. Replace `workspaceProjectFingerprint(...)` with `PROJECT_FINGERPRINT` at the five production sites: `chat/index.ts` (four: the inventory scope near the top, `activeTodoScope`, the evidence-first preflight request — keep its `!workspace.workspaceFolders?.length` guard — and the `todoScope` in the tool wiring) and `webview/base.ts` (one). Remove the now-unused imports.
+**Tests:** exact revised DDL objects and FKs, FTS5, two connections, newer/older invalid versions left byte-for-byte intact, project move/reopen, stable DB identity and root registrations when folders are reordered, override and saved multi-root home resolution, empty/unsupported workspace errors, project isolation, **task/list deletion retains observations, retained text, source references and accepted facts**, legacy safety tests.
 
-**Tests**
-
-- In `todo-feedback.standalone.ts` **delete exactly these eight migration-ladder tests** (they test the removed ladder; the user's dev-reset policy replaces them): *"existing version-2 TODO databases migrate review tables without losing tasks"* · *"a version-15 database keeps its alias rows as history, gains a nullable registered_tool, and does not promote them into authoritative links"* · *"a version-16 database keeps its tool observations as history with no execution owner, and gains the execution index"* · *"existing version-4 TODO databases gain child proposals and accepted evidence without losing tasks"* · *"a version-10 database with accepted evidence upgrades to version 11 with every evidence row and relationship intact"* · *"the v12 edit ledger rebuilds for optional task association, keeps its rows, and keeps a v12 backup"* · *"the owner column is additive: legacy edit rows stay unowned and each reopened row keeps its owner"* · *"the v11 TODO database gains the edit operation ledger while keeping the active intent task"*. Then remove helpers that become unused.
-- Add to `todo-feedback.standalone.ts`: *"edit operation owners survive closing and reopening the database"* (the surviving behaviour of the deleted owner test: begin an unowned and an owned operation, reopen twice, owners listed as before, `user_version` 20).
-- In `todos-sqlite.standalone.ts`: replace the literal `evidence.sqlite` with `project.sqlite` everywhere (including the first test's title); `user_version` assertion `19` → `20`; the *newer schema* test sets `user_version = 21`; rewrite *"ambiguous, empty, and non-local workspace folders fail explicitly and create no .twinny directory"* → *"a multi-root window stores the project in the first folder, while empty and non-local first folders fail explicitly and create no .twinny directory"* (two `file` folders resolve to `<first>/.twinny/project.sqlite` and create nothing under the second; `[]` and a `vscode-remote` first folder still throw).
-- Add to `todos-sqlite.standalone.ts` (real temp dirs; name them as written):
-  - *a fresh database has exactly the v20 schema: version 20, every table, index and trigger of Appendix A, and one home source root* (compare `sqlite_master` names with the Appendix A list).
-  - *a database older than v20 is refused with a reset message and left byte-for-byte untouched* (create it with `better-sqlite3`, set `journal_mode = WAL` and `user_version = 19`, close, compare bytes before and after the refused open).
-  - *a file that is not a database is refused and left in place*.
-  - *two connections opening the same new database at once create the schema once* (`Promise.all` of two `initialize()` calls; one home row; `user_version` 20).
-  - *the home source root follows the project when the .twinny directory moves with it* (create, close, copy the project directory elsewhere, open the copy: the home locator is the new directory and the `root_id` is unchanged).
-  - *the project key is independent of the folder set* (the repository stores one `todo_projects` row for `PROJECT_FINGERPRINT` whichever folders are open).
-
-**Acceptance criteria**
-
-- `grep -rn "evidence.sqlite" src` returns nothing; `grep -rn "applyMigrations\|VACUUM INTO" src/extension` returns nothing.
-- `PRAGMA user_version` of a new database is 20 and it contains every Appendix A object.
-- All gates pass, including **[VS Code suite]** (or the recorded `NOT RUN`); the legacy-retirement tests in `todos-sqlite.standalone.ts` pass unchanged apart from the path rename.
-
-**Do not:** add migrations, auto-delete or rename any existing database file, touch the index code, change table shapes beyond Appendix A.
+**Acceptance:** all gates and VS Code suite pass or exact NOT RUN recorded; no first-root identity dependency, no project evidence deletion cascade. Regenerate Appendix A object-count tests from actual revised DDL.
 
 ```
-You are implementing Stage 4 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md in /home/stark/source/twinny (branch feature/unified-project-db, base 0ca082a). Do not commit.
-Read first: §0, §1, §2.1–§2.2, Appendix A, Appendix E (test inventory), the Progress Log, Stage 4. Confirm Stage 3 is done.
-Do only Stage 4. Satisfy its acceptance criteria, run its gates (including the VS Code suite or record NOT RUN with the error), update the Progress Log, and finish with the §0.5 report.
+Implement Stage 4 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md. Read §0, the maintainer corrections, §2, Stage 4, Appendix A and the Progress Log. Do only Stage 4; verify stable multi-root identity and evidence retention; run gates and update the log.
 ```
 
 ---
@@ -748,82 +713,46 @@ Do only Stage 10. Satisfy its acceptance criteria, run its gates (including the 
 
 ---
 
-### Stage 11 — Observation sources and project-scoped recording
+### Stage 11 — Independent project observations and source references
 
-**Depends on:** 4, 8, 9, 10. **[VS Code suite]** (`chat/index.ts`).
-**Goal:** every observation that touches files carries `observation_source` rows (root, root-relative path, role, whole-file hash); observations are recorded as project evidence even when no task is active (when the conversation has a TODO plan); the recording hook becomes testable. (JC-6.)
+**Depends on:** Stages 4, 8, 9, 10. **[VS Code suite].** **Goal:** retain project evidence regardless of conversation/TODO plan existence, including actual file source references and disk/buffer origin.
 
-**Read first:** `recordToolObservation`, `TodoToolObservationInput`/`TodoToolObservation` usage, `getReviewPackages` and `listIntentEvidence` (the `item_id AS itemId` selects), `bumpList`, `ensureList` in `todos/repository.ts`; `preserveEvidence`/`parseSources`/`EvidenceSource` in `todos/evidence.ts`; the `onToolResult` hook in `chat/index.ts` (starts at `onToolResult: async (call, result) =>`); `ToolResult` in `tools/workspace.ts`; `SourceRoots` (Stage 3); `hasAuthoritativePlan` and `getActiveIntentContext` in the repository.
+**Read first:** `recordToolObservation`, `TodoToolObservationInput`/`TodoToolObservation`, `preserveEvidence`, `getReviewPackages`, `listIntentEvidence`, `SourceRoots`, and `onToolResult` in `chat/index.ts`.
 
 **Changes**
+1. Store `project_id`, a durable observation ID, tool name, structured args, tool output, failure status, execution/request metadata, optional list/task/conversation provenance and references to retained evidence. A task ID or TODO plan is **not required**. Preserve request-id idempotency, including observations without list IDs; prefer unique project+request IDs where request IDs are globally unique.
+2. Insert `observation_source` rows from authoritative native reads and structured mutations: source root, actual path, relevant line range, role (`read`, `modified`, `created`, `deleted`, `moved_from`, `moved_to`), whole-file fingerprint, `observed_version` (`disk`/`buffer`) and optional editor version. Include both paths of moves and every known rename target. Do not fabricate file hashes for a command with unknown side effects.
+3. Extract a reusable `recordToolResult` implementation from the live `onToolResult` path; continue existing security/declination handling. With a valid project repository, capture eligible tool results when there is no active TODO and even in chats with **no TODO plan**. Never fabricate a TODO to justify observation storage.
+4. Expose project-wide candidate observations to Feedback and evidence lookup regardless of which task or conversation saw them. Retain source and provenance; matching target, success and criterion decide proof. Stage 12 supplies automatic validity on every repository result.
+5. Do not let task/list deletion erase the project observation, retained output, source references or accepted fact. Write actual foreign-key tests.
 
-1. **Types.** `todos/types.ts`: add
-   ```ts
-   export type ObservationSourceRole = "read" | "created" | "modified" | "deleted" | "moved_from" | "moved_to"
-   export interface ObservationSourceInput { path: string; role: ObservationSourceRole; contentHash?: string; startLine?: number; endLine?: number; totalLines?: number }   // path is canonical
-   ```
-   `TodoToolObservationInput.itemId` becomes optional and gains `sources?: readonly ObservationSourceInput[]`; `TodoToolObservation.itemId` and the retained-evidence record's `itemId` become `string | undefined` (fix every use the compiler flags; an observation without an owner never matches `criterionOwners`).
-2. **`repository.recordToolObservation`:** when `input.itemId` is given, keep every existing check (actionable task, active intent task). When it is omitted, skip those two checks, store `item_id = NULL` and call `bumpList(..., undefined, "tool_observed", ...)`. Insert `observation_source` rows (ordinal 0…n) for `input.sources` **plus** the read sources parsed by `preserveEvidence(...).sources` (role `read`, `contentHash`/lines from the header), deduplicated on `(role, path, startLine, endLine)`; resolve each canonical path with `new SourceRoots(database, homePathOfDatabase(this.sqlite.filePath)).fromCanonical(path)`; a source that cannot be located is skipped, never an error. The request-id replay path must not insert duplicates. Add `observationSources(observationIds: readonly string[]): Promise<ObservationSourceRecord[]>` (canonical path via `canonicalPath`, role, hash, lines, `observationId`).
-3. **Declared mutation sources.** `ToolResult.observation` becomes `{ arguments: Record<string, string>; sources?: ObservationSourceInput[] }`. On success only: `edit_lines` → `modified` + `contentHash`; `create_file` → `created` + hash (when known); `delete_file` → `deleted`; `move_file` → `moved_from` and `moved_to` (both with the hash when known); `rename_symbol` → one `modified` per file with its `fileHashes` entry; legacy `edit_file` → `modified` (no hash). Paths are `view.relative(absolute)`. Reads need no declaration (their header is parsed).
-4. **Extract the hook.** New `src/extension/chat/tool-observation.ts` (no `vscode` import):
-   ```ts
-   export interface ToolObservationContext { repository: Pick<TodoRepository, "getActiveIntentContext" | "hasAuthoritativePlan" | "recordToolObservation" | "addEvidence">; scope: TodoWriteRequest; executionId: string; markUnrecorded(): void }
-   export const recordToolResult = async (context: ToolObservationContext, call: ToolCall, result: ToolResult): Promise<void>
-   ```
-   It contains the existing body of `onToolResult` after its early returns (same `compactToolEvidence`, `observationArguments`, `compactEvidenceText`, same error handling and the `evidence_storage_failed` evidence), with one new branch: when `getActiveIntentContext` is `undefined`, call `markUnrecorded()` and return **only if** `hasAuthoritativePlan(scope)` is false; otherwise record the observation with no `itemId`. Pass `sources: result.observation?.sources`. `chat/index.ts` keeps the early returns (`twinny_todo_*`, declined `run_command`, no repository/scope) and delegates; use the logger the TODO modules already use.
+**Tests:** no-plan capture via real hook, unowned project observation, cross-TODO/cross-conversation project reuse, correct source path/range/hash for full and partial reads, external paths, buffer vs disk provenance, both sides of move, deduped tool-result replay, list/task deletion survival, successful matching mutation vs unrelated/failed record. Existing agent-reply suite must pass.
 
-**Tests (standalone; real repository, real `recordToolResult`)**
-
-- *an observation can be recorded without a task, keeps no owner, and never satisfies a task's workspace_mutation criterion* (including a prerequisite-less task).
-- *a read observation stores its source with the root-relative path, whole-file hash and line range from its header* (`observation_source` row: home root, role `read`, hash equals the header's).
-- *a read of a file outside the project stores an external source whose canonical path is absolute and round-trips* (`/etc/nginx/nginx.conf` → external root, path `etc/nginx/nginx.conf`).
-- *declared mutation sources are stored with their roles, including both ends of a move*; *replaying a request id stores no duplicate sources*.
-- *recordToolResult records an unowned observation when a plan exists but no task is active, and leaves a conversation without a plan unrecorded and marked* (build the plan with the existing `fixture`/`recordAsActive` helpers; complete its task through the existing review path so none is active).
-- *an observation recorded under one task is returned by `observationSources` for another conversation of the same project* (cross-TODO reuse at the data level).
-- In `chat-tools.standalone.ts` (fake sinks): each mutating tool's result carries the expected `observation.sources` (role, path, hash).
-- Existing evidence, review and accepted-fact tests pass unchanged; `agent-reply.test.ts` passes ([VS Code suite]).
-
-**Acceptance criteria:** `onToolResult` in `chat/index.ts` delegates to `recordToolResult`; the `todo_tool_observations` DDL has a nullable `item_id` with `ON DELETE SET NULL` (Appendix A, in force since Stage 4); gates including the VS Code suite (or recorded `NOT RUN`).
-
-**Do not:** change criterion or proof logic, attribute observations to tasks, record for chats without a plan, or broaden what `markUnrecordedTool` means.
+**Acceptance:** independent evidence lifetime and project-wide retrieval work, with no criterion auto-satisfied merely by observation existence. Run all gates and VS Code integration tests.
 
 ```
-You are implementing Stage 11 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md in /home/stark/source/twinny (branch feature/unified-project-db, base 0ca082a). Do not commit.
-Read first: §0, §1 (JC-6), §2.2, §2.6, Appendix A (observation_source), the Progress Log, Stage 11. Confirm Stages 4, 8, 9 and 10 are done.
-Do only Stage 11. Satisfy its acceptance criteria, run its gates (including the VS Code suite or record NOT RUN with the error), update the Progress Log, and finish with the §0.5 report.
+Implement Stage 11 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md. Read §0, maintainer corrections, §2, Stage 11 and the Progress Log. Do only Stage 11; prove no-plan capture, cross-task relevance and deletion survival; run gates and update the log.
 ```
 
 ---
 
-### Stage 12 — Automatic evidence validity
+### Stage 12 — Automatic validity on every file-backed evidence boundary
 
-**Depends on:** 1, 4. **[VS Code suite]** (`chat/index.ts` reader).
-**Goal:** accepted evidence is classified `valid` / `stale` / `invalid` automatically from the current file state whenever it is retrieved or accepted; the model is never asked to check; history is retained; ordinary I/O errors stay separate.
+**Depends on:** Stages 1, 4, 11. **[VS Code suite].** **Goal:** file source validity checked centrally whenever evidence is stored or retrieved.
 
-**Read first:** `CurrentSourceReader`, `cachedCurrentReader`, `AcceptedFactStatus`, `assessAcceptedFacts`, `evidencePreflight`, `EvidencePreflightFact`, `authenticateSource`, `evaluateTodoReview` (where accepted facts are recorded) in `todos/feedback.ts`; `twinny_evidence_lookup` in `tools/todos.ts`; `currentSourceReader()` in `chat/index.ts`; `WorkspaceView.text()` and `resolve()` in `tools/view.ts`; the existing freshness tests (search `freshness` and `unverifiable` in `todo-feedback.standalone.ts`).
+**Read first:** `CurrentSourceReader`, `assessAcceptedFacts`, `evidencePreflight`, `twinny_evidence_lookup`, `WorkspaceView` file reads, Stage 11 observation/source repository APIs and existing freshness tests.
 
 **Changes**
+1. Implement a shared source-reference validity service in the project evidence repository. Use current authoritative source text and `fingerprintContent`, never trust stale indexed text. Consumers do **not** opt in to correctness by passing a reader callback.
+2. Validate each file reference during **storage** and **retrieval** of observations, retained source-backed evidence and reusable accepted facts. Apply the boundary to project-wide lookup, preflight and Feedback packages. Return per-reference and aggregate validity, not just an accepted-fact-specific `freshness` field.
+3. For matching whole-file hash return `valid`; changed hash `stale`; missing file `invalid`; restoring matching content `valid` again. Multi-file aggregate: invalid > stale > valid. Preserve every historical record. Normal I/O errors are errors, not `invalid`; non-file tool results receive no invented file hash.
+4. Respect the original source kind: `disk` observations validate against disk, `buffer` observations validate against the current unsaved editor buffer if open, otherwise disk. Track editor version when available. A buffer-only read cannot certify a persisted edit.
+5. Reuse/extend existing accepted-fact freshness logic rather than introducing another independent cache. Preserve compatible `freshness` fields, but ensure central source checks underpin them.
 
-1. **`WorkspaceView.currentText(canonical: string): Promise<string | undefined>`** (`view.ts`): absolute = `canonical` if absolute else `path.join(root, canonical)`; `lstat` first — `ENOENT`/`ENOTDIR` → return `undefined` (file absent); other I/O errors throw; then `this.resolve(absolute, "file")` (authorization, ignore rules, symlinks; throws `ToolInputError`); buffer-first (`_read`, like `read_file`), else disk with the same size cap, binary sniff and BOM handling as `text()` — **too large or binary → throw** (not `undefined`).
-2. **`chat/index.ts` `currentSourceReader()`** uses `view.currentText(path)` instead of `view.text(view.resolve(path, "file"))`.
-3. **`todos/feedback.ts`:** document `CurrentSourceReader` as *resolves to the text, `undefined` when the file does not exist, rejects when it exists but cannot be read*. Add `validity?: "valid" | "stale" | "invalid"` to `AcceptedFactStatus` (keep `freshness`). Add `cachedSourceReader` (per-path cache returning `{ state: "text", text } | { state: "absent" } | { state: "unreadable" }`; a rejected read is `unreadable`) and use it in `assessAcceptedFacts`; leave `cachedCurrentReader` for review reconciliation untouched. Classification: superseded → unchanged, no validity; no reader supplied → `unverifiable`, no validity (as before); **absent → `freshness: "unverifiable"`, `validity: "invalid"`, reason `"<path> no longer exists"`**; unreadable → `unverifiable`, no validity; hash differs → `historical` + `stale`; hash matches → `current` + `valid`. Readers that return `undefined` for every miss (existing tests) therefore keep their `freshness` results. Add `evidencePreflight` projection field `validity`. Export `aggregateValidity(items)` (invalid over stale over valid; empty → `undefined`) and `assessSourceReferences(references: { path: string; contentHash?: string }[], readCurrent)` that evaluates every reference **with a hash** (references without one are ignored) and returns the aggregate plus per-reference results — the multi-file rule of §2.6. No caller is required in this stage beyond tests.
-4. **Storage-time check.** Where `evaluateTodoReview` records accepted facts after an accepted evaluation, when `options.readCurrentSource` is supplied do **not** store a fact whose `assessAcceptedFacts` validity is not `valid` (its observation and the evaluation remain). If `authenticateSource` already rejects sources whose current fingerprint differs, reuse that decision and add only the test; do not duplicate logic. Without a reader, behaviour is unchanged.
-5. **`twinny_evidence_lookup`:** add `validity` (when defined) to each returned fact and mention validity in the tool description; keep every existing field and the `refresh` hint.
-
-**Tests**
-
-- `todo-feedback.standalone.ts`: *a fact is valid while its file matches, stale after it changes, invalid after it is deleted, and valid again when the same contents are restored* (real temp file, `view.currentText` as the reader, `assessAcceptedFacts`; also an **external authorized** absolute path); *an unreadable file is not an invalid fact* (too large and binary → `unverifiable`, no validity); *historical facts are retained whatever their validity* (still in `listAcceptedEvidence` after deletion); *twinny_evidence_lookup reports validity for every fact*; *evidence preflight carries validity*; *aggregateValidity orders invalid over stale over valid and assessSourceReferences evaluates every referenced file*; *a fact whose file changed before acceptance is not stored*.
-- `tool-safety.standalone.ts`: *currentText reports an absent file as undefined, prefers the open buffer, throws for a too-large file and refuses a path outside every authorized root*.
-- Every existing freshness/`unverifiable` test passes **unmodified**.
-
-**Acceptance criteria:** validity rules of §2.6 demonstrably hold in the first test above; no model-facing instruction asks the model to compare hashes; gates including the VS Code suite (or recorded `NOT RUN`).
-
-**Do not:** persist validity, treat I/O errors as `invalid`, change `freshness` semantics for existing readers, or surface observation-level validity in prompts (Appendix D, out of scope).
+**Tests:** valid → stale → invalid → restored valid on original record; same behavior on accepted facts; per-file and aggregate multi-source flags; correct validation through every public evidence API plus lookup/preflight/Feedback; external authorized paths; unsaved buffer vs saved disk, buffer close; invalid file vs unreadable-file error; project evidence survives task/list deletion; unknown `run_command` side effects not hashed; no model-side hash comparisons. Run VS Code suite and all gates.
 
 ```
-You are implementing Stage 12 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md in /home/stark/source/twinny (branch feature/unified-project-db, base 0ca082a). Do not commit.
-Read first: §0, §2.6, the Progress Log, Stage 12. Confirm Stages 1 and 4 are done.
-Do only Stage 12. Satisfy its acceptance criteria, run its gates (including the VS Code suite or record NOT RUN with the error), update the Progress Log, and finish with the §0.5 report.
+Implement Stage 12 of docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md. Read §0, maintainer corrections, §2, Stage 12 and the Progress Log. Do only Stage 12; prove centralized validity across all evidence paths; run gates and update the log.
 ```
 
 ---
@@ -914,7 +843,7 @@ Do only Stage 15. Satisfy its acceptance criteria, run its gates (including the 
 **Changes**
 
 1. `npm uninstall sqlite3` (updates `package.json` and `package-lock.json`). Then `grep -rn "sqlite3" package.json scripts .vscodeignore src` and remove the remaining references that are **only** about the `sqlite3` package: the `sqlite3` entry in `scripts/build.mjs`' externals and the `!node_modules/sqlite3/**` line in `.vscodeignore`. Leave `better-sqlite3` and `node:sqlite` (the gateway) alone.
-2. `CHANGELOG.md`: add one entry in the format of the newest section: the workspace search index now lives in `.twinny/project.sqlite` together with TODO and evidence records (the old `.twinny/evidence.sqlite` and the global `workspace-index.sqlite` are no longer used and can be deleted); native edits refresh the search index before they return; accepted evidence is checked against the current file and reported as valid, stale or invalid; `evidence_from` is gone because relevant project-wide evidence can be reused without TODO ownership; new machine-scoped setting `twinny.chatToolsAllowedPaths` lets the chat tools work in folders outside the workspace, for example on a Remote-SSH host; the project database is shared by all folders of a multi-root window and lives in the first folder.
+2. `CHANGELOG.md`: add one entry in the format of the newest section: the workspace search index now lives in `.twinny/project.sqlite` together with TODO and evidence records (the old `.twinny/evidence.sqlite` and the global `workspace-index.sqlite` are no longer used and can be deleted); native edits refresh the search index before they return; accepted evidence is checked against the current file and reported as valid, stale or invalid; `evidence_from` is gone because relevant project-wide evidence can be reused without TODO ownership; new machine-scoped setting `twinny.chatToolsAllowedPaths` lets the chat tools work in folders outside the workspace, for example on a Remote-SSH host; the project database is shared across roots using a stable project home independent of folder ordering.
 
 **Acceptance criteria**
 
@@ -1057,7 +986,7 @@ CREATE TABLE todo_tool_observations (
   created_at TEXT NOT NULL,
   list_revision INTEGER,
   execution_id TEXT,
-  UNIQUE(list_id, request_id)
+  UNIQUE(project_id, request_id)
 );
 CREATE INDEX todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision);
 CREATE INDEX todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id);
@@ -1370,7 +1299,7 @@ Environment: VSCodium connected with Remote-SSH to a Linux host; the project in 
 
 **Updated in place:** `workspace-index.test.ts` constructor calls (Stage 6) and the `index-main/src/extension/**/*.ts` path assertion (Stage 15, optional).
 
-**Must pass untouched (guards):** the `/etc/passwd`, `../escape.ts` and `/packages/web/…` refusal and resolution tests (`tool-safety`, `chat-tools`); *a file change recorded for a sibling task, or a failed edit, cannot satisfy another task's workspace mutation*; every existing `freshness` / `unverifiable` test; the legacy-retirement tests in `todos-sqlite.standalone.ts`; *accepted evidence is shared across conversations of the same project while TODO lists stay conversation-scoped*; the whole `agent-reply` suite.
+**Must preserve as safety guards:** the `/etc/passwd`, `../escape.ts` and `/packages/web/…` unauthorized-path refusal tests (`tool-safety`, `chat-tools`); a *failed or wrong-target* edit must not satisfy another task's workspace mutation criterion (matching evidence from any task may); every existing `freshness` / `unverifiable` test; the legacy-retirement tests in `todos-sqlite.standalone.ts`; *accepted evidence is shared across conversations of the same project while TODO lists stay conversation-scoped*; the whole `agent-reply` suite.
 
 **New test files:** `authorized-paths.standalone.ts` (Stage 1), `source-roots.standalone.ts` (Stage 3), `index-sql.standalone.ts` (Stage 5). All other new tests are additions to existing files, named in their stage. The regression-to-stage mapping is §3.2.
 
