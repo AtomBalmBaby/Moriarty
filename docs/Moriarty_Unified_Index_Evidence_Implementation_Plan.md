@@ -12,7 +12,7 @@
 
 | Stage | Title | Status | Date | Verification (command → actual counts) | Notes / deviations |
 |---|---|---|---|---|---|
-| 0 | Baseline, branch, progress log | todo | | | |
+| 0 | Baseline, branch, progress log | done | 2026-11-16 | clean exit 0; build-tests exit 0; build exit 0; eslint --quiet 0 findings; tsc type check exit 0 (0 findings); git diff --check no output; test:sqlite 966 tests / 966 pass / 0 fail / 0 skipped (4761 ms). VS Code suite NOT RUN to completion: the full gate run was cut by the 120 s tool window (timeout exit 124, no Mocha summary printed); per-suite runs of the four configured files each exit 0 - Agent reply, end to end 16 passing (10 s); Read-file acceptance, production controller 51 passing (60 s, includes nested edit operation recovery 17); custom agent registry 2 passing (1 s); Hash-verified native line edits 32 passing (15 s); Persistent workspace intelligence index 1 passing (12 s) = 102 passing, 0 failing, 0 pending | Branch feature/unified-project-db, HEAD 9205cc4 (not base 0ca082a); only this plan file differs from base, so Appendix B was spot-checked, not re-verified: fingerprintContent 23, CURRENT_SCHEMA_VERSION 214, resolveProjectTodoStorage 562, prepareProjectTodoStorage 591, ensureProjectGitignore 601, retireLegacyTodoDatabase 660, WorkspaceIntelligenceIndex 245 - all as recorded. Suites that did not run: Chat edit_file and the prompt-compiler suite (.vscode-test.js lists only agent-reply, agents, line-edit, workspace-index). No source changed, nothing committed. |
 | 1 | External path authorization in the native tools | todo | | | |
 | 2 | Remove evidence handoff and owner gating (revised above) | todo | | | |
 | 3 | `SourceRoots` (resource identity + path normalization) | todo | | | |
