@@ -22,8 +22,21 @@ suite("Persistent workspace intelligence index", () => {
   const waitUntil = async (condition: () => Promise<boolean>) => {
     for (let attempt = 0; attempt < 50 && !(await condition()); attempt++) await new Promise((resolve) => setTimeout(resolve, 200))
   }
+  // VS Code ignores workspace-folder updates while a previous one is still unconfirmed by the main thread,
+  // so each change is awaited until onDidChangeWorkspaceFolders reports it.
+  const updateWorkspaceFolders = async (start: number, deleteCount: number, ...folders: Array<{ uri: vscode.Uri; name: string }>) => {
+    let subscription: vscode.Disposable | undefined
+    const confirmed = new Promise<void>((resolve) => {
+      subscription = vscode.workspace.onDidChangeWorkspaceFolders(() => resolve())
+    })
+    const changed = vscode.workspace.updateWorkspaceFolders(start, deleteCount, ...folders)
+    if (changed) await confirmed
+    subscription?.dispose()
+    return changed
+  }
 
-  setup(async () => {
+  setup(async function () {
+    this.timeout(30000)
     root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-index-main-"))
     secondRoot = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-index-secondary-"))
     storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-index-storage-"))
@@ -40,7 +53,7 @@ suite("Persistent workspace intelligence index", () => {
     fs.writeFileSync(path.join(storage, "twinny-state.sqlite"), "durable TODO database sentinel")
     originalFolders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ uri: folder.uri, name: folder.name }))
     const repositoryRoot = vscode.Uri.file(path.resolve(__dirname, "../../.."))
-    const changed = vscode.workspace.updateWorkspaceFolders(
+    const changed = await updateWorkspaceFolders(
       0,
       originalFolders.length,
       { uri: vscode.Uri.file(root), name: "index-main" },
@@ -50,10 +63,11 @@ suite("Persistent workspace intelligence index", () => {
     assert.equal(changed, true)
   })
 
-  teardown(async () => {
+  teardown(async function () {
+    this.timeout(30000)
     index?.dispose()
     const currentCount = vscode.workspace.workspaceFolders?.length ?? 0
-    vscode.workspace.updateWorkspaceFolders(0, currentCount, ...originalFolders)
+    await updateWorkspaceFolders(0, currentCount, ...originalFolders)
     for (const document of vscode.workspace.textDocuments.filter((entry) => entry.uri.fsPath.startsWith(root + path.sep) || entry.uri.fsPath.startsWith(secondRoot + path.sep))) {
       await vscode.window.showTextDocument(document)
       await vscode.commands.executeCommand("workbench.action.revertAndCloseActiveEditor")
