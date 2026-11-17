@@ -25,6 +25,7 @@ export const TWINNY_COMMAND_NAME = {
   saveEntireChat: "twinny.saveEntireChat",
   showShortcuts: "twinny.showShortcuts",
   forgetAlwaysRunCommands: "twinny.forgetAlwaysRunCommands",
+  revokeFileAccess: "twinny.revokeFileAccess",
   openPanelChat: "twinny.openPanelChat",
   openChat: "twinny.openChat",
   openTeamPlugins: "twinny.openTeamPlugins",

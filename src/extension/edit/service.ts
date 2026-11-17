@@ -9,8 +9,10 @@ import { GenerationRun, GenerationTracker } from "../generations"
 import { isCancelled, resolveInferenceProvider } from "../inference"
 import { Base } from "../providers/base"
 import { describeProviderErrorPlain, isAbortError } from "../providers/errors"
+import { currentAccessHostKey } from "../tools/access-host"
 import { authorizedRootOf, normalizeAuthorizedRoots } from "../tools/authorized-paths"
 import { ContentSource, LineEditFailure, lineEditFailure, LineEditRequest } from "../tools/line-edit"
+import { claimWrites, WriteOperation } from "../tools/operation-authorization"
 
 import { DiffLayout, layoutDiff, locateSnippet } from "./diff"
 import { applyDocumentLineEdits, EditorVisibility } from "./line-edit"
@@ -94,6 +96,10 @@ const removedLines = (document: vscode.TextDocument, lines: vscode.Range): vscod
 const allowedChatPaths = (): string[] =>
   normalizeAuthorizedRoots(vscode.workspace.getConfiguration("twinny").get<string[]>("chatToolsAllowedPaths", []))
 
+/** Whether `twinny.chatToolsAllowedPaths` grants this path right now; read on each use, as the edit service does. */
+export const preauthorizedNow = (absolute: string): boolean =>
+  authorizedRootOf(path.resolve(absolute), allowedChatPaths()) !== undefined
+
 /** With a folder open, a chat edit stays inside it, or inside a folder the setting granted. */
 const outsideWorkspace = (uri: vscode.Uri) => {
   if (!vscode.workspace.workspaceFolders?.length) return false
@@ -101,6 +107,15 @@ const outsideWorkspace = (uri: vscode.Uri) => {
   if (uri.scheme === "file" && authorizedRootOf(uri.fsPath, allowedChatPaths())) return false
   return true
 }
+
+/**
+ * Whether a write outside the workspace is the one this call was approved to make. Only the native
+ * tool dispatcher holds such an approval, and it covers this file, this operation and this host alone;
+ * review mode never writes outside, as before.
+ */
+const approvedOutsideWrite = (write: unknown, mode: ChatEditMode, operation: WriteOperation, file: string): boolean =>
+  mode === "apply" && claimWrites(write, [{ operation, absolute: file }], currentAccessHostKey())
+
 export interface PendingEditInfo {
   line: number
   streaming: boolean
@@ -301,14 +316,16 @@ export class InlineEditService extends Base {
    */
   public async chatEdit(
     proposal: FileEditProposal,
-    mode: ChatEditMode = "apply"
+    mode: ChatEditMode = "apply",
+    write?: unknown
   ): Promise<ChatEditOutcome> {
     const pending = this._pending
     const uri = vscode.Uri.file(proposal.file)
     const relative = vscode.workspace.asRelativePath(uri)
     // The tools keep to the workspace themselves; the command that reaches
-    // this can be run by anything, so it holds the line too.
-    if (outsideWorkspace(uri)) {
+    // this can be run by anything, so it holds the line too. Outside the
+    // workspace only the write the native tool was approved for gets through.
+    if (outsideWorkspace(uri) && !approvedOutsideWrite(write, mode, "edit", proposal.file)) {
       return { ok: false, message: `Not changed: ${relative} is outside the workspace.`, error: lineEditFailure("permission_denied", "The document is outside the workspace.") }
     }
     if (this.running || (pending && (mode === "review" || pending.document.uri.fsPath === proposal.file))) {
@@ -384,11 +401,12 @@ export class InlineEditService extends Base {
   public async chatCreate(
     file: string,
     content: string,
-    mode: ChatEditMode = "apply"
+    mode: ChatEditMode = "apply",
+    write?: unknown
   ): Promise<ChatEditOutcome> {
     const target = vscode.Uri.file(file)
     const relative = vscode.workspace.asRelativePath(target)
-    if (outsideWorkspace(target)) {
+    if (outsideWorkspace(target) && !approvedOutsideWrite(write, mode, "create", file)) {
       return { ok: false, message: `Not created: ${relative} is outside the workspace.` }
     }
     if (fs.existsSync(file)) {

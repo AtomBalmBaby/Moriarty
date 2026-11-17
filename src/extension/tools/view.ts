@@ -17,6 +17,7 @@ import path from "path"
 
 import { isIndexablePath, looksBinary } from "../embeddings/indexable"
 
+import { canonicalPath, GrantScope, isFilesystemRoot, isWithin } from "./access-grants"
 import { authorizedRootOf, normalizeAuthorizedRoots } from "./authorized-paths"
 
 export const MAX_LINE_CHARS = 200
@@ -53,9 +54,13 @@ export interface AuthorizedRoot {
   root: string
   /** Its path with links resolved, so a link inside it cannot lead out of it. */
   real: string
+  /** A file is only its own path; a folder is everything under it. */
+  scope: GrantScope
 }
 
 /** A granted folder as it really is, or the folder itself where it does not exist yet. */
+const isDirectoryAt = (file: string): boolean => fs.statSync(file, { throwIfNoEntry: false })?.isDirectory() ?? false
+
 const realPathOf = (dir: string): string => {
   try {
     return fs.realpathSync(dir)
@@ -77,22 +82,32 @@ export class WorkspaceView {
   /** Paths the team's rules keep from the agent, said so when one is asked for. */
   private readonly _blocked?: Ignore
 
-  /** Folders the tools were granted outside the root, never inside it. */
-  private readonly _authorized: AuthorizedRoot[]
+  /** Folders the user set in `twinny.chatToolsAllowedPaths`, outside the root, never inside it. */
+  private readonly _static: AuthorizedRoot[]
+
+  /** Read on each use, so a grant made during a reply applies to the calls after it. */
+  private readonly _granted: () => readonly AuthorizedRoot[]
 
   constructor(
     readonly root: string,
     ignoredGlobs: string[] = [],
     private readonly _read?: (file: string) => Promise<string | undefined>,
     blockedGlobs: string[] = [],
-    authorizedRoots: readonly string[] = []
+    authorizedRoots: readonly string[] = [],
+    granted: () => readonly AuthorizedRoot[] = () => []
   ) {
     this._realRoot = fs.realpathSync(root)
     this._base = ignore().add([".git", "node_modules", ...ignoredGlobs])
     if (blockedGlobs.length) this._blocked = ignore().add(blockedGlobs)
-    this._authorized = normalizeAuthorizedRoots(authorizedRoots)
+    this._static = normalizeAuthorizedRoots(authorizedRoots)
       .filter((entry) => !this.inside(entry))
-      .map((entry) => ({ root: entry, real: realPathOf(entry) }))
+      .map((entry) => ({ root: entry, real: realPathOf(entry), scope: "folder" }))
+    this._granted = granted
+  }
+
+  /** Every folder or file outside the root the tools may use: the settings' folders and the grants in force. */
+  private authorizedRoots(): AuthorizedRoot[] {
+    return [...this._static, ...this._granted()]
   }
 
   /** Whether the team's rules keep a path under the root from the agent. */
@@ -140,12 +155,13 @@ export class WorkspaceView {
   /** The granted folder `absolute` sits in, when it is outside the root itself. */
   private externalRoot(absolute: string): AuthorizedRoot | undefined {
     const target = path.resolve(absolute)
-    const granted = authorizedRootOf(target, this._authorized.map((entry) => entry.root))
+    const roots = this.authorizedRoots()
+    const granted = authorizedRootOf(target, roots.map((entry) => entry.root))
     if (!granted) return undefined
     // A path inside the root is the root's own, with the root's own rules.
     const relative = path.relative(this.root, target)
     if (relative === "" || (!path.isAbsolute(relative) && !relative.startsWith(".."))) return undefined
-    return this._authorized.find((entry) => entry.root === granted)
+    return roots.find((entry) => entry.root === granted)
   }
 
   /** Whether the path is outside the root but inside a folder the user granted. */
@@ -186,14 +202,62 @@ export class WorkspaceView {
     return !this.ignored(relative)
   }
 
-  /** `relative` as an absolute path inside the root, or a reason it is not allowed. */
-  resolve(relative = ".", kind: "file" | "dir" | "any"): string {
+  /** Whether the path lies inside the workspace folder itself, whatever outside folders are authorized. */
+  inWorkspace(absolute: string): boolean {
+    const relative = path.relative(this.root, absolute)
+    return !!relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+  }
+
+  /** The path a relative one names, before any link is followed; `/src/a.ts` falls back to the workspace's own src. */
+  private lexicalOf(relative: string): string {
     const cleaned = relative.trim().replace(/^\.\/+/, "") || "."
     let absolute = path.resolve(this.root, cleaned)
-    // `/src/a.ts` meaning the workspace's src, as models sometimes write it.
     if (path.isAbsolute(cleaned) && !this.inside(absolute) && !fs.existsSync(absolute)) {
       absolute = path.join(this.root, cleaned)
     }
+    return absolute
+  }
+
+  /**
+   * The absolute path a relative one names when it is outside the root, both as written and really; undefined when it is inside.
+   * A path being created is judged as `resolveNew` judges it, a path already used as `resolve` does.
+   */
+  outsideLexical(relative: string, creates = false): string | undefined {
+    const absolute = creates ? path.resolve(this.root, relative.trim().replace(/^\.\/+/, "")) : this.lexicalOf(relative)
+    if (isWithin(this.root, absolute) || this.inside(canonicalPath(absolute))) return undefined
+    return absolute
+  }
+
+  /** Whether an absolute path is in a folder set in the settings, which is allowed without asking. */
+  preauthorized(absolute: string): boolean {
+    return authorizedRootOf(path.resolve(absolute), this._static.map((entry) => entry.root)) !== undefined
+  }
+
+  /**
+   * Why an outside path may never be used, whatever is granted; undefined when nothing forbids it.
+   * A path in a granted folder is also refused when a link takes it out of that folder, or when the
+   * folder's own rules keep it: these are decided before anyone is asked, not after a grant.
+   */
+  refusal(absolute: string): string | undefined {
+    const real = canonicalPath(absolute)
+    if (isFilesystemRoot(real)) return `${absolute} is a filesystem root and cannot be granted.`
+    const whole = real.slice(path.parse(real).root.length).split(path.sep).join("/")
+    if (!whole) return undefined
+    if (this._blocked?.ignores(whole)) return `${absolute} is kept from the agent by the team's rules.`
+    if (this._base.ignores(whole)) return `${absolute} is ignored and cannot be used.`
+    const external = this.externalRoot(absolute)
+    if (!external) return undefined
+    if (!this.inside(real, external.real)) return `${absolute} leads outside the folder it is in and cannot be used.`
+    const denied = this.externalDenied(external, real, isDirectoryAt(real))
+    if (denied === "blocked") return `${absolute} is kept from the agent by the team's rules.`
+    if (denied === "ignored") return `${absolute} is ignored and cannot be used.`
+    return undefined
+  }
+
+  /** `relative` as an absolute path inside the root, or a reason it is not allowed. */
+  resolve(relative = ".", kind: "file" | "dir" | "any"): string {
+    const cleaned = relative.trim().replace(/^\.\/+/, "") || "."
+    const absolute = this.lexicalOf(relative)
     let real: string
     try {
       real = fs.realpathSync(absolute)
@@ -271,8 +335,11 @@ export class WorkspaceView {
     }
     if (external) {
       // A new file is judged by where its folder really is, since a link
-      // inside a granted folder could put it somewhere never granted.
-      if (!this.inside(realParent, external.real)) {
+      // inside a granted folder could put it somewhere never granted. A
+      // granted file is only ever its own path.
+      const landed = path.join(realParent, path.basename(absolute))
+      const reaches = external.scope === "file" ? landed === external.real : this.inside(realParent, external.real)
+      if (!reaches) {
         throw new ToolInputError(`${cleaned} is outside the workspace.`)
       }
       const denied = this.externalDenied(external, path.join(realParent, path.relative(parent, absolute)), false)
@@ -321,7 +388,7 @@ export class WorkspaceView {
     try {
       const real = path.join(fs.realpathSync(existing), ...rest)
       if (!this.inside(real)) {
-        const granted = authorizedRootOf(real, this._authorized.map((entry) => entry.real))
+        const granted = authorizedRootOf(real, this.authorizedRoots().map((entry) => entry.real))
         if (granted) return real.split(path.sep).join("/")
       }
       return path.relative(this._realRoot, real).split(path.sep).join("/") || "."

@@ -40,15 +40,17 @@ import {
 } from "../../common/constants"
 import { logger } from "../../common/logger"
 import { EditorVisibility, revealEditor, UNSAVED_REQUIRES_VISIBLE } from "../edit/line-edit"
-import type { ChatEditMode, ChatEditOutcome } from "../edit/service"
+import { type ChatEditMode, type ChatEditOutcome, preauthorizedNow } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { stripAnsi, tailOutput } from "../terminal/output"
 import { editDigest } from "../todos/repository"
 import type { EditOperationInput } from "../todos/types"
+import { currentAccessHostKey } from "../tools/access-host"
 import type { Replacement } from "../tools/edit"
 import { isProtectedPath } from "../tools/helpers"
 import { contentHash, LineEditError, lineEditFailure, type LinePatch, planLineEdits } from "../tools/line-edit"
 import { EditorDiagnostic, EditorLocation, EditorSink, FileOpsSink } from "../tools/more"
+import { claimWrites, coversWrites, type OperationAuthorization, type WriteOperation, type WriteRequest } from "../tools/operation-authorization"
 import { WorkspaceView } from "../tools/view"
 import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink } from "../tools/workspace"
 
@@ -441,6 +443,23 @@ export const editorEdits = (
   const blocked = (): EditOutcome | undefined => mutationsBlocked || safety.canMutate?.() === false
     ? { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
     : undefined
+  /** The paths outside the workspace that a call of `operation` changes, unless a preauthorization already covers them. */
+  const outsideWrites = (operation: WriteOperation, paths: string[]): WriteRequest[] =>
+    paths
+      .filter((absolute) => view.outsideLexical(absolute, true) !== undefined && !preauthorizedNow(absolute))
+      .map((absolute) => ({ operation, absolute }))
+  /**
+   * The reason outside changes are refused, unless this call approved them; undefined when all may change.
+   * Checked before any file is read or copied. With `spend`, the approval is claimed right before the change.
+   */
+  const outsideRefusal = (requests: WriteRequest[], write?: OperationAuthorization, spend = false): string | undefined => {
+    if (requests.length === 0) return undefined
+    const approved = spend
+      ? claimWrites(write, requests, currentAccessHostKey())
+      : coversWrites(write, requests, currentAccessHostKey())
+    if (mode === "apply" && approved) return undefined
+    return `${requests.map((request) => view.relative(request.absolute)).join(", ")} is outside the workspace and the change was not approved.`
+  }
   const checkedOutcome = async (file: string, outcome: EditOutcome & { recoveryBaseline?: string[]; diagnosticCheckAvailable?: boolean; diagnosticsObserved?: boolean; diagnosticFailure?: DiagnosticObservation }): Promise<EditOutcome> => {
     if (!outcome.ok || outcome.pending) return outcome
     const introduced = outcome.newErrors ?? 0
@@ -526,9 +545,11 @@ export const editorEdits = (
     async read(file) {
       return (await workspace.openTextDocument(Uri.file(file))).getText()
     },
-    async editLines(file, request, save) {
+    async editLines(file, request, save, write) {
       const denied = blocked()
       if (denied) return { ...denied, error: lineEditFailure("permission_denied", denied.message) }
+      const refused = outsideRefusal(outsideWrites("edit", [file]), write)
+      if (refused) return { ok: false, message: `Not changed: ${refused}`, error: lineEditFailure("permission_denied", "The document is outside the workspace.") }
       if (!save && visibility !== "visible") {
         const error = lineEditFailure("permission_denied", UNSAVED_REQUIRES_VISIBLE)
         return { ok: false, message: error.message, error }
@@ -579,7 +600,7 @@ export const editorEdits = (
         const outcome = await withNewErrors(view, file, "apply", changed, () => held(async () => {
           await changes?.touch(file)
           return (await runCommand<ChatEditOutcome>(
-            TWINNY_COMMAND_NAME.chatFileEdit, { file, lineEdits: request, save, visibility }, "apply"
+            TWINNY_COMMAND_NAME.chatFileEdit, { file, lineEdits: request, save, visibility }, "apply", write
           )) ?? { ok: false, message: "Not changed: the editor did not answer.", error: lineEditFailure("application_failed", "The editor did not answer.") }
         }), async () => { await safety.checkpoints?.markChanged([file]) })
         command = outcome
@@ -596,9 +617,11 @@ export const editorEdits = (
       }
       return { ...checked, contentHash: hash }
     },
-    async edit(file, replacement) {
+    async edit(file, replacement, write) {
       const denied = blocked()
       if (denied) return denied
+      const refused = outsideRefusal(outsideWrites("edit", [file]), write)
+      if (refused) return { ok: false, message: `Not changed: ${refused}` }
       if (modeFor(file) === "apply") await safety.checkpoints?.capture([file])
       let pending: PendingEdit | undefined
       let command: EditOutcome | undefined
@@ -616,7 +639,8 @@ export const editorEdits = (
             return (await runCommand<ChatEditOutcome>(
               TWINNY_COMMAND_NAME.chatFileEdit,
               { file, ...replacement },
-              modeFor(file)
+              modeFor(file),
+              write
             )) ?? { ok: false, message: "Not changed: the editor did not answer." }
           }),
           async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
@@ -629,9 +653,11 @@ export const editorEdits = (
       }
       return checked
     },
-    async create(file, content) {
+    async create(file, content, write) {
       const denied = blocked()
       if (denied) return denied
+      const refused = outsideRefusal(outsideWrites("create", [file]), write)
+      if (refused) return { ok: false, message: `Not created: ${refused}` }
       if (modeFor(file) === "apply" && existsSync(file)) return { ok: false, message: "Not created: " + view.relative(file) + " already exists." }
       if (modeFor(file) === "apply") await safety.checkpoints?.capture([file])
       let pending: PendingEdit | undefined
@@ -648,7 +674,8 @@ export const editorEdits = (
               TWINNY_COMMAND_NAME.chatFileCreate,
               file,
               content,
-              modeFor(file)
+              modeFor(file),
+              write
             )) ?? { ok: false, message: "Not created: the editor did not answer." }
           }),
           async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
@@ -660,10 +687,13 @@ export const editorEdits = (
         if (pending) editOperationsInFlight.delete(pending.id)
       }
     },
-    async remove(file) {
+    async remove(file, write) {
       const relative = view.relative(file)
       const denied = blocked()
       if (denied) return denied
+      const removal = outsideWrites("remove", [file])
+      const refused = outsideRefusal(removal, write)
+      if (refused) return { ok: false, message: `Not deleted: ${refused}` }
       const conflict = safety.goal ? forbiddenDeleteReason(safety.goal, relative) : undefined
       if (conflict) return { ok: false, message: `Not deleted: ${conflict}` }
       const lost = mode === "apply" && !isProtected(file) && !(await recoverableFromGit(file))
@@ -671,6 +701,8 @@ export const editorEdits = (
         return { ok: false, message: "The user chose not to delete it." }
       }
       return held(async () => {
+        const claimed = outsideRefusal(removal, write, true)
+        if (claimed) return { ok: false, message: `Not deleted: ${claimed}` }
         await safety.checkpoints?.capture([file])
         await changes?.touch(file)
         const edit = new WorkspaceEdit()
@@ -682,14 +714,19 @@ export const editorEdits = (
           : { ok: false, message: `The editor refused to delete ${relative}.` }
       })
     },
-    async move(from, to) {
+    async move(from, to, write) {
       const denied = blocked()
       if (denied) return denied
+      const relocation = outsideWrites("move", [from, to])
+      const refused = outsideRefusal(relocation, write)
+      if (refused) return { ok: false, message: `Not moved: ${refused}` }
       const [source, target] = [view.relative(from), view.relative(to)]
       if ((mode === "review" || isProtected(from) || isProtected(to)) && !(await approve(`move ${source} → ${target}`, "change"))) {
         return { ok: false, message: "The user chose not to move it." }
       }
       return held(async () => {
+        const claimed = outsideRefusal(relocation, write, true)
+        if (claimed) return { ok: false, message: `Not moved: ${claimed}` }
         await safety.checkpoints?.capture([from, to])
         await changes?.touch(from)
         await changes?.touch(to)
@@ -800,7 +837,7 @@ export const editorKnowledge = (
       )
     )
   },
-  async rename(file, line, character, newName) {
+  async rename(file, line, character, newName, authorizeOutside) {
     if (safety.canMutate?.() === false) return { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
     let edit: WorkspaceEdit | undefined
     try {
@@ -823,13 +860,26 @@ export const editorKnowledge = (
       }
     }
     // A rename reaches wherever the language server follows the symbol.
-    // It is held to the files the other tools may touch.
-    const beyond = edit.entries().find(([uri]) => uri.scheme !== "file" || !view.visible(uri.fsPath))
+    // Files in the workspace must be ones the other tools may touch; files
+    // outside it must each be authorized for writing before any changes.
+    const beyond = edit
+      .entries()
+      .find(([uri]) => uri.scheme !== "file" || (view.inWorkspace(uri.fsPath) && !view.visible(uri.fsPath)))
     if (beyond) {
       return {
         ok: false,
-        message: `Not renamed: it would change ${beyond[0].fsPath}, which is outside the workspace or ignored.`
+        message: `Not renamed: it would change ${beyond[0].fsPath}, which is ignored or not a file on disk.`
       }
+    }
+    const outside = edit
+      .entries()
+      .map(([uri]) => uri.fsPath)
+      .filter((target) => !view.inWorkspace(target))
+    if (outside.length) {
+      const refusal = authorizeOutside
+        ? await authorizeOutside(outside)
+        : `Not renamed: it would change ${outside[0]}, which is outside the workspace.`
+      if (refusal) return { ok: false, message: refusal }
     }
     const files = edit.entries().map(([uri]) => view.relative(uri.fsPath))
     const changes = edit.entries().reduce((n, [, edits]) => n + edits.length, 0)

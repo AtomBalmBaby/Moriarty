@@ -13,6 +13,7 @@ import { execFile } from "child_process"
 import fs from "fs"
 import path from "path"
 
+import type { AccessPreflight, AccessTarget } from "./access-preflight"
 import {
   gitNamedPaths,
   globToRegExp,
@@ -22,6 +23,7 @@ import {
   withoutHiddenDiffs,
   withoutHiddenLines
 } from "./helpers"
+import type { OperationAuthorization } from "./operation-authorization"
 import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
 import type { EditOutcome, Tool, WorkspaceSearchProvider } from "./workspace"
 
@@ -58,15 +60,18 @@ export interface EditorSink {
   diagnostics(file?: string): Promise<EditorDiagnostic[]>
   references(file: string, line: number, character: number): Promise<EditorLocation[]>
   definition(file: string, line: number, character: number): Promise<EditorLocation[]>
-  /** Rename everywhere the language server knows of; applied or put to the user as the edit mode says. */
-  rename(file: string, line: number, character: number, newName: string): Promise<EditOutcome & { files?: string[] }>
+  /**
+   * Rename everywhere the language server knows of; applied or put to the user as the edit mode says.
+   * Before anything changes, `authorizeOutside` is asked about the affected files outside the workspace; a message back refuses the whole rename.
+   */
+  rename(file: string, line: number, character: number, newName: string, authorizeOutside?: (files: string[]) => Promise<string | undefined>): Promise<EditOutcome & { files?: string[] }>
   context(): Promise<EditorContextView>
 }
 
 /** Deleting and moving files, applied or put to the user as the edit mode says. */
 export interface FileOpsSink {
-  remove(file: string): Promise<EditOutcome>
-  move(from: string, to: string): Promise<EditOutcome>
+  remove(file: string, write?: OperationAuthorization): Promise<EditOutcome>
+  move(from: string, to: string, write?: OperationAuthorization): Promise<EditOutcome>
 }
 
 // The words in a glob, for looking around when it matches nothing:
@@ -392,15 +397,25 @@ export const goToDefinition = (view: WorkspaceView, editor: EditorSink): Tool =>
   }
 })
 
-export const renameSymbol = (view: WorkspaceView, editor: EditorSink): Tool => ({
+export const renameSymbol = (view: WorkspaceView, editor: EditorSink, access?: AccessPreflight): Tool => ({
   name: "rename_symbol",
   description: "Rename a function, class, variable or type everywhere it is used, through the language server. Better than editing each use.",
   parameters: [...SYMBOL_PARAMETERS.slice(0, 2), { name: "new_name", description: "The new name." }, SYMBOL_PARAMETERS[2]],
-  async run({ path: file, symbol, new_name, line }) {
+  async run({ path: file, symbol, new_name, line }, context) {
     const newName = new_name?.trim()
     if (!newName) throw new ToolInputError("rename_symbol needs new_name.")
     const at = await symbolAt(view, file, symbol, line)
-    const outcome = await editor.rename(at.absolute, at.line, at.character, newName)
+    const authorizeOutside = access
+      ? async (files: string[]) => {
+          const verdict = await access.authorize(
+            files.map((target): AccessTarget => ({ path: target, access: "write" })),
+            "rename_symbol",
+            context?.signal
+          )
+          return verdict.ok ? undefined : verdict.message
+        }
+      : undefined
+    const outcome = await editor.rename(at.absolute, at.line, at.character, newName, authorizeOutside)
     view.forgetFiles()
     if (!outcome.ok) {
       return { output: outcome.message, summary: `\`${at.wanted}\` not renamed · ${outcome.message}`, failed: true }
@@ -444,11 +459,11 @@ export const deleteFile = (view: WorkspaceView, ops: FileOpsSink): Tool => ({
   name: "delete_file",
   description: "Delete a file in the workspace.",
   parameters: [{ name: "path", description: "The file to delete." }],
-  async run({ path: file }) {
+  async run({ path: file }, context) {
     if (!file) throw new ToolInputError("delete_file needs a path.")
     const absolute = view.resolve(file, "file")
     const rel = view.relative(absolute)
-    const outcome = await ops.remove(absolute)
+    const outcome = await ops.remove(absolute, context?.write)
     view.forgetFiles()
     return outcome.ok
       ? { output: outcome.message, summary: `deleted \`${rel}\`` }
@@ -464,11 +479,11 @@ export const moveFile = (view: WorkspaceView, ops: FileOpsSink): Tool => ({
     { name: "from", description: "The file now." },
     { name: "to", description: "Where it goes; must not exist yet." }
   ],
-  async run({ from, to }) {
+  async run({ from, to }, context) {
     if (!from || !to) throw new ToolInputError("move_file needs from and to.")
     const source = view.resolve(from, "file")
     const target = view.resolveNew(to)
-    const outcome = await ops.move(source, target)
+    const outcome = await ops.move(source, target, context?.write)
     view.forgetFiles()
     const summary = `\`${view.relative(source)}\` → \`${view.relative(target)}\``
     return outcome.ok

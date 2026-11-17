@@ -12,6 +12,7 @@
 import { TodoRepository } from "../todos/repository"
 import { TodoWriteRequest } from "../todos/types"
 
+import { AccessPreflight,accessTargetsOf } from "./access-preflight"
 import { planReplacement, Replacement } from "./edit"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
 import { contentHash, ContentSource, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
@@ -30,6 +31,7 @@ import {
   moveFile,
   renameSymbol
 } from "./more"
+import type { OperationAuthorization } from "./operation-authorization"
 import { ToolCall, ToolSpec } from "./protocol"
 import { type TodoToolOptions,todoTools } from "./todos"
 import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
@@ -56,9 +58,10 @@ export interface ToolResult {
   observation?: { arguments: Record<string, string> }
 }
 
-/** What a running tool is told: when the user has stopped the reply. */
+/** What a running tool is told: when the user has stopped the reply, and the write its approval allows, if the call needs one outside the workspace. */
 export interface ToolContext {
   signal?: AbortSignal
+  write?: OperationAuthorization
 }
 
 export interface Tool extends ToolSpec {
@@ -92,11 +95,11 @@ const MAX_MATCHED_LINE_CHARS = 2000
 export interface EditSink {
   mode: "apply" | "review"
   read?(file: string): Promise<string | undefined>
-  /** Make or show the change; resolves to what the model is told. */
-  edit(file: string, replacement: Replacement): Promise<EditOutcome>
-  editLines?(file: string, request: LineEditRequest, save: boolean): Promise<EditOutcome>
+  /** Make or show the change; resolves to what the model is told. `write` is the call's approval for a file outside the workspace. */
+  edit(file: string, replacement: Replacement, write?: OperationAuthorization): Promise<EditOutcome>
+  editLines?(file: string, request: LineEditRequest, save: boolean, write?: OperationAuthorization): Promise<EditOutcome>
   /** Make or show a new file; resolves to what the model is told. */
-  create(file: string, content: string): Promise<EditOutcome>
+  create(file: string, content: string, write?: OperationAuthorization): Promise<EditOutcome>
 }
 
 export interface EditOutcome {
@@ -478,12 +481,12 @@ const createFile = (view: WorkspaceView, sink: EditSink): Tool => ({
     { name: "path", description: "Where the new file goes, relative to the workspace root, or an absolute path inside an allowed folder." },
     { name: "content", description: "The whole file." }
   ],
-  async run({ path: file, content }) {
+  async run({ path: file, content }, context) {
     if (content === undefined) throw new ToolInputError("create_file needs content.")
     if (content.length > MAX_NEW_FILE_CHARS) throw new ToolInputError("That file is too large to create in one go.")
     const absolute = view.resolveNew(file)
     const rel = view.relative(absolute)
-    const outcome = await sink.create(absolute, content)
+    const outcome = await sink.create(absolute, content, context?.write)
     if (!outcome.ok) {
       return { output: outcome.message, summary: `\`${rel}\` not created · ${outcome.message}`, failed: true }
     }
@@ -571,8 +574,8 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       }
     }
   },
-  async run(args) {
-    const { path: file, expected_hash, edits, save } = args
+  async run(args, context) {
+      const { path: file, expected_hash, edits, save } = args
     if (!file || !/^(?:xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}|[a-f0-9]{64})$/.test(expected_hash ?? "")) {
       return lineEditErrorResult(lineEditFailure("invalid_range", "path and a valid content fingerprint from read_file are required."))
     }
@@ -590,7 +593,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     try { operations = JSON.parse(edits) } catch {
       return lineEditErrorResult(lineEditFailure("invalid_range", "edits must be a JSON array of line operations."))
     }
-    const outcome = await apply(absolute, { expected_hash, edits: operations }, save !== false)
+    const outcome = await apply(absolute, { expected_hash, edits: operations }, save !== false, context?.write)
     if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
     if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))
     return {
@@ -610,7 +613,7 @@ const editFile = (view: WorkspaceView, sink: EditSink): Tool => ({
     { name: "find", description: "Text already in the file, copied exactly." },
     { name: "replace", description: "What it becomes." }
   ],
-  async run({ path: file, find, replace }) {
+  async run({ path: file, find, replace }, context) {
     if (!file) throw new ToolInputError("edit_file needs a path.")
     if (find === undefined || replace === undefined) {
       throw new ToolInputError("edit_file needs find and replace.")
@@ -623,7 +626,7 @@ const editFile = (view: WorkspaceView, sink: EditSink): Tool => ({
     if (typeof plan === "string") throw new ToolInputError(`${rel}: ${plan}${/[.\n]$/.test(plan) ? "" : "."}`)
     const lines =
       plan.startLine === plan.endLine ? `${plan.startLine + 1}` : `${plan.startLine + 1}–${plan.endLine + 1}`
-    const outcome = await sink.edit(absolute, plan)
+    const outcome = await sink.edit(absolute, plan, context?.write)
     if (!outcome.ok) {
       return { output: outcome.message, summary: `\`${rel}\` not changed · ${outcome.message}`, failed: true }
     }
@@ -847,6 +850,11 @@ export interface ToolExtras {
   todos?: { repository: TodoRepository; scope: TodoWriteRequest; onChanged: () => void; options?: TodoToolOptions }
   /** Tools from MCP servers the user set up, and how to call one. */
   mcp?: McpSink
+  /**
+   * Asks before a call touches a path outside the workspace. Without it,
+   * such paths are refused, as they always were.
+   */
+  access?: AccessPreflight
 }
 
 /**
@@ -896,7 +904,7 @@ export const workspaceTools = (
   if (edits && extras.legacyEditFile) tools.push(editFile(view, edits))
   if (edits) tools.push(createFile(view, edits))
   if (edits?.editLines) tools.push(editLines(view, edits.editLines.bind(edits)))
-  if (edits && editor) tools.push(renameSymbol(view, editor))
+  if (edits && editor) tools.push(renameSymbol(view, editor, extras.access))
   if (edits?.remove && edits.move) {
     const ops = { remove: edits.remove.bind(edits), move: edits.move.bind(edits) }
     tools.push(moveFile(view, ops), deleteFile(view, ops))
@@ -933,10 +941,17 @@ export const workspaceTools = (
   }
 
   async function runTool(tool: Tool, call: ToolCall, context?: ToolContext): Promise<ToolResult> {
+    let write: OperationAuthorization | undefined
     try {
+      if (extras.access) {
+        const outcome = await extras.access.authorize(accessTargetsOf(call.name, call.args), call.name, context?.signal)
+        if (!outcome.ok) return { output: outcome.message, summary: `${call.name} refused · access not granted`, failed: true }
+        write = outcome.write
+      }
       const run = () => {
         if (!tool.readOnly && context?.signal?.aborted) throw new ToolInputError("The execution stopped before this tool could run.")
-        return tool.run(call.args, context)
+        // The write approval comes only from this call's authorization, never from the caller's context.
+        return tool.run(call.args, { ...context, write })
       }
       return withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
     } catch (error) {
@@ -951,6 +966,10 @@ export const workspaceTools = (
       return error instanceof ToolInputError
         ? { output: full, summary: `${call.name} failed · ${message}`, failed: true }
         : { output: `${call.name} could not run: ${message}`, summary: `${call.name} failed · ${message}`, failed: true }
+    } finally {
+      // A once grant was for this call alone, and so is its write approval.
+      extras.access?.endCall()
+      write?.end()
     }
   }
 }

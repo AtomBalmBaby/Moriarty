@@ -79,6 +79,7 @@
     "onCommand:twinny.saveEntireChat",
     "onCommand:twinny.showShortcuts",
     "onCommand:twinny.forgetAlwaysRunCommands",
+    "onCommand:twinny.revokeFileAccess",
     "onCommand:twinny.openPanelChat",
     "onCommand:twinny.openChat",
     "onCommand:twinny.openTeamPlugins",
@@ -359,6 +360,10 @@
       {
         "command": "twinny.forgetAlwaysRunCommands",
         "title": "Twinny - Forget commands set to always run"
+      },
+      {
+        "command": "twinny.revokeFileAccess",
+        "title": "Twinny - Review and revoke always-allowed file access"
       },
       {
         "command": "twinny.newConversation",

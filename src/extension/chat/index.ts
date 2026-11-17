@@ -74,6 +74,9 @@ import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, de
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
+import { AccessStore } from "../tools/access-grants"
+import { currentAccessHostKey } from "../tools/access-host"
+import { createAccessPreflight } from "../tools/access-preflight"
 import { type ContextCapacity, type ContextDiagnostics, type ContextUsage, ContextUsageStore, FALLBACK_CONTEXT_TOKENS } from "../tools/budget"
 import { formatCountedTokens, formatFullRequestTrace, formatRequestBreakdown, type FullRequestPayload, type RequestBreakdown } from "../tools/context-breakdown"
 import { DEFAULT_MAX_STEPS, describeResultBudget, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
@@ -85,6 +88,7 @@ import type { ToolResult } from "../tools/workspace"
 import { readFileSettings, ToolExtras, WorkspaceSearchProvider, WorkspaceTools, workspaceTools } from "../tools/workspace"
 import { getLanguage } from "../utils"
 
+import { chatAccessApprover, pickAlwaysGrantsToRevoke } from "./access-approval"
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
 import { allIntentTasksComplete, classifyUnresolvedPlan, continuationContext, ExecutionReconciliationController, observationReference, unresolvedPlanMessage } from "./execution-reconciliation"
@@ -334,6 +338,8 @@ export class Chat extends Base {
   /** The running conversation's live prompt usage, read by the composer's bar. */
   private readonly _contextUsage = new ContextUsageStore()
   private readonly _steps: ToolSteps
+  /** The files outside the workspace the user has allowed: once and session in memory, always in global storage. */
+  private readonly _accessStore: AccessStore
   private readonly _stopSubscription: { dispose(): void }
   /** What agent replies changed, kept so each can be compared or undone from the chat. */
   private _changes?: { store: ChangeStore; editor: ReplyChangesEditor }
@@ -405,6 +411,7 @@ export class Chat extends Base {
     this._search = search
     this._agents = agents
     this._workspaceSearch = workspaceSearch
+    this._accessStore = new AccessStore(extensionContext.globalState, currentAccessHostKey())
     this._steps = new ToolSteps((steps) => {
       const last = steps[steps.length - 1]
       logger.debug(`[ToolSteps] emit count=${steps.length} last=${last ? `${last.id}:${last.status}` : "none"} at=${Date.now()}`)
@@ -1284,8 +1291,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       // it can be set.
       (workspace.workspaceFolders?.slice(1).filter((folder) => folder.uri.scheme === "file").map((folder) => folder.uri.fsPath) ?? []).concat(
         this.config.get<string[]>("chatToolsAllowedPaths", [])
-      )
+      ),
+      // Grants the user made in the chat, read live so a grant made mid-reply counts from the next call.
+      () => this._accessStore.grants().map((grant) => ({ root: grant.root, real: grant.real, scope: grant.scope }))
     )
+  }
+
+  /** Lets the user review and revoke the always grants for this host. Returns how many were revoked. */
+  public async revokeAlwaysAccess(): Promise<number> {
+    const picked = await pickAlwaysGrantsToRevoke(this._accessStore.always())
+    if (!picked?.length) return 0
+    return this._accessStore.revoke((grant) => picked.includes(grant))
   }
 
   public async evaluateTodoTask(scope: TodoWriteRequest, itemId: string): Promise<TodoListSnapshot> {
@@ -2534,6 +2550,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     } : undefined
     let available = workspaceTools(view, [], {
       workspaceSearch: this._workspaceSearch,
+      access: createAccessPreflight({ store: this._accessStore, view, approve: chatAccessApprover }),
       edits: editorEdits(view, editMode, approveChange, changes, safety, this.config.get<EditorVisibility>("chatToolsEditorVisibility", "background")),
       editor: editorKnowledge(view, editMode, approveChange, changes, safety),
       ...readFileSettings((key, fallback) => this.config.get(key, fallback)),

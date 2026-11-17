@@ -451,11 +451,11 @@ export async function activate(context: ExtensionContext) {
     ),
     commands.registerCommand(
       TWINNY_COMMAND_NAME.chatFileEdit,
-      (proposal: FileEditProposal, mode?: ChatEditMode) => inlineEdit.chatEdit(proposal, mode)
+      (proposal: FileEditProposal, mode?: ChatEditMode, write?: unknown) => inlineEdit.chatEdit(proposal, mode, write)
     ),
     commands.registerCommand(
       TWINNY_COMMAND_NAME.chatFileCreate,
-      (file: string, content: string, mode?: ChatEditMode) => inlineEdit.chatCreate(file, content, mode)
+      (file: string, content: string, mode?: ChatEditMode, write?: unknown) => inlineEdit.chatCreate(file, content, mode, write)
     ),
     commands.registerCommand(TWINNY_COMMAND_NAME.addTests, () =>
       inlineEdit.writeTests()
@@ -614,6 +614,11 @@ export async function activate(context: ExtensionContext) {
           ? `Twinny will ask again before running ${kept.length === 1 ? "the command" : `the ${kept.length} commands`} you chose Always run for.`
           : "No commands were set to always run."
       )
+    }),
+    commands.registerCommand(TWINNY_COMMAND_NAME.revokeFileAccess, async () => {
+      const chat = await requireChat()
+      const revoked = (await chat?.revokeAlwaysAccess()) ?? 0
+      if (revoked) window.showInformationMessage(`Twinny revoked ${revoked === 1 ? "one always-allowed grant" : `${revoked} always-allowed grants`}.`)
     }),
     commands.registerCommand(TWINNY_COMMAND_NAME.openPanelChat, () => {
       commands.executeCommand("workbench.action.closeSidebar")
