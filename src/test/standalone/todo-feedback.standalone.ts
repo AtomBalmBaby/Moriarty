@@ -4909,6 +4909,7 @@ test("a host-verified accepted fact referenced by a TODO that names it is record
     assert.equal(evidence.result, "observed", "a reference is never recorded as a pass")
     assert.match(evidence.summary, new RegExp(`accepted fact ${factId}`))
     assert.match(evidence.summary, new RegExp(before.observationId))
+    assert.ok(before.conversationId, "the fact keeps its originating conversation as provenance")
     assert.match(evidence.summary, new RegExp(before.conversationId))
     assert.match(evidence.summary, new RegExp(before.sourceHash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
 

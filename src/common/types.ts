@@ -96,6 +96,12 @@ export type ChatCompletionMessage = ChatCompletionMessageParam & {
    */
   toolNotes?: string
   /**
+   * The messages the reply's tool steps sent and received, in order, before its final text: the calls and their
+   * results as the model saw them. Kept with the reply so a Continue sends them back, not a summary of them.
+   * Never shown.
+   */
+  toolTranscript?: ChatCompletionMessage[]
+  /**
    * The files agent mode changed while writing this reply, with what it
    * takes to undo them; shown under it, never sent to the model.
    */

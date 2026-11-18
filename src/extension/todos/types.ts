@@ -160,7 +160,8 @@ export interface TodoToolObservationInput {
 /** Stored tool output for one observation, with whatever the store still holds. */
 export interface RetainedObservationEvidence {
   observationId: string
-  itemId: string
+  /** Provenance only: the task active when the observation was recorded. */
+  itemId?: string
   toolName: string
   arguments: Record<string, string>
   failed: boolean
@@ -197,8 +198,10 @@ export interface RequirementActivation {
  */
 export interface AcceptedFact extends TodoSourceFact {
   id: string
-  conversationId: string
-  itemId: string
+  /** Provenance only: the conversation that accepted the fact. It outlives that conversation. */
+  conversationId?: string
+  /** Provenance only: the task the fact was accepted for, never an owner. */
+  itemId?: string
   criterionIndex: number
   criterion: string
   toolName: string

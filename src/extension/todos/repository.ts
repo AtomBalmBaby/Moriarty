@@ -12,6 +12,8 @@ import {
   samePath
 } from "./evidence"
 import { validateIntentTaskPlan } from "./intent-plan"
+import { rootLabelOf } from "./project-home"
+import { SourceRoots } from "./source-roots"
 import { type Database, SqliteFile, type SqliteLocation } from "./sqlite"
 import {
   type AcceptedFact,
@@ -582,8 +584,8 @@ export const DEFAULT_EVIDENCE_STORAGE_LIMITS: EvidenceStorageLimits = { listChar
  */
 interface AcceptedFactRow {
   id: string
-  conversation_id: string
-  item_id: string
+  conversation_id: string | null
+  item_id: string | null
   criterion_index: number
   criterion: string
   observation_id: string
@@ -614,13 +616,13 @@ const ACCEPTED_FACT_COLUMNS = "evidence.id, lists.conversation_id, evidence.item
  */
 const acceptedFactsFor = (database: Database, projectId: string, options: { symbol?: string; path?: string; includeSuperseded?: boolean } = {}): AcceptedFact[] => {
   const facts = rows<AcceptedFactRow>(database,
-    `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id ` +
-    "WHERE lists.project_id = ? ORDER BY evidence.created_at DESC, evidence.id",
+    `SELECT ${ACCEPTED_FACT_COLUMNS} FROM todo_accepted_evidence AS evidence LEFT JOIN todo_lists AS lists ON lists.id = evidence.list_id ` +
+    "WHERE evidence.project_id = ? ORDER BY evidence.created_at DESC, evidence.id",
     [projectId]
   ).map((row) => ({
     id: row.id,
-    conversationId: row.conversation_id,
-    itemId: row.item_id,
+    conversationId: row.conversation_id ?? undefined,
+    itemId: row.item_id ?? undefined,
     criterionIndex: row.criterion_index,
     criterion: row.criterion,
     toolName: row.tool_name,
@@ -657,12 +659,12 @@ const acceptedFactsFor = (database: Database, projectId: string, options: { symb
 const symbolAliasesFor = (database: Database, projectId: string): SymbolAlias[] =>
   rows<{ id: string; conversation_id: string; tool_name: string; implementation: string; path: string; start_line: number; end_line: number; observation_id: string; source_hash: string; created_at: string }>(database,
     "SELECT evidence.id, lists.conversation_id, evidence.registered_tool AS tool_name, evidence.symbol AS implementation, evidence.path, evidence.start_line, evidence.end_line, evidence.observation_id, evidence.source_hash, evidence.created_at " +
-    "FROM todo_accepted_evidence AS evidence JOIN todo_lists AS lists ON lists.id = evidence.list_id " +
-    "WHERE lists.project_id = ? AND evidence.registered_tool IS NOT NULL ORDER BY evidence.created_at DESC, evidence.id",
+    "FROM todo_accepted_evidence AS evidence LEFT JOIN todo_lists AS lists ON lists.id = evidence.list_id " +
+    "WHERE evidence.project_id = ? AND evidence.registered_tool IS NOT NULL ORDER BY evidence.created_at DESC, evidence.id",
     [projectId]
   ).map((row) => ({
     id: row.id,
-    conversationId: row.conversation_id,
+    conversationId: row.conversation_id ?? undefined,
     toolName: row.tool_name,
     implementation: row.implementation,
     path: row.path,
@@ -699,6 +701,7 @@ const observationShows = (
 const recordAcceptedFacts = (
     database: Database,
     listId: string,
+    projectId: string,
     plan: { plan_id: string; revision: number },
     itemId: string,
     evaluation: TodoEvaluation,
@@ -724,8 +727,8 @@ const recordAcceptedFacts = (
     if (fact.registeredTool !== undefined && !fact.registeredTool.trim()) refuse(index, "registered tool name is empty")
     const id = randomUUID()
     execute(database,
-      "INSERT INTO todo_accepted_evidence(id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, registered_tool, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
-      [id, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, fact.registeredTool ?? null, acceptedAt]
+      "INSERT INTO todo_accepted_evidence(id, project_id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, registered_tool, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+      [id, projectId, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, fact.registeredTool ?? null, acceptedAt]
     )
     execute(database,
       "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
@@ -806,8 +809,16 @@ export class TodoRepository {
   // In-memory only: a scoring request in flight. Restarts clear it, and unscored items then read as not evaluated.
   private readonly pendingObservations = new Map<string, Set<string>>()
 
-  constructor(databasePath: SqliteLocation, evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS) {
-    this.sqlite = new SqliteFile(databasePath)
+  constructor(
+    databasePath: SqliteLocation,
+    evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS,
+    roots: () => readonly string[] = () => []
+  ) {
+    this.sqlite = new SqliteFile(databasePath, (database, home) => {
+      const sourceRoots = new SourceRoots(database, home)
+      sourceRoots.home()
+      for (const root of roots()) sourceRoots.register(root, rootLabelOf(root))
+    })
     this.evidenceLimits = evidenceLimits
   }
 
@@ -1203,7 +1214,7 @@ export class TodoRepository {
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
       const prior = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
-        "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE list_id = ? AND request_id = ?", [list.id, input.requestId])[0]
+    "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE project_id = ? AND request_id = ?", [list.project_id, input.requestId])[0]
       if (prior) {
         const priorEvidence = rows<{ retained: number; complete: number; original_chars: number; preserved_chars: number }>(database,
           "SELECT retained, complete, original_chars, preserved_chars FROM todo_tool_evidence WHERE observation_id = ?", [prior.id])[0]
@@ -1233,8 +1244,8 @@ export class TodoRepository {
       }
       const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence, executionId: input.executionId }
       const listRevision = bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
-      execute(database, "INSERT INTO todo_tool_observations(id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [observation.id, list.id, input.itemId, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision, input.executionId ?? null])
+      execute(database, "INSERT INTO todo_tool_observations(id, project_id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [observation.id, list.project_id, list.id, input.itemId ?? null, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision, input.executionId ?? null])
       if (preserved) {
         execute(database, "INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
@@ -1436,7 +1447,7 @@ export class TodoRepository {
         [status, verification, blockedReason, updatedAt, itemId, expectedVersion])
       if (updateResult.changes !== 1) throw new TodoConflictError("TODO changed while applying its evaluation")
       if (observation) recordAssessment(database, list.id, itemId, evaluationId, requestId, observation, expectedVersion + 1)
-      if (evaluation.decision === "accept") recordAcceptedFacts(database, list.id, currentPlan, itemId, evaluation, new Map(observations.map((observation) => [observation.id, observation])), updatedAt)
+      if (evaluation.decision === "accept") recordAcceptedFacts(database, list.id, list.project_id, currentPlan, itemId, evaluation, new Map(observations.map((observation) => [observation.id, observation])), updatedAt)
       bumpList(database, list.id, itemId, "evaluation_recorded", "system", requestId, { decision: evaluation.decision, evaluation: recorded })
       logTodoEvent("feedback.reconciled", { operation_id: list.id, item_id: itemId, decision: evaluation.decision, status, verification, request_id: requestId })
       if (status === "completed") logTodoEvent("todo.completed", { operation_id: list.id, item_id: itemId, verification, request_id: requestId })
@@ -2045,6 +2056,8 @@ export class TodoRepository {
   }
 }
 
+/** The production project key: one project per database, so folder order never splits project evidence. */
+export const PROJECT_FINGERPRINT = "project"
 export const workspaceProjectFingerprint = (workspaceUris: string[]): string => {
   if (!workspaceUris.length) return "unscoped"
   const normalized = workspaceUris.map((uri) => uri.trim()).filter(Boolean).sort()

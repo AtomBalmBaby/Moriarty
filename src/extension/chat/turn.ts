@@ -13,6 +13,7 @@
 import * as cheerio from "cheerio"
 
 import { ASSISTANT, SYSTEM, TOP_LEVEL_MENTIONS, USER } from "../../common/constants"
+import { isContinuationText } from "../../common/messaging/chat-continuation"
 import { ChatCompletionMessage } from "../../common/types"
 
 export type ContextSource = "workspace" | "problems" | "git" | "terminal"
@@ -134,13 +135,32 @@ const TOOL_NOTES_HEADER =
 const NEW_MESSAGE_HEADER = "[The user's new message:]"
 
 /**
+ * The replies a Continue carries on: the assistant replies after the latest real request, joined by the continuation
+ * messages between them. Returns their indexes, not counting the last message, which is the continuation itself.
+ */
+const continuedIndexes = (messages: ChatCompletionMessage[]): Set<number> => {
+  const indexes = new Set<number>()
+  for (let i = messages.length - 2; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role === ASSISTANT) indexes.add(i)
+    else if (message.role === USER && isContinuationText(message.prompt ?? userText(message))) continue
+    else break
+  }
+  return indexes
+}
+
+/**
  * The messages to send for the webview's conversation, whose last message
- * is the user's new question.
+ * is the user's new question. When `continuing`, the replies the question
+ * carries on from are sent with the tool steps they exchanged, as the
+ * model saw them, so it resumes with its own calls and results.
  */
 export const buildChatTurn = async (
   messages: ChatCompletionMessage[],
-  context: TurnContext
+  context: TurnContext,
+  options: { continuing?: boolean } = {}
 ): Promise<ChatCompletionMessage[]> => {
+  const continued = options.continuing ? continuedIndexes(messages) : new Set<number>()
   const history = messages
     .slice(0, -1)
     .map((message) => ({ message, text: modelText(message) }))
@@ -152,10 +172,14 @@ export const buildChatTurn = async (
     contextSources(said),
     history.map(({ message, text }) => ({ ...message, content: text }) as ChatCompletionMessage)
   )
+  // The reply the question carries on from keeps its tool steps in the
+  // transcript, so its notes would say the same twice.
+  const resumed = messages.length - 2
+  const transcribed = continued.has(resumed) && !!messages[resumed].toolTranscript?.length
   // The last reply's notes; when it failed after its tools ran, the error
   // message came after it, and the notes are on the reply before that.
   let notes: string | undefined
-  for (let i = messages.length - 2; i >= 0 && messages[i].role === ASSISTANT && !notes; i--) {
+  for (let i = resumed; i >= 0 && messages[i].role === ASSISTANT && !notes && !transcribed; i--) {
     notes = messages[i].toolNotes?.trim() || undefined
   }
   // The notes go before the question and the question's own context after
@@ -163,7 +187,10 @@ export const buildChatTurn = async (
   const asked = `${question}\n\n${extra.trim()}`.trim()
   return [
     { role: SYSTEM, content: await context.systemPrompt() },
-    ...history.map(({ message, text }) => toApiMessage(message, text)),
+    ...history.flatMap(({ message, text }, index) => {
+      const transcript = continued.has(index) ? message.toolTranscript : undefined
+      return transcript?.length ? [...transcript, toApiMessage(message, text)] : [toApiMessage(message, text)]
+    }),
     toApiMessage(last, notes ? `${TOOL_NOTES_HEADER}\n${notes}\n\n${NEW_MESSAGE_HEADER}\n${asked}` : asked)
   ]
 }

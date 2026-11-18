@@ -294,6 +294,11 @@ export interface ToolLoopOptions {
    * still has them. Undefined when no tool ran.
    */
   onNotes?(notes: string | undefined): void
+  /**
+   * Called when the reply ends, with the messages its tool steps exchanged, as the model saw them (untrimmed only
+   * as far as the context budget required). Empty when no tool ran.
+   */
+  onTranscript?(messages: ChatMessage[]): void
   /** Called last, when the reply is over or was stopped. */
   onEnd?(): void
 }
@@ -581,6 +586,11 @@ class ToolLoop {
   private _mode: ToolMode
   private _effort: ChatRequest["reasoningEffort"]
   private _messages: ChatMessage[] = []
+  /**
+   * The tool messages of this reply, the same objects `_messages` holds from the first tool step on, so trimming
+   * and flattening that change `_messages` change these too.
+   */
+  private _turn: ChatMessage[] = []
   /** The tool and project sections of the system prompt, as `prompt` added them. */
   private _sections: string[] = []
   private _results: ResultSlot[] = []
@@ -623,6 +633,7 @@ class ToolLoop {
       // However the reply ends (answered, stopped, failed), what the tools
       // did is kept for the next turn and the host is told it is over.
       this._options.onNotes?.(this.notes())
+      this._options.onTranscript?.(this._turn)
       this._options.onEnd?.()
     }
   }
@@ -685,6 +696,7 @@ class ToolLoop {
     const definitions = this._workspace.tools.map(toolDefinition)
     const definitionChars = JSON.stringify(definitions).length
     this._messages = this.prompt(request)
+    this._turn = []
 
     // Set once a tool's result says to answer now (an edit waits for review).
     let settled = false
@@ -840,6 +852,7 @@ class ToolLoop {
             this._options.onFallback?.((error as Error).message, "tools")
             this._mode = "text"
             this._messages = this.prompt(request)
+            this._turn = []
             step--
             continue
           }
@@ -855,6 +868,7 @@ class ToolLoop {
             })
             this._flattened = true
             this._messages = flattenToolHistory(this._messages)
+            this._turn = flattenToolHistory(this._turn)
             this._results = []
             this._answered.clear()
             this._mode = "text"
@@ -1108,7 +1122,7 @@ class ToolLoop {
     const at = this._messages.length - 1
     const final = this._messages[at]
     if (this._mode === "text" && final?.role === USER && typeof final.content === "string") {
-      this._messages[at] = { ...final, content: `${final.content}\n\n${message}` }
+      this.replace(at, { ...final, content: `${final.content}\n\n${message}` })
       // The result it follows may be trimmed later; what the user said is not.
       const slot = this._results.find((result) => result.message === at)
       if (slot) slot.after = `${slot.after ?? ""}\n\n${message}`
@@ -1262,10 +1276,24 @@ class ToolLoop {
     if (!parts) return
     const kept = parts.preface ? `${parts.preface}\n\n${output}` : output
     const { message, after } = parts
-    this._messages[slot.message] = (
+    this.replace(slot.message, (
       message.role === "tool" ? { ...message, content: kept } : { ...message, content: toolResultMessage(slot.name, kept) + after }
-    ) as ChatMessage
+    ) as ChatMessage)
     slot.trimmed = true
+  }
+
+  /** Adds a message to the conversation, and to this reply's tool transcript. */
+  private keep(message: ChatMessage) {
+    this._messages.push(message)
+    this._turn.push(message)
+  }
+
+  /** Replaces a message of the conversation, and of this reply's tool transcript when it is kept there. */
+  private replace(at: number, message: ChatMessage) {
+    const previous = this._messages[at]
+    this._messages[at] = message
+    const kept = this._turn.indexOf(previous)
+    if (kept !== -1) this._turn[kept] = message
   }
 
   private trim(slot: ResultSlot) {
@@ -1384,20 +1412,20 @@ class ToolLoop {
         }))
       }
       if (reasoning) assistant.reasoning = reasoning
-      this._messages.push(assistant)
+      this.keep(assistant)
       calls.forEach(({ raw }, i) => {
         slots.push(slot(raw!.name, results[i].preface, `${step}.${i}`))
-        this._messages.push({ role: "tool", tool_call_id: raw!.id, content: results[i].output } as ChatMessage)
+        this.keep({ role: "tool", tool_call_id: raw!.id, content: results[i].output } as ChatMessage)
       })
       this._results.push(...slots)
       return slots
     }
     const name = calls[0].call?.name ?? "error"
     // A call read before its closing marker arrived is recorded closed.
-    this._messages.push({ role: ASSISTANT, content: found?.unclosed ? `${text.trimEnd()}\n${found.unclosed}` : text })
+    this.keep({ role: ASSISTANT, content: found?.unclosed ? `${text.trimEnd()}\n${found.unclosed}` : text })
     slots.push(slot(name, results[0].preface, `${step}.0`))
     this._results.push(...slots)
-    this._messages.push({ role: USER, content: toolResultMessage(name, results[0].output) })
+    this.keep({ role: USER, content: toolResultMessage(name, results[0].output) })
     return slots
   }
 }

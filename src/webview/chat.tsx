@@ -16,6 +16,7 @@ import { ASSISTANT, EVENT_NAME, TODO_EVENT_NAME, USER } from "../common/constant
 import { exportEntireChat } from "../common/conversation-export"
 import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
 import { isStaleTodoSnapshot } from "../common/guards"
+import { CARRY_ON_PROMPT, CONTINUE_PROMPT } from "../common/messaging/chat-continuation"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
 import type { EntireChatAction, PromptCompileResult } from "../common/messaging/protocol"
 import { buildChatRows, type ChatRow } from "../common/reply-parts"
@@ -1133,11 +1134,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         {
           role: USER,
           content: t("reply-continue"),
-          prompt: outOfSteps
-            ? "Carry on with the task from where your last reply got to, using the tools again as you need them. " +
-              "Do not redo steps that already worked."
-            : "Continue exactly where your last reply stopped. " +
-              "Do not repeat anything you already wrote."
+          prompt: outOfSteps ? CARRY_ON_PROMPT : CONTINUE_PROMPT
         }
       ]
       saveLastConversation({ ...conversation, messages: updatedMessages })
@@ -1145,6 +1142,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         messages: updatedMessages,
         mentions: [],
         conversationId: conversation?.id,
+        continuation: { kind: "continue" as const },
       }, storedAgentSelection))
       return updatedMessages
     })

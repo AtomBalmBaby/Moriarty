@@ -474,6 +474,7 @@ export const editorEdits = (
         baseline: outcome.recoveryBaseline,
         diagnosticFailure: outcome.diagnosticFailure,
         checkpoints: safety.checkpoints,
+        checkpointPath: file,
         monitor: safety.diagnosticMonitor,
         errorSpikeThreshold: safety.errorSpikeThreshold,
         blockMutations: () => {
@@ -511,7 +512,7 @@ export const editorEdits = (
       diagnosticsStatus: recovery.diagnosticsStatus,
       reason
     })
-    return { ...outcome, ok: false, message: reason + " Further file mutations are blocked for this execution." }
+    return { ...outcome, ok: false, message: reason + (mutationsBlocked || safety.canMutate?.() === false ? " Further file mutations are blocked for this execution." : " The last safe checkpoint was restored and verified.") }
   }
   const runCommand: EditCommandRunner = safety.runEditCommand ?? ((command, ...args) => commands.executeCommand(command, ...args))
   type PendingEdit = { id: string; ticket?: EditOperationTicket; file: string; preDigest: string }

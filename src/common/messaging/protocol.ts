@@ -131,6 +131,16 @@ export interface ChatRequest {
   /** Files/symbols the user @-mentioned in the composer. */
   mentions: MentionType[]
   conversationId?: string
+  /**
+   * Set when the user pressed Continue on a paused, stopped, or step-limited reply. It names the intent, so the
+   * host resumes the existing task instead of starting a new one from the message text.
+   */
+  continuation?: ChatContinuation
+}
+
+/** The user asked to resume the task the latest reply left off. */
+export interface ChatContinuation {
+  kind: "continue"
 }
 
 export interface ConfigValue<T = unknown> {

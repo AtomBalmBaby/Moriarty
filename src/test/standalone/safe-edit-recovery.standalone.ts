@@ -325,3 +325,73 @@ test("unsafe catastrophic recovery preserves a concurrent edit and reports conte
   assert.match(result?.reason ?? "", /concurrent edit/)
   assert.equal(adapter.files.get("panel.tsx"), "agent change\n")
 })
+
+test("a scoped rollback restores only the affected file and keeps other checkpoints", async () => {
+  const adapter = new MemoryAdapter()
+  adapter.files.set("a.ts", "a before\n")
+  adapter.files.set("b.ts", "b before\n")
+  const checkpoints = new SafeEditCheckpoints(adapter)
+  await checkpoints.capture(["a.ts", "b.ts"])
+  adapter.files.set("a.ts", "a broken\n")
+  adapter.files.set("b.ts", "b verified\n")
+  await checkpoints.markChanged(["a.ts", "b.ts"])
+  assert.deepEqual(await checkpoints.rollback(["a.ts"]), { restored: true, contentVerified: true })
+  assert.equal(adapter.files.get("a.ts"), "a before\n")
+  assert.equal(adapter.files.get("b.ts"), "b verified\n")
+  adapter.files.set("b.ts", "b broken\n")
+  await checkpoints.markChanged(["b.ts"])
+  assert.equal((await checkpoints.rollback(["b.ts"])).restored, true)
+  assert.equal(adapter.files.get("b.ts"), "b before\n")
+})
+
+const preparedRecovery = async (options: { restore?: boolean; diagnostics?: { errors: string[]; version?: number } | { status: "timeout"; errors: string[]; reason: string } } = {}) => {
+  const adapter = new MemoryAdapter()
+  adapter.files.set("panel.tsx", "baseline\n")
+  const checkpoints = new SafeEditCheckpoints(adapter)
+  await checkpoints.capture(["panel.tsx"])
+  adapter.files.set("panel.tsx", "agent change\n")
+  await checkpoints.markChanged(["panel.tsx"])
+  if (options.restore === false) adapter.restore = async () => false
+  let blocked = false
+  const result = await recoverSignificantEdit({
+    file: "panel.tsx", introducedErrors: 20, diagnosticsObserved: true, diagnosticCheckAvailable: true, baseline: [], checkpoints,
+    monitor: new DiagnosticRegressionMonitor(),
+    blockMutations: () => { blocked = true },
+    observeRestoredDiagnostics: async () => options.diagnostics ?? { errors: [], version: 2 }
+  })
+  return { adapter, result, blocked }
+}
+
+test("verified restore with matching diagnostics does not lock further mutations", async () => {
+  const { adapter, result, blocked } = await preparedRecovery()
+  assert.equal(result?.fileVerified, true)
+  assert.equal(result?.diagnosticsVerified, true)
+  assert.equal(blocked, false)
+  assert.equal(adapter.files.get("panel.tsx"), "baseline\n")
+})
+
+test("refused restore keeps further mutations locked", async () => {
+  const { result, blocked } = await preparedRecovery({ restore: false })
+  assert.equal(result?.fileVerified, false)
+  assert.equal(blocked, true)
+})
+
+test("verified restore with unverified diagnostics keeps further mutations locked", async () => {
+  const { result, blocked } = await preparedRecovery({ diagnostics: { status: "timeout", errors: [], reason: "No diagnostics arrived after restore." } })
+  assert.equal(result?.fileVerified, true)
+  assert.equal(result?.diagnosticsVerified, false)
+  assert.equal(blocked, true)
+})
+
+test("a throwing rollback is reported as failed and keeps further mutations locked", async () => {
+  let blocked = false
+  const checkpoints = { rollback: async () => { throw new Error("disk unavailable") } } as unknown as SafeEditCheckpoints
+  const result = await recoverSignificantEdit({
+    file: "panel.tsx", introducedErrors: 20, diagnosticsObserved: true, diagnosticCheckAvailable: true, baseline: [], checkpoints,
+    monitor: new DiagnosticRegressionMonitor(),
+    blockMutations: () => { blocked = true }
+  })
+  assert.equal(result?.fileVerified, false)
+  assert.match(result?.reason ?? "", /Rollback failed: disk unavailable/)
+  assert.equal(blocked, true)
+})

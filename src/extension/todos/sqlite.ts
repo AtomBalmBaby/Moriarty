@@ -3,14 +3,16 @@ import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
 
+import { type ProjectHomeOptions, type ProjectTodoStorage, projectTodoStorageOf, type WorkspaceFolderLocation } from "./project-home"
+import { homePathOfDatabase, SOURCE_ROOT_SCHEMA } from "./source-roots"
+
 const SCHEMA = `
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS todo_projects (
+CREATE TABLE todo_projects (
   id TEXT PRIMARY KEY,
   fingerprint TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS todo_lists (
+CREATE TABLE todo_lists (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES todo_projects(id),
   conversation_id TEXT,
@@ -18,7 +20,7 @@ CREATE TABLE IF NOT EXISTS todo_lists (
   created_at TEXT NOT NULL,
   UNIQUE(project_id, conversation_id)
 );
-CREATE TABLE IF NOT EXISTS todo_items (
+CREATE TABLE todo_items (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   parent_id TEXT REFERENCES todo_items(id),
@@ -35,14 +37,14 @@ CREATE TABLE IF NOT EXISTS todo_items (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS todo_items_list_status ON todo_items(list_id, status, created_at);
-CREATE TABLE IF NOT EXISTS todo_dependencies (
+CREATE INDEX todo_items_list_status ON todo_items(list_id, status, created_at);
+CREATE TABLE todo_dependencies (
   item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
   depends_on_item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
   PRIMARY KEY(item_id, depends_on_item_id),
   CHECK(item_id != depends_on_item_id)
 );
-CREATE TABLE IF NOT EXISTS todo_events (
+CREATE TABLE todo_events (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   item_id TEXT REFERENCES todo_items(id) ON DELETE SET NULL,
@@ -53,8 +55,8 @@ CREATE TABLE IF NOT EXISTS todo_events (
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS todo_events_list_revision ON todo_events(list_id, list_revision);
-CREATE TABLE IF NOT EXISTS todo_evidence (
+CREATE INDEX todo_events_list_revision ON todo_events(list_id, list_revision);
+CREATE TABLE todo_evidence (
   id TEXT PRIMARY KEY,
   item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
@@ -62,7 +64,7 @@ CREATE TABLE IF NOT EXISTS todo_evidence (
   result TEXT NOT NULL CHECK(result IN ('observed','passed','failed')),
   created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS todo_requests (
+CREATE TABLE todo_requests (
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   request_id TEXT NOT NULL,
   operation TEXT NOT NULL,
@@ -70,16 +72,17 @@ CREATE TABLE IF NOT EXISTS todo_requests (
   created_at TEXT NOT NULL,
   PRIMARY KEY(list_id, request_id)
 );
-CREATE TABLE IF NOT EXISTS todo_intent_plans (
+CREATE TABLE todo_intent_plans (
   list_id TEXT PRIMARY KEY REFERENCES todo_lists(id) ON DELETE CASCADE,
   plan_id TEXT NOT NULL,
   revision INTEGER NOT NULL,
   goal TEXT NOT NULL,
   constraints_json TEXT NOT NULL,
   intent_result_json TEXT NOT NULL,
+  answer_json TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS todo_intent_tasks (
+CREATE TABLE todo_intent_tasks (
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   task_id TEXT NOT NULL,
   item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE,
@@ -88,10 +91,11 @@ CREATE TABLE IF NOT EXISTS todo_intent_tasks (
   active INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(list_id, task_id)
 );
-CREATE TABLE IF NOT EXISTS todo_tool_observations (
+CREATE TABLE todo_tool_observations (
   id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  list_id TEXT,
+  item_id TEXT,
   request_id TEXT NOT NULL,
   tool_name TEXT NOT NULL,
   arguments_json TEXT NOT NULL,
@@ -100,10 +104,14 @@ CREATE TABLE IF NOT EXISTS todo_tool_observations (
   exit_code INTEGER,
   created_at TEXT NOT NULL,
   list_revision INTEGER,
-  UNIQUE(list_id, request_id)
+  execution_id TEXT,
+  UNIQUE(project_id, request_id)
 );
-CREATE INDEX IF NOT EXISTS todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision);
-CREATE TABLE IF NOT EXISTS todo_evaluations (
+CREATE INDEX todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision);
+CREATE INDEX todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id);
+CREATE INDEX todo_tool_observations_item ON todo_tool_observations(item_id);
+CREATE INDEX todo_tool_observations_project ON todo_tool_observations(project_id, created_at);
+CREATE TABLE todo_evaluations (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
@@ -114,10 +122,10 @@ CREATE TABLE IF NOT EXISTS todo_evaluations (
   created_at TEXT NOT NULL,
   UNIQUE(list_id, request_id)
 );
-CREATE INDEX IF NOT EXISTS todo_evaluations_item ON todo_evaluations(item_id, created_at);
-CREATE TABLE IF NOT EXISTS todo_tool_evidence (
+CREATE INDEX todo_evaluations_item ON todo_evaluations(item_id, created_at);
+CREATE TABLE todo_tool_evidence (
   observation_id TEXT PRIMARY KEY REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  list_id TEXT,
   content TEXT,
   retained INTEGER NOT NULL DEFAULT 1,
   complete INTEGER NOT NULL,
@@ -126,9 +134,8 @@ CREATE TABLE IF NOT EXISTS todo_tool_evidence (
   metadata_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS todo_tool_evidence_list ON todo_tool_evidence(list_id, retained, created_at);
-PRAGMA user_version = 4;
-CREATE TABLE IF NOT EXISTS todo_child_proposals (
+CREATE INDEX todo_tool_evidence_list ON todo_tool_evidence(list_id, retained, created_at);
+CREATE TABLE todo_child_proposals (
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   request_id TEXT NOT NULL,
   fingerprint TEXT NOT NULL,
@@ -140,13 +147,14 @@ CREATE TABLE IF NOT EXISTS todo_child_proposals (
   created_at TEXT NOT NULL,
   PRIMARY KEY(list_id, request_id)
 );
-CREATE INDEX IF NOT EXISTS todo_child_proposals_fingerprint ON todo_child_proposals(list_id, fingerprint, created_at);
-CREATE TABLE IF NOT EXISTS todo_accepted_evidence (
+CREATE INDEX todo_child_proposals_fingerprint ON todo_child_proposals(list_id, fingerprint, created_at);
+CREATE TABLE todo_accepted_evidence (
   id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  plan_id TEXT NOT NULL,
-  plan_revision INTEGER NOT NULL,
-  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  list_id TEXT,
+  plan_id TEXT,
+  plan_revision INTEGER,
+  item_id TEXT,
   criterion_index INTEGER NOT NULL,
   criterion TEXT NOT NULL,
   observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
@@ -157,14 +165,15 @@ CREATE TABLE IF NOT EXISTS todo_accepted_evidence (
   end_line INTEGER NOT NULL,
   source_hash TEXT NOT NULL,
   superseded_by TEXT REFERENCES todo_accepted_evidence(id) ON DELETE SET NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  registered_tool TEXT
 );
-CREATE INDEX IF NOT EXISTS todo_accepted_evidence_lookup ON todo_accepted_evidence(list_id, symbol, path, superseded_by);
-CREATE INDEX IF NOT EXISTS todo_accepted_evidence_item ON todo_accepted_evidence(item_id, criterion_index);
-CREATE INDEX IF NOT EXISTS todo_accepted_evidence_observation ON todo_accepted_evidence(observation_id);
-CREATE INDEX IF NOT EXISTS todo_accepted_evidence_revision ON todo_accepted_evidence(list_id, plan_id, plan_revision);
-PRAGMA user_version = 6;
-CREATE TABLE IF NOT EXISTS todo_symbol_aliases (
+CREATE INDEX todo_accepted_evidence_lookup ON todo_accepted_evidence(list_id, symbol, path, superseded_by);
+CREATE INDEX todo_accepted_evidence_item ON todo_accepted_evidence(item_id, criterion_index);
+CREATE INDEX todo_accepted_evidence_project ON todo_accepted_evidence(project_id, symbol, path);
+CREATE INDEX todo_accepted_evidence_observation ON todo_accepted_evidence(observation_id);
+CREATE INDEX todo_accepted_evidence_revision ON todo_accepted_evidence(list_id, plan_id, plan_revision);
+CREATE TABLE todo_symbol_aliases (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   tool_name TEXT NOT NULL,
@@ -176,10 +185,9 @@ CREATE TABLE IF NOT EXISTS todo_symbol_aliases (
   source_hash TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS todo_symbol_aliases_tool ON todo_symbol_aliases(tool_name, path);
-CREATE INDEX IF NOT EXISTS todo_symbol_aliases_list ON todo_symbol_aliases(list_id);
-PRAGMA user_version = 7;
-CREATE TABLE IF NOT EXISTS todo_requirement_activations (
+CREATE INDEX todo_symbol_aliases_tool ON todo_symbol_aliases(tool_name, path);
+CREATE INDEX todo_symbol_aliases_list ON todo_symbol_aliases(list_id);
+CREATE TABLE todo_requirement_activations (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
   item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
@@ -189,12 +197,11 @@ CREATE TABLE IF NOT EXISTS todo_requirement_activations (
   activated_at INTEGER NOT NULL,
   UNIQUE(list_id, request_id)
 );
-CREATE INDEX IF NOT EXISTS todo_requirement_activations_item ON todo_requirement_activations(list_id, item_id, list_revision);
-PRAGMA user_version = 11;
-CREATE TABLE IF NOT EXISTS todo_edit_operations (
+CREATE INDEX todo_requirement_activations_item ON todo_requirement_activations(list_id, item_id, list_revision);
+CREATE TABLE todo_edit_operations (
   id TEXT PRIMARY KEY,
   list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  item_id TEXT REFERENCES todo_items(id) ON DELETE CASCADE,
   target TEXT NOT NULL,
   mode TEXT NOT NULL CHECK(mode IN ('apply','review')),
   pre_digest TEXT NOT NULL,
@@ -202,16 +209,115 @@ CREATE TABLE IF NOT EXISTS todo_edit_operations (
   status TEXT NOT NULL CHECK(status IN ('dispatched','succeeded','failed','reconciled_applied','reconciled_absent','diverged')),
   detail TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  owner_id TEXT
 );
-CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
-PRAGMA user_version = 12;
+CREATE INDEX todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
+CREATE TABLE todo_evidence_usage (
+  id TEXT PRIMARY KEY,
+  fact_id TEXT NOT NULL REFERENCES todo_accepted_evidence(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('lookup', 'reuse')),
+  created_at TEXT NOT NULL,
+  UNIQUE (fact_id, kind, execution_id)
+);
+CREATE INDEX todo_evidence_usage_project ON todo_evidence_usage(project_id, fact_id);
+CREATE TABLE todo_assessments (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+  evaluation_id TEXT NOT NULL REFERENCES todo_evaluations(id) ON DELETE CASCADE,
+  evaluation_request_id TEXT NOT NULL,
+  task_version INTEGER NOT NULL,
+  result_version INTEGER NOT NULL,
+  plan_revision INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('assessed', 'unavailable')),
+  progress_score INTEGER CHECK (progress_score BETWEEN 1 AND 5),
+  progress_explanation TEXT,
+  verification_score INTEGER CHECK (verification_score BETWEEN 1 AND 5),
+  verification_explanation TEXT,
+  evidence_refs_json TEXT NOT NULL,
+  reason TEXT,
+  evaluator_provider TEXT NOT NULL,
+  evaluator_model TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (list_id, evaluation_request_id, item_id),
+  CHECK (
+    (status = 'assessed' AND progress_score IS NOT NULL AND progress_explanation IS NOT NULL
+      AND verification_score IS NOT NULL AND verification_explanation IS NOT NULL AND reason IS NULL)
+    OR (status = 'unavailable' AND progress_score IS NULL AND progress_explanation IS NULL
+      AND verification_score IS NULL AND verification_explanation IS NULL AND reason IS NOT NULL)
+  )
+);
+CREATE INDEX todo_assessments_item ON todo_assessments(item_id, created_at);
+CREATE TRIGGER todo_assessments_immutable BEFORE UPDATE ON todo_assessments
+BEGIN SELECT RAISE(ABORT, 'TODO assessments are immutable'); END;
+CREATE TABLE todo_assessment_current (
+  item_id TEXT PRIMARY KEY REFERENCES todo_items(id) ON DELETE CASCADE,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  assessment_id TEXT NOT NULL REFERENCES todo_assessments(id) ON DELETE CASCADE
+);
+CREATE INDEX todo_assessment_current_list ON todo_assessment_current(list_id);
+CREATE TABLE todo_assessment_reactions (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
+  assessment_id TEXT NOT NULL REFERENCES todo_assessments(id) ON DELETE CASCADE,
+  reaction TEXT CHECK (reaction IS NULL OR reaction IN ('agree', 'disagree', 'facepalm')),
+  actor TEXT NOT NULL CHECK (actor = 'user'),
+  request_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (list_id, request_id)
+);
+CREATE INDEX todo_assessment_reactions_assessment ON todo_assessment_reactions(assessment_id, seq);
+CREATE TRIGGER todo_assessment_reactions_append_only BEFORE UPDATE ON todo_assessment_reactions
+BEGIN SELECT RAISE(ABORT, 'TODO assessment reactions are append-only'); END;
+${SOURCE_ROOT_SCHEMA}
+CREATE TABLE observation_source (
+  observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  root_id TEXT NOT NULL REFERENCES source_root(root_id),
+  path TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('read','created','modified','deleted','moved_from','moved_to')),
+  start_line INTEGER,
+  end_line INTEGER,
+  total_lines INTEGER,
+  content_hash TEXT,
+  observed_version TEXT NOT NULL DEFAULT 'disk' CHECK(observed_version IN ('disk','buffer')),
+  editor_version INTEGER,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(observation_id, ordinal)
+);
+CREATE INDEX observation_source_location ON observation_source(root_id, path);
+CREATE INDEX observation_source_hash ON observation_source(content_hash);
+CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE documents (
+  uri TEXT PRIMARY KEY, workspace_uri TEXT NOT NULL, relative_path TEXT NOT NULL,
+  filename TEXT NOT NULL, language_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+  hash_algorithm TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms REAL,
+  text TEXT NOT NULL, indexed_at TEXT NOT NULL, skip_reason TEXT, error TEXT,
+  symbols_fingerprint TEXT, scan_id TEXT
+);
+CREATE INDEX documents_workspace ON documents(workspace_uri);
+CREATE INDEX documents_path ON documents(relative_path);
+CREATE INDEX documents_fingerprint ON documents(fingerprint);
+CREATE TABLE symbols (
+  document_uri TEXT NOT NULL REFERENCES documents(uri) ON DELETE CASCADE,
+  name TEXT NOT NULL, kind TEXT NOT NULL, line INTEGER NOT NULL, column_no INTEGER NOT NULL,
+  end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, container TEXT,
+  PRIMARY KEY(document_uri,name,kind,line,column_no)
+);
+CREATE INDEX symbols_name ON symbols(name);
+CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, relative_path, text);
+PRAGMA user_version = 20;
 `
 
 /** The authoritative native connection type for the TODO database. */
 export type Database = BetterSqlite.Database
 
-const CURRENT_SCHEMA_VERSION = 19
+const CURRENT_SCHEMA_VERSION = 20
 const BUSY_TIMEOUT_MS = 5000
 
 /**
@@ -227,20 +333,31 @@ const sqlitePrebuildBinding = (): string | undefined => {
   return existsSync(binding) ? binding : undefined
 }
 
-const tableColumns = (database: Database, table: string): { name: string; notnull: number }[] =>
-  database.pragma(`table_info(${table})`) as { name: string; notnull: number }[]
+/** A database at any other version is refused: the development phase has no migrations and nothing is changed. */
+const refusedVersion = (version: number, databasePath: string): string => {
+  const direction = version > CURRENT_SCHEMA_VERSION ? "newer" : "older"
+  return `TODO database version ${version} is ${direction} than this Twinny version (v${CURRENT_SCHEMA_VERSION}), so it was left untouched. To reset this development database, delete ${databasePath} and its -wal and -shm sidecars and reopen; Twinny never migrates or deletes a database by itself.`
+}
 
 const schemaVersion = (database: Database): number => Number(database.pragma("user_version", { simple: true }))
 
-const verifyIntegrity = (database: Database): void => {
-  const problems = (database.pragma("integrity_check") as { integrity_check: string }[])
-    .map((row) => row.integrity_check)
+const checkedDatabasePaths = new Set<string>()
+
+/** quick_check once per database path per process, which replaces the full integrity_check on every open. */
+const verifyIntegrity = (database: Database, databasePath: string): void => {
+  if (checkedDatabasePaths.has(databasePath)) return
+  const problems = (database.pragma("quick_check") as { quick_check: string }[])
+    .map((row) => row.quick_check)
     .filter((message) => message !== "ok")
-  if (problems.length > 0) throw new Error(`integrity_check failed: ${problems.slice(0, 5).join("; ")}`)
+  if (problems.length > 0) throw new Error(`quick_check failed: ${problems.slice(0, 5).join("; ")}`)
+  checkedDatabasePaths.add(databasePath)
 }
 
 /** A database path, or a resolver awaited on first use so a failure is reported by the operation that needed the database. */
 export type SqliteLocation = string | (() => Promise<string>)
+
+/** Runs once for a connection after the schema is ready, so the owner can register its project identity. */
+export type DatabaseOpened = (database: Database, home: string) => void
 
 /**
  * The one authoritative native SQLite connection for a TODO database, opened on first use and kept until close().
@@ -255,9 +372,11 @@ export class SqliteFile {
   private connection?: Promise<Database>
   private database?: Database
   private closed = false
+  private readonly onOpened?: DatabaseOpened
 
-  constructor(location: SqliteLocation) {
+  constructor(location: SqliteLocation, onOpened?: DatabaseOpened) {
     this.location = location
+    this.onOpened = onOpened
     if (typeof location === "string") this.databasePath = location
     openSqliteFiles.add(this)
   }
@@ -287,8 +406,9 @@ export class SqliteFile {
       database.pragma("foreign_keys = ON")
       database.pragma("synchronous = FULL")
       if (database.pragma("journal_mode = WAL", { simple: true }) !== "wal") throw new Error("SQLite did not enable WAL journaling")
-      verifyIntegrity(database)
+      verifyIntegrity(database, this.databasePath)
       this.migrate(database)
+      this.onOpened?.(database, homePathOfDatabase(this.databasePath))
       if (this.closed) throw new Error("The Twinny TODO database was closed while opening")
       this.database = database
       return database
@@ -299,216 +419,14 @@ export class SqliteFile {
     }
   }
 
+  /** Version 0 initializes the development schema; version 20 reopens it; any other version is refused. */
   private migrate(database: Database): void {
     const version = schemaVersion(database)
-    if (version > CURRENT_SCHEMA_VERSION) throw new Error(`TODO database version ${version} is newer than this Twinny version`)
-    if (version === CURRENT_SCHEMA_VERSION) return
-    if (version > 0) this.backup(database, version)
-    database.transaction(() => {
-      const current = schemaVersion(database)
-      if (current > CURRENT_SCHEMA_VERSION) throw new Error(`TODO database version ${current} is newer than this Twinny version`)
-      this.applyMigrations(database, current)
-    }).immediate()
-  }
-
-  // VACUUM INTO writes a consistent snapshot, including WAL content, and cannot run inside a transaction.
-  // Each backup gets a new name, so an earlier backup is never overwritten.
-  private backup(database: Database, version: number): void {
-    database.prepare("VACUUM INTO ?").run(`${this.databasePath}.v${version}.${Date.now()}.bak`)
-  }
-
-  private applyMigrations(database: Database, version: number): void {
     if (version === 0) {
-      database.exec(SCHEMA)
-    } else if (version === 1) {
-      database.exec("ALTER TABLE todo_items ADD COLUMN source TEXT NOT NULL DEFAULT 'model' CHECK(source IN ('user','model','intent_compiler'))")
-      database.exec(
-        "CREATE TABLE IF NOT EXISTS todo_intent_plans (list_id TEXT PRIMARY KEY REFERENCES todo_lists(id) ON DELETE CASCADE, plan_id TEXT NOT NULL, revision INTEGER NOT NULL, goal TEXT NOT NULL, constraints_json TEXT NOT NULL, intent_result_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS todo_intent_tasks (list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE, task_id TEXT NOT NULL, item_id TEXT NOT NULL UNIQUE REFERENCES todo_items(id) ON DELETE CASCADE, acceptance_json TEXT NOT NULL, dependencies_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(list_id, task_id)); PRAGMA user_version = 2;"
-      )
+      database.transaction(() => database.exec(SCHEMA)).immediate()
+      return
     }
-    if (version > 0 && version < 3) {
-      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_observations"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
-    } else if (version === 3) {
-      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_tool_evidence"), SCHEMA.indexOf("PRAGMA user_version = 4;") + "PRAGMA user_version = 4;".length))
-    }
-    if (version > 0 && version < 5) {
-      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_child_proposals"), SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence")))
-    }
-    if (version > 0 && version < 6) {
-      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_accepted_evidence"), SCHEMA.indexOf("PRAGMA user_version = 6;") + "PRAGMA user_version = 6;".length))
-    }
-    if (version > 0 && version < 7) {
-      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_symbol_aliases"), SCHEMA.indexOf("PRAGMA user_version = 7;") + "PRAGMA user_version = 7;".length))
-    }
-    if (version > 0 && version < 8) {
-      if (!tableColumns(database, "todo_intent_tasks").some((column) => column.name === "criteria_json")) database.exec("ALTER TABLE todo_intent_tasks ADD COLUMN criteria_json TEXT")
-      database.exec("PRAGMA user_version = 8")
-    }
-    if (version > 0 && version < 9) {
-      // Pre-typed plans have no criteria_json. Their links are deactivated, never deleted; the pre-migration backup keeps the original rows.
-      database.exec("UPDATE todo_intent_tasks SET active = 0 WHERE criteria_json IS NULL")
-      if (tableColumns(database, "todo_intent_tasks").some((column) => column.name === "acceptance_json")) database.exec("ALTER TABLE todo_intent_tasks DROP COLUMN acceptance_json")
-      database.exec("PRAGMA user_version = 9")
-    }
-    if (version > 0 && version < 10) {
-      // Observations record the list revision that ordered them. Legacy rows stay NULL and sort before any new observation.
-      if (!tableColumns(database, "todo_tool_observations").some((column) => column.name === "list_revision")) database.exec("ALTER TABLE todo_tool_observations ADD COLUMN list_revision INTEGER")
-      database.exec("CREATE INDEX IF NOT EXISTS todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision); PRAGMA user_version = 10")
-    }
-    if (version > 0 && version < 11) {
-      // Activations are host-owned and additive: no existing row changes, and a v10 database gains an empty table.
-      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_requirement_activations"), SCHEMA.indexOf("PRAGMA user_version = 11;") + "PRAGMA user_version = 11;".length))
-    }
-    if (version > 0 && version < 12) {
-      // Edit operations are additive: an existing database gains an empty ledger and no existing row changes.
-      database.exec(SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS todo_edit_operations"), SCHEMA.indexOf("PRAGMA user_version = 12;") + "PRAGMA user_version = 12;".length))
-    }
-    if (version < 13) this.migrateEditOperationsToV13(database)
-    if (version < 14) this.migrateEditOperationsToV14(database)
-    if (version < 15) this.migrateIntentPlanAnswerToV15(database)
-    if (version < 16) this.migrateAcceptedEvidenceToV16(database)
-    if (version < 17) this.migrateObservationExecutionToV17(database)
-    if (version < 18) this.migrateEvidenceUsageToV18(database)
-    if (version < 19) this.migrateAssessmentsToV19(database)
-  }
-
-  // v13 makes an operation's task optional so project-scoped edits can be recorded without an active TODO.
-  // Fresh databases pass through here after SCHEMA creates the v12 shape. Only the NOT NULL item column is rebuilt.
-  private migrateEditOperationsToV13(database: Database): void {
-    const itemColumn = tableColumns(database, "todo_edit_operations").find((column) => column.name === "item_id")
-    if (itemColumn?.notnull === 1) {
-      database.exec(`
-CREATE TABLE todo_edit_operations_v13 (
-  id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  item_id TEXT REFERENCES todo_items(id) ON DELETE CASCADE,
-  target TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK(mode IN ('apply','review')),
-  pre_digest TEXT NOT NULL,
-  post_digest TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('dispatched','succeeded','failed','reconciled_applied','reconciled_absent','diverged')),
-  detail TEXT NOT NULL DEFAULT '',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-INSERT INTO todo_edit_operations_v13 (id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at)
-  SELECT id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at FROM todo_edit_operations;
-DROP TABLE todo_edit_operations;
-ALTER TABLE todo_edit_operations_v13 RENAME TO todo_edit_operations;
-CREATE INDEX IF NOT EXISTS todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
-`)
-    }
-    database.exec("PRAGMA user_version = 13")
-  }
-
-  // v14 records the extension host that dispatched each edit. The column is additive; rows from earlier versions keep
-  // a NULL owner, which another host can never settle as absent.
-  private migrateEditOperationsToV14(database: Database): void {
-    if (!tableColumns(database, "todo_edit_operations").some((column) => column.name === "owner_id")) database.exec("ALTER TABLE todo_edit_operations ADD COLUMN owner_id TEXT")
-    database.exec("PRAGMA user_version = 14")
-  }
-
-  // v15 stores the objective answer requirements of an intent plan. The column is additive; plans from earlier versions
-  // have no requirements, which is the same as a plan that asks for none.
-  private migrateIntentPlanAnswerToV15(database: Database): void {
-    if (!tableColumns(database, "todo_intent_plans").some((column) => column.name === "answer_json")) database.exec("ALTER TABLE todo_intent_plans ADD COLUMN answer_json TEXT NOT NULL DEFAULT '[]'")
-    database.exec("PRAGMA user_version = 15")
-  }
-
-  // v16 makes an accepted evidence row the single authority for a tool registration it proves: registered_tool names the
-  // tool, and symbol names the implementation. Rows from earlier versions keep a NULL registered_tool and are not
-  // backfilled from todo_symbol_aliases, because those rows came from the removed line-indentation heuristic. The alias
-  // table is kept unchanged as history and is no longer written or read.
-  private migrateAcceptedEvidenceToV16(database: Database): void {
-    if (!tableColumns(database, "todo_accepted_evidence").some((column) => column.name === "registered_tool")) database.exec("ALTER TABLE todo_accepted_evidence ADD COLUMN registered_tool TEXT")
-    database.exec("PRAGMA user_version = 16")
-  }
-
-  // v17 records the host-generated execution that produced each tool observation, so failures can be reported for the
-  // execution that made them. Rows from earlier versions keep a NULL execution_id: they stay as history and are never
-  // attributed to a later execution. No rows are rewritten or deleted.
-  private migrateObservationExecutionToV17(database: Database): void {
-    if (!tableColumns(database, "todo_tool_observations").some((column) => column.name === "execution_id")) database.exec("ALTER TABLE todo_tool_observations ADD COLUMN execution_id TEXT")
-    database.exec("CREATE INDEX IF NOT EXISTS todo_tool_observations_execution ON todo_tool_observations(list_id, execution_id)")
-    database.exec("PRAGMA user_version = 17")
-  }
-
-  // v18 records project-wide accepted-evidence usage. One row per fact, kind, and execution, so repeated identical
-  // requests within one execution count once, while each execution in any conversation of the project counts once.
-  // Usage rows never change the accepted fact they reference; they are removed only if their fact is removed.
-  private migrateEvidenceUsageToV18(database: Database): void {
-    database.exec(`
-CREATE TABLE IF NOT EXISTS todo_evidence_usage (
-  id TEXT PRIMARY KEY,
-  fact_id TEXT NOT NULL REFERENCES todo_accepted_evidence(id) ON DELETE CASCADE,
-  project_id TEXT NOT NULL REFERENCES todo_projects(id) ON DELETE CASCADE,
-  conversation_id TEXT NOT NULL,
-  execution_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('lookup', 'reuse')),
-  created_at TEXT NOT NULL,
-  UNIQUE (fact_id, kind, execution_id)
-);
-CREATE INDEX IF NOT EXISTS todo_evidence_usage_project ON todo_evidence_usage(project_id, fact_id);
-PRAGMA user_version = 18;`)
-  }
-
-  /**
-   * Observational assessments are additive. Assessments and reactions are immutable history: a new evaluation
-   * supersedes the current projection, and a changed reaction is a new row. Neither table gains execution state.
-   */
-  private migrateAssessmentsToV19(database: Database): void {
-    database.exec(`
-CREATE TABLE IF NOT EXISTS todo_assessments (
-  id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
-  evaluation_id TEXT NOT NULL REFERENCES todo_evaluations(id) ON DELETE CASCADE,
-  evaluation_request_id TEXT NOT NULL,
-  task_version INTEGER NOT NULL,
-  result_version INTEGER NOT NULL,
-  plan_revision INTEGER NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('assessed', 'unavailable')),
-  progress_score INTEGER CHECK (progress_score BETWEEN 1 AND 5),
-  progress_explanation TEXT,
-  verification_score INTEGER CHECK (verification_score BETWEEN 1 AND 5),
-  verification_explanation TEXT,
-  evidence_refs_json TEXT NOT NULL,
-  reason TEXT,
-  evaluator_provider TEXT NOT NULL,
-  evaluator_model TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE (list_id, evaluation_request_id, item_id),
-  CHECK (
-    (status = 'assessed' AND progress_score IS NOT NULL AND progress_explanation IS NOT NULL
-      AND verification_score IS NOT NULL AND verification_explanation IS NOT NULL AND reason IS NULL)
-    OR (status = 'unavailable' AND progress_score IS NULL AND progress_explanation IS NULL
-      AND verification_score IS NULL AND verification_explanation IS NULL AND reason IS NOT NULL)
-  )
-);
-CREATE INDEX IF NOT EXISTS todo_assessments_item ON todo_assessments(item_id, created_at);
-CREATE TRIGGER IF NOT EXISTS todo_assessments_immutable BEFORE UPDATE ON todo_assessments
-BEGIN SELECT RAISE(ABORT, 'TODO assessments are immutable'); END;
-CREATE TABLE IF NOT EXISTS todo_assessment_current (
-  item_id TEXT PRIMARY KEY REFERENCES todo_items(id) ON DELETE CASCADE,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  assessment_id TEXT NOT NULL REFERENCES todo_assessments(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS todo_assessment_current_list ON todo_assessment_current(list_id);
-CREATE TABLE IF NOT EXISTS todo_assessment_reactions (
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  id TEXT NOT NULL UNIQUE,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  assessment_id TEXT NOT NULL REFERENCES todo_assessments(id) ON DELETE CASCADE,
-  reaction TEXT CHECK (reaction IS NULL OR reaction IN ('agree', 'disagree', 'facepalm')),
-  actor TEXT NOT NULL CHECK (actor = 'user'),
-  request_id TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE (list_id, request_id)
-);
-CREATE INDEX IF NOT EXISTS todo_assessment_reactions_assessment ON todo_assessment_reactions(assessment_id, seq);
-CREATE TRIGGER IF NOT EXISTS todo_assessment_reactions_append_only BEFORE UPDATE ON todo_assessment_reactions
-BEGIN SELECT RAISE(ABORT, 'TODO assessment reactions are append-only'); END;
-PRAGMA user_version = 19;`)
+    if (version !== CURRENT_SCHEMA_VERSION) throw new Error(refusedVersion(version, this.databasePath))
   }
 
   async read<T>(operation: (database: Database) => T): Promise<T> {
@@ -538,8 +456,6 @@ export const closeTodoDatabases = (): void => {
   for (const file of [...openSqliteFiles]) file.close()
 }
 
-export const PROJECT_TODO_DIRECTORY = ".twinny"
-export const PROJECT_TODO_DATABASE_NAME = "evidence.sqlite"
 
 const LEGACY_TODO_DATABASE_NAME = "twinny-state.sqlite"
 const LEGACY_TODO_SIDECAR = /^twinny-state\.sqlite(?:-wal|-shm|-journal|\.v\d+\.bak|\.\d+\.[0-9a-f-]{36}\.tmp)$/
@@ -548,34 +464,9 @@ const LOCK_STALE_MS = 120_000
 const GITIGNORE_ENTRY = ".twinny/"
 const GITIGNORE_EQUIVALENTS = new Set([".twinny", ".twinny/", "/.twinny", "/.twinny/"])
 
-export interface WorkspaceFolderLocation {
-  readonly scheme: string
-  readonly fsPath: string
-}
-
-export interface ProjectTodoStorage {
-  readonly projectRoot: string
-  readonly databasePath: string
-}
-
-/** Resolves the single project that owns the TODO database. Never selects one root from several. */
-export const resolveProjectTodoStorage = (folders: readonly WorkspaceFolderLocation[]): ProjectTodoStorage => {
-  if (folders.length === 0) {
-    throw new Error("Twinny TODO storage needs an open project folder to create .twinny/evidence.sqlite")
-  }
-  if (folders.length > 1) {
-    throw new Error("Twinny TODO storage cannot choose between multiple workspace folders; open a single project folder")
-  }
-  const [folder] = folders
-  if (folder.scheme !== "file") {
-    throw new Error(`Twinny TODO storage needs a local project folder, not a "${folder.scheme}" folder`)
-  }
-  const projectRoot = path.resolve(folder.fsPath)
-  return {
-    projectRoot,
-    databasePath: path.join(projectRoot, PROJECT_TODO_DIRECTORY, PROJECT_TODO_DATABASE_NAME)
-  }
-}
+/** The project that owns the project database, decided without workspace folder order. */
+export const resolveProjectTodoStorage = (folders: readonly WorkspaceFolderLocation[], options: ProjectHomeOptions = {}): ProjectTodoStorage =>
+  projectTodoStorageOf({ folders, ...options })
 
 const refuseSymbolicLink = async (target: string): Promise<void> => {
   try {
@@ -593,7 +484,7 @@ export const prepareProjectTodoStorage = async (storage: ProjectTodoStorage): Pr
   await refuseSymbolicLink(directory)
   await fs.mkdir(directory, { recursive: true })
   await refuseSymbolicLink(storage.databasePath)
-  await ensureProjectGitignore(storage.projectRoot)
+  await ensureProjectGitignore(storage.home)
   return storage.databasePath
 }
 

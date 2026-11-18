@@ -85,7 +85,7 @@ export const rankPromotionCandidates = (usage: AcceptedFactUsage[], requestText:
   return usage
     .map((entry) => ({
       entry,
-      relevance: (namedInRequest(requestText, subjects, entry.fact) ? 2 : 0) + (planItems.has(entry.fact.itemId) ? 1 : 0)
+      relevance: (namedInRequest(requestText, subjects, entry.fact) ? 2 : 0) + (entry.fact.itemId !== undefined && planItems.has(entry.fact.itemId) ? 1 : 0)
     }))
     .sort((left, right) =>
       (right.entry.lookups + right.entry.reuses) - (left.entry.lookups + left.entry.reuses)

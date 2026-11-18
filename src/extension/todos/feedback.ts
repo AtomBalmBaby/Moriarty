@@ -298,7 +298,7 @@ export const selectAcceptedFacts = async (
   const relevance = (fact: AcceptedFact): number =>
     (subjects.some((subject) => factMatchesSymbol(fact, subject)) ? RELEVANCE_SYMBOL : 0)
     + (request.text.includes(fact.path) ? RELEVANCE_PATH : 0)
-    + (planItems.has(fact.itemId) ? RELEVANCE_PLAN : 0)
+    + (fact.itemId !== undefined && planItems.has(fact.itemId) ? RELEVANCE_PLAN : 0)
   const ranked = (await assessAcceptedFacts(live, readCurrent))
     .map((status) => ({ status, score: relevance(status.fact) }))
     .sort((left, right) => right.score - left.score
@@ -325,8 +325,8 @@ export interface EvidencePreflightFact {
   endLine: number
   sourceHash: string
   observationId: string
-  itemId: string
-  conversationId: string
+  itemId?: string
+  conversationId?: string
   planRevision: number
   verification: "verified" | "changed" | "unreadable"
 }

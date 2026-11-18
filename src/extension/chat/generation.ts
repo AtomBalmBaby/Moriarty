@@ -35,6 +35,8 @@ const contentLength = (content: ChatCompletionMessage["content"]) =>
 export interface ReplyExtras {
   /** What the reply's tools were asked and returned, kept with it for the next turn; never shown. */
   toolNotes?(): string | undefined
+  /** The messages the reply's tool steps exchanged, kept with it so a Continue sends them back; never shown. */
+toolTranscript?(): ChatCompletionMessage[] | undefined
   /** More about how the reply came about, read once it has ended. */
   meta?(): Partial<ReplyMeta>
   /** True when the reply is worth keeping with no text: its tools ran, and their steps are its record. */
@@ -68,7 +70,7 @@ export class ChatGeneration {
   /** Runs stopped because the user left their conversation: what they wrote is not kept. */
   private readonly _discarded = new WeakSet<GenerationRun>()
   /** The last reply, held back by `ReplyExtras.hold`, until it is released. */
-  private _held?: { content: string; meta: ReplyMeta; toolNotes?: string; changes?: ReplyChangesView }
+  private _held?: { content: string; meta: ReplyMeta; toolNotes?: string; toolTranscript?: ChatCompletionMessage[]; changes?: ReplyChangesView }
   private readonly _stopSubscription: { dispose(): void }
 
   constructor(
@@ -236,7 +238,7 @@ export class ChatGeneration {
       await extras.settle?.()
       // A discarded reply is nobody's: not shown, and not part of the conversation.
       if (this._discarded.has(run)) return ""
-      if (reply || extras.keepEmpty?.()) this.present(holding, reply, finish(), extras.toolNotes?.(), extras.changes?.())
+      if (reply || extras.keepEmpty?.()) this.present(holding, reply, finish(), extras.toolNotes?.(), extras.changes?.(), extras.toolTranscript?.())
       return reply
     } catch (error) {
       operationState = run.signal.aborted ? "cancelled" : "failed"
@@ -246,7 +248,7 @@ export class ChatGeneration {
       const partial = text.trim() === prefix.trim() ? "" : text.trim()
       if (this._discarded.has(run)) return ""
       await extras.settle?.().catch(() => undefined)
-      if (partial || extras.keepEmpty?.()) this.present(holding, partial, finish(), extras.toolNotes?.(), extras.changes?.())
+      if (partial || extras.keepEmpty?.()) this.present(holding, partial, finish(), extras.toolNotes?.(), extras.changes?.(), extras.toolTranscript?.())
       if (!run.signal.aborted) extras.onFailure?.(error)
       this.report(error, provider)
       return partial
@@ -263,12 +265,12 @@ export class ChatGeneration {
   }
 
   /** Shows the reply now, or keeps it back until the host releases it. */
-  private present(holding: boolean, content: string, meta: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView) {
+  private present(holding: boolean, content: string, meta: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView, toolTranscript?: ChatCompletionMessage[]) {
     if (!holding) {
-      this.addMessage(content, meta, toolNotes, changes)
+      this.addMessage(content, meta, toolNotes, changes, toolTranscript)
       return
     }
-    this._held = { content, meta, toolNotes, changes }
+    this._held = { content, meta, toolNotes, toolTranscript, changes }
   }
 
   /**
@@ -280,7 +282,7 @@ export class ChatGeneration {
     this._held = undefined
     if (!held) return
     const meta = unverified ? { ...held.meta, unverified: { ...unverified, detail: unverified.detail?.slice(0, 300) } } : held.meta
-    this.addMessage(held.content, meta, held.toolNotes, held.changes)
+    this.addMessage(held.content, meta, held.toolNotes, held.changes, held.toolTranscript)
   }
 
   /** Drops the held answer when a correction replaces it; its reasoning has already been shown. */
@@ -288,12 +290,13 @@ export class ChatGeneration {
     this._held = undefined
   }
 
-  private addMessage(content: string, meta?: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView) {
+  private addMessage(content: string, meta?: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView, toolTranscript?: ChatCompletionMessage[]) {
     this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
       content,
       role: ASSISTANT,
       ...(meta ? { meta } : {}),
       ...(toolNotes ? { toolNotes } : {}),
+      ...(toolTranscript?.length ? { toolTranscript } : {}),
       ...(changes ? { changes } : {})
     })
   }

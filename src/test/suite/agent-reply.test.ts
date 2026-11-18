@@ -16,6 +16,7 @@ import * as vscode from "vscode"
 
 import { AGENT_SELECTION_STORAGE_KEY } from "../../common/agents"
 import { ACTIVE_CHAT_PROVIDER_STORAGE_KEY, ACTIVE_CONVERSATION_STORAGE_KEY, ACTIVE_INTENT_PROVIDER_STORAGE_KEY, CONTINUATION_PREFIX, EVENT_NAME, GLOBAL_STORAGE_KEY, TODO_EVENT_NAME } from "../../common/constants"
+import { CONTINUE_PROMPT } from "../../common/messaging/chat-continuation"
 import { ChatCompletionMessage, ReplyChangesView, TodoListSnapshot, ToolStepView, TwinnyProvider } from "../../common/types"
 import { AgentRegistry } from "../../extension/agents/registry"
 import { CHILD_TODO_PROTOCOL, FEEDBACK_PLAN_ATTEMPTS } from "../../extension/chat/feedback-planner"
@@ -26,8 +27,8 @@ import { ChatRequest, InferenceError, InferenceProvider, providerRegistry } from
 import { ExtensionBridge } from "../../extension/messaging/bridge"
 import { commandDigest } from "../../extension/todos/evidence"
 import { todoReviewSystemPrompt } from "../../extension/todos/feedback"
-import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import { PROJECT_TODO_DATABASE_NAME, PROJECT_TODO_DIRECTORY } from "../../extension/todos/sqlite"
+import { PROJECT_TODO_DATABASE_NAME, PROJECT_TODO_DIRECTORY } from "../../extension/todos/project-home"
+import { PROJECT_FINGERPRINT, TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import { contentHash } from "../../extension/tools/line-edit"
 import { BaseProvider } from "../../extension/webview/base"
 
@@ -368,6 +369,73 @@ suite("Agent reply, end to end", function () {
       assert.match(revisedSystem, /"revision":2/)
       assert.match(revisedSystem, /The revised acceptance criterion reaches the next request\./)
       assert.doesNotMatch(revisedSystem, /The active task acceptance criterion is visible to the model\./)
+    } finally {
+      chat.dispose()
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("Continue resumes the existing task plan: same plan ID, TODO IDs and goal, and no planning request", async () => {
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-continue-plan-"))
+    const model = new ScriptedModel(["Done.", "Done.", "Done."])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
+    const planner = new ScriptedModel([], JSON.stringify({ track: false, plan: null }))
+    providerRegistry.register("scripted-task-planner", { id: "scripted-task-planner", create: () => planner })
+    const plannerProvider: TwinnyProvider = { ...provider, id: "scripted-task-planner", provider: "scripted-task-planner", type: "intent" }
+    const stored: Record<string, unknown> = { [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider, [ACTIVE_INTENT_PROVIDER_STORAGE_KEY]: plannerProvider }
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(directory, ".twinny-global-storage")),
+      globalState: { get: (key: string) => stored[key], update: async (key: string, value: unknown) => void (stored[key] = value) },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
+    const scope = {
+      projectFingerprint: PROJECT_FINGERPRINT,
+      conversationId: "continue-plan-chat",
+      writer: "continue-plan-chat"
+    }
+    const plan = {
+      planId: "continue-plan",
+      version: 1 as const,
+      revision: 1,
+      goal: "Implement the requested feature while preserving existing behavior.",
+      constraints: ["Preserve existing behavior"],
+      tasks: [
+        { id: "first-task", title: "Implement the focused change", description: "Modify only the relevant feature surface.", criteria: [{ id: "criterion-1", description: "The change is made.", verification: { kind: "semantic_review" } }], dependencies: [] },
+        { id: "second-task", title: "Verify the change", description: "Check the result.", criteria: [{ id: "criterion-1", description: "The result is checked.", verification: { kind: "semantic_review" } }], dependencies: ["first-task"] }
+      ]
+    }
+    await repository.synchronizeIntentPlan(scope, plan, { prompt: "Implement the feature", plan })
+    const chat = new Chat(new GenerationTracker(), undefined, context, new ExtensionBridge(fakeWebview() as unknown as vscode.Webview), undefined, undefined, repository)
+    // The reply a paused turn leaves behind, as the webview sends it back.
+    const paused = { role: "assistant", content: "Partly done.", meta: { task: { state: "paused" } } } as unknown as ChatCompletionMessage
+    try {
+      await settings.update("feedback.enabled", true, vscode.ConfigurationTarget.Global)
+      await chat.completion([{ role: "user", content: "Implement it." }], [], "off", scope.conversationId)
+      const planningRequests = () => planner.requests.filter((request) => /track \(boolean\)/.test(String(request.messages[0]?.content ?? ""))).length
+      const plannerCalls = planningRequests()
+      const before = await repository.getIntentTaskPlan(scope)
+      assert.ok(before, "the plan exists before Continue")
+
+      await chat.completion([{ role: "user", content: "Implement it." }, paused, { role: "user", content: CONTINUE_PROMPT }], [], "off", scope.conversationId, { kind: "continue" })
+      await chat.completion([{ role: "user", content: "Implement it." }, paused, { role: "user", content: CONTINUE_PROMPT }, { role: "assistant", content: "Done.", meta: { stopped: true } } as unknown as ChatCompletionMessage, { role: "user", content: CONTINUE_PROMPT }], [], "off", scope.conversationId, { kind: "continue" })
+
+      assert.equal(planningRequests(), plannerCalls, "Continue sends no planning request")
+      const after = await repository.getIntentTaskPlan(scope)
+      assert.equal(after?.planId, before.planId)
+      assert.equal(after?.revision, before.revision)
+      assert.equal(after?.goal, before.goal, "the original goal is not replaced by the continuation prompt")
+      assert.deepStrictEqual(after?.tasks.map((task) => task.id), before.tasks.map((task) => task.id))
+      assert.equal(model.requests.length, 3, "each Continue reaches the implementing model")
+      await chat.completion([{ role: "user", content: "Implement it." }, paused, { role: "user", content: "continue" }], [], "off", scope.conversationId)
+      assert.equal(planningRequests(), plannerCalls, "a typed continue after a resumable reply resumes without planning")
+      await chat.completion([{ role: "user", content: "continue" }], [], "off", "unrelated-chat")
+      assert.equal(planningRequests(), plannerCalls + 1, "a typed continue in an unrelated chat is an ordinary request and is planned")
     } finally {
       chat.dispose()
       await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)

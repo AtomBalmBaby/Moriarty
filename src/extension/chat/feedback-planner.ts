@@ -659,6 +659,16 @@ export class FeedbackPlanner {
     return this.start(last.scope, last.prompt)
   }
 
+  /**
+   * Whether the scope already has a TODO plan. A continuation resumes that plan rather than planning again, so this is
+   * asked before a continuation decides whether planning is needed at all.
+   */
+  public async hasTaskPlan(scope: TodoWriteRequest): Promise<boolean> {
+    const repository = this._deps.repository()
+    if (!repository) return false
+    return !!(await repository.getIntentTaskPlan(scope))
+  }
+
   public start(scope: TodoWriteRequest, prompt: string, parentOperationId?: string): Promise<FeedbackPlanOutcome> {
     if (!this._deps.enabled()) return Promise.resolve({ status: "disabled" })
     const repository = this._deps.repository()
@@ -979,5 +989,10 @@ export class FeedbackGate {
   public clear() {
     this._epoch++
     this._held = undefined
+  }
+
+  /** Whether a turn of this conversation is held back waiting for its plan. */
+  public isHolding(conversationId: string): boolean {
+    return this._held?.conversationId === conversationId
   }
 }

@@ -10,6 +10,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
 
+import { CARRY_ON_PROMPT, CONTINUE_PROMPT, isContinuationText, requestBehindContinuation } from "../../common/messaging/chat-continuation"
 import { shouldResumeQueuedChat } from "../../common/messaging/chat-stop"
 import { ChatCompletionMessage } from "../../common/types"
 import { buildChatTurn } from "../../extension/chat/turn"
@@ -786,6 +787,75 @@ test("in text mode a call is taken the moment its JSON closes and recorded with 
   )
 })
 
+test("a continuation is recognised from the Continue button or typed, and is not mistaken for a new request", () => {
+  for (const text of [CONTINUE_PROMPT, CARRY_ON_PROMPT, "continue", " Continue. ", "resume", "keep going"]) {
+    assert.equal(isContinuationText(text), true, text)
+  }
+  for (const text of ["Fix the parser", "continue the refactor of parser.ts", "Also add tests"]) {
+    assert.equal(isContinuationText(text), false, text)
+  }
+})
+
+test("a continuation carries on from the request before it, through chained continues", () => {
+  assert.equal(requestBehindContinuation(["Fix the parser", "continue"]), "Fix the parser")
+  assert.equal(requestBehindContinuation(["Fix the parser", CONTINUE_PROMPT, "resume"]), "Fix the parser")
+  assert.equal(requestBehindContinuation(["Fix the parser", "Also add tests"]), "Also add tests")
+  assert.equal(requestBehindContinuation(["Fix the parser"]), "Fix the parser")
+  assert.equal(requestBehindContinuation(["continue"]), "continue")
+  assert.equal(requestBehindContinuation([]), undefined)
+})
+
+const toolStep = (id: string, file: string, output: string) =>
+  [
+    { role: "assistant", content: "", tool_calls: [{ id, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: file }) } }] },
+    { role: "tool", tool_call_id: id, content: output }
+  ] as unknown as ChatCompletionMessage[]
+
+const roles = (messages: ChatCompletionMessage[]) => messages.map((message) => message.role)
+const textOf = (message: ChatCompletionMessage) =>
+  typeof message.content === "string"
+    ? message.content
+    : (message.content as Array<{ text: string }>).map((part) => part.text).join("")
+
+test("a Continue sends the reply it carries on with its tool steps, once, and without the notes that repeat them", async () => {
+  const context = { systemPrompt: async () => "s", additionalContext: async () => "" }
+  const replied = [
+    { role: "user", content: "<p>Fix the parser</p>" },
+    { role: "assistant", content: "I read it.", toolNotes: "read_file {\"path\":\"a.ts\"}\n1: x", toolTranscript: toolStep("call-1", "a.ts", "1: x") },
+    { role: "user", content: "continue" }
+  ] as ChatCompletionMessage[]
+  const turn = await buildChatTurn(replied, context, { continuing: true })
+  assert.deepStrictEqual(roles(turn), ["system", "user", "assistant", "tool", "assistant", "user"])
+  assert.strictEqual(turn[3].tool_call_id, "call-1", "the result is paired with its call")
+  assert.strictEqual(turn.filter((message) => textOf(message) === "I read it.").length, 1, "the reply's text is sent once")
+  assert.strictEqual(textOf(turn[turn.length - 1]), "continue", "the question is the continuation itself, with no notes ahead of it")
+  assert.ok(!JSON.stringify(turn).includes("[For reference"), "the transcript replaces the notes")
+
+  const notContinued = await buildChatTurn(replied, context)
+  assert.deepStrictEqual(roles(notContinued), ["system", "user", "assistant", "user"], "without Continue the tool steps are not sent")
+  assert.match(textOf(notContinued[notContinued.length - 1]), /^\[For reference: [^\n]*\]\nread_file \{"path":"a\.ts"\}\n1: x/)
+})
+
+test("chained Continues each send their own tool steps once, in order, with the continuations between them", async () => {
+  const turn = await buildChatTurn(
+    [
+      { role: "user", content: "<p>Fix the parser</p>" },
+      { role: "assistant", content: "First.", toolNotes: "read_file a", toolTranscript: toolStep("call-1", "a.ts", "1: a") },
+      { role: "user", content: "continue" },
+      { role: "assistant", content: "Second.", toolNotes: "read_file b", toolTranscript: toolStep("call-2", "b.ts", "1: b") },
+      { role: "user", content: "resume" }
+    ] as ChatCompletionMessage[],
+    { systemPrompt: async () => "s", additionalContext: async () => "" },
+    { continuing: true }
+  )
+  assert.deepStrictEqual(roles(turn), ["system", "user", "assistant", "tool", "assistant", "user", "assistant", "tool", "assistant", "user"])
+  assert.deepStrictEqual(
+    turn.filter((message) => message.role === "tool").map((message) => message.tool_call_id),
+    ["call-1", "call-2"]
+  )
+  assert.strictEqual(textOf(turn[turn.length - 1]), "resume")
+})
+
 test("the previous reply's tool notes travel with the next question, once", async () => {
   const turn = await buildChatTurn(
     [
@@ -1034,7 +1104,21 @@ test("a call fenced as JSON inside tool_call tags is still a call", async () => 
   assert.strictEqual(text, "It is 1.")
 })
 
+test("the tool steps behind a reply are handed on for a Continue, with each result as the model saw it", async () => {
+  const root = workspace({ "lib/a.ts": "export const answer = 42\n" })
+  const { client, requests } = scripted([{ calls: [read("1", "lib/a.ts")] }, "42."])
+  let transcript: ChatCompletionMessage[] = []
+  await collect(withTools(client, workspaceTools(root), { mode: "native", onTranscript: (messages) => (transcript = structuredClone(messages) as ChatCompletionMessage[]) }).chat(ask("Read.")))
+  assert.deepStrictEqual(roles(transcript), ["assistant", "tool"], "the user's request is not part of the steps")
+  assert.strictEqual(transcript[0].tool_calls?.[0]?.id, "1")
+  assert.strictEqual(transcript[1].tool_call_id, "1")
+  const seen = requests[1].messages.find((message) => message.role === "tool" && message.tool_call_id === "1")
+  assert.deepStrictEqual(transcript[1].content, seen?.content, "the transcript holds the result the next request showed the model")
+  assert.match(String(transcript[1].content), /answer = 42/)
+})
+
 test("the next turn's notes keep what a tool returned, not the folder's instructions ahead of it", async () => {
+
   const root = workspace({ "lib/AGENTS.md": "x".repeat(3000), "lib/a.ts": "export const answer = 42\n" })
   const { client } = scripted([{ calls: [read("1", "lib/a.ts")] }, "42."])
   let notes: string | undefined

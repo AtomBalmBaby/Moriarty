@@ -43,7 +43,7 @@ export const authoritativeExecutionReport = (outline: IntentPlanOutline, failedO
  */
 export const acceptedFactEntry = ({ fact, freshness, reason }: AcceptedFactStatus): string => [
   `- ${fact.id} [${freshness}] ${fact.symbol} (${fact.toolName}) ${fact.path} lines ${fact.startLine}-${fact.endLine}`,
-  `  fingerprint ${fact.sourceHash}; observation ${fact.observationId}; task ${fact.itemId}`,
+  `  fingerprint ${fact.sourceHash}; observation ${fact.observationId}${fact.itemId ? `; task ${fact.itemId}` : "; no originating task recorded"}`,
   ...(reason ? [`  status: ${clip(reason, 160)}`] : [])
 ].join("\n")
 

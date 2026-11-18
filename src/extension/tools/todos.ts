@@ -449,7 +449,7 @@ const acceptedFactReference = async (
   const evidence = await repository.addEvidence(scope, {
     itemId,
     kind: "accepted_fact",
-    summary: `Host-verified accepted fact ${fact.id}: ${fact.symbol} in ${fact.path} lines ${fact.startLine}-${fact.endLine}, fingerprint ${fact.sourceHash}, observation ${fact.observationId}, from conversation ${fact.conversationId}, accepted ${fact.acceptedAt}.`,
+    summary: `Host-verified accepted fact ${fact.id}: ${fact.symbol} in ${fact.path} lines ${fact.startLine}-${fact.endLine}, fingerprint ${fact.sourceHash}, observation ${fact.observationId}, ${fact.conversationId ? `from conversation ${fact.conversationId}` : "with no originating conversation recorded"}, accepted ${fact.acceptedAt}.`,
     result: "observed",
     requestId
   })

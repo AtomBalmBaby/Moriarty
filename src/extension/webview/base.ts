@@ -45,7 +45,7 @@ import { TeamPluginsBridge, TeamShareBridge } from "../team/bridge"
 import type { TeamPlugins } from "../team/plugins-page"
 import { TeamShare } from "../team/share"
 import { TemplateProvider } from "../templates/provider"
-import { TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../todos/repository"
+import { DEFAULT_EVIDENCE_STORAGE_LIMITS, PROJECT_FINGERPRINT, TodoRepository, trustedTodoPanelApproval } from "../todos/repository"
 import { prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase } from "../todos/sqlite"
 import type { CreateTodoInput, TodoWriteRequest, UpdateTodoInput } from "../todos/types"
 import type { WorkspaceSearchProvider } from "../tools/workspace"
@@ -61,9 +61,18 @@ const storageKeyFor = (scope: string, key: string) => `${scope}-${key}`
 /** Set once the extension-global TODO database has been retired, so that removal never repeats. */
 const LEGACY_TODO_RETIRED_KEY = "twinny.legacyTodoDatabaseRetired"
 
-/** The TODO database belongs to the single open project; throws when the workspace has none or several. */
-const currentProjectTodoStorage = () =>
-  resolveProjectTodoStorage((vscode.workspace.workspaceFolders ?? []).map((folder) => ({ scheme: folder.uri.scheme, fsPath: folder.uri.fsPath })))
+/** `workspaceFileUri` is the current form; `workspaceFile` is the older one the extension typings still declare. */
+const savedWorkspaceFile = (): string | undefined =>
+  ((vscode.workspace as { workspaceFileUri?: vscode.Uri }).workspaceFileUri ?? vscode.workspace.workspaceFile)?.fsPath
+
+/**
+ * The folder that owns the project database, chosen without workspace folder order. The home says where the
+ * database lives; it never says which paths a tool may reach.
+ */
+const currentProjectTodoStorage = () => resolveProjectTodoStorage(
+  (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ scheme: folder.uri.scheme, fsPath: folder.uri.fsPath })),
+  { workspaceFile: savedWorkspaceFile(), projectHome: vscode.workspace.getConfiguration("twinny").get<string>("projectHome") }
+)
 
 let legacyTodoRetirement: Promise<void> | undefined
 
@@ -111,7 +120,7 @@ export class BaseProvider {
     workspaceSearch?: WorkspaceSearchProvider
   ) {
     this.context = context
-    this._todoRepository = new TodoRepository(async () => prepareProjectTodoStorage(currentProjectTodoStorage()))
+    this._todoRepository = new TodoRepository(async () => prepareProjectTodoStorage(currentProjectTodoStorage()), DEFAULT_EVIDENCE_STORAGE_LIMITS, () => currentProjectTodoStorage().roots)
     this._agentRegistry = new AgentRegistry(context)
     this._fileTreeProvider = new FileTreeProvider()
     this._workspaceIndex = index
@@ -195,7 +204,7 @@ export class BaseProvider {
   private todoReadScope(conversationId: string) {
     if (!conversationId) throw new Error("A conversation is required")
     return {
-      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      projectFingerprint: PROJECT_FINGERPRINT,
       conversationId
     }
   }
@@ -334,13 +343,13 @@ export class BaseProvider {
         return profiles
       },
       [EVENT_NAME.twinnyPromptInstructions]: (request) => this.promptInstructions(request),
-      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection, conversationId }) => {
+      [EVENT_NAME.twinnyChatMessage]: ({ messages, mentions, agentSelection, conversationId, continuation }) => {
         if (!this.chat) {
           this.bridge?.emit(EVENT_NAME.twinnyNotification, "The chat is not ready. Reload the window and send again.")
           this.bridge?.emit(EVENT_NAME.twinnyStopGeneration, { cancelled: true })
           return
         }
-        void this.chat.completion(messages, mentions, agentSelection, conversationId).catch((error: unknown) => {
+        void this.chat.completion(messages, mentions, agentSelection, conversationId, continuation).catch((error: unknown) => {
           logger.error(`[Chat] message failed conversation=${conversationId ?? "-"}: ${error instanceof Error ? error.message : String(error)}`)
           this.bridge?.emit(EVENT_NAME.twinnyNotification, "The message could not be sent. See the Twinny output log for details.")
         })

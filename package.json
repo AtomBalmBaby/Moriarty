@@ -989,6 +989,13 @@
           "markdownDescription": "Folders outside the workspace folder the chat's tools may read, list and write in: one path per line, absolute, or starting with `~` for your home folder. A relative path, a blank line or the root of the disk does not grant anything. Only your own settings can hold this: a workspace or folder setting is not read, and a team policy cannot grant it. The rules that hold everywhere - `.git`, `node_modules` and `twinny.embeddingIgnoredGlobs` - and the team's blocked paths still hold there. These folders are not searched by meaning and never written into the project's index.",
           "scope": "machine"
         },
+        "twinny.projectHome": {
+          "order": 20,
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Where this machine keeps the project database, as `<home>/.twinny/project.sqlite`. A single-folder window uses that folder; a saved multi-root workspace uses the folder holding its `.code-workspace` file; otherwise the first workspace folder in path order. This says only where the database lives - it never decides which paths a tool may read, list or write, and the folder is never searched by meaning.",
+          "scope": "machine"
+        },
         "twinny.chatToolsEditorVisibility": {
           "order": 20,
           "type": "string",

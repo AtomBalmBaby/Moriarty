@@ -32,7 +32,8 @@ import {
   RoleSelection
 } from "../../common/feedback-settings"
 import { formatCount, logger, redact } from "../../common/logger"
-import type { ComposerTurn, ContextWindowStatus, PromptCompileRequest, PromptCompileResult, ToolInventoryItem } from "../../common/messaging/protocol"
+import { isContinuationText, isResumableReply, requestBehindContinuation } from "../../common/messaging/chat-continuation"
+import type { ChatContinuation, ComposerTurn, ContextWindowStatus, PromptCompileRequest, PromptCompileResult, ToolInventoryItem } from "../../common/messaging/protocol"
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
 import { kebabToSentence } from "../../common/text"
@@ -72,7 +73,7 @@ import { compactEvidenceText, compactToolEvidence, observationArguments } from "
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
 import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
-import { editDigest, TodoRepository, workspaceProjectFingerprint } from "../todos/repository"
+import { editDigest, PROJECT_FINGERPRINT, TodoRepository } from "../todos/repository"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
 import { AccessStore } from "../tools/access-grants"
 import { currentAccessHostKey } from "../tools/access-host"
@@ -496,7 +497,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const todoInventory = this._todoRepository ? todoTools(
       this._todoRepository,
       {
-        projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+        projectFingerprint: PROJECT_FINGERPRINT,
         conversationId: inventoryConversationId,
         writer: inventoryConversationId
       },
@@ -672,12 +673,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   /**
    * Feedback plans TODOs from every ordinary user message, compiled or not,
    * on its own provider and alongside the reply. Planning reads the execution
-   * prompt, the text the agent acts on. Continuation turns bypass this path,
-   * so they keep the plan they continue.
+   * prompt, the text the agent acts on. A continuation keeps the plan it
+   * resumes instead, see keepsTaskPlan.
    */
   private startFeedbackPlanning(messages: ChatCompletionMessage[]): Promise<FeedbackPlanOutcome> | undefined {
     const scope = this.activeTodoScope()
-    const text = this.latestUserText(messages)
+    // A continuation plans the request it carries on from, so Continue does not replace the plan with its own wording.
+    const text = this.requestText(messages)
     if (!scope || !text) {
       logger.debug(`[Feedback] planning not started: ${scope ? "the latest message has no text" : "this conversation has no TODO scope"}`)
       return undefined
@@ -685,11 +687,55 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return this._feedbackPlanner.start(scope, text)
   }
 
+  /**
+   * Whether the message resumes the task it follows. The Continue button says so
+   * explicitly, when a reply exists to resume. Typed "continue" counts only after
+   * a resumable reply; in a new chat it is an ordinary request.
+   */
+  private isContinuation(messages: ChatCompletionMessage[], continuation?: ChatContinuation): boolean {
+    if (messages.at(-1)?.role !== USER) return false
+    // Host notices, such as a pause reason, can follow a reply, so the reply is the nearest one that carries meta.
+    let reply: ChatCompletionMessage | undefined
+    for (let index = messages.length - 2; index >= 0; index -= 1) {
+      const message = messages[index]
+      if (message.role === USER) break
+      if (message.role === ASSISTANT && message.meta) {
+        reply = message
+        break
+      }
+    }
+    if (!reply) return false
+    if (continuation?.kind === "continue") return true
+    const latest = messages[messages.length - 1]
+    return isContinuationText(this.userMessageText(latest) ?? "") && isResumableReply(reply)
+  }
+
+  /**
+   * Whether a continuation keeps the scope's existing TODO plan instead of planning again. A held turn still plans,
+   * so the gate can release it; Continue must not bypass that.
+   */
+  private async keepsTaskPlan(conversationId?: string): Promise<boolean> {
+    const scope = this.activeTodoScope()
+    if (!scope || this._feedbackGate.isHolding(conversationId ?? "")) return false
+    return this._feedbackPlanner.hasTaskPlan(scope)
+  }
+
   /** The text of the latest user message, as the user typed it. */
   private latestUserText(messages: ChatCompletionMessage[]): string | undefined {
     const latest = messages.at(-1)
     if (latest?.role !== USER) return undefined
-    const source = typeof latest.prompt === "string" && latest.prompt.trim() ? latest.prompt : latest.content
+    return this.userMessageText(latest)
+  }
+
+  /** The request the latest message is about: a continuation is about the request it carries on from. */
+  private requestText(messages: ChatCompletionMessage[]): string | undefined {
+    if (messages.at(-1)?.role !== USER) return undefined
+    const texts = messages.filter((message) => message.role === USER).map((message) => this.userMessageText(message) ?? "")
+    return requestBehindContinuation(texts) || undefined
+  }
+
+  private userMessageText(message: ChatCompletionMessage): string | undefined {
+    const source = typeof message.prompt === "string" && message.prompt.trim() ? message.prompt : message.content
     const text = (typeof source === "string" ? source : normalizeText(source))
       .replace(/<br\s*\/?>/gi, "\n")
       .replace(/<[^>]+>/g, "")
@@ -832,7 +878,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     messages: ChatCompletionMessage[],
     mentions?: MentionType[],
     requestedSelection?: AgentSelection,
-    conversationId?: string
+    conversationId?: string,
+    continuation?: ChatContinuation
   ): Promise<string | undefined> {
     this._activeConversationId = conversationId
     this._evidencePreflight = undefined
@@ -845,7 +892,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         this._bridge.emit(EVENT_NAME.twinnyNotification, "No chat provider is configured. Choose one in Twinny settings, then send again.")
         return undefined
       }
-      return this.completionReply(provider, messages, mentions, requestedSelection, conversationId)
+      return this.completionReply(provider, messages, mentions, requestedSelection, conversationId, continuation)
     })
   }
 
@@ -854,7 +901,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     messages: ChatCompletionMessage[],
     mentions?: MentionType[],
     requestedSelection?: AgentSelection,
-    conversationId?: string
+    conversationId?: string,
+    continuation?: ChatContinuation
   ): Promise<string | undefined> {
     this._editRecoveryNotes = await this.reconcileEditOperations()
     // Gathering context can take a while (a workspace search, the team's
@@ -939,15 +987,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
       // Mycroft starts only after Feedback has produced an authoritative plan
       // (or Feedback is off). The gate holds the turn on any other outcome.
-      this._userRequestsTodo = userRequestsTodoCreation(this.latestUserText(messages) ?? "")
+      this._userRequestsTodo = userRequestsTodoCreation(this.requestText(messages) ?? "")
       const feedbackOn = isFeedbackEnabled(workspace.getConfiguration("twinny"))
       if (!feedbackOn) logger.debug("[Feedback] planning not started: Feedback is off")
-      const planning = feedbackOn ? this.startFeedbackPlanning(messages) : undefined
+      const continuing = this.isContinuation(messages, continuation)
+      // A continuation resumes the task's open TODO plan; it is not planned again, so its goal and TODO IDs stay.
+      const keepPlan = feedbackOn && continuing && await this.keepsTaskPlan(conversationId)
+      if (keepPlan) logger.debug(`[Feedback] continuation keeps the existing TODO plan; planning not started conversation=${conversationId ?? "-"}`)
+      if (continuing) {
+        const transcriptMessages = messages.reduce((count, message) => count + (message.toolTranscript?.length ?? 0), 0)
+        logger.debug(`[Continue] resumes the same task conversation=${conversationId ?? "-"} messages=${messages.length} retainedToolMessages=${transcriptMessages} plan=${keepPlan ? "kept" : feedbackOn ? "planned-from-request" : "feedback-off"}`)
+      }
+      const planning = feedbackOn && !keepPlan ? this.startFeedbackPlanning(messages) : undefined
       const dispatch = async (): Promise<string | undefined> => {
         // A turn whose operation was cancelled while it waited for planning must not start.
         if (this._lifecycle.contextCancelled) return undefined
-        this._replyText = this.latestUserText(messages) ?? ""
-        this._evidencePreflight = await this.runEvidencePreflight(this.latestUserText(messages) ?? "")
+        this._replyText = this.requestText(messages) ?? ""
+        this._evidencePreflight = await this.runEvidencePreflight(this.requestText(messages) ?? "")
         this._preparing = true
         try {
           this._conversation = await buildChatTurn(messages, {
@@ -980,7 +1036,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
               const hint = view ? editorHint(view) : ""
               return hint ? `${hint}\n\n${context}` : context
             }
-          })
+          }, { continuing })
         } finally {
           this._preparing = false
         }
@@ -1900,7 +1956,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   private activeTodoScope(): TodoWriteRequest | undefined {
     if (!this._todoRepository || !this._activeConversationId) return undefined
     return {
-      projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      projectFingerprint: PROJECT_FINGERPRINT,
       conversationId: this._activeConversationId,
       writer: this._activeConversationId
     }
@@ -2115,7 +2171,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   private async runEvidencePreflight(text: string): Promise<string | undefined> {
     if (!this._todoRepository || !workspace.workspaceFolders?.length || !isEvidenceFirstRequest(text)) return undefined
     const request = {
-      projectFingerprint: workspaceProjectFingerprint(workspace.workspaceFolders.map((folder) => folder.uri.toString(true))),
+      projectFingerprint: PROJECT_FINGERPRINT,
       conversationId: this._activeConversationId ?? ""
     }
     try {
@@ -2207,6 +2263,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     })
     if (!workflow) this._activeExecution = execution
     let toolNotes: string | undefined
+    let toolTranscript: ChatCompletionMessage[] | undefined
     let instructionFiles = (): string[] => []
     let tracked: ReplyChanges | undefined
     let changed: ReplyChangesView | undefined
@@ -2227,6 +2284,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     })
     const hooks = {
       onNotes: (notes: string | undefined) => (toolNotes = notes),
+      onTranscript: (messages: ChatCompletionMessage[]) => (toolTranscript = messages.length ? messages.map((message) => ({ ...message })) : undefined),
       onUsage: (counted: ToolLoopUsage) => Object.assign(usage, counted),
       onTools: (tools: WorkspaceTools) => (instructionFiles = () => tools.instructionFiles?.() ?? []),
       onChanges: (changes: ReplyChanges) => (tracked = changes),
@@ -2336,6 +2394,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       prefix,
       {
         toolNotes: () => toolNotes,
+        toolTranscript: () => toolTranscript,
         keepEmpty: () => ((!!view || todoOnly) && this._steps.steps.length > 0) || this.replyTask()?.state === "paused",
         // A reply that must state verified values is held until the delivery gate has checked it.
         hold: () => !!todoScope && isFeedbackEnabled(workspace.getConfiguration("twinny")) && !!(intentAtStart ?? this.awaitingDeliveryIntent(execution))?.answer?.length,
@@ -2440,6 +2499,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     scope: TodoWriteRequest,
     hooks: {
       onNotes(notes: string | undefined): void
+      onTranscript(messages: ChatCompletionMessage[]): void
       onUsage(usage: ToolLoopUsage): void
       onTools(tools: WorkspaceTools): void
       onChanges(changes: ReplyChanges): void
@@ -2477,6 +2537,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       requestContext: () => this.planRequestContext(),
       onOutOfSteps: hooks.onOutOfSteps,
       onNotes: hooks.onNotes,
+      onTranscript: hooks.onTranscript,
       onUsage: hooks.onUsage,
       onRequest: (chars, step, mode, tokens, breakdown) => {
         logger.debug(`Chat TODO tools · request ${step + 1} (${mode}, ${provider.provider}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
@@ -2502,6 +2563,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     view: WorkspaceView,
     hooks: {
       onNotes(notes: string | undefined): void
+      onTranscript(messages: ChatCompletionMessage[]): void
       onUsage(usage: ToolLoopUsage): void
       onTools(tools: WorkspaceTools): void
       onChanges(changes: ReplyChanges): void
@@ -2544,7 +2606,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       DEFAULT_RESULT_CHARS
     )
     const todoScope = this._todoRepository && this._activeConversationId ? {
-      projectFingerprint: workspaceProjectFingerprint((workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      projectFingerprint: PROJECT_FINGERPRINT,
       conversationId: this._activeConversationId,
       writer: this._activeConversationId
     } : undefined
@@ -2679,6 +2741,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       requestContext: () => this.planRequestContext(),
       onOutOfSteps: hooks.onOutOfSteps,
       onNotes: hooks.onNotes,
+      onTranscript: hooks.onTranscript,
       onUsage: hooks.onUsage,
       onRequest: (chars, step, mode, tokens, breakdown) => {
         logger.debug(`Chat tools · request ${step + 1} (${mode}, ${provider.provider}) · ${formatCount(chars)} chars, about ${formatCount(tokens)} tokens`)
