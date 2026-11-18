@@ -687,7 +687,7 @@ export interface CodeSearch {
   search(query: string): Promise<CodeHit[]>
 }
 
-const MAX_COMMAND_CHARS = 1000
+const MAX_COMMAND_CHARS = 65536 /*1000 chars, WTF kind of shell command is this? 64 KiB, a reasonable upper limit */
 const MAX_SEARCH_OUTPUT_CHARS = 6000
 
 const runCommand = (sink: CommandSink): Tool => ({
