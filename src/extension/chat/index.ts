@@ -2581,7 +2581,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const commandMode = team?.commands === "off" ? "off" : this.config.get<ChatCommandMode>("chatToolsCommands", "ask")
     const editMode = team?.edits === "review" ? "review" : this.config.get<ChatEditMode>("chatToolsEdits", "apply")
     const changes = new ReplyChanges(view.root, openDocumentText)
-    let mutationsBlocked = false
+    const mutationsBlocked = new Map<string, boolean>()
+    const mutateKey = (file: string) => path.resolve(view.root, file)
     const safety = {
       goal: intentGoal,
       checkpoints,
@@ -2589,8 +2590,20 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         clampNumericSetting(this.config.get<number>("chatToolsRegressionErrorSpike", 20), 10, 1000, 20),
         clampNumericSetting(this.config.get<number>("chatToolsRegressionCumulativeErrors", 40), 20, 2000, 40)
       ),
-      canMutate: () => !mutationsBlocked,
-      blockMutations: () => { mutationsBlocked = true },
+      mutations: mutationsBlocked,
+      canMutate: (file?: string) => !file || !mutationsBlocked.has(mutateKey(file)),
+      blockMutations: (files: string[], reconcileOnFreshBaseline: boolean) => {
+        for (const file of files) mutationsBlocked.set(mutateKey(file), reconcileOnFreshBaseline)
+      },
+      clearMutations: (files: string[]) => {
+        for (const file of files) mutationsBlocked.delete(mutateKey(file))
+      },
+      reconcileMutations: (files: string[]) => {
+        for (const file of files) {
+          const key = mutateKey(file)
+          if (mutationsBlocked.get(key) === true) mutationsBlocked.delete(key)
+        }
+      },
       onCatastrophic,
       runEditCommand: this._editCommands,
       recordEditOperation: this.editOperationLedger(this.activeTodoScope())
@@ -2751,7 +2764,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
-      shouldStop: () => !safety.canMutate(),
+      shouldStop: () => false,
       onStep: (step) => {
         this._steps.finish(step)
         logger.debug(`Chat tools · ${step.summary}`)

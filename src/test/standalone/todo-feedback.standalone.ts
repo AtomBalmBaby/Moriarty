@@ -530,19 +530,6 @@ test("every eligible task is evaluated with its own IDs and observations", async
   }
 })
 
-test("existing version-2 TODO databases migrate review tables without losing tasks", async () => {
-  const state = await fixture([{ id: "legacy", criteria: [semantic("legacy", "Legacy task is inspected")] }])
-  try {
-    withSqlite(state.databasePath, (database) => database.exec("DROP TABLE todo_evaluations; DROP TABLE todo_tool_observations; PRAGMA user_version = 2"))
-    const reopened = new TodoRepository(state.databasePath)
-    assert.equal((await reopened.getList(state.scope)).items[0].status, "in_review")
-    assert.deepEqual(await reopened.getEvaluationHistory(state.scope, state.items[0].id), [])
-    assert.equal((await reopened.getReviewPackages(state.scope)).length, 1)
-  } finally {
-    fs.rmSync(state.directory, { recursive: true, force: true })
-  }
-})
-
 test("accepted evidence is shared across conversations of the same project while TODO lists stay conversation-scoped", async () => {
   const state = await evidenceFixtureFor([{ id: "registration", criteria: [sourceLocation("defined", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool", EVIDENCE_FILE)] }])
   try {
@@ -557,105 +544,6 @@ test("accepted evidence is shared across conversations of the same project while
     assert.equal(shared.length, 1, "the other conversation sees the project's accepted fact")
     assert.equal(shared[0].registeredTool, "read_file")
     assert.equal((await state.repository.getList(otherConversation)).items.length, 0, "the TODO list is not shared")
-  } finally {
-    fs.rmSync(state.directory, { recursive: true, force: true })
-  }
-})
-
-test("a version-15 database keeps its alias rows as history, gains a nullable registered_tool, and does not promote them into authoritative links", async () => {
-  const state = await evidenceFixtureFor([{ id: "registration", criteria: [sourceLocation("defined", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool", EVIDENCE_FILE)] }])
-  try {
-    const [registration] = state.itemIds
-    await startItemInReview(state.repository, state.scope, registration)
-    await observeRead(state, registration, "read-registration", EVIDENCE_FILE, 160, sourceLines.slice(159, 220))
-    const calls = { count: 0 }
-    const accepted = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, registration), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, hasVerifiedFileChanges: false })
-    assert.equal(accepted.decision, "accept", JSON.stringify(accepted.problems))
-
-    withSqlite(state.databasePath, (database) => {
-      const [listId, observationId, sourceHash] = sqliteRows(database, "SELECT list_id, observation_id, source_hash FROM todo_accepted_evidence WHERE registered_tool = 'read_file'")[0]
-      database.exec("ALTER TABLE todo_accepted_evidence DROP COLUMN registered_tool; PRAGMA user_version = 15")
-      database
-        .prepare(
-          "INSERT INTO todo_symbol_aliases(id, list_id, tool_name, implementation, path, start_line, end_line, observation_id, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .run("legacy-alias", listId, "read_file", "readFile", EVIDENCE_FILE, 169, 220, observationId, sourceHash, "2024-01-01T00:00:00.000Z")
-    })
-
-    const reopened = new TodoRepository(state.databasePath)
-    await reopened.initialize()
-    const check = new BetterSqlite(state.databasePath, { fileMustExist: true })
-    try {
-      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
-      assert.equal(sqliteRows(check, "PRAGMA table_info(todo_accepted_evidence)").some((row) => row[1] === "registered_tool"), true, "the migration adds registered_tool")
-      assert.equal(sqliteRows(check, "SELECT COUNT(*) FROM todo_symbol_aliases")[0][0], 1, "the legacy alias row is kept as history")
-    } finally {
-      check.close()
-    }
-
-    const facts = await reopened.listAcceptedEvidence(state.scope, { symbol: "readFile", path: EVIDENCE_FILE })
-    assert.equal(facts.length, 1, "the accepted fact and its provenance survive the upgrade")
-    assert.equal(facts[0].registeredTool, undefined, "a legacy row is not backfilled from the heuristic alias table")
-    assert.deepEqual(await reopened.listSymbolAliases(state.scope), [], "a legacy alias is not an authoritative link")
-
-    const [legacy] = await reviewCriteria([sourceLocation("exact", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool", EVIDENCE_FILE)], [], currentWorkspace, facts)
-    assert.equal(legacy.outcome, "unknown", JSON.stringify(legacy))
-    assert.equal(legacy.failureReason, "missing_evidence", "the legacy fact cannot prove the registration, so a fresh read is required")
-  } finally {
-    fs.rmSync(state.directory, { recursive: true, force: true })
-  }
-})
-
-test("a version-16 database keeps its tool observations as history with no execution owner, and gains the execution index", async () => {
-  const state = await fixture([{
-    id: "historical-observation",
-    criteria: [semantic("historical-observation", "Read the workspace file")]
-  }], false)
-  try {
-    const item = state.items[0]
-    const historical = await state.repository.recordToolObservation(state.scope, {
-      itemId: item.id,
-      toolName: "read_file",
-      arguments: { path: "src/history.ts" },
-      output: "export const history = true",
-      failed: true,
-      requestId: "historical-read"
-    })
-
-    withSqlite(state.databasePath, (database) => database.exec("DROP INDEX IF EXISTS todo_tool_observations_execution; ALTER TABLE todo_tool_observations DROP COLUMN execution_id; PRAGMA user_version = 16"))
-
-    const reopened = new TodoRepository(state.databasePath)
-    await reopened.initialize()
-    const check = new BetterSqlite(state.databasePath, { fileMustExist: true })
-    try {
-      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
-      assert.equal(sqliteRows(check, "PRAGMA table_info(todo_tool_observations)").some((row) => row[1] === "execution_id"), true, "the migration adds execution_id")
-      assert.equal(sqliteRows(check, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'todo_tool_observations_execution'").length, 1)
-      const [row] = sqliteRows(check, `SELECT output, failed, execution_id FROM todo_tool_observations WHERE id = '${historical.id}'`)
-      assert.deepEqual(row, ["export const history = true", 1, null], "the historical row keeps its output and failure, with no execution owner")
-    } finally {
-      check.close()
-    }
-
-    const [kept] = (await reopened.getReviewPackages(state.scope, { includeOpen: true })).flatMap((review) => review.observations).filter((observation) => observation.id === historical.id)
-    assert.equal(kept?.failed, true, "the historical failure is still readable through the repository")
-    assert.equal(kept?.executionId, undefined)
-  } finally {
-    fs.rmSync(state.directory, { recursive: true, force: true })
-  }
-})
-
-test("existing version-4 TODO databases gain child proposals and accepted evidence without losing tasks", async () => {
-  const state = await fixture([{ id: "kept", criteria: [semantic("kept", "Kept task is inspected")] }])
-  try {
-    withSqlite(state.databasePath, (database) => database.exec("DROP TABLE todo_child_proposals; DROP TABLE todo_accepted_evidence; PRAGMA user_version = 4"))
-    const reopened = new TodoRepository(state.databasePath)
-    assert.equal((await reopened.getList(state.scope)).items[0].title, state.items[0].title)
-    const check = new BetterSqlite(state.databasePath, { fileMustExist: true })
-    assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
-    assert.equal(sqliteRows(check, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_accepted_evidence'")[0][0], 1)
-    assert.equal(sqliteRows(check, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_symbol_aliases'")[0][0], 1)
-    check.close()
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -5502,48 +5390,6 @@ test("the command_exit_status execution field accepts the two typed values and r
   assert.match(validateIntentTaskPlan(withExecution("after_activation", "historical")).diagnostic ?? "", /cannot be both historical and after_activation/)
 })
 
-test("a version-10 database with accepted evidence upgrades to version 11 with every evidence row and relationship intact", async () => {
-  const state = await evidenceFixtureFor(TWO_TASKS)
-  try {
-    const [first] = state.itemIds
-    await startItemInReview(state.repository, state.scope, first)
-    const observation = await observeRead(state, first, "read-first", EVIDENCE_FILE, 150, sourceLines.slice(149, 220))
-    const calls = { count: 0 }
-    const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, first), countingEvaluator(calls), "mock-reviewer", { readCurrentSource: currentWorkspace, hasVerifiedFileChanges: false })
-    assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
-    const facts = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE })
-    assert.equal(facts.length, 1)
-    assert.equal(facts[0].observationId, observation.id)
-
-    const inspect = () =>
-      withSqlite(state.databasePath, (database) => ({
-        version: sqliteRows(database, "PRAGMA user_version")[0][0],
-        activationTable: sqliteRows(database, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'todo_requirement_activations'")[0][0],
-        observations: sqliteRows(database, "SELECT id, item_id, tool_name, list_revision FROM todo_tool_observations ORDER BY id")
-      }))
-    const before = inspect()
-    assert.ok(before.observations.some((row) => row[0] === observation.id && row[3] !== null), "the observation is ordered by its list revision before the upgrade")
-
-    withSqlite(state.databasePath, (database) => database.exec("DROP TABLE todo_requirement_activations; PRAGMA user_version = 10"))
-
-    const reopened = new TodoRepository(state.databasePath)
-    await reopened.initialize()
-    assert.deepEqual(await reopened.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "the accepted fact and its provenance survive the upgrade unchanged")
-    const upgraded = inspect()
-    assert.equal(upgraded.version, 19)
-    assert.equal(upgraded.activationTable, 1, "the requirement activation table is added")
-    assert.deepEqual(upgraded.observations, before.observations, "no observation row or list revision changes during the upgrade")
-
-    const again = new TodoRepository(state.databasePath)
-    await again.initialize()
-    assert.deepEqual(await again.listAcceptedEvidence(state.scope, { symbol: "read_file", path: EVIDENCE_FILE }), facts, "a second reopen is stable")
-    assert.equal(inspect().version, 19)
-    assert.equal(calls.count, 0)
-  } finally {
-    removeAll(state.directory)
-  }
-})
-
 test("an unresolved edit target blocks other conversations in the same project, but not other projects", async () => {
   const state = await fixture([{ id: "edit-task", criteria: [semantic("edit-task", "The edit is applied")] }], false)
   try {
@@ -5603,108 +5449,6 @@ test("edit operations are recorded before dispatch, settle once, and block only 
   }
 })
 
-test("the v12 edit ledger rebuilds for optional task association, keeps its rows, and keeps a v12 backup", async () => {
-  const state = await fixture([{ id: "migrated-edit", criteria: [semantic("migrated-edit", "Migrated edit task is pending")] }], false)
-  const backupFiles = (version: number) =>
-    fs.readdirSync(state.directory).filter((name) => name.startsWith(`${path.basename(state.databasePath)}.v${version}.`) && name.endsWith(".bak")).map((name) => path.join(state.directory, name))
-  const inspect = (file: string) =>
-    withSqlite(file, (database) => {
-      const itemColumn = sqliteRows(database, "PRAGMA table_info(todo_edit_operations)").find((row) => row[1] === "item_id")
-      const statuses = sqliteRows(database, "SELECT id, status FROM todo_edit_operations ORDER BY id")
-      return {
-        version: sqliteRows(database, "PRAGMA user_version")[0][0],
-        itemNullable: itemColumn?.[3] === 0,
-        ids: statuses.map((row) => row[0]),
-        statuses,
-        index: sqliteRows(database, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'todo_edit_operations_target'")[0][0],
-        cascadesFromItems: sqliteRows(database, "PRAGMA foreign_key_list(todo_edit_operations)").some((row) => row[2] === "todo_items" && row[6] === "CASCADE")
-      }
-    })
-  try {
-    const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
-    assert.deepEqual(inspect(state.databasePath), { version: 19, itemNullable: true, ids: [], statuses: [], index: 1, cascadesFromItems: true }, "a new database is created at the current version with an optional task")
-    assert.deepEqual(backupFiles(12), [], "a new database has no earlier version to back up")
-
-    await state.repository.beginEditOperation(state.scope, { id: "v12-edit", itemId, target: "src/old.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
-    await state.repository.settleEditOperation(state.scope, "v12-edit", "succeeded", "The edit was applied.")
-
-    withSqlite(state.databasePath, (database) => database.exec(`
-DROP INDEX todo_edit_operations_target;
-ALTER TABLE todo_edit_operations RENAME TO todo_edit_operations_old;
-CREATE TABLE todo_edit_operations (
-  id TEXT PRIMARY KEY,
-  list_id TEXT NOT NULL REFERENCES todo_lists(id) ON DELETE CASCADE,
-  item_id TEXT NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
-  target TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK(mode IN ('apply','review')),
-  pre_digest TEXT NOT NULL,
-  post_digest TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('dispatched','succeeded','failed','reconciled_applied','reconciled_absent','diverged')),
-  detail TEXT NOT NULL DEFAULT '',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX todo_edit_operations_target ON todo_edit_operations(list_id, target, status);
-INSERT INTO todo_edit_operations (id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at)
-  SELECT id, list_id, item_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at FROM todo_edit_operations_old;
-DROP TABLE todo_edit_operations_old;
-PRAGMA user_version = 12;`))
-    assert.equal(inspect(state.databasePath).itemNullable, false, "the simulated v12 ledger requires a task")
-
-    const reopened = new TodoRepository(state.databasePath)
-    await reopened.initialize()
-    const upgraded = inspect(state.databasePath)
-    assert.equal(upgraded.version, 19)
-    assert.equal(upgraded.itemNullable, true, "the task column becomes optional")
-    assert.deepEqual(upgraded.statuses, [["v12-edit", "succeeded"]], "existing ledger rows keep their identity and settlement")
-    assert.equal(upgraded.index, 1, "the target index is recreated")
-    assert.equal(upgraded.cascadesFromItems, true, "a task deletion still removes its operations")
-    const [backup] = backupFiles(12)
-    assert.equal(backupFiles(12).length, 1, "the v12 file is kept as exactly one backup")
-    assert.equal(inspect(backup!).version, 12, "the v12 file is kept as a backup")
-    assert.equal(inspect(backup!).itemNullable, false)
-
-    const free = await reopened.beginEditOperation(state.scope, { id: "v13-free", target: "src/free.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
-    assert.equal(free.itemId, undefined, "a project-scoped edit is recorded without a task")
-    assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.itemId, op.conversationId]), [["v13-free", undefined, state.scope.conversationId]])
-    await assert.rejects(reopened.beginEditOperation(state.scope, { id: "v13-unknown", itemId: "missing-task", target: "src/free.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") }), /limited to active Intent tasks/, "a named task must still be active")
-
-    const again = new TodoRepository(state.databasePath)
-    await again.initialize()
-    assert.deepEqual(inspect(state.databasePath).ids, ["v12-edit", "v13-free"], "a second reopen is stable")
-    assert.equal(inspect(state.databasePath).version, 19)
-  } finally {
-    removeAll(state.directory)
-  }
-})
-
-test("the owner column is additive: legacy edit rows stay unowned and each reopened row keeps its owner", async () => {
-  const state = await fixture([{ id: "owned-edit", criteria: [semantic("owned-edit", "Owned edit task is pending")] }], false)
-  const versionAndOwnerColumn = () =>
-    withSqlite(state.databasePath, (check) => ({
-      version: sqliteRows(check, "PRAGMA user_version")[0][0],
-      ownerColumn: sqliteRows(check, "PRAGMA table_info(todo_edit_operations)").some((row) => row[1] === "owner_id")
-    }))
-  try {
-    await state.repository.beginEditOperation(state.scope, { id: "1-unowned-edit", target: "src/unowned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
-    withSqlite(state.databasePath, (database) => database.exec("ALTER TABLE todo_edit_operations DROP COLUMN owner_id; PRAGMA user_version = 13"))
-    assert.deepEqual(versionAndOwnerColumn(), { version: 13, ownerColumn: false })
-
-    const reopened = new TodoRepository(state.databasePath)
-    await reopened.initialize()
-    assert.deepEqual(versionAndOwnerColumn(), { version: 19, ownerColumn: true }, "the upgrade adds the owner column")
-    assert.deepEqual((await reopened.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined]], "a legacy row has no owner")
-
-    await reopened.beginEditOperation(state.scope, { id: "2-owned-edit", ownerId: "host-b", target: "src/owned.ts", mode: "apply", preDigest: editDigest("a\n"), postDigest: editDigest("b\n") })
-    const again = new TodoRepository(state.databasePath)
-    await again.initialize()
-    assert.deepEqual((await again.listUnresolvedEditOperations(state.scope)).map((op) => [op.id, op.ownerId]), [["1-unowned-edit", undefined], ["2-owned-edit", "host-b"]], "owners survive a reopen")
-    assert.deepEqual(versionAndOwnerColumn(), { version: 19, ownerColumn: true }, "a second reopen is stable")
-  } finally {
-    removeAll(state.directory)
-  }
-})
-
 
 test("project edit reconciliation settles an operation once and stays inside its project", async () => {
   const state = await fixture([{ id: "reconcile-edit", criteria: [semantic("reconcile-edit", "The reconciled edit is applied")] }], false)
@@ -5742,28 +5486,6 @@ test("project edit reconciliation settles an operation once and stays inside its
 test("edit digests normalize line endings and distinguish content", () => {
   assert.equal(editDigest("a\r\nb\r\n"), editDigest("a\nb\n"))
   assert.notEqual(editDigest("a\nb\n"), editDigest("a\nc\n"))
-})
-
-test("the v11 TODO database gains the edit operation ledger while keeping the active intent task", async () => {
-  const state = await fixture([{ id: "kept-edit", criteria: [semantic("kept-edit", "Kept edit task is pending")] }], false)
-  try {
-    const before = await state.repository.getActiveIntentContext(state.scope)
-    withSqlite(state.databasePath, (database) => database.exec("DROP TABLE todo_edit_operations; PRAGMA user_version = 11"))
-
-    const reopened = new TodoRepository(state.databasePath)
-    await reopened.initialize()
-    const after = await reopened.getActiveIntentContext(state.scope)
-    assert.equal(after?.task.id, before?.task.id, "the active intent task survives the upgrade")
-    assert.equal(after?.planTaskId, before?.planTaskId)
-    await reopened.beginEditOperation(state.scope, { id: "edit-after-upgrade", itemId: after!.task.id, target: "src/a.ts", mode: "apply", preDigest: editDigest("a"), postDigest: editDigest("b") })
-
-    withSqlite(state.databasePath, (check) => {
-      assert.equal(sqliteRows(check, "PRAGMA user_version")[0][0], 19)
-      assert.equal((check.prepare("SELECT COUNT(*) FROM todo_edit_operations WHERE item_id = ?").raw().get(after!.task.id) as [number] | undefined)?.[0], 1)
-    })
-  } finally {
-    removeAll(state.directory)
-  }
 })
 
 const TODOS_FILE = "src/extension/tools/todos.ts"

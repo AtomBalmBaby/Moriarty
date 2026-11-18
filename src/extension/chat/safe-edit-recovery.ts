@@ -253,7 +253,8 @@ export interface SignificantEditRecoveryInput {
   monitor?: DiagnosticRegressionMonitor
   errorSpikeThreshold?: number
   observeRestoredDiagnostics?(): Promise<DiagnosticObservation | { errors: string[]; version?: number }>
-  blockMutations?(): void
+  blockMutations?(files: string[], reconcileOnFreshBaseline: boolean): void
+  clearMutations?(files: string[]): void
 }
 
 export interface SignificantEditRecoveryResult {
@@ -270,6 +271,7 @@ export const recoverSignificantEdit = async (input: SignificantEditRecoveryInput
   if (!input.diagnosticsObserved) return undefined
   const catastrophic = input.monitor?.record(input.file, input.introducedErrors) ?? (input.introducedErrors >= (input.errorSpikeThreshold ?? 20))
   if (!catastrophic) return undefined
+  input.monitor?.reset(input.file)
   let rollback: { restored: boolean; contentVerified: boolean; reason?: string }
   try {
     rollback = input.checkpoints
@@ -288,11 +290,24 @@ export const recoverSignificantEdit = async (input: SignificantEditRecoveryInput
           : "A stable pre-edit diagnostic baseline was unavailable."
       })
   if (rollback.restored && input.baseline && input.diagnosticCheckAvailable && input.observeRestoredDiagnostics) {
-    verification = verifyDiagnosticBaseline(input.baseline, await input.observeRestoredDiagnostics())
+    try {
+      verification = verifyDiagnosticBaseline(input.baseline, await input.observeRestoredDiagnostics())
+    } catch (error) {
+      verification = verifyDiagnosticBaseline(input.baseline, {
+        status: "unavailable",
+        errors: [],
+        reason: "Rollback diagnostic observation failed: " + (error instanceof Error ? error.message : String(error))
+      })
+    }
   }
   const fileVerified = rollback.contentVerified
-  // Mutations unlock only when both the restored file and its diagnostics are verified.
-  if (!fileVerified || !verification.verified) input.blockMutations?.()
+  if (!fileVerified) {
+    input.blockMutations?.([input.checkpointPath ?? input.file], false)
+  } else if (verification.verified) {
+    input.clearMutations?.([input.checkpointPath ?? input.file])
+  } else {
+    input.blockMutations?.([input.checkpointPath ?? input.file], true)
+  }
   const reason = !fileVerified
     ? "Could not safely restore file contents: " + rollback.reason
     : verification.verified
@@ -316,6 +331,10 @@ export class DiagnosticRegressionMonitor {
     readonly errorSpikeThreshold = 20,
     readonly cumulativeErrorThreshold = 40
   ) {}
+
+  reset(file: string): void {
+    this._totals.delete(file)
+  }
 
   record(file: string, introducedErrors: number): boolean {
     if (introducedErrors <= 0) {

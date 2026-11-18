@@ -806,6 +806,7 @@ const enforceEvidenceBudget = (database: Database, listId: string, keepId: strin
 export class TodoRepository {
   private readonly sqlite: SqliteFile
   private readonly evidenceLimits: EvidenceStorageLimits
+  private sourceRoots: SourceRoots | undefined
   // In-memory only: a scoring request in flight. Restarts clear it, and unscored items then read as not evaluated.
   private readonly pendingObservations = new Map<string, Set<string>>()
 
@@ -816,6 +817,7 @@ export class TodoRepository {
   ) {
     this.sqlite = new SqliteFile(databasePath, (database, home) => {
       const sourceRoots = new SourceRoots(database, home)
+      this.sourceRoots = sourceRoots
       sourceRoots.home()
       for (const root of roots()) sourceRoots.register(root, rootLabelOf(root))
     })
@@ -828,6 +830,7 @@ export class TodoRepository {
 
   close(): void {
     this.sqlite.close()
+    this.sourceRoots = undefined
   }
 
   getIntentTaskPlan(request: TodoListRequest): Promise<IntentTaskPlan | undefined> {
@@ -1244,11 +1247,12 @@ export class TodoRepository {
       }
       const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence, executionId: input.executionId }
       const listRevision = bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
-      execute(database, "INSERT INTO todo_tool_observations(id, project_id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      execute(database, "INSERT INTO todo_tool_observations(id, project_id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [observation.id, list.project_id, list.id, input.itemId ?? null, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision, input.executionId ?? null])
       if (preserved) {
         execute(database, "INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
+        this.sourceRoots?.recordObservationSources(observation.id, preserved.sources, preserved.hits, observation.createdAt)
         enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
       }
       // Evidence does not change the task's content or status, so it does not bump its version: an unrelated observation

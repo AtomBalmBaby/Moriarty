@@ -376,7 +376,7 @@ test("refused restore keeps further mutations locked", async () => {
   assert.equal(blocked, true)
 })
 
-test("verified restore with unverified diagnostics keeps further mutations locked", async () => {
+test("verified restore with unverified diagnostics locks only the affected resource until reconciled", async () => {
   const { result, blocked } = await preparedRecovery({ diagnostics: { status: "timeout", errors: [], reason: "No diagnostics arrived after restore." } })
   assert.equal(result?.fileVerified, true)
   assert.equal(result?.diagnosticsVerified, false)

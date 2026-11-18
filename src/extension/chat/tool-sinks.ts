@@ -127,8 +127,11 @@ export interface EditSafetyOptions {
   cumulativeErrorThreshold?: number
   diagnosticMonitor?: DiagnosticRegressionMonitor
   onCatastrophic?(notice: EditRecoveryNotice): Promise<void> | void
-  canMutate?(): boolean
-  blockMutations?(): void
+  mutations?: Map<string, boolean>
+  canMutate?(file?: string): boolean
+  blockMutations?(files: string[], reconcileOnFreshBaseline: boolean): void
+  clearMutations?(files: string[]): void
+  reconcileMutations?(files: string[]): void
 }
 
 export const createSafeEditCheckpoints = (storageUri: Uri): SafeEditCheckpoints => {
@@ -439,10 +442,24 @@ export const editorEdits = (
   const isProtected = (file: string) => isProtectedPath(view.relative(file)) || isProtectedPath(view.realRelative(file))
   const modeFor = (file: string): ChatEditMode => (isProtected(file) ? "review" : mode)
   const held = <T>(work: () => Promise<T>): Promise<T> => changes?.hold(work()) ?? work()
-  let mutationsBlocked = false
-  const blocked = (): EditOutcome | undefined => mutationsBlocked || safety.canMutate?.() === false
-    ? { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
-    : undefined
+  const mutationsBlocked = safety.mutations ?? new Map<string, boolean>()
+  safety.mutations = mutationsBlocked
+  const resourceKey = (file: string) => path.resolve(file)
+  const blocked = (file?: string): EditOutcome | undefined => {
+    if (!file) return safety.canMutate?.() === false
+      ? { ok: false, message: "Mutation blocked after an unsafe recovery state." }
+      : undefined
+    const key = resourceKey(file)
+    if (mutationsBlocked.has(key) || safety.canMutate?.(key) === false) {
+      return {
+        ok: false,
+        message: mutationsBlocked.get(key)
+          ? "Mutation blocked for " + view.relative(file) + " until a fresh diagnostic baseline is reconciled."
+          : "Mutation blocked for " + view.relative(file) + " until the recovery problem is reconciled."
+      }
+    }
+    return undefined
+  }
   /** The paths outside the workspace that a call of `operation` changes, unless a preauthorization already covers them. */
   const outsideWrites = (operation: WriteOperation, paths: string[]): WriteRequest[] =>
     paths
@@ -477,9 +494,13 @@ export const editorEdits = (
         checkpointPath: file,
         monitor: safety.diagnosticMonitor,
         errorSpikeThreshold: safety.errorSpikeThreshold,
-        blockMutations: () => {
-          mutationsBlocked = true
-          safety.blockMutations?.()
+        blockMutations: (files, reconcileOnFreshBaseline) => {
+          for (const blockedFile of files) mutationsBlocked.set(resourceKey(blockedFile), reconcileOnFreshBaseline)
+          safety.blockMutations?.(files, reconcileOnFreshBaseline)
+        },
+        clearMutations: (files) => {
+          for (const clearedFile of files) mutationsBlocked.delete(resourceKey(clearedFile))
+          safety.clearMutations?.(files)
         },
         observeRestoredDiagnostics: async () => {
           const uri = Uri.file(file)
@@ -512,7 +533,14 @@ export const editorEdits = (
       diagnosticsStatus: recovery.diagnosticsStatus,
       reason
     })
-    return { ...outcome, ok: false, message: reason + (mutationsBlocked || safety.canMutate?.() === false ? " Further file mutations are blocked for this execution." : " The last safe checkpoint was restored and verified.") }
+    const resourceLocked = blocked(file) !== undefined
+    return {
+      ...outcome,
+      ok: false,
+      message: reason + (resourceLocked
+        ? " Further mutations to " + view.relative(file) + " are blocked until this recovery state is reconciled."
+        : " The last safe checkpoint was restored and verified.")
+    }
   }
   const runCommand: EditCommandRunner = safety.runEditCommand ?? ((command, ...args) => commands.executeCommand(command, ...args))
   type PendingEdit = { id: string; ticket?: EditOperationTicket; file: string; preDigest: string }
@@ -547,7 +575,7 @@ export const editorEdits = (
       return (await workspace.openTextDocument(Uri.file(file))).getText()
     },
     async editLines(file, request, save, write) {
-      const denied = blocked()
+      const denied = blocked(file)
       if (denied) return { ...denied, error: lineEditFailure("permission_denied", denied.message) }
       const refused = outsideRefusal(outsideWrites("edit", [file]), write)
       if (refused) return { ok: false, message: `Not changed: ${refused}`, error: lineEditFailure("permission_denied", "The document is outside the workspace.") }
@@ -575,7 +603,7 @@ export const editorEdits = (
         const error = lineEditFailure("permission_denied", "The user declined the line edits; nothing was changed.")
         return { ok: false, message: error.message, error }
       }
-      const deniedAfterApproval = blocked()
+      const deniedAfterApproval = blocked(file)
       if (deniedAfterApproval) return { ...deniedAfterApproval, error: lineEditFailure("permission_denied", deniedAfterApproval.message) }
       try {
         await revealEditor(document, visibility)
@@ -619,7 +647,7 @@ export const editorEdits = (
       return { ...checked, contentHash: hash }
     },
     async edit(file, replacement, write) {
-      const denied = blocked()
+      const denied = blocked(file)
       if (denied) return denied
       const refused = outsideRefusal(outsideWrites("edit", [file]), write)
       if (refused) return { ok: false, message: `Not changed: ${refused}` }
@@ -655,7 +683,7 @@ export const editorEdits = (
       return checked
     },
     async create(file, content, write) {
-      const denied = blocked()
+      const denied = blocked(file)
       if (denied) return denied
       const refused = outsideRefusal(outsideWrites("create", [file]), write)
       if (refused) return { ok: false, message: `Not created: ${refused}` }
@@ -690,7 +718,7 @@ export const editorEdits = (
     },
     async remove(file, write) {
       const relative = view.relative(file)
-      const denied = blocked()
+      const denied = blocked(file)
       if (denied) return denied
       const removal = outsideWrites("remove", [file])
       const refused = outsideRefusal(removal, write)
@@ -716,7 +744,7 @@ export const editorEdits = (
       })
     },
     async move(from, to, write) {
-      const denied = blocked()
+      const denied = blocked(from)
       if (denied) return denied
       const relocation = outsideWrites("move", [from, to])
       const refused = outsideRefusal(relocation, write)
@@ -812,6 +840,7 @@ export const editorKnowledge = (
       const settled = settledDiagnostics(uri)
       await workspace.openTextDocument(uri)
       await settled
+      safety.reconcileMutations?.([uri.fsPath])
       return languages.getDiagnostics(uri).map((d) => toDiagnostic(uri, d))
     }
     return languages
@@ -839,7 +868,7 @@ export const editorKnowledge = (
     )
   },
   async rename(file, line, character, newName, authorizeOutside) {
-    if (safety.canMutate?.() === false) return { ok: false, message: "Mutation blocked after a catastrophic edit regression." }
+    if (safety.canMutate?.(file) === false) return { ok: false, message: "Mutation blocked for " + view.relative(file) + " until the recovery problem is reconciled." }
     let edit: WorkspaceEdit | undefined
     try {
       edit = await commands.executeCommand<WorkspaceEdit>(
@@ -933,15 +962,26 @@ export const editorKnowledge = (
       }
       editObservers.forEach((observer) => observer.dispose())
       if (!catastrophic) return true
-      safety.blockMutations?.()
+      absoluteFiles.forEach((absolute) => safety.diagnosticMonitor?.reset(absolute))
       const rollbackObservers = new Map(absoluteFiles.map((absolute) => [absolute, diagnosticObserver(Uri.file(absolute))]))
-      const rollback = safety.checkpoints
-        ? await safety.checkpoints.rollback()
-        : { restored: false, contentVerified: false, reason: "No safe checkpoint service is available." }
+      let rollback: { restored: boolean; contentVerified: boolean; reason?: string }
+      try {
+        rollback = safety.checkpoints
+          ? await safety.checkpoints.rollback(absoluteFiles)
+          : { restored: false, contentVerified: false, reason: "No safe checkpoint service is available." }
+      } catch (error) {
+        rollback = {
+          restored: false,
+          contentVerified: false,
+          reason: "Rollback failed: " + (error instanceof Error ? error.message : String(error))
+        }
+      }
       let diagnosticsVerified = rollback.restored && baseline.size === absoluteFiles.length
       let diagnosticsStatus: DiagnosticVerificationStatus = rollback.restored ? "verified" : "unavailable"
       let diagnosticReason = "Restored diagnostics match the pre-rename baseline."
       const evidence: string[] = []
+      const cleared: string[] = []
+      const inconclusive: string[] = []
       if (rollback.restored) {
         for (const absolute of absoluteFiles) {
           const before = baseline.get(absolute)
@@ -952,19 +992,45 @@ export const editorKnowledge = (
             diagnosticsVerified = false
             diagnosticsStatus = "unavailable"
             diagnosticReason = "A stable pre-rename baseline or restored document version was unavailable for " + view.relative(absolute) + "."
+            inconclusive.push(absolute)
             continue
           }
-          const observed = await observer.wait(document.version, true)
-          const verification = verifyDiagnosticBaseline(before.errors, observed)
+          let verification: ReturnType<typeof verifyDiagnosticBaseline>
+          try {
+            verification = verifyDiagnosticBaseline(before.errors, await observer.wait(document.version, true))
+          } catch (error) {
+            verification = verifyDiagnosticBaseline(before.errors, {
+              status: "unavailable",
+              errors: [],
+              reason: "Rollback diagnostic observation failed: " + (error instanceof Error ? error.message : String(error))
+            })
+          }
           evidence.push(verification.evidence)
           if (!verification.verified) {
             diagnosticsVerified = false
             diagnosticsStatus = verification.status
             diagnosticReason = verification.reason
+            inconclusive.push(absolute)
+          } else {
+            cleared.push(absolute)
           }
         }
       }
       rollbackObservers.forEach((observer) => observer.dispose())
+      if (!rollback.restored || !rollback.contentVerified) {
+        safety.blockMutations?.(absoluteFiles, false)
+        for (const absolute of absoluteFiles) {
+          if (safety.mutations) safety.mutations.set(path.resolve(absolute), false)
+        }
+      } else {
+        if (cleared.length) safety.clearMutations?.(cleared)
+        if (inconclusive.length) {
+          safety.blockMutations?.(inconclusive, true)
+          for (const absolute of inconclusive) {
+            if (safety.mutations) safety.mutations.set(path.resolve(absolute), true)
+          }
+        }
+      }
       renameFailure = !rollback.restored
         ? "Could not safely restore after rename introduced diagnostics: " + rollback.reason
         : !diagnosticsVerified

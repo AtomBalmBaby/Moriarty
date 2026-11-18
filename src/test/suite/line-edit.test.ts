@@ -4,7 +4,9 @@ import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
 
-import { createSafeEditCheckpoints, EditOperationLedger, editorEdits } from "../../extension/chat/tool-sinks"
+import { ChangeStore, ReplyChanges } from "../../extension/chat/reply-changes"
+import { ReplyChangesEditor } from "../../extension/chat/reply-changes-editor"
+import { createSafeEditCheckpoints, EditOperationLedger, editorEdits, openDocumentText } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits, revealEditor } from "../../extension/edit/line-edit"
 import { contentHash, LineEditRequest } from "../../extension/tools/line-edit"
 import { WorkspaceView } from "../../extension/tools/view"
@@ -489,11 +491,15 @@ suite("Hash-verified native line edits", () => {
     })
     const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
     let recoveries = 0
+    const changes = new ReplyChanges(root, openDocumentText)
     const tools = workspaceTools(root, [], {
-      edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { checkpoints, onCatastrophic: () => { recoveries++ } }),
+      edits: editorEdits(new WorkspaceView(root), "apply", async () => true, changes, { checkpoints, onCatastrophic: () => { recoveries++ } }),
       git: false, instructions: false
     })
     try {
+      const invalid = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: "{not-json" } })
+      assert.strictEqual(invalid.failed, true, invalid.output)
+      assert.strictEqual(recoveries, 0, "invalid arguments must not trigger catastrophic recovery")
       const result = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
       assert.strictEqual(result.failed, true, result.output)
       assert.strictEqual(recoveries, 1)
@@ -501,7 +507,15 @@ suite("Hash-verified native line edits", () => {
       const corrected = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
       assert.strictEqual(corrected.failed, undefined, corrected.output)
       assert.strictEqual(document.getText(), "export const value = 2\n")
+      assert.strictEqual(JSON.parse(corrected.output).content_hash, await contentHash("export const value = 2\n"))
       assert.strictEqual(recoveries, 1)
+      const record = await changes.record()
+      assert.ok(record)
+      const store = new ChangeStore(path.join(root, "reply-changes"))
+      store.save(record)
+      const undone = await new ReplyChangesEditor(store, openDocumentText).undo(record.id)
+      assert.strictEqual(undone.error, undefined)
+      assert.strictEqual(document.getText(), source, "Undo all remains available after verified rollback")
     } finally {
       listener.dispose()
       diagnostics.dispose()
@@ -541,6 +555,12 @@ suite("Hash-verified native line edits", () => {
       const blocked = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(broken), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
       assert.strictEqual(JSON.parse(blocked.output).error.code, "permission_denied")
       assert.strictEqual(document.getText(), broken)
+      const unrelated = path.join(root, "unrelated.ts")
+      fs.writeFileSync(unrelated, "export const safe = 1\n")
+      const unrelatedDocument = await vscode.workspace.openTextDocument(unrelated)
+      const unrelatedEdit = await tools.run({ name: "edit_lines", args: { path: "unrelated.ts", expected_hash: await contentHash("export const safe = 1\n"), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const safe = 2"] }]) } })
+      assert.strictEqual(unrelatedEdit.failed, undefined, unrelatedEdit.output)
+      assert.strictEqual(unrelatedDocument.getText(), "export const safe = 2\n")
     } finally {
       listener.dispose()
       diagnostics.dispose()

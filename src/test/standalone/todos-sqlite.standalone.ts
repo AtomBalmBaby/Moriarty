@@ -7,6 +7,7 @@ import path from "node:path"
 import { test } from "node:test"
 
 import { logger } from "../../common/logger"
+import { resolveProjectHome } from "../../extension/todos/project-home"
 import { TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
 import { type LegacyTodoRetirement, prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase } from "../../extension/todos/sqlite"
 import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
@@ -557,6 +558,54 @@ test("a review of a task the plan superseded names the supersession, while unkno
   }
 })
 
+test("recordToolObservation inserts one v20 read_file observation with 13 matching columns and values", async () => {
+  await withDirectory("twinny-tool-observation-", async (directory) => {
+    const databasePath = path.join(directory, "project.sqlite")
+    const scope = { projectFingerprint: "project", conversationId: "chat-observation", writer: "chat-observation" }
+    const repository = new TodoRepository(databasePath)
+    const plan = {
+      planId: "plan-read-file", version: 1 as const, revision: 1, goal: "Inspect the source",
+      constraints: [], tasks: [{
+        id: "read", title: "Read parser", description: "Read src/parser.ts",
+        criteria: [{ id: "read-done", description: "The file was read", verification: { kind: "semantic_review" as const } }],
+        dependencies: []
+      }]
+    }
+    try {
+      const [item] = (await repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: "Read the parser", plan })).items
+      const observation = await repository.recordToolObservation(scope, {
+        itemId: item.id,
+        toolName: "read_file",
+        arguments: { path: "src/parser.ts" },
+        output: "export function parse() {}",
+        failed: false,
+        exitCode: 0,
+        requestId: "observe-read-file",
+        executionId: "execution-read-file"
+      })
+      assert.equal(observation.toolName, "read_file")
+
+      const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+      try {
+        assert.equal(database.pragma("user_version", { simple: true }), 20)
+        const row = database.prepare(
+          "SELECT tool_name, item_id, exit_code, execution_id FROM todo_tool_observations WHERE request_id = ?"
+        ).get("observe-read-file") as { tool_name: string; item_id: string; exit_code: number; execution_id: string }
+        assert.deepEqual(row, {
+          tool_name: "read_file",
+          item_id: item.id,
+          exit_code: 0,
+          execution_id: "execution-read-file"
+        })
+      } finally {
+        database.close()
+      }
+    } finally {
+      repository.close()
+    }
+  })
+})
+
 test("evidence records log successes at DEBUG and failures at INFO, so routine evidence stays out of INFO", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-evidence-log-"))
   const lines: { level: "info" | "debug"; message: string }[] = []
@@ -752,16 +801,44 @@ const blockedReason = (outcome: LegacyTodoRetirement): string => {
   return outcome.reason
 }
 
-test("a project creates .twinny/evidence.sqlite with the current schema and git-ignores it on first initialization", async () => {
+test("a project creates .twinny/project.sqlite with the v20 schema and git-ignores it on first initialization", async () => {
   await withDirectory("twinny-project-init-", async (directory) => {
     const root = makeProject(directory)
     await projectRepository(root).initialize()
 
-    const databasePath = path.join(root, ".twinny", "evidence.sqlite")
+    const databasePath = path.join(root, ".twinny", "project.sqlite")
     assert.equal(fs.existsSync(databasePath), true)
     const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
     try {
-      assert.equal(database.pragma("user_version", { simple: true }), 19)
+      assert.equal(database.pragma("user_version", { simple: true }), 20)
+      assert.equal(database.pragma("integrity_check", { simple: true }), "ok")
+      assert.equal((database.prepare("SELECT COUNT(*) AS n FROM pragma_foreign_key_check").get() as { n: number }).n, 0)
+
+      const tables = database.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'documents_fts_%' ORDER BY name"
+      ).all().map((row) => (row as { name: string }).name)
+      assert.deepEqual(tables, [
+        "documents", "documents_fts", "index_meta", "observation_source", "source_root", "symbols",
+        "todo_accepted_evidence", "todo_assessment_current", "todo_assessment_reactions", "todo_assessments",
+        "todo_child_proposals", "todo_dependencies", "todo_edit_operations", "todo_evaluations", "todo_events",
+        "todo_evidence", "todo_evidence_usage", "todo_intent_plans", "todo_intent_tasks", "todo_items",
+        "todo_lists", "todo_projects", "todo_requests", "todo_requirement_activations", "todo_symbol_aliases",
+        "todo_tool_evidence", "todo_tool_observations"
+      ])
+
+      const indexes = database.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      ).all().map((row) => (row as { name: string }).name)
+      assert.equal(indexes.length, 29)
+      assert.ok(indexes.includes("todo_tool_observations_item"))
+      assert.ok(indexes.includes("todo_tool_observations_project"))
+      assert.ok(indexes.includes("documents_fingerprint"))
+      assert.ok(indexes.includes("source_root_one_home"))
+
+      const triggers = database.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name"
+      ).all().map((row) => (row as { name: string }).name)
+      assert.deepEqual(triggers, ["todo_assessment_reactions_append_only", "todo_assessments_immutable"])
     } finally {
       database.close()
     }
@@ -788,8 +865,8 @@ test("separate projects receive independent project-local databases", async () =
 
     assert.equal((await projectRepository(second).getList(projectScope(second))).items.length, 0)
     assert.equal((await projectRepository(first).getList(projectScope(first))).items.length, 1)
-    const firstDatabase = path.join(first, ".twinny", "evidence.sqlite")
-    const secondDatabase = path.join(second, ".twinny", "evidence.sqlite")
+    const firstDatabase = path.join(first, ".twinny", "project.sqlite")
+    const secondDatabase = path.join(second, ".twinny", "project.sqlite")
     assert.notEqual(firstDatabase, secondDatabase)
     assert.equal(fs.existsSync(firstDatabase) && fs.existsSync(secondDatabase), true)
   })
@@ -822,7 +899,7 @@ test("legacy removal deletes only the verified legacy database and its exact sid
     for (const name of unrelated) fs.writeFileSync(path.join(globalStorageDir, name), "keep")
     fs.writeFileSync(path.join(globalStorageDir, "intent-compiler-traces", "trace.json"), "{}")
 
-    const outcome = await retireLegacyTodoDatabase(globalStorageDir, path.join(root, ".twinny", "evidence.sqlite"))
+    const outcome = await retireLegacyTodoDatabase(globalStorageDir, path.join(root, ".twinny", "project.sqlite"))
     assert.equal(outcome.status, "removed")
     assert.equal(outcome.legacyPath, legacyPath)
     assert.deepEqual(fs.readdirSync(globalStorageDir).sort(), [...unrelated, "intent-compiler-traces"].sort())
@@ -833,7 +910,7 @@ test("legacy removal deletes only the verified legacy database and its exact sid
 test("legacy removal is refused for unverified or live legacy storage and deletes nothing", async () => {
   await withDirectory("twinny-legacy-refuse-", async (directory) => {
     const root = makeProject(directory)
-    const activePath = path.join(root, ".twinny", "evidence.sqlite")
+    const activePath = path.join(root, ".twinny", "project.sqlite")
 
     const textDir = path.join(directory, "text")
     fs.mkdirSync(textDir)
@@ -884,7 +961,7 @@ test("legacy removal is refused for unverified or live legacy storage and delete
 test("a stale legacy lock is taken over and an absent legacy database is reported without deletion", async () => {
   await withDirectory("twinny-legacy-stale-", async (directory) => {
     const root = makeProject(directory)
-    const activePath = path.join(root, ".twinny", "evidence.sqlite")
+    const activePath = path.join(root, ".twinny", "project.sqlite")
     const staleDir = path.join(directory, "stale")
     fs.mkdirSync(staleDir)
     const legacyPath = await legacyDatabaseIn(staleDir, root)
@@ -902,20 +979,23 @@ test("a stale legacy lock is taken over and an absent legacy database is reporte
   })
 })
 
-test("ambiguous, empty, and non-local workspace folders fail explicitly and create no .twinny directory", async () => {
+test("multi-root project home is stable, overridable, saved-workspace-aware, and rejects unsupported roots", async () => {
   await withDirectory("twinny-project-resolve-", async (directory) => {
     const first = makeProject(directory, "first")
     const second = makeProject(directory, "second")
     assert.throws(() => resolveProjectTodoStorage([]), /needs an open project folder/)
-    assert.throws(() => resolveProjectTodoStorage([{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]), /cannot choose between multiple workspace folders/)
     assert.throws(() => resolveProjectTodoStorage([{ scheme: "vscode-remote", fsPath: first }]), /not a "vscode-remote" folder/)
 
-    const ambiguous = new TodoRepository(projectLocation([{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]))
-    await assert.rejects(ambiguous.getList(projectScope(first)), /cannot choose between multiple workspace folders/)
+    const folders = [{ scheme: "file", fsPath: first }, { scheme: "file", fsPath: second }]
+    const forward = resolveProjectTodoStorage(folders)
+    const reverse = resolveProjectTodoStorage([...folders].reverse())
+    assert.equal(forward.databasePath, reverse.databasePath)
+    assert.equal(forward.databasePath, path.join(first, ".twinny", "project.sqlite"))
+    assert.equal(resolveProjectHome({ folders, workspaceFile: path.join(directory, "saved.code-workspace") }), directory)
+    assert.equal(resolveProjectHome({ folders, projectHome: path.join(directory, "override") }), path.join(directory, "override"))
+
     const none = new TodoRepository(projectLocation([]))
     await assert.rejects(none.getList(projectScope(first)), /needs an open project folder/)
-    assert.equal(fs.existsSync(path.join(first, ".twinny")), false)
-    assert.equal(fs.existsSync(path.join(second, ".twinny")), false)
   })
 })
 
@@ -926,11 +1006,11 @@ test("a symlinked .twinny directory or database is refused rather than followed 
     const linkedDirectoryRoot = makeProject(directory, "linked-directory")
     fs.symlinkSync(outside, path.join(linkedDirectoryRoot, ".twinny"), "dir")
     await assert.rejects(projectRepository(linkedDirectoryRoot).initialize(), /symbolic link/)
-    assert.equal(fs.existsSync(path.join(outside, "evidence.sqlite")), false)
+    assert.equal(fs.existsSync(path.join(outside, "project.sqlite")), false)
 
     const linkedFileRoot = makeProject(directory, "linked-file")
     fs.mkdirSync(path.join(linkedFileRoot, ".twinny"))
-    fs.symlinkSync(path.join(outside, "elsewhere.sqlite"), path.join(linkedFileRoot, ".twinny", "evidence.sqlite"))
+    fs.symlinkSync(path.join(outside, "elsewhere.sqlite"), path.join(linkedFileRoot, ".twinny", "project.sqlite"))
     await assert.rejects(projectRepository(linkedFileRoot).initialize(), /symbolic link/)
     assert.equal(fs.existsSync(path.join(outside, "elsewhere.sqlite")), false)
   })
@@ -954,13 +1034,74 @@ test("the project ignore rule preserves existing .gitignore content and is not d
   })
 })
 
+test("deleting a TODO list retains observations, retained output, source references, and accepted facts", async () => {
+  await withDirectory("twinny-evidence-retention-", async (directory) => {
+    const databasePath = path.join(directory, "project.sqlite")
+    const scope = { projectFingerprint: "project", conversationId: "chat-retention", writer: "chat-retention" }
+    const repository = new TodoRepository(databasePath)
+    const plan = {
+      planId: "plan-retention", version: 1 as const, revision: 1, goal: "Retain evidence",
+      constraints: [], tasks: [{
+        id: "inspect", title: "Inspect parser", description: "Read parser source",
+        criteria: [{ id: "parser-read", description: "Parser source was read", verification: { kind: "semantic_review" as const } }],
+        dependencies: []
+      }]
+    }
+    try {
+      const [item] = (await repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: "Read the parser", plan })).items
+      const observation = await repository.recordToolObservation(scope, {
+        itemId: item.id,
+        toolName: "read_file",
+        arguments: { path: "src/parser.ts" },
+        output: "export function parse() {}",
+        failed: false,
+        requestId: "retention-observation",
+        evidenceOutput: "src/parser.ts (lines 1–1 of 1)\ncontent_hash: sha256:" + "a".repeat(64) + "; total_lines: 1\n1: export function parse() {}"
+      })
+
+      const database = new BetterSqlite(databasePath)
+      try {
+        database.pragma("foreign_keys = ON")
+        const list = database.prepare("SELECT id, project_id FROM todo_lists WHERE conversation_id = ?").get(scope.conversationId) as { id: string; project_id: string }
+        database.prepare(
+          "INSERT INTO todo_accepted_evidence(id, project_id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, registered_tool, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)"
+        ).run(
+          "accepted-retention", list.project_id, list.id, "plan-retention", 1, item.id, 0,
+          "Parser source was read", observation.id, "read_file", "parse", "src/parser.ts", 1, 1,
+          "sha256:" + "a".repeat(64), "read_file", "2026-11-18T00:00:00.000Z"
+        )
+        database.prepare("DELETE FROM todo_lists WHERE id = ?").run(list.id)
+      } finally {
+        database.close()
+      }
+
+      const reopened = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+      try {
+        const counts = {
+          observations: (reopened.prepare("SELECT COUNT(*) AS n FROM todo_tool_observations").get() as { n: number }).n,
+          retained: (reopened.prepare("SELECT COUNT(*) AS n FROM todo_tool_evidence WHERE retained = 1").get() as { n: number }).n,
+          sources: (reopened.prepare("SELECT COUNT(*) AS n FROM observation_source").get() as { n: number }).n,
+          accepted: (reopened.prepare("SELECT COUNT(*) AS n FROM todo_accepted_evidence").get() as { n: number }).n
+        }
+        assert.deepEqual(counts, { observations: 1, retained: 1, sources: 1, accepted: 1 })
+      } finally {
+        reopened.close()
+      }
+    } finally {
+      repository.close()
+    }
+  })
+})
+
 test("deleting the project database and its sidecars then reopening creates a clean database", async () => {
   await withDirectory("twinny-project-reset-", async (directory) => {
     const root = makeProject(directory)
     const scope = projectScope(root)
-    await projectRepository(root).createItem(scope, { title: "Before reset" }, "before-reset")
+    const before = projectRepository(root)
+    await before.createItem(scope, { title: "Before reset" }, "before-reset")
+    before.close()
 
-    const databasePath = path.join(root, ".twinny", "evidence.sqlite")
+    const databasePath = path.join(root, ".twinny", "project.sqlite")
     for (const suffix of ["", "-wal", "-shm", "-journal", ".lock"]) fs.rmSync(`${databasePath}${suffix}`, { force: true })
 
     const reopened = projectRepository(root)
@@ -971,13 +1112,28 @@ test("deleting the project database and its sidecars then reopening creates a cl
   })
 })
 
+test("a project database from an older unsupported schema is refused and left untouched", async () => {
+  await withDirectory("twinny-project-old-", async (directory) => {
+    const root = makeProject(directory)
+    await projectRepository(root).initialize()
+    const databasePath = path.join(root, ".twinny", "project.sqlite")
+    const database = new BetterSqlite(databasePath)
+    database.pragma("user_version = 19")
+    database.close()
+    const before = fs.readFileSync(databasePath)
+
+    await assert.rejects(projectRepository(root).initialize(), /older than this Twinny version/)
+    assert.deepEqual(fs.readFileSync(databasePath), before, "no automatic migration or deletion occurs")
+  })
+})
+
 test("a project database from a newer Twinny schema is refused and left untouched", async () => {
   await withDirectory("twinny-project-future-", async (directory) => {
     const root = makeProject(directory)
     await projectRepository(root).initialize()
-    const databasePath = path.join(root, ".twinny", "evidence.sqlite")
+    const databasePath = path.join(root, ".twinny", "project.sqlite")
     const database = new BetterSqlite(databasePath)
-    database.pragma("user_version = 20")
+    database.pragma("user_version = 21")
     database.close()
     const before = fs.readFileSync(databasePath)
 
