@@ -437,31 +437,33 @@ export const evidenceCheckRecord = (live: AcceptedFact[]): { arguments: Record<s
 const PROHIBITION_SCOPE = "Covers file operations Twinny controls (create_file, edit_lines, edit_file, rename_symbol, delete_file, move_file). Writes made by other mechanisms, including shell commands, are not audited."
 
 /**
- * Proves a required workspace change from the host's record of this task. Failed mutations changed nothing,
- * so only a successful one counts.
+ * Proves a required workspace change from a relevant host-recorded mutation. Relevance is the operation the
+ * criterion names: a mutation of another operation is not its evidence. Sufficiency is the outcome, and a failed
+ * mutation changed nothing, so only a successful one counts. Which task recorded the mutation is provenance only.
  */
 const mutationOutcome = (verification: Extract<CriterionVerification, { kind: "workspace_mutation" }>, records: RetainedObservationEvidence[]): CriterionOutcome => {
   const allowed = verification.operation ? OPERATION_TOOLS[verification.operation] : MUTATING_TOOLS
   const mutations = records.filter((record) => allowed.includes(record.toolName))
   const succeeded = mutations.filter((record) => !record.failed)
   if (succeeded.length) return reconciled("proven", succeeded.map((record) => record.observationId), [])
-  return reconciled("unknown", [], [mutations.length ? "every file-mutation observation recorded for this task failed" : `no successful file-mutation observation (${allowed.join(", ")}) is recorded for this task`])
+  return reconciled("unknown", [], [mutations.length ? "every file-mutation observation recorded in this plan failed" : `no successful file-mutation observation (${allowed.join(", ")}) is recorded in this plan`])
 }
 
 /**
- * Decides a command result from the latest host-recorded run of the exact command in this task. A run only proves the
- * current workspace if no successful Twinny-recorded mutation followed it in the plan. A `historical` result is diagnostic:
- * it proves the recorded run, labelled as not validated against the current workspace. An `after_activation` result
- * also needs the run to be recorded after the task's requirement activation, by causal list revision.
+ * Decides a command result from the latest host-recorded run of the exact command the criterion names, among the
+ * plan's records. The exact command is the relevance test: another run is not this criterion's evidence. A run only
+ * proves the current workspace if no successful Twinny-recorded mutation followed it. A `historical` result is
+ * diagnostic: it proves the recorded run, labelled as not validated against the current workspace. An
+ * `after_activation` result also needs the run to be recorded after the task's requirement activation, by causal
+ * list revision.
  */
 const commandOutcome = (
   verification: Extract<CriterionVerification, { kind: "command_exit_status" }>,
-  taskRecords: RetainedObservationEvidence[],
-  planRecords: RetainedObservationEvidence[],
+  records: RetainedObservationEvidence[],
   activation: RequirementActivation | undefined
 ): CriterionOutcome => {
   const digest = commandDigest(verification.command)
-  const latest = taskRecords.filter((record) => record.toolName === "run_command" && record.arguments.command_sha256 === digest).at(-1)
+  const latest = records.filter((record) => record.toolName === "run_command" && record.arguments.command_sha256 === digest).at(-1)
   if (verification.execution === "after_activation") {
     if (!activation) return reconciled("unknown", [], [`the requirement to run ${verification.command} is not activated for this task yet; it is activated when a reply starts`])
     const eligible = latest !== undefined && latest.listRevision !== undefined && latest.listRevision > activation.listRevision
@@ -474,8 +476,8 @@ const commandOutcome = (
   if (latest.failed || latest.exitCode === undefined) return reconciled("unknown", [], ["the latest run of " + verification.command + " did not complete"])
   const historical = verification.scope === "historical"
   if (!historical) {
-    const position = planRecords.findIndex((record) => record.observationId === latest.observationId)
-    const later = planRecords.slice(position + 1).filter((record) => !record.failed && MUTATING_TOOLS.includes(record.toolName))
+    const position = records.findIndex((record) => record.observationId === latest.observationId)
+    const later = records.slice(position + 1).filter((record) => !record.failed && MUTATING_TOOLS.includes(record.toolName))
     if (later.length) {
       return reconciled("unknown", [], [`the workspace changed after the latest run of ${verification.command} (observation ${later[0].observationId}); run it again to test the current revision`])
     }
@@ -970,14 +972,15 @@ const sourceOutcome = async (
 }
 
 /**
- * The items whose recorded work counts for this task's criteria: the task itself and the prerequisites it declared as
- * evidence. Records are referenced, not copied, so each observation keeps the item it was recorded under.
+ * Which records a criterion may be proven from, and whether one of them is sufficient, are two separate questions.
+ * Relevance is what the criterion's typed contract names: the file a source predicate matches its records against,
+ * the operation a mutation criterion names, the exact command a command criterion names. Sufficiency is the outcome
+ * the criterion asks for — a successful persisted mutation, the exact exit code, a source fingerprint that still
+ * matches the current document. A record's task id is provenance only: no task owns evidence, and no dependency edge
+ * or declared handoff makes a record count. Proximity between tasks proves nothing.
  */
-const criterionOwners = (review: { task: Pick<TodoReviewPackage["task"], "id">; evidenceSources?: string[] }): ReadonlySet<string> => new Set([review.task.id, ...(review.evidenceSources ?? [])])
-
 const typedOutcome = async (
   verification: CriterionVerification,
-  owners: ReadonlySet<string>,
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
   current: (path: string) => Promise<string | undefined>,
@@ -994,9 +997,9 @@ const typedOutcome = async (
     case "execution_invariant":
       return prohibitionOutcome(records)
     case "workspace_mutation":
-      return mutationOutcome(verification, records.filter((record) => owners.has(record.itemId)))
+      return mutationOutcome(verification, records)
     case "command_exit_status":
-      return commandOutcome(verification, records.filter((record) => owners.has(record.itemId)), records, activation)
+      return commandOutcome(verification, records, activation)
     case "evidence_lookup_completed": {
       const check = completedProjectLookup(records)
       return check
@@ -1020,7 +1023,7 @@ export const reviewReconciliations = async (
   const current = cachedCurrentReader(readCurrentSource)
   const outcomes: TodoCriterionReconciliation[] = []
   for (const criterion of review.criteria) {
-    const outcome = await typedOutcome(criterion.verification, criterionOwners(review), review.retainedEvidence, review.acceptedEvidence, current, review.requirementActivation).catch((error: unknown) => {
+    const outcome = await typedOutcome(criterion.verification, review.retainedEvidence, review.acceptedEvidence, current, review.requirementActivation).catch((error: unknown) => {
       logger.error("[Feedback] verifier.criterion_failed criterion=" + criterion.id + " error=" + String(error))
       return reconciled("unknown", [], ["the verifier could not evaluate this criterion; the fault was logged"], "internal_error")
     })
@@ -1501,13 +1504,13 @@ export const dependenciesComplete = (review: TodoReviewPackage): boolean =>
   review.dependencies.every((dependency) => dependency.status === "completed")
 
 /**
- * Whether this task itself has a successful, host-recorded file mutation. Edits recorded for other tasks, and a
- * request-level changes view, do not satisfy this task's workspace requirement.
+ * Whether a relevant successful mutation in the plan can satisfy one of this task's mutation criteria. The record
+ * may have been recorded under another task; what decides it is the operation the criterion names and the
+ * mutation's outcome. A failed mutation changed nothing, and the model's own assertion of a change is not a record.
  */
-export const taskHasVerifiedMutation = (review: TodoReviewPackage): boolean => {
-  const owners = criterionOwners(review)
-  return review.observations.some((record) => owners.has(record.itemId) && !record.failed && MUTATING_TOOLS.includes(record.toolName))
-}
+export const taskHasVerifiedMutation = (review: TodoReviewPackage): boolean =>
+  review.criteria.some((criterion) => criterion.verification.kind === "workspace_mutation" &&
+    mutationOutcome(criterion.verification, review.retainedEvidence).outcome === "proven")
 
 /**
  * A verdict that keeps the task in review (needs_evidence) bumps its version once, so the version alone looks like a

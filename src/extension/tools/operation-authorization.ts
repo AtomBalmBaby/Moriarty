@@ -5,8 +5,7 @@
  * they change one. A claim checks the operation, the host and the current
  * canonical target of each path, and it is spent by the first success. It ends
  * with the call, so a later command cannot reuse it.
- * Only instances this module issued are accepted, so a caller of a public
- * command cannot forge one.
+ * Only what this module issued is accepted, so a caller of a public command cannot forge one.
  */
 import path from "path"
 
@@ -26,9 +25,23 @@ interface Approved {
   real: string
 }
 
-const issued = new WeakSet<OperationAuthorization>()
 
-export class OperationAuthorization {
+/** What an accepted authorization has to be able to do. */
+interface WriteAuthorization {
+  covers(requests: readonly WriteRequest[], host: string): boolean
+  take(requests: readonly WriteRequest[], host: string): boolean
+}
+
+/**
+ * The authorizations issued in this process. The shipped extension runs as one bundle that holds its
+ * own copy of this file, while the extension host also loads this file as its own module, so the same
+ * approval can be issued through one copy and claimed through the other. Being in this set is what
+ * makes an authorization genuine: an object built by hand, or one from another process, is refused.
+ */
+const sharedIssued = (globalThis as { twinnyIssuedWrites?: WeakSet<WriteAuthorization> }).twinnyIssuedWrites ??=
+  new WeakSet<WriteAuthorization>()
+
+export class OperationAuthorization implements WriteAuthorization {
   private open = true
   private readonly approved: readonly Approved[]
 
@@ -45,7 +58,7 @@ export class OperationAuthorization {
 
   static issue(host: string, requests: readonly WriteRequest[]): OperationAuthorization {
     const authorization = new OperationAuthorization(host, requests)
-    issued.add(authorization)
+    sharedIssued.add(authorization)
     return authorization
   }
 
@@ -78,10 +91,13 @@ export class OperationAuthorization {
   }
 }
 
-/** Whether `authorization` is a live authorization this module issued that covers exactly `requests` on `host`. Spends nothing. */
+/** Whether `authorization` is one issued in this process that covers exactly `requests` on `host`. Spends nothing. */
+const isIssued = (authorization: unknown): authorization is WriteAuthorization =>
+  typeof authorization === "object" && authorization !== null && sharedIssued.has(authorization as WriteAuthorization)
+
 export const coversWrites = (authorization: unknown, requests: readonly WriteRequest[], host: string): boolean =>
-  authorization instanceof OperationAuthorization && issued.has(authorization) && authorization.covers(requests, host)
+  isIssued(authorization) && authorization.covers(requests, host)
 
 /** As `coversWrites`, and spends the authorization. */
 export const claimWrites = (authorization: unknown, requests: readonly WriteRequest[], host: string): boolean =>
-  authorization instanceof OperationAuthorization && issued.has(authorization) && authorization.take(requests, host)
+  isIssued(authorization) && authorization.take(requests, host)

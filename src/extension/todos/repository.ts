@@ -548,18 +548,6 @@ const planUmbrellaMatch = (candidates: ItemRow[], title: string): ItemRow | unde
   return scored.sort((left, right) => right.shared - left.shared)[0].row
 }
 
-/** Every TODO the item transitively depends on. Only these may be named as evidence sources for it. */
-const prerequisiteIdsOf = (database: Database, itemId: string): Set<string> =>
-  new Set(rows<{ id: string }>(database,
-    "WITH RECURSIVE closure(id) AS (SELECT depends_on_item_id FROM todo_dependencies WHERE item_id = ? " +
-    "UNION SELECT dependency.depends_on_item_id FROM todo_dependencies dependency JOIN closure ON dependency.item_id = closure.id) SELECT id FROM closure", [itemId]).map((row) => row.id))
-
-/** Prerequisites whose recorded work a TODO has declared as its evidence, from its latest handoff events. */
-const declaredEvidenceSourcesOf = (database: Database, listId: string, itemId: string): string[] =>
-  [...new Set(rows<{ payload_json: string }>(database,
-    "SELECT payload_json FROM todo_events WHERE list_id = ? AND item_id = ? AND event_type = 'evidence_linked' ORDER BY list_revision", [listId, itemId])
-    .flatMap((row) => (JSON.parse(row.payload_json) as { sourceItemIds: string[] }).sourceItemIds))]
-
 const latestItemEvent = (database: Database, listId: string, itemId: string, eventType: string) =>
   rows<{ list_revision: number; payload_json: string }>(database,
     "SELECT list_revision, payload_json FROM todo_events WHERE list_id = ? AND item_id = ? AND event_type = ? ORDER BY list_revision DESC LIMIT 1",
@@ -1186,7 +1174,6 @@ export class TodoRepository {
           retainedEvidence,
           acceptedEvidence,
           symbolAliases,
-          evidenceSources: declaredEvidenceSourcesOf(database, list.id, row.id),
           requirementActivation: latestActivation(database, list.id, row.id),
           lastEvaluation: lastEvaluation ? JSON.parse(lastEvaluation.evaluation_json) as TodoEvaluation : undefined
         }
@@ -1937,7 +1924,7 @@ export class TodoRepository {
    * review is pending are acknowledged without changing the version. Only
    * Feedback or a trusted user action can complete the TODO.
    */
-  claimCompletion(request: TodoWriteRequest, input: { itemId: string; expectedVersion: number; requestId: string; evidenceFrom?: string[] }): Promise<TodoCompletionClaim> {
+  claimCompletion(request: TodoWriteRequest, input: { itemId: string; expectedVersion: number; requestId: string }): Promise<TodoCompletionClaim> {
     assertWriter(request)
     validateRequestId(input.requestId)
     return this.sqlite.write((database) => {
@@ -1979,12 +1966,6 @@ export class TodoRepository {
       if (row.version !== input.expectedVersion) throw new TodoConflictError(`TODO changed since version ${input.expectedVersion}; current version is ${row.version}`)
       const alreadyInReview = row.status === "in_review"
       if (!alreadyInReview && !statusTransitions[row.status].has("in_review")) throw new Error(`Invalid TODO transition: ${row.status} -> in_review`)
-      const evidenceSourceIds = [...new Set(input.evidenceFrom ?? [])]
-      if (evidenceSourceIds.length) {
-        const prerequisites = prerequisiteIdsOf(database, row.id)
-        const outside = evidenceSourceIds.filter((sourceId) => !prerequisites.has(sourceId))
-        if (outside.length) throw new Error(`Evidence can only come from prerequisite TODOs of this TODO; not prerequisites: ${outside.join(", ")}`)
-      }
 
       if (!alreadyInReview) {
         const claim = execute(database,
@@ -1993,8 +1974,6 @@ export class TodoRepository {
         )
         if (claim.changes !== 1) throw new TodoConflictError("TODO changed while recording its completion claim")
       }
-      // A handoff is host-recorded and references the prerequisite's existing observations; nothing is copied.
-      if (evidenceSourceIds.length) bumpList(database, list.id, row.id, "evidence_linked", "model", input.requestId, { sourceItemIds: evidenceSourceIds })
       const resultVersion = alreadyInReview ? row.version : row.version + 1
       bumpList(database, list.id, row.id, "completion_claimed", "model", input.requestId, { expectedVersion: input.expectedVersion, resultVersion, previousStatus: row.status, review })
       const claim: TodoCompletionClaim = { disposition: "accepted", item: itemOf(rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ?", [row.id])[0]), review }

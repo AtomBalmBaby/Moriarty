@@ -298,7 +298,6 @@ export const todoTools = (
       { name: "details", description: "Replacement details (empty clears details).", optional: true },
       { name: "status", description: "pending, in_progress, in_review, blocked, completed, or cancelled.", optional: true },
       { name: "priority", description: "low, normal, high, or urgent.", optional: true },
-      { name: "evidence_from", description: "With status completed only: comma-separated IDs of prerequisite TODOs whose recorded work and read-back this task relies on as evidence. Only prerequisites of this TODO are accepted; their observations are shared, not copied.", optional: true },
       { name: "blocked_reason", description: "Required when setting status to blocked. Must name the specific external condition preventing progress (for example, 'the file is locked by another process'); placeholders such as 'No reason' are rejected.", optional: true }
     ],
     schema: {
@@ -312,7 +311,6 @@ export const todoTools = (
         status: { type: "string", enum: [...statuses] },
         priority: { type: "string", enum: [...priorities] },
         blocked_reason: { type: "string", maxLength: 1000 },
-        evidence_from: { type: "string", maxLength: 1000 }
       },
       required: ["item_id", "expected_version", "request_id"],
       additionalProperties: false
@@ -332,14 +330,11 @@ export const todoTools = (
         if (status === "completed") {
           const others = Object.keys(patch).filter((key) => key !== "status")
           if (others.length) throw new Error(`A completion claim must not change other fields (${others.join(", ")}); update those in a separate call first`)
-          const evidenceFrom = typeof args.evidence_from === "string"
-            ? args.evidence_from.split(",").map((id: string) => id.trim()).filter(Boolean)
-            : undefined
+          // A caller that still sends evidence_from is ignored: relevance is decided by the host, not by a declared handoff.
           const claim = await repository.claimCompletion(scope, {
             itemId: args.item_id,
             expectedVersion,
-            requestId: requestId(args),
-            evidenceFrom
+            requestId: requestId(args)
           })
           onChanged()
           return result({
@@ -355,7 +350,6 @@ export const todoTools = (
             ...(claim.review === "user_approval" ? { note: "This task is not in a Feedback plan; it awaits the user's approval in the TODO panel." } : {})
           }, claim.disposition === "accepted" ? "completion claim accepted; Feedback review is pending" : "completion claim already submitted; no change")
         }
-        if (args.evidence_from !== undefined) throw new Error("evidence_from is only accepted with status completed")
         const item = await repository.updateItem(scope, {
           itemId: args.item_id,
           expectedVersion,

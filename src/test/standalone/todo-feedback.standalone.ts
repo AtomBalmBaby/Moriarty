@@ -1215,33 +1215,56 @@ test("a task that needs evidence is reopened only by evidence recorded after its
   }
 })
 
-test("a file change recorded for a sibling task, or a failed edit, cannot satisfy another task's workspace mutation", async () => {
-  const mutation = (id: string) => ({ id, criteria: [{ id, description: `${id} is updated in the workspace`, verification: { kind: "workspace_mutation" as const } }] })
-  const state = await fixture([mutation("writer"), mutation("other")], false)
+test("relevant records serve any task in the plan without an owner, while a failed record or a record for another file does not", async () => {
+  const mutation = (id: string, operation: WorkspaceMutationOperation): TypedCriterion =>
+    ({ id, description: `${id} is changed in the workspace`, verification: { kind: "workspace_mutation", operation } })
+  const state = await fixture([
+    { id: "recorded", criteria: [semantic("recorded", "The work is recorded")] },
+    { id: "created", criteria: [mutation("created", "create")] },
+    { id: "edited", criteria: [mutation("edited", "edit")], dependencies: ["recorded"] },
+    { id: "located", criteria: [locate("read_file", WORKSPACE_FILE, "registered_tool")] }
+  ], false)
   try {
-    const [writer, other] = state.items
-    await addObservation(state.repository, state.scope, writer.id, "edit_file")
-    await state.repository.recordToolObservation(state.scope, {
-      itemId: other.id,
-      toolName: "edit_file",
-      arguments: { path: "src/fixture.ts" },
-      output: "No match found for the requested text.",
-      failed: true,
-      requestId: "failed-edit-other"
-    })
-    await state.repository.claimCompletion(state.scope, { itemId: writer.id, expectedVersion: writer.version, requestId: "claim-writer" })
-    await state.repository.claimCompletion(state.scope, { itemId: other.id, expectedVersion: other.version, requestId: "claim-other" })
-    const reviews = await state.repository.getReviewPackages(state.scope)
-    const writerReview = reviews.find((review) => review.task.id === writer.id)
-    const otherReview = reviews.find((review) => review.task.id === other.id)
-    assert.ok(writerReview && otherReview)
-    assert.equal(taskHasVerifiedMutation(writerReview), true, "the task's own successful edit counts")
-    assert.equal(taskHasVerifiedMutation(otherReview), false, "a sibling's edit and a failed edit do not count")
-    const evaluation = await evaluateTodoReview(state.repository, state.scope, otherReview,
-      async () => responseFor(otherReview, { refs: [] }), "mock-reviewer",
-      { hasVerifiedFileChanges: taskHasVerifiedMutation(otherReview) })
-    assert.equal(evaluation.decision, "needs_evidence")
-    assert.equal((await state.repository.getItem(state.scope, other.id)).item.status, "in_review")
+    const item = (id: string) => state.items.find((entry) => entry.title === id)!
+    const [recorded, created, edited, located] = ["recorded", "created", "edited", "located"].map(item)
+    // Every record is made under `recorded`; the other tasks record nothing and share no dependency edge.
+    const record = (itemId: string, toolName: string, target: string, failed: boolean, requestId: string) =>
+      state.repository.recordToolObservation(state.scope, { itemId, toolName, arguments: { path: target }, output: failed ? "Tool failed." : "Tool returned the expected result.", failed, requestId })
+    const create = await record(recorded.id, "create_file", "src/fixture.ts", false, "create-recorded")
+    const failedEdit = await record(recorded.id, "edit_lines", "src/fixture.ts", true, "edit-recorded")
+    const otherFileRead = await record(recorded.id, "read_file", "src/other-file.ts", false, "read-other-file")
+    const namedFileRead = await observeWorkspaceWindow(state, recorded.id, "read-named-file", 160, 220)
+    const check = async (task: { id: string; version: number }) => {
+      await state.repository.claimCompletion(state.scope, { itemId: task.id, expectedVersion: task.version, requestId: `claim-${task.id}` })
+      const review = (await state.repository.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === task.id)!
+      return { review, outcome: (await reviewReconciliations(review, currentWorkspace))[0] }
+    }
+    const createdCheck = await check(created)
+    assert.deepEqual(createdCheck.review.dependencies, [], "no dependency edge links these tasks")
+    assert.equal(createdCheck.outcome.outcome, "proven", "the create recorded under another task serves this task")
+    assert.deepEqual(createdCheck.review.retainedEvidence.filter((entry) => entry.observationId === create.id).map((entry) => entry.itemId), [recorded.id], "the record keeps the task it was recorded under")
+    const editedCheck = await check(edited)
+    assert.equal(dependenciesComplete(editedCheck.review), false, "the plan edge gates release only; it grants no evidence")
+    assert.equal(editedCheck.outcome.outcome, "unknown", "the only record for the edit operation failed, so it proves nothing even though its prerequisite recorded it")
+    const locatedCheck = await check(located)
+    const retained = locatedCheck.review.retainedEvidence
+    const namedRead = retained.filter((entry) => entry.observationId === namedFileRead.id)
+    const otherRead = retained.filter((entry) => entry.observationId === otherFileRead.id)
+    assert.equal(namedRead.length, 1, "the read recorded under another task is this task's candidate")
+    assert.equal(otherRead.length, 1)
+    // Target relevance: a record naming another file cannot answer a criterion that names this file.
+    const [wrongTarget] = await reviewCriteria([locate("read_file", WORKSPACE_FILE, "registered_tool")], otherRead, currentWorkspace)
+    assert.equal(wrongTarget.outcome, "unknown", "the only record names a different file")
+    assert.deepEqual(wrongTarget.supportingObservationIds, [])
+    assert.deepEqual(locatedCheck.outcome.supportingObservationIds, [namedFileRead.id], "the criterion is proven from the read of its own file only")
+    assert.equal(taskHasVerifiedMutation(createdCheck.review), true)
+    assert.equal(taskHasVerifiedMutation(editedCheck.review), false)
+    const createdEvaluation = await evaluateTodoReview(state.repository, state.scope, createdCheck.review,
+      async () => responseFor(createdCheck.review, { refs: [] }), "mock-reviewer", { readCurrentSource: currentWorkspace, hasVerifiedFileChanges: taskHasVerifiedMutation(createdCheck.review) })
+    assert.equal(createdEvaluation.decision, "accept", "the relevant record from another task completes the task")
+    const editedEvaluation = await evaluateTodoReview(state.repository, state.scope, editedCheck.review,
+      async () => responseFor(editedCheck.review, { refs: [failedEdit.id] }), "mock-reviewer", { readCurrentSource: currentWorkspace, hasVerifiedFileChanges: taskHasVerifiedMutation(editedCheck.review) })
+    assert.notEqual(editedEvaluation.decision, "accept", "a failed record cannot support the claim")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -1254,84 +1277,99 @@ const recordAsActive = async (state: Awaited<ReturnType<typeof fixture>>, toolNa
   return state.repository.recordToolObservation(state.scope, { itemId: active.task.id, toolName, arguments: args, output: options.output ?? "ok", failed: options.failed ?? false, exitCode: options.exitCode, requestId })
 }
 
-test("the live Locate, Replace, Verify sequence: an edit recorded under Locate is handed to Replace, its read-back and check to Verify, and the chain completes", async () => {
+test("the live Locate, Replace, Verify sequence completes from relevant records with no dependency edge and no declared handoff", async () => {
   const command = "npx tsc --strict && node example/intent-smoke/check.cjs"
   const state = await fixture([
     { id: "locate", criteria: [semantic("locate", "The renamed symbol is located")] },
-    { id: "replace", criteria: [{ id: "replace", description: "The symbol is renamed in the workspace", verification: { kind: "workspace_mutation" as const } }], dependencies: ["locate"] },
-    { id: "verify", criteria: [exitZero(command)], dependencies: ["replace"] }
+    { id: "replace", criteria: [{ id: "replace", description: "The symbol is renamed in the workspace", verification: { kind: "workspace_mutation" as const } }] },
+    { id: "verify", criteria: [exitZero(command)] }
   ], false)
   try {
     const [locate, replace, verify] = state.items
+    // Nothing links these tasks, so every result is recorded under the active task, Locate.
     const find = await recordAsActive(state, "read_file", { path: WORKSPACE_FILE }, "read-locate", { output: "const oldName = 1" })
-    // Serial execution: while Locate is the only actionable TODO, every result is recorded under it.
-    await recordAsActive(state, "edit_lines", { path: WORKSPACE_FILE }, "edit-rename", { output: "Edited 1 line." })
-    await recordAsActive(state, "read_file", { path: WORKSPACE_FILE }, "read-back", { output: "const newName = 1" })
-    await recordAsActive(state, "run_command", runCommandArguments(command), "check", { output: "3 assertions passed.", exitCode: 0 })
+    assert.equal(find.itemId, locate.id, "the record keeps the task it was recorded under")
+    const rename = await recordAsActive(state, "edit_lines", { path: WORKSPACE_FILE }, "edit-rename", { output: "Edited 1 line." })
+    const check = await recordAsActive(state, "run_command", runCommandArguments(command), "check", { output: "3 assertions passed.", exitCode: 0 })
+    await recordAsActive(state, "run_command", runCommandArguments("npm run build-tests"), "unrelated-run", { output: "built", exitCode: 0 })
 
-    const workspace = todoWorkspaceTools(state.repository, state.scope, () => undefined)
-    const complete = (item: { id: string; version: number }, extra: Record<string, string> = {}) =>
-      workspace.run({ name: "twinny_todo_update", args: { item_id: item.id, expected_version: item.version, request_id: `claim-${item.id}`, status: "completed", ...extra } } as never, undefined)
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined)
+    const tool = tools.tools.find((candidate) => candidate.name === "twinny_todo_update")!
+    assert.ok(!tool.parameters.some((parameter) => parameter.name === "evidence_from"), "the tool no longer advertises evidence_from")
+    assert.ok(!Object.keys((tool.schema?.properties as Record<string, unknown>) ?? {}).includes("evidence_from"), "its argument schema no longer names it")
+    const complete = (task: { id: string; version: number }) =>
+      tools.run({ name: "twinny_todo_update", args: { item_id: task.id, expected_version: task.version, request_id: `claim-${task.id}`, status: "completed" } } as never, undefined)
     assert.equal((await complete(locate)).failed, undefined)
-    assert.equal((await complete(replace, { evidence_from: locate.id })).failed, undefined, "Replace may cite its prerequisite's work")
-    assert.equal((await complete(verify, { evidence_from: locate.id })).failed, undefined, "Verify may cite its transitive prerequisite's work")
+    assert.equal((await complete(replace)).failed, undefined)
+    assert.equal((await complete(verify)).failed, undefined)
 
-    const reviewFor = async (taskId: string) => (await state.repository.getReviewPackages(state.scope)).find((review) => review.task.id === taskId)
+    const reviewFor = async (taskId: string) => (await state.repository.getReviewPackages(state.scope)).find((review) => review.task.id === taskId)!
     const replaceReview = await reviewFor(replace.id)
-    assert.ok(replaceReview)
+    assert.deepEqual(replaceReview.dependencies, [], "no dependency edge links these tasks")
     const edits = replaceReview.retainedEvidence.filter((record) => record.toolName === "edit_lines")
     assert.equal(edits.length, 1, "the edit is referenced once, never copied")
     assert.equal(edits[0].itemId, locate.id, "the edit keeps the TODO it was recorded under")
-    assert.equal(taskHasVerifiedMutation(replaceReview), true, "the prerequisite's successful edit is evidence for Replace")
+    const replaceOutcome = (await reviewReconciliations(replaceReview))[0]
+    assert.equal(replaceOutcome.outcome, "proven", "Replace is proven by the edit recorded under Locate")
+    assert.deepEqual(replaceOutcome.supportingObservationIds, [rename.id])
+    assert.equal(taskHasVerifiedMutation(replaceReview), true)
+    const verifyOutcome = (await reviewReconciliations(await reviewFor(verify.id)))[0]
+    assert.equal(verifyOutcome.outcome, "proven", "Verify is proven by the run of the exact command recorded under Locate")
+    assert.deepEqual(verifyOutcome.supportingObservationIds, [check.id], "the other run is not this criterion's evidence")
 
     const evaluate = async (taskId: string, refs: string[] = []) => {
       const candidate = reviewCandidates(await state.repository.getReviewPackages(state.scope)).find((review) => review.task.id === taskId)
-      assert.ok(candidate, `${taskId} must be released for review`)
+      assert.ok(candidate, `${taskId} must be reviewable without any dependency edge`)
       return evaluateTodoReview(state.repository, state.scope, candidate, async () => responseFor(candidate, { refs }), "mock-reviewer",
         { hasVerifiedFileChanges: taskHasVerifiedMutation(candidate) })
     }
     assert.equal((await evaluate(locate.id, [find.id])).decision, "accept")
     assert.equal((await evaluate(replace.id)).decision, "accept")
     assert.equal((await evaluate(verify.id)).decision, "accept")
-    for (const item of [locate, replace, verify]) {
-      assert.equal((await state.repository.getItem(state.scope, item.id)).item.status, "completed", `${item.title} completes`)
+    for (const task of [locate, replace, verify]) {
+      assert.equal((await state.repository.getItem(state.scope, task.id)).item.status, "completed", `${task.title} completes`)
     }
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
 })
 
-test("a handoff is accepted only from a prerequisite on a completion claim, and an undeclared dependent gains nothing from a sibling's handoff", async () => {
-  const mutation = (id: string) => ({ id, criteria: [{ id, description: `${id} is updated in the workspace`, verification: { kind: "workspace_mutation" as const } }] })
+test("a completion claim ignores a stray legacy evidence_from argument, records no handoff event, and relevance decides which record counts", async () => {
+  const mutation = (id: string, operation: WorkspaceMutationOperation): TypedCriterion =>
+    ({ id, description: `${id} is changed in the workspace`, verification: { kind: "workspace_mutation", operation } })
   const state = await fixture([
-    { id: "locate", criteria: [semantic("locate", "The target is located")] },
-    { ...mutation("replace"), dependencies: ["locate"] },
-    { ...mutation("docs"), dependencies: ["locate"] },
-    mutation("unrelated")
+    { id: "recorded", criteria: [semantic("recorded", "The work is recorded")] },
+    { id: "creates", criteria: [mutation("creates", "create")] },
+    { id: "edits", criteria: [mutation("edits", "edit")] }
   ], false)
   try {
     const item = (id: string) => state.items.find((entry) => entry.title === id)!
-    const [locate, replace, docs, unrelated] = ["locate", "replace", "docs", "unrelated"].map(item)
-    await recordAsActive(state, "edit_lines", { path: WORKSPACE_FILE }, "edit-locate")
-    const workspace = todoWorkspaceTools(state.repository, state.scope, () => undefined)
-    const update = (target: { id: string; version: number }, args: Record<string, string>) =>
-      workspace.run({ name: "twinny_todo_update", args: { item_id: target.id, expected_version: target.version, request_id: `req-${target.id}-${args.status ?? "completed"}-${args.evidence_from ?? ""}`, ...args } } as never, undefined)
+    const [recorded, creates, edits] = ["recorded", "creates", "edits"].map(item)
+    const record = (itemId: string, toolName: string, failed: boolean, requestId: string) =>
+      state.repository.recordToolObservation(state.scope, { itemId, toolName, arguments: { path: WORKSPACE_FILE }, output: failed ? "Tool failed." : "Tool returned the expected result.", failed, requestId })
+    await record(recorded.id, "create_file", false, "create-recorded")
+    await record(recorded.id, "edit_lines", true, "edit-recorded")
 
-    const notPrerequisite = await update(unrelated, { status: "completed", evidence_from: locate.id })
-    assert.equal(notPrerequisite.failed, true, "a TODO that does not depend on the source cannot cite it")
-    assert.match(notPrerequisite.output, /prerequisite/)
-    const wrongStatus = await update(replace, { status: "in_progress", evidence_from: locate.id })
-    assert.equal(wrongStatus.failed, true, "evidence_from is only accepted on a completion claim")
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined)
+    const claim = (task: { id: string; version: number }, legacy: string) =>
+      tools.run({ name: "twinny_todo_update", args: { item_id: task.id, expected_version: task.version, request_id: `claim-${task.id}`, status: "completed", evidence_from: legacy } } as never, undefined)
+    // A caller that still sends the removed argument is not rejected: nothing is read from it.
+    const ignored = await claim(edits, recorded.id)
+    assert.equal(ignored.failed, undefined, "the stray legacy argument is ignored")
+    assert.match(ignored.summary, /completion claim accepted/)
+    assert.equal((await claim(creates, recorded.id)).failed, undefined)
+    assert.equal((await claim(recorded, creates.id)).failed, undefined)
 
-    assert.equal((await update(replace, { status: "completed", evidence_from: locate.id })).failed, undefined)
-    assert.equal((await update(docs, { status: "completed" })).failed, undefined)
-    assert.equal((await update(unrelated, { status: "completed" })).failed, undefined)
-    assert.equal((await update(locate, { status: "completed" })).failed, undefined)
     const reviews = await state.repository.getReviewPackages(state.scope)
     const reviewFor = (taskId: string) => reviews.find((review) => review.task.id === taskId)!
-    assert.equal(taskHasVerifiedMutation(reviewFor(replace.id)), true, "the declared prerequisite's edit counts for Replace")
-    assert.equal(taskHasVerifiedMutation(reviewFor(docs.id)), false, "an undeclared dependent does not inherit the handoff")
-    assert.equal(taskHasVerifiedMutation(reviewFor(unrelated.id)), false, "an unrelated TODO never counts a sibling's edit")
+    assert.equal(taskHasVerifiedMutation(reviewFor(creates.id)), true, "the successful create recorded under another task serves this task")
+    assert.equal(taskHasVerifiedMutation(reviewFor(edits.id)), false, "the only edit record in the plan failed")
+    assert.deepEqual(reviewFor(creates.id).retainedEvidence.filter((entry) => entry.toolName === "create_file").map((entry) => entry.itemId), [recorded.id], "the record keeps the task it was recorded under")
+    assert.deepEqual(reviewFor(creates.id).dependencies, [], "no dependency edge links these tasks")
+    const events = withSqlite(state.databasePath, (database) => sqliteRows(database, "SELECT event_type FROM todo_events WHERE event_type = 'evidence_linked'"))
+    assert.equal(events.length, 0, "no handoff event is recorded")
+    const claims = withSqlite(state.databasePath, (database) => sqliteRows(database, "SELECT COUNT(*) FROM todo_events WHERE event_type = 'completion_claimed'")[0][0])
+    assert.equal(claims, 3, "the claims themselves are still recorded")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }

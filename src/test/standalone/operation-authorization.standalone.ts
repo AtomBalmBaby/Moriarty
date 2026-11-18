@@ -86,3 +86,24 @@ test("a symlink retargeted after approval no longer matches the approved target"
   fs.symlinkSync(second, link)
   assert.equal(claimWrites(authorization, requests, HOST), false)
 }))
+
+type AuthModule = {
+  OperationAuthorization: { issue: (host: string, requests: readonly WriteRequest[]) => unknown }
+  claimWrites: (authorization: unknown, requests: readonly WriteRequest[], host: string) => boolean
+}
+
+test("an authorization issued by another copy of this module is accepted, a forgery still is not", withDir((dir) => {
+  const requests: WriteRequest[] = [{ operation: "edit", absolute: path.join(dir, "a.txt") }]
+  // In the extension host the shipped extension runs as a bundle that holds its own copy of this
+  // module, so what one copy approves is claimed by the other. That is the same rule, so the set of
+  // what was approved is held once for the process.
+  const id = path.resolve(__dirname, "../../extension/tools/operation-authorization.js")
+  delete require.cache[id]
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const other = require(id) as AuthModule
+  assert.notEqual(other.OperationAuthorization, OperationAuthorization, "the second copy is a separate module instance")
+  assert.equal(claimWrites(other.OperationAuthorization.issue(HOST, requests), requests, HOST), true, "what this process approved is claimed whichever copy runs the claim")
+  assert.equal(other.claimWrites(OperationAuthorization.issue(HOST, requests), requests, HOST), true, "and the other way round")
+  assert.equal(claimWrites(Object.create(OperationAuthorization.prototype), requests, HOST), false, "a forgery is still refused")
+  delete require.cache[id]
+}))

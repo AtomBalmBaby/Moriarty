@@ -252,16 +252,17 @@ export interface TodoReviewPackage {
   dependencies: { id: string; title: string; status: TodoItem["status"] }[]
   evidence: TodoEvidence[]
   observations: TodoToolObservation[]
+  /**
+   * The observations this review can use: this task's own tool records plus the retained observations of the
+   * other tasks on its plan. A record keeps the item it was recorded under, and relevance to a criterion is
+   * decided by what the criterion names, never by which task recorded it. Model notes are shown as context
+   * but cannot satisfy a criterion on their own.
+   */
   retainedEvidence: RetainedObservationEvidence[]
   /** Current accepted source facts for this conversation, so verification can reuse them across TODOs. */
   acceptedEvidence: AcceptedFact[]
   /** Proven tool-name to implementation relationships in this project. */
   symbolAliases: SymbolAlias[]
-  /**
-   * Prerequisite TODOs whose recorded work this task explicitly declared as its evidence. Their observations are referenced,
-   * never copied, and count for this task's file-mutation and command criteria. Undeclared siblings never count.
-   */
-  evidenceSources?: string[]
   /** The latest requirement activation or renewal for this task, if any. */
   requirementActivation?: RequirementActivation
   lastEvaluation?: TodoEvaluation
