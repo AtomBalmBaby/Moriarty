@@ -184,7 +184,7 @@ const feedbackRig = async (
   const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
   const goal = "Make the requested change to the cancellation fixture."
   const scope = {
-    projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+    projectFingerprint: PROJECT_FINGERPRINT,
     conversationId: name,
     writer: name
   }
@@ -248,7 +248,7 @@ suite("Agent reply, end to end", function () {
     try {
       await chat.completion([{ role: "user", content: "Create a native TODO." }], [], "off", "ordinary-chat")
       const snapshot = await repository.getList({
-        projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+        projectFingerprint: PROJECT_FINGERPRINT,
         conversationId: "ordinary-chat"
       })
       assert.deepStrictEqual(snapshot.items.map((item) => item.title), ["Verify native TODO persistence"])
@@ -281,7 +281,7 @@ suite("Agent reply, end to end", function () {
       subscriptions: []
     } as unknown as vscode.ExtensionContext
     const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
-    const scope = { projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))), conversationId: "feedback-disabled-chat", writer: "feedback-disabled-chat" }
+    const scope = { projectFingerprint: PROJECT_FINGERPRINT, conversationId: "feedback-disabled-chat", writer: "feedback-disabled-chat" }
     const plan = { planId: "feedback-disabled-plan", version: 1 as const, revision: 1, goal: "Verify one task", constraints: [], tasks: [
       { id: "review-me", title: "Review me", description: "A task to remain in review", criteria: [{ id: "criterion-1", description: "Source inspected", verification: { kind: "semantic_review" } }], dependencies: [] as string[] }
     ] }
@@ -321,7 +321,7 @@ suite("Agent reply, end to end", function () {
     } as unknown as vscode.ExtensionContext
     const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
     const scope = {
-      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      projectFingerprint: PROJECT_FINGERPRINT,
       conversationId: "bounded-task-chat",
       writer: "bounded-task-chat"
     }
@@ -479,7 +479,7 @@ suite("Agent reply, end to end", function () {
     const repository = new TodoRepository(path.join(directory, "todos.sqlite"))
     const goal = "Implement the requested TODO panel improvements."
     const scope = {
-      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      projectFingerprint: PROJECT_FINGERPRINT,
       conversationId: "premature-surrender-regression",
       writer: "premature-surrender-regression"
     }
@@ -675,7 +675,7 @@ suite("Agent reply, end to end", function () {
     const repository = new TodoRepository(path.join(root, "todos.sqlite"))
     const goal = "Modify src/webview/todo-panel.tsx with collapsible TODO cards; do not delete the component."
     const scope = {
-      projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true))),
+      projectFingerprint: PROJECT_FINGERPRINT,
       conversationId: "destructive-recovery-regression",
       writer: "destructive-recovery-regression"
     }
@@ -1515,7 +1515,7 @@ suite("Read-file acceptance, production controller", function () {
         root,
         storage,
         databasePath: path.join(storage, "todos.sqlite"),
-        projectFingerprint: workspaceProjectFingerprint((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString(true)))
+        projectFingerprint: PROJECT_FINGERPRINT
       })
     } finally {
       await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
