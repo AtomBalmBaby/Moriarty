@@ -201,7 +201,7 @@ export class SafeEditCheckpoints {
     await this.persist()
   }
 
-  async rollback(paths?: string[]): Promise<{ restored: boolean; contentVerified: boolean; reason?: string }> {
+  async rollback(paths?: string[]): Promise<{ restored: boolean; contentVerified: boolean; reason?: string; expectedHash?: string; observedHash?: string }> {
     const scope = paths ? new Set(paths) : undefined
     const files = [...this._files.values()].filter((file) => !scope || scope.has(file.path))
     if (!files.length) return { restored: false, contentVerified: false, reason: "No safe file checkpoint is available." }
@@ -209,13 +209,38 @@ export class SafeEditCheckpoints {
       if (file.expectedHash === undefined) return { restored: false, contentVerified: false, reason: `The current version of ${file.path} was not recorded after the agent operation.` }
       const current = await this._adapter.read(file.path)
       if (current === undefined || checkpointHash(current) !== file.expectedHash) {
-        return { restored: false, contentVerified: false, reason: `${file.path} changed after the agent operation; rollback would overwrite a concurrent edit.` }
+        const observedHash = current === undefined ? "missing" : checkpointHash(current)
+        return {
+          restored: false,
+          contentVerified: false,
+          reason: `${file.path} changed after the agent operation; rollback would overwrite a concurrent edit. Expected content hash ${file.expectedHash}; observed ${observedHash}.`,
+          expectedHash: file.expectedHash,
+          observedHash
+        }
       }
     }
-    if (!(await this._adapter.restore(files))) return { restored: false, contentVerified: false, reason: "The editor refused to restore the safe checkpoint." }
+    if (!(await this._adapter.restore(files))) {
+      const expectedHash = checkpointHash(files[0].before)
+      const observedHash = await this._adapter.read(files[0].path)
+      return {
+        restored: false,
+        contentVerified: false,
+        reason: "The editor refused to restore the safe checkpoint.",
+        expectedHash,
+        observedHash: observedHash === undefined ? "missing" : checkpointHash(observedHash)
+      }
+    }
     for (const file of files) {
       const restored = await this._adapter.read(file.path)
-      if (restored !== file.before) return { restored: false, contentVerified: false, reason: `Checkpoint verification failed for ${file.path}.` }
+      const expectedHash = checkpointHash(file.before)
+      const observedHash = restored === undefined ? "missing" : checkpointHash(restored)
+      if (restored !== file.before) return {
+        restored: false,
+        contentVerified: false,
+        reason: `Checkpoint verification failed for ${file.path}. Expected content hash ${expectedHash}; observed ${observedHash}.`,
+        expectedHash,
+        observedHash
+      }
     }
     for (const file of files) {
       this._files.delete(file.path)
@@ -245,6 +270,8 @@ export interface SignificantEditRecoveryInput {
   introducedErrors: number
   diagnosticsObserved: boolean
   diagnosticCheckAvailable: boolean
+  /** Set only by an explicit non-diagnostic recovery trigger. Diagnostics alone never request a rollback. */
+  rollbackRequested?: boolean
   baseline?: string[]
   diagnosticFailure?: DiagnosticObservation
   checkpoints?: SafeEditCheckpoints
@@ -268,10 +295,7 @@ export interface SignificantEditRecoveryResult {
 }
 
 export const recoverSignificantEdit = async (input: SignificantEditRecoveryInput): Promise<SignificantEditRecoveryResult | undefined> => {
-  if (!input.diagnosticsObserved) return undefined
-  const catastrophic = input.monitor?.record(input.file, input.introducedErrors) ?? (input.introducedErrors >= (input.errorSpikeThreshold ?? 20))
-  if (!catastrophic) return undefined
-  input.monitor?.reset(input.file)
+  if (!input.rollbackRequested) return undefined
   let rollback: { restored: boolean; contentVerified: boolean; reason?: string }
   try {
     rollback = input.checkpoints
@@ -303,16 +327,17 @@ export const recoverSignificantEdit = async (input: SignificantEditRecoveryInput
   const fileVerified = rollback.contentVerified
   if (!fileVerified) {
     input.blockMutations?.([input.checkpointPath ?? input.file], false)
-  } else if (verification.verified) {
-    input.clearMutations?.([input.checkpointPath ?? input.file])
   } else {
-    input.blockMutations?.([input.checkpointPath ?? input.file], true)
+    // Restored content is authoritative. A language-server diagnostic snapshot
+    // may be stale or asynchronous and is not file-integrity evidence.
+    input.clearMutations?.([input.checkpointPath ?? input.file])
   }
   const reason = !fileVerified
     ? "Could not safely restore file contents: " + rollback.reason
-    : verification.verified
-      ? "Restored and verified the safe file checkpoint; diagnostics match the pre-edit baseline."
-      : "Restored and verified file contents, but diagnostic verification " + verification.status + ": " + verification.reason
+    : "Restored and verified the authoritative safe checkpoint by content hash." +
+      (verification.verified
+        ? " Diagnostics match the pre-edit baseline."
+        : " Diagnostic verification " + verification.status + " is not file-integrity evidence: " + verification.reason)
   return {
     catastrophic: true,
     restored: rollback.restored,

@@ -475,7 +475,7 @@ suite("Hash-verified native line edits", () => {
     } finally { listener.dispose() }
   })
 
-  test("line edits retain catastrophic diagnostic recovery and allow a corrected edit after verified rollback", async function () {
+  test("line edits keep legitimate work when diagnostics spike and allow a corrected edit", async function () {
     this.timeout(20000)
     file = path.join(root, "regression.ts")
     const source = "export const value = 1\n"
@@ -499,16 +499,17 @@ suite("Hash-verified native line edits", () => {
     try {
       const invalid = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: "{not-json" } })
       assert.strictEqual(invalid.failed, true, invalid.output)
-      assert.strictEqual(recoveries, 0, "invalid arguments must not trigger catastrophic recovery")
+      assert.strictEqual(recoveries, 0, "invalid arguments must not trigger recovery")
       const result = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
-      assert.strictEqual(result.failed, true, result.output)
-      assert.strictEqual(recoveries, 1)
-      assert.strictEqual(document.getText(), source, "the existing safe checkpoint restored the complete snapshot")
-      const corrected = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
+      assert.strictEqual(result.failed, undefined, result.output)
+      assert.strictEqual(recoveries, 0)
+      assert.strictEqual(document.getText(), "export const BROKEN = 1\n", "new diagnostics do not roll back the applied edit")
+      const brokenSource = "export const BROKEN = 1\n"
+      const corrected = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(brokenSource), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
       assert.strictEqual(corrected.failed, undefined, corrected.output)
       assert.strictEqual(document.getText(), "export const value = 2\n")
       assert.strictEqual(JSON.parse(corrected.output).content_hash, await contentHash("export const value = 2\n"))
-      assert.strictEqual(recoveries, 1)
+      assert.strictEqual(recoveries, 0)
       const record = await changes.record()
       assert.ok(record)
       const store = new ChangeStore(path.join(root, "reply-changes"))
@@ -524,7 +525,7 @@ suite("Hash-verified native line edits", () => {
   })
 
 
-  test("a refused rollback keeps the affected file locked and leaves the broken content in place", async function () {
+  test("asynchronous diagnostic changes do not block subsequent valid edits", async function () {
     this.timeout(20000)
     file = path.join(root, "refused.ts")
     const source = "export const value = 1\n"
@@ -539,22 +540,20 @@ suite("Hash-verified native line edits", () => {
       ) : [])
     })
     const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
-    const refused: ReturnType<typeof createSafeEditCheckpoints> = Object.create(checkpoints)
-    refused.rollback = async () => ({ restored: false, contentVerified: false, reason: "forced refusal for test" })
     let recoveries = 0
     const tools = workspaceTools(root, [], {
-      edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { checkpoints: refused, onCatastrophic: () => { recoveries++ } }),
+      edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { checkpoints, onCatastrophic: () => { recoveries++ } }),
       git: false, instructions: false
     })
     try {
       const result = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
-      assert.strictEqual(result.failed, true, result.output)
-      assert.strictEqual(recoveries, 1)
+      assert.strictEqual(result.failed, undefined, result.output)
+      assert.strictEqual(recoveries, 0)
       const broken = document.getText()
       assert.match(broken, /BROKEN/)
-      const blocked = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(broken), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
-      assert.strictEqual(JSON.parse(blocked.output).error.code, "permission_denied")
-      assert.strictEqual(document.getText(), broken)
+      const corrected = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(broken), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
+      assert.strictEqual(corrected.failed, undefined, corrected.output)
+      assert.strictEqual(document.getText(), "export const value = 2\n")
       const unrelated = path.join(root, "unrelated.ts")
       fs.writeFileSync(unrelated, "export const safe = 1\n")
       const unrelatedDocument = await vscode.workspace.openTextDocument(unrelated)
@@ -568,7 +567,7 @@ suite("Hash-verified native line edits", () => {
     }
   })
 
-  test("recovering one file leaves a previously verified edit to another file intact", async function () {
+  test("diagnostics on one file do not affect another verified edit", async function () {
     this.timeout(20000)
     const brokenPath = path.join(root, "isolated-broken.ts")
     const cleanPath = path.join(root, "isolated-clean.ts")
@@ -596,9 +595,9 @@ suite("Hash-verified native line edits", () => {
       const verified = await tools.run({ name: "edit_lines", args: { path: "isolated-clean.ts", expected_hash: await contentHash(cleanSource), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const other = 2"] }]) } })
       assert.strictEqual(verified.failed, undefined, verified.output)
       const broke = await tools.run({ name: "edit_lines", args: { path: "isolated-broken.ts", expected_hash: await contentHash(brokenSource), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
-      assert.strictEqual(broke.failed, true, broke.output)
-      assert.strictEqual(recoveries, 1)
-      assert.strictEqual(brokenDocument.getText(), brokenSource, "the affected file was restored to its checkpoint")
+      assert.strictEqual(broke.failed, undefined, broke.output)
+      assert.strictEqual(recoveries, 0)
+      assert.strictEqual(brokenDocument.getText(), "export const BROKEN = 1\n", "diagnostics keep the valid edit applied")
       assert.strictEqual(cleanDocument.getText(), "export const other = 2\n", "the unaffected file keeps its verified edit")
     } finally {
       listener.dispose()
