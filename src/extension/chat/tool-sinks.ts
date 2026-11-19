@@ -48,7 +48,7 @@ import type { EditOperationInput } from "../todos/types"
 import { currentAccessHostKey } from "../tools/access-host"
 import type { Replacement } from "../tools/edit"
 import { isProtectedPath } from "../tools/helpers"
-import { contentHash, LineEditError, lineEditFailure, type LinePatch, planLineEdits } from "../tools/line-edit"
+import { changedSpan, contentHash, LineEditError, lineEditFailure, patchedText, planLineEdits } from "../tools/line-edit"
 import { EditorDiagnostic, EditorLocation, EditorSink, FileOpsSink } from "../tools/more"
 import { claimWrites, coversWrites, type OperationAuthorization, type WriteOperation, type WriteRequest } from "../tools/operation-authorization"
 import { WorkspaceView } from "../tools/view"
@@ -100,10 +100,6 @@ const replacedText = ({ startLine, endLine, text }: Replacement, before: string)
   const lines = before.replace(/\r\n/g, "\n").split("\n")
   return [...lines.slice(0, startLine), ...(text ? text.split("\n") : []), ...lines.slice(endLine + 1)].join("\n")
 }
-
-/** The document text the line patches leave; offsets address the original text, end exclusive. */
-const patchedText = (before: string, patches: LinePatch[]) =>
-  [...patches].sort((a, b) => b.start - a.start).reduce((text, patch) => text.slice(0, patch.start) + patch.text + text.slice(patch.end), before)
 
 /** The precondition digest of a create: the file does not exist yet. It is not hex, so no content digest can equal it. */
 export const ABSENT_DIGEST = "absent"
@@ -613,10 +609,8 @@ export const editorEdits = (
         return { ok: false, message: failure.message, error: failure }
       }
       await safety.checkpoints?.capture([file])
-      const changed = {
-        start: document.positionAt(patches[0].start).line,
-        end: document.positionAt(patches[patches.length - 1].end).line + patches.reduce((added, patch) => added + patch.text.split("\n").length - 1, 0)
-      }
+      const span = changedSpan(patches)
+      const changed = { start: document.positionAt(span.start).line, end: document.positionAt(span.end).line + span.added }
       const before = document.getText()
       const pending = await beginEdit(file, before, patchedText(before, patches))
       if ("refused" in pending) {

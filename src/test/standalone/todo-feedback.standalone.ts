@@ -22,7 +22,7 @@ import type { AcceptedFact, AnswerRequirement, ChildTodoDecision, ChildTodoRevie
 import { RUNTIME_INVENTORY_TOOL, TodoConflictError } from "../../extension/todos/types"
 import { capabilityOf } from "../../extension/todos/verification-capabilities"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
-import { contentHash, planLineEdits } from "../../extension/tools/line-edit"
+import { contentHash, patchedText, planLineEdits } from "../../extension/tools/line-edit"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
 import { type EditSink, type ToolResult,workspaceTools } from "../../extension/tools/workspace"
 
@@ -4872,7 +4872,7 @@ const diskEditSink = (): EditSink => ({
     const text = fs.readFileSync(file, "utf8")
     const patches = await planLineEdits(text, request)
     let next = text
-    for (const patch of [...patches].reverse()) next = next.slice(0, patch.start) + patch.text + next.slice(patch.end)
+    next = patchedText(next, patches)
     fs.writeFileSync(file, next)
     return { ok: true, message: "applied", contentHash: await contentHash(next) }
   }

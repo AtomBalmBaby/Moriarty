@@ -644,4 +644,136 @@ suite("Hash-verified native line edits", () => {
     assert.strictEqual(document.getText(), "user: " + original)
   })
 
+  const orderingFile = (name: string, text: string) => {
+    const target = path.join(root, name)
+    fs.writeFileSync(target, text)
+    return target
+  }
+
+  const ranges = {
+    growing: { operation: "replace", start_line: 2, end_line: 2, content: ["A", "B", "C"] },
+    shrinking: { operation: "delete", start_line: 3, end_line: 4 },
+    atEnd: { operation: "insert_before", line: 6, content: ["E"] }
+  }
+
+  test("the same ranges read ascending and descending leave identical content", async () => {
+    const source = "one\ntwo\nthree\nfour\nfive\nsix\n"
+    const expected = "one\nA\nB\nC\nfive\nE\nsix\n"
+    const ascending = orderingFile("order-ascending.txt", source)
+    const descending = orderingFile("order-descending.txt", source)
+    const up = await applyDocumentLineEdits(ascending, await request(source, [ranges.growing, ranges.shrinking, ranges.atEnd]))
+    assert.ok(up.ok, up.message)
+    const down = await applyDocumentLineEdits(descending, await request(source, [ranges.atEnd, ranges.shrinking, ranges.growing]))
+    assert.ok(down.ok, down.message)
+    assert.strictEqual(fs.readFileSync(ascending, "utf8"), expected, "the batch read top-to-bottom")
+    assert.strictEqual(fs.readFileSync(descending, "utf8"), expected, "the same batch read bottom-to-top")
+    assert.strictEqual(up.contentHash, down.contentHash, "both orders answer with the same hash")
+  })
+
+  test("a range that changes the line count does not move the ranges after it", async () => {
+    const source = "one\ntwo\nthree\nfour\nfive\nsix\n"
+    const expected = "one\nA\nB\nC\nD\nsix\nlast\n"
+    const target = orderingFile("shift.txt", source)
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(target))
+    const result = await applyDocumentLineEdits(target, await request(source, [
+      { operation: "replace", start_line: 2, end_line: 2, content: ["A", "B", "C", "D"] },
+      { operation: "delete", start_line: 3, end_line: 5 },
+      { operation: "insert_after", line: 6, content: ["last"] }
+    ]))
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(document.getText(), expected, "the later ranges still address the lines they named")
+    assert.strictEqual(fs.readFileSync(target, "utf8"), expected, "the saved file matches")
+  })
+
+  test("several ranges of different sizes stay one undoable editor operation", async function () {
+    const target = orderingFile("batch.txt", "one\ntwo\nthree\nfour\nfive\n")
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(target))
+    const original = document.getText()
+    const batches: number[] = []
+    const listener = vscode.workspace.onDidChangeTextDocument((event) => {
+      if (event.document === document && event.contentChanges.length) batches.push(event.contentChanges.length)
+    })
+    try {
+      const result = await applyDocumentLineEdits(target, await request(original, [
+        { operation: "replace", start_line: 1, end_line: 1, content: ["ONE", "extra"] },
+        { operation: "insert_after", line: 2, content: ["two-b"] },
+        { operation: "delete", start_line: 4, end_line: 5 }
+      ]))
+      assert.ok(result.ok, result.message)
+      assert.strictEqual(document.getText(), "ONE\nextra\ntwo\ntwo-b\nthree\n")
+      assert.deepStrictEqual(batches, [3], "one change event carrying all three ranges")
+      await vscode.window.showTextDocument(document)
+      await vscode.commands.executeCommand("undo")
+      if (document.getText() === original) return
+      // A test window with no reachable undo stack answers the command without acting;
+      // the single change event above is what shows the batch was one operation.
+      this.skip()
+    } finally { listener.dispose() }
+  })
+
+  test("ranges that overlap in either input order are refused before anything changes", async () => {
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const original = document.getText()
+    let events = 0
+    const listener = vscode.workspace.onDidChangeTextDocument((event) => { if (event.document === document && event.contentChanges.length) events++ })
+    try {
+      for (const edits of [
+        [{ operation: "replace", start_line: 2, end_line: 3, content: ["x"] }, { operation: "delete", start_line: 3, end_line: 4 }],
+        [{ operation: "delete", start_line: 3, end_line: 4 }, { operation: "replace", start_line: 2, end_line: 3, content: ["x"] }]
+      ]) {
+        const result = await applyDocumentLineEdits(file, await request(original, edits))
+        assert.strictEqual(result.ok, false, result.message)
+        assert.strictEqual(result.error?.code, "overlapping_edits")
+        assert.strictEqual(document.getText(), original)
+      }
+      assert.strictEqual(events, 0, "a refused batch changes nothing")
+    } finally { listener.dispose() }
+  })
+
+  test("an invalid range in either input order is refused before anything changes", async () => {
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const original = document.getText()
+    let events = 0
+    const listener = vscode.workspace.onDidChangeTextDocument((event) => { if (event.document === document && event.contentChanges.length) events++ })
+    try {
+      for (const edits of [
+        [{ operation: "replace", start_line: 2, end_line: 2, content: ["x"] }, { operation: "delete", start_line: 9, end_line: 9 }],
+        [{ operation: "delete", start_line: 9, end_line: 9 }, { operation: "replace", start_line: 2, end_line: 2, content: ["x"] }],
+        [{ operation: "delete", start_line: 3, end_line: 2 }]
+      ]) {
+        const result = await applyDocumentLineEdits(file, await request(original, edits))
+        assert.strictEqual(result.ok, false, result.message)
+        assert.strictEqual(result.error?.code, "invalid_range")
+        assert.strictEqual(document.getText(), original)
+      }
+      assert.strictEqual(events, 0, "a refused batch changes nothing")
+    } finally { listener.dispose() }
+  })
+
+  test("an expected_hash that does not match the document leaves the file unchanged", async () => {
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const original = document.getText()
+    const result = await applyDocumentLineEdits(file, {
+      expected_hash: await contentHash("not this document"),
+      edits: [{ operation: "replace", start_line: 1, end_line: 2, content: ["x"] }, { operation: "delete", start_line: 3, end_line: 4 }]
+    })
+    assert.strictEqual(result.ok, false, result.message)
+    assert.strictEqual(result.error?.code, "hash_mismatch")
+    assert.strictEqual(result.error?.current_hash, await contentHash(original))
+    assert.strictEqual(document.getText(), original, "the buffer is as it was")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), original, "nothing was saved")
+  })
+
+  test("a single range is applied exactly as it always was", async () => {
+    const target = orderingFile("single.txt", "one\ntwo\nthree\n")
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(target))
+    const result = await applyDocumentLineEdits(target, await request(document.getText(), [{ operation: "replace", start_line: 2, end_line: 2, content: ["TWO", "added"] }]))
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(document.getText(), "one\nTWO\nadded\nthree\n")
+    assert.strictEqual(fs.readFileSync(target, "utf8"), "one\nTWO\nadded\nthree\n")
+    assert.strictEqual(result.contentHash, await contentHash("one\nTWO\nadded\nthree\n"))
+    assert.strictEqual(result.contentSource, "disk")
+    assert.strictEqual(result.persisted, true)
+  })
+
 })

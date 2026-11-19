@@ -26,7 +26,7 @@ import {
   trimmedResult
 } from "../../extension/tools/budget"
 import { describeMismatch, shapeOf } from "../../extension/tools/failure-log"
-import { contentHash, planLineEdits } from "../../extension/tools/line-edit"
+import { contentHash, patchedText, planLineEdits } from "../../extension/tools/line-edit"
 import {
   flattenToolHistory,
   GENERATION_LIMIT_DEFAULTS,
@@ -1533,7 +1533,7 @@ test("the logged llama.cpp edit_lines call is refused by name, then a replace th
         const text = fs.readFileSync(absolute, "utf8")
         const patches = await planLineEdits(text, request)
         let next = text
-        for (const patch of [...patches].reverse()) next = next.slice(0, patch.start) + patch.text + next.slice(patch.end)
+        next = patchedText(next, patches)
         fs.writeFileSync(absolute, next)
         writes++
         return { ok: true, message: "saved", contentHash: await contentHash(next), persisted: true }

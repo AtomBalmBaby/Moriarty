@@ -31,6 +31,17 @@ export interface LinePatch {
   text: string
 }
 
+/** The text `patches` leave when applied to `original`; offsets address `original`, end exclusive. Applying them bottom-to-top is what keeps every offset valid. */
+export const patchedText = (original: string, patches: LinePatch[]): string =>
+  [...patches].sort((a, b) => b.start - a.start || b.end - a.end).reduce((text, patch) => text.slice(0, patch.start) + patch.text + text.slice(patch.end), original)
+
+/** The span `patches` cover in `original` and the lines they add, which is the same whatever order the ranges were supplied in. */
+export const changedSpan = (patches: LinePatch[]): { start: number; end: number; added: number } => ({
+  start: Math.min(...patches.map((patch) => patch.start)),
+  end: Math.max(...patches.map((patch) => patch.end)),
+  added: patches.reduce((added, patch) => added + patch.text.split("\n").length - 1, 0)
+})
+
 export const lineEditFailure = (code: LineEditFailureCode, message: string, current_hash?: string): LineEditFailure =>
   ({ code, message, ...(current_hash ? { current_hash } : {}) })
 
@@ -50,7 +61,7 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
   const terminated = text.endsWith("\n")
   const integer = (value: unknown, min: number, max: number): value is number =>
     typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max
-  const patches = request.edits.map((raw: unknown): LinePatch => {
+  const planned = request.edits.map((raw: unknown): LinePatch => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) invalid("Each edit must be an operation object.")
     const edit = raw as Record<string, unknown>
     const operation = edit.operation
@@ -91,13 +102,17 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
       return { start, end, text: "" }
     }
     return { start, end, text: content + (edit.end_line < lines.length || terminated ? eol : "") }
-  }).sort((a: LinePatch, b: LinePatch) => a.start - b.start || a.end - b.end)
-  for (let i = 1; i < patches.length; i++) {
-    const a = patches[i - 1]
-    const b = patches[i]
+  })
+  const ordered = [...planned].sort((a: LinePatch, b: LinePatch) => a.start - b.start || a.end - b.end)
+  for (let i = 1; i < ordered.length; i++) {
+    const a = ordered[i - 1]
+    const b = ordered[i]
     if (b.start < a.end || (b.start === a.end && (a.start === a.end || b.start === b.end))) {
       throw new LineEditError(lineEditFailure("overlapping_edits", "Edits overlap or insert at the same/touched boundary. Combine them into one operation; nothing was changed."))
     }
   }
-  return patches
+  // Every range addresses the snapshot expected_hash names, so the order applied is
+  // normalised to bottom-to-top: a range that changes the line count cannot move a
+  // range above it, and no caller is required to supply ranges in any order.
+  return [...ordered].reverse()
 }

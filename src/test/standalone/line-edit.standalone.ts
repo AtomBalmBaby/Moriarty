@@ -8,7 +8,7 @@ import { test } from "node:test"
 import { parseReadFile } from "../../common/tool-output"
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { buildStreamingRequest } from "../../extension/inference/adapters/fluency"
-import { contentHash, planLineEdits } from "../../extension/tools/line-edit"
+import { contentHash, patchedText, planLineEdits } from "../../extension/tools/line-edit"
 import { findToolCall, toolDefinition } from "../../extension/tools/protocol"
 import { EditSink, workspaceTools } from "../../extension/tools/workspace"
 
@@ -35,7 +35,7 @@ const fixture = (initial: string) => {
     async editLines(_file, request) {
       const patches = await planLineEdits(text, request)
       await Promise.resolve()
-      for (const patch of [...patches].reverse()) text = text.slice(0, patch.start) + patch.text + text.slice(patch.end)
+      text = patchedText(text, patches)
       transactions++
       return { ok: true, message: "applied", contentHash: await contentHash(text), persisted: true }
     }
@@ -241,3 +241,89 @@ test("legacy sinks without an open buffer still read the filesystem", async () =
   assert.ok(read.output.includes(await contentHash("disk\n")))
   assert.equal(parseReadFile(read.output)?.code, "disk")
 })
+
+const orderRanges = [
+  { operation: "insert_before", line: 1, content: ["top"] },
+  { operation: "replace", start_line: 2, end_line: 2, content: ["B1", "B2", "B3"] },
+  { operation: "replace", start_line: 4, end_line: 4, content: ["D"] }
+]
+const orderExpected = "top\na\nB1\nB2\nB3\nc\nD\ne\n"
+
+for (const [name, order] of [["top-to-bottom", orderRanges], ["bottom-to-top", [...orderRanges].reverse()]] as [string, unknown[]][]) {
+  test(`the same batch read ${name} leaves the same content through the production path`, async () => {
+    const f = fixture("a\nb\nc\nd\ne\n")
+    const result = await f.edit(order)
+    assert.equal(result.failed, undefined, result.output)
+    assert.equal(f.text(), orderExpected)
+    assert.equal(JSON.parse(result.output).content_hash, await contentHash(orderExpected))
+    assert.equal(f.transactions(), 1, "the batch stays one transaction")
+  })
+}
+
+test("the planned ranges address the original snapshot and are ordered bottom-to-top", async () => {
+  const source = "a\nb\nc\nd\ne\n"
+  for (const order of [orderRanges, [...orderRanges].reverse()]) {
+    const patches = await planLineEdits(source, { expected_hash: hash(source), edits: order })
+    const starts = patches.map((patch) => patch.start)
+    assert.deepEqual(starts, [...starts].sort((a, b) => b - a), "planned from the bottom up, whatever order the call supplied")
+    for (const patch of patches) {
+      assert.match(source.slice(patch.start, patch.end), /^(?:[a-e]\n)?$/, `the range at offset ${patch.start} still addresses the lines it named`)
+    }
+    assert.equal(patchedText(source, patches), orderExpected)
+  }
+})
+
+test("a range that changes the line count does not shift the ranges after it", async () => {
+  const source = "1\n2\n3\n4\n5\n6\n"
+  const expected = "1\nA\nB\nC\n6\ntail\n"
+  const f = fixture(source)
+  const result = await f.edit([
+    { operation: "replace", start_line: 2, end_line: 2, content: ["A", "B", "C"] },
+    { operation: "delete", start_line: 3, end_line: 5 },
+    { operation: "insert_after", line: 6, content: ["tail"] }
+  ])
+  assert.equal(result.failed, undefined, result.output)
+  assert.equal(f.text(), expected, "the ranges below the changed one still land on the lines they named")
+  assert.equal(JSON.parse(result.output).content_hash, await contentHash(expected))
+})
+
+test("an expected_hash that does not match leaves every range unapplied", async () => {
+  const f = fixture("a\nb\nc\n")
+  const result = await f.edit([{ operation: "replace", start_line: 1, end_line: 1, content: ["x"] }, { operation: "delete", start_line: 3, end_line: 3 }], hash("other text\n"))
+  assert.equal(result.failed, true)
+  assert.equal(JSON.parse(result.output).error.code, "hash_mismatch")
+  assert.equal(JSON.parse(result.output).error.current_hash, await contentHash("a\nb\nc\n"))
+  assert.equal(f.text(), "a\nb\nc\n")
+  assert.equal(f.transactions(), 0)
+})
+
+test("a single range is planned and applied as it always was", async () => {
+  const source = "a\nb\nc\n"
+  const edits = [{ operation: "replace", start_line: 2, end_line: 2, content: ["B", "extra"] }]
+  const f = fixture(source)
+  const result = await f.edit(edits)
+  assert.equal(result.failed, undefined, result.output)
+  assert.equal(f.text(), "a\nB\nextra\nc\n")
+  assert.equal(f.transactions(), 1)
+  const planned = await planLineEdits(source, { expected_hash: hash(source), edits })
+  assert.equal(planned.length, 1)
+  assert.equal(patchedText(source, planned), "a\nB\nextra\nc\n")
+})
+
+const orderRejections: [string, unknown[], string][] = [
+  ["overlapping ranges given bottom-to-top", [{ operation: "delete", start_line: 3, end_line: 4 }, { operation: "replace", start_line: 2, end_line: 3, content: ["x"] }], "overlapping_edits"],
+  ["invalid range given bottom-to-top", [{ operation: "delete", start_line: 9, end_line: 9 }, { operation: "replace", start_line: 2, end_line: 2, content: ["x"] }], "invalid_range"]
+]
+
+for (const [name, edits, code] of orderRejections) {
+  test(`rejects ${name} without modification`, async () => {
+    const f = fixture("a\nb\nc\nd\n")
+    const result = await f.edit(edits)
+    assert.equal(result.failed, true, result.output)
+    assert.equal(JSON.parse(result.output).error.code, code)
+    assert.equal(f.text(), "a\nb\nc\nd\n")
+    assert.equal(f.transactions(), 0)
+  })
+}
+
+

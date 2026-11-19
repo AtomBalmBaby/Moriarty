@@ -518,7 +518,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
   name: "edit_lines",
   description:
     "The standard way to change an existing source file. Edit complete source lines atomically, guarded by expected_hash from read_file (the fingerprint of the entire editor buffer). " +
-    "All coordinates refer to the SAME original snapshot, not earlier edits. Lines are 1-based; a terminal newline is not an extra line. " +
+    "All coordinates refer to the SAME original snapshot, not earlier edits, and ranges may be supplied in any order; they are applied from the bottom of the file upwards. Lines are 1-based; a terminal newline is not an extra line. " +
     "replace/delete use inclusive start_line/end_line. insert_before accepts 1 through total_lines+1; insert_after accepts 1 through total_lines. " +
     "For an empty document only insert_before line=1 or insert_after line=0 is valid. EOF insertion preserves the final-newline convention. " +
     "content is an array of complete lines without newline characters (use [''] for a blank line). " +
@@ -531,7 +531,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
   parameters: [
     { name: "path", description: "Workspace-relative file path." },
     { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted." },
-    { name: "edits", description: "Array of line operations, all against the original snapshot. Each has operation: replace {operation,start_line,end_line,content} or delete {operation,start_line,end_line}, or insert_before/insert_after {operation,line,content}." },
+    { name: "edits", description: "Array of line operations in any order, all against the original snapshot. Each has operation: replace {operation,start_line,end_line,content} or delete {operation,start_line,end_line}, or insert_before/insert_after {operation,line,content}." },
     { name: "save", description: "Optional, default true. false leaves the edit unsaved for review; only allowed when the editor mode is visible and the task instructions say so." }
   ],
   schema: {
@@ -544,7 +544,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       save: { type: "boolean", description: "Default true: save the complete document to disk. false: leave the edit unsaved in the editor; only allowed when the editor mode is visible and the task instructions ask for it." },
       edits: {
         type: "array", minItems: 1,
-        description: "Line operations, all against the original snapshot. Each object's key is operation, set to replace, delete, insert_before or insert_after; not type, op or action.",
+        description: "Line operations in any order, all against the original snapshot. Each object's key is operation, set to replace, delete, insert_before or insert_after; not type, op or action.",
         items: {
           type: "object",
           description: "replace and delete use start_line and end_line (inclusive, 1-based). insert_before and insert_after use line. replace and inserts require content, an array of complete lines.",

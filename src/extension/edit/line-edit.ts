@@ -1,6 +1,6 @@
 import { EndOfLine, Range, TextDocument, TextEditor, Uri, window, workspace } from "vscode"
 
-import { contentHash, ContentSource, LineEditError, lineEditFailure, LineEditFailureCode, LineEditRequest, LinePatch, planLineEdits } from "../tools/line-edit"
+import { contentHash, ContentSource, LineEditError, lineEditFailure, LineEditFailureCode, LineEditRequest, LinePatch, patchedText, planLineEdits } from "../tools/line-edit"
 
 import type { ChatEditOutcome } from "./service"
 
@@ -18,9 +18,6 @@ export interface DocumentEditOptions {
   visibility: EditorVisibility
 }
 
-/** The text the patches leave; offsets address `original`, end exclusive. */
-const patchedText = (original: string, patches: LinePatch[]) =>
-  [...patches].sort((a, b) => b.start - a.start).reduce((text, patch) => text.slice(0, patch.start) + patch.text + text.slice(patch.end), original)
 
 /** The text a file holds on disk, or undefined when its bytes cannot be read as UTF-8 or UTF-16 with a byte-order mark. */
 const decodePersisted = (bytes: Uint8Array): string | undefined => {
@@ -92,6 +89,7 @@ export const revealEditor = async (document: TextDocument, visibility: EditorVis
  * Applies the patches in one undo transaction and returns undefined, or returns why it was not applied. The version
  * is compared synchronously just before the edit is issued, so a change made since the edit was prepared is never
  * overwritten; the caller must issue the edit without awaiting in between.
+ * Patches reach this point planned bottom-to-top, so a range that changes the line count cannot move a range above it.
  */
 const applyTransaction = async (editor: TextEditor, document: TextDocument, version: number, original: string, patches: LinePatch[]): Promise<ChatEditOutcome | undefined> => {
   if (document.isClosed || document.version !== version) {
