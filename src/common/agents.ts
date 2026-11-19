@@ -107,3 +107,39 @@ export const agentGlyphState = (input: AgentGlyphInput): AgentGlyphState => {
   if (input.celebration) return input.celebration
   return "ready"
 }
+
+/**
+ * The tool steps one agent reply may take. `twinny.chatToolsMaxSteps` accepts 4 to
+ * 1000, so the bounds below are that setting's own range: a number the user set
+ * inside it is the number the tool loop gets, and one outside it is bounded by
+ * the setting's declared minimum and maximum, not by a ceiling of Twinny's own.
+ */
+export const MIN_STEPS_SETTING = 4
+export const MAX_STEPS_SETTING = 1000
+
+export interface AgentStepLimit {
+  /** The number `twinny.chatToolsMaxSteps` holds. */
+  configured: number
+  /** The number the tool loop is given, which is the same one inside the range the setting declares. */
+  effective: number
+}
+
+/**
+ * `twinny.chatToolsMaxSteps` as the tool loop should receive it. A value that is
+ * not a usable number keeps `fallback`, which is the setting's default; any number
+ * is bounded by the declared range.
+ */
+export const agentStepLimit = (configured: number | undefined, fallback: number): AgentStepLimit => {
+  const setting = typeof configured === "number" && Number.isFinite(configured) ? Math.round(configured) : Math.round(fallback)
+  return { configured: setting, effective: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, setting)) }
+}
+
+/**
+ * What the chat reports about the step limit when the reply cannot use the
+ * number the settings hold, naming both so a reply that ran out of steps is
+ * judged by the limit it actually had. Nothing when the two are the same number.
+ */
+export const agentStepLimitNotice = (limit: AgentStepLimit): string | undefined =>
+  limit.effective === limit.configured
+    ? undefined
+    : `Agent step limit: you set ${limit.configured} tool steps per reply, which is outside the ${MIN_STEPS_SETTING} to ${MAX_STEPS_SETTING} the setting allows, so replies use ${limit.effective}.`

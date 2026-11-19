@@ -1149,6 +1149,59 @@ suite("Agent reply, end to end", function () {
       await settings.update("chatToolsMaxSteps", undefined, vscode.ConfigurationTarget.Global)
     }
   })
+  test("the limit each agent-loop path uses is the number the settings hold, bounded by the range the setting declares", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-step-limit-"))
+    for (let i = 0; i < 101; i++) fs.writeFileSync(path.join(root, `a${i}.ts`), `line ${i}\n`)
+    const settings = vscode.workspace.getConfiguration("twinny")
+    const previousSteps = settings.inspect<number>("chatToolsMaxSteps")?.globalValue
+    const previousFeedback = settings.inspect<boolean>("feedback.enabled")?.globalValue
+    // Feedback off: the native TODO tools path is taken by the conversation's own scope, and nothing else speaks through the bridge.
+    await settings.update("feedback.enabled", false, vscode.ConfigurationTarget.Global)
+    const model = new ScriptedModel([
+      ...Array.from({ length: 101 }, (_, i) => call("read_file", { path: `a${i}.ts` })),
+      "Read them all.",
+      ...Array.from({ length: 4 }, (_, i) => call("twinny_todo_create", { title: `Task ${i}`, request_id: `step-limit-${i}` })),
+      "Tracked four tasks."
+    ])
+    providerRegistry.register("scripted-agent", { id: "scripted-agent", create: () => model })
+    const stored: Record<string, unknown> = {
+      [ACTIVE_CHAT_PROVIDER_STORAGE_KEY]: provider,
+      [`${EVENT_NAME.twinnyGlobalContext}-${GLOBAL_STORAGE_KEY.agentMode}`]: true
+    }
+    const emitted: { type: string; data: unknown }[] = []
+    const bridge = { handle: () => undefined, emit: (type: string, data: unknown) => emitted.push({ type, data }) } as unknown as ExtensionBridge
+    const context = {
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, "../../..")),
+      globalStorageUri: vscode.Uri.file(path.join(root, ".twinny-global-storage")),
+      globalState: { get: (key: string) => stored[key], update: async () => undefined },
+      workspaceState: { get: () => undefined, update: async () => undefined },
+      subscriptions: []
+    } as unknown as vscode.ExtensionContext
+    const repository = new TodoRepository(path.join(root, "todos.sqlite"))
+    const chat = new ChatIn(new GenerationTracker(), undefined, context, bridge, undefined, undefined, repository)
+    chat.root = root
+    const notices = () => emitted.filter((entry) => entry.type === EVENT_NAME.twinnyNotification).map((entry) => String(entry.data)).filter((notice) => notice.includes("step limit"))
+    const lastReply = () => emitted.filter((entry) => entry.type === EVENT_NAME.twinnyAddMessage).pop()?.data as ChatCompletionMessage
+    try {
+      // The agent tools path, with the largest number the setting accepts.
+      await settings.update("chatToolsMaxSteps", 1000, vscode.ConfigurationTarget.Global)
+      await chat.completion([{ role: "user", content: "Read them." }], [], "default", "step-limit-agent")
+      assert.equal(model.requests.length, 102, "the reply went past the 100 the code used to impose")
+      assert.ok(!lastReply().meta?.outOfSteps, "1000 steps were there, so the reply did not run out")
+      assert.equal(notices().length, 0, "a number inside the range is not reported")
+      // The native TODO tools path, with a number outside the range: the reply gets the declared minimum, not the number it was set to.
+      await settings.update("chatToolsMaxSteps", 2, vscode.ConfigurationTarget.Global)
+      await chat.completion([{ role: "user", content: "Track four tasks." }], [], "off", "step-limit-todos")
+      assert.equal(model.requests.length, 107, "four calls, then the answer that cannot call anything")
+      assert.ok(lastReply().meta?.outOfSteps, "it used every step the setting allows")
+      assert.ok(notices().some((notice) => notice.includes("you set 2") && notice.includes("replies use 4")), notices().join("\n"))
+    } finally {
+      chat.dispose()
+      await settings.update("chatToolsMaxSteps", previousSteps, vscode.ConfigurationTarget.Global)
+      await settings.update("feedback.enabled", previousFeedback, vscode.ConfigurationTarget.Global)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
   test("Chat Base Instructions=None leaves eligible agent tools intact and profile restrictions resolve safely", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-agent-tool-resolution-"))
     const profilePath = path.join(root, ".github", "agents", "plan.agent.md")

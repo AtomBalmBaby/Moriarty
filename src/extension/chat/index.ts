@@ -5,7 +5,7 @@ import path from "path"
 import { ExtensionContext, RelativePattern, Uri, workspace } from "vscode"
 
 import type { AgentSelection } from "../../common/agents"
-import { AGENT_SELECTION_STORAGE_KEY, AGENT_STARTUP_SELECTION_SETTING, isAgentSelectionEnabled, LAST_AGENT_SELECTION_STORAGE_KEY, normalizeAgentSelection, normalizeAgentStartupSelection, resolveAgentSelection, resolveStartupAgentSelection } from "../../common/agents"
+import { AGENT_SELECTION_STORAGE_KEY, AGENT_STARTUP_SELECTION_SETTING, agentStepLimit, agentStepLimitNotice, isAgentSelectionEnabled, LAST_AGENT_SELECTION_STORAGE_KEY, normalizeAgentSelection, normalizeAgentStartupSelection, resolveAgentSelection, resolveStartupAgentSelection } from "../../common/agents"
 import { cleanModelSuggestion, composerSuggestionMessages } from "../../common/composer-predict"
 import {
   ACTIVE_CONVERSATION_STORAGE_KEY,
@@ -151,9 +151,6 @@ const describeEditBlocker = (operation: UnresolvedEditOperation, conversationId:
 /** How long an agent reply waits for the team's policy to be re-read. */
 const POLICY_REFRESH_WAIT_MS = 1500
 const PROVIDER_RESUME_DELAY_MS = 1000
-/** The steps an agent reply may take, as `twinny.chatToolsMaxSteps` may set them. */
-const MIN_STEPS_SETTING = 4
-const MAX_STEPS_SETTING = 100
 const DEFAULT_RESULT_CHARS = 100_000
 const MIN_RESULT_CHARS = 10_000
 const MAX_RESULT_CHARS = 200_000
@@ -2489,6 +2486,22 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   }
 
   /**
+   * The tool steps this reply may take: `twinny.chatToolsMaxSteps` as the tool loop
+   * should have it, bounded by the range that setting declares. When the number the
+   * settings hold is not the number the loop gets, the chat is told which is which,
+   * so a reply that ran out of steps is judged by the limit it really had.
+   */
+  private agentStepsForReply(): number {
+    const limit = agentStepLimit(this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS), DEFAULT_MAX_STEPS)
+    const notice = agentStepLimitNotice(limit)
+    if (notice) {
+      logger.warn(`[ToolSteps] ${notice}`)
+      this._bridge.emit(EVENT_NAME.twinnyNotification, notice)
+    }
+    return limit.effective
+  }
+
+  /**
    * The provider's client with the workspace's tools: reading and
    * searching (by meaning too, when there is an index), what the language
    * servers know, editing files and running commands, each as the
@@ -2526,7 +2539,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       provider: provider.provider,
-      maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
+      maxSteps: this.agentStepsForReply(),
       ...this.generationOptions(),
       maxResultChars,
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
@@ -2741,7 +2754,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return withTools(resolveInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       provider: provider.provider,
-      maxSteps: Math.min(MAX_STEPS_SETTING, Math.max(MIN_STEPS_SETTING, this.config.get<number>("chatToolsMaxSteps", DEFAULT_MAX_STEPS) || DEFAULT_MAX_STEPS)),
+      maxSteps: this.agentStepsForReply(),
       ...this.generationOptions(),
       maxResultChars,
       // OpenAI's reasoning models think silently on the chat route; at their
