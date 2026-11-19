@@ -45,8 +45,9 @@ import { TeamPluginsBridge, TeamShareBridge } from "../team/bridge"
 import type { TeamPlugins } from "../team/plugins-page"
 import { TeamShare } from "../team/share"
 import { TemplateProvider } from "../templates/provider"
+import { currentProjectTodoStorage } from "../todos/project-storage"
 import { DEFAULT_EVIDENCE_STORAGE_LIMITS, PROJECT_FINGERPRINT, TodoRepository, trustedTodoPanelApproval } from "../todos/repository"
-import { prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase } from "../todos/sqlite"
+import { prepareProjectTodoStorage, retireLegacyTodoDatabase } from "../todos/sqlite"
 import type { CreateTodoInput, TodoWriteRequest, UpdateTodoInput } from "../todos/types"
 import type { WorkspaceSearchProvider } from "../tools/workspace"
 import { getLanguage, getTerminal, getTextSelection, getTheme } from "../utils"
@@ -60,19 +61,6 @@ const storageKeyFor = (scope: string, key: string) => `${scope}-${key}`
 
 /** Set once the extension-global TODO database has been retired, so that removal never repeats. */
 const LEGACY_TODO_RETIRED_KEY = "twinny.legacyTodoDatabaseRetired"
-
-/** `workspaceFileUri` is the current form; `workspaceFile` is the older one the extension typings still declare. */
-const savedWorkspaceFile = (): string | undefined =>
-  ((vscode.workspace as { workspaceFileUri?: vscode.Uri }).workspaceFileUri ?? vscode.workspace.workspaceFile)?.fsPath
-
-/**
- * The folder that owns the project database, chosen without workspace folder order. The home says where the
- * database lives; it never says which paths a tool may reach.
- */
-const currentProjectTodoStorage = () => resolveProjectTodoStorage(
-  (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ scheme: folder.uri.scheme, fsPath: folder.uri.fsPath })),
-  { workspaceFile: savedWorkspaceFile(), projectHome: vscode.workspace.getConfiguration("twinny").get<string>("projectHome") }
-)
 
 let legacyTodoRetirement: Promise<void> | undefined
 

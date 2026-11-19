@@ -2,11 +2,13 @@ import { minimatch } from "minimatch"
 import { randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
-import sqlite3, { Database } from "sqlite3"
 import * as vscode from "vscode"
 
 import { logger } from "../../common/logger"
+import { type Database, SqliteFile, type SqliteLocation } from "../todos/sqlite"
 import { ContentHashAlgorithm, fingerprintContent } from "../tools/fingerprint"
+
+import { eachRow, get, rows, run, type SqlValue, transaction } from "./sql"
 
 type IndexStatus = "disabled" | "not-initialized" | "scanning" | "indexing" | "ready" | "paused" | "error"
 type SearchMode = "auto" | "path" | "symbol" | "literal" | "regex"
@@ -83,56 +85,6 @@ interface SymbolRow {
   path: string
 }
 
-type SqlValue = string | number | null | Buffer
-
-const run = (database: Database, sql: string, values: SqlValue[] = []): Promise<sqlite3.RunResult> =>
-  new Promise((resolve, reject) => {
-    database.run(sql, values, function (error) {
-      if (error) reject(error)
-      else resolve(this)
-    })
-  })
-
-const get = <T>(database: Database, sql: string, values: SqlValue[] = []): Promise<T | undefined> =>
-  new Promise((resolve, reject) => {
-    database.get<T>(sql, values, (error, row) => error ? reject(error) : resolve(row))
-  })
-
-const rows = <T>(database: Database, sql: string, values: SqlValue[] = []): Promise<T[]> =>
-  new Promise((resolve, reject) => {
-    database.all<T>(sql, values, (error, result) => error ? reject(error) : resolve(result))
-  })
-
-const eachRow = <T>(database: Database, sql: string, values: SqlValue[], visit: (row: T) => void): Promise<number> =>
-  new Promise((resolve, reject) => {
-    let visitError: unknown
-    database.each<T>(sql, values, (error, row) => {
-      if (error) visitError = error
-      else if (!visitError) {
-        try {
-          visit(row)
-        } catch (error) {
-          visitError = error
-        }
-      }
-    }, (error, count) => {
-      if (error) reject(error)
-      else if (visitError) reject(visitError)
-      else resolve(count)
-    })
-  })
-
-const exec = (database: Database, sql: string): Promise<void> =>
-  new Promise((resolve, reject) => database.exec(sql, (error) => error ? reject(error) : resolve()))
-
-const closeDatabase = (database: Database): Promise<void> =>
-  new Promise((resolve, reject) => database.close((error) => error ? reject(error) : resolve()))
-
-const openDatabase = (filename: string): Promise<Database> =>
-  new Promise((resolve, reject) => {
-    const database: Database = new sqlite3.Database(filename, (error) => error ? reject(error) : resolve(database))
-  })
-
 const DEFAULT_EXCLUDES = [
   "**/.git/**", "**/node_modules/**", "**/vendor/**", "**/dist/**", "**/build/**",
   "**/out/**", "**/coverage/**", "**/.next/**", "**/target/**", "**/.venv/**",
@@ -140,27 +92,6 @@ const DEFAULT_EXCLUDES = [
   "**/*.min.js", "**/*.map", "**/*.lockb", "**/.env", "**/.env.*",
   "**/*.pem", "**/*.key", "**/*credentials*", "**/*secret*"
 ]
-const SCHEMA = `
-PRAGMA foreign_keys=ON;
-CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS documents (
-  uri TEXT PRIMARY KEY, workspace_uri TEXT NOT NULL, relative_path TEXT NOT NULL,
-  filename TEXT NOT NULL, language_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
-  hash_algorithm TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms REAL,
-  text TEXT NOT NULL, indexed_at TEXT NOT NULL, skip_reason TEXT, error TEXT,
-  symbols_fingerprint TEXT, scan_id TEXT
-);
-CREATE INDEX IF NOT EXISTS documents_workspace ON documents(workspace_uri);
-CREATE INDEX IF NOT EXISTS documents_path ON documents(relative_path);
-CREATE TABLE IF NOT EXISTS symbols (
-  document_uri TEXT NOT NULL REFERENCES documents(uri) ON DELETE CASCADE,
-  name TEXT NOT NULL, kind TEXT NOT NULL, line INTEGER NOT NULL, column_no INTEGER NOT NULL,
-  end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, container TEXT,
-  PRIMARY KEY(document_uri,name,kind,line,column_no)
-);
-CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
-PRAGMA user_version=3;
-`
 
 const globRegex = (glob: string): RegExp => {
   let source = "^"
@@ -244,7 +175,7 @@ const lineColumn = (text: string, offset: number) => {
 
 export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   private database?: Database
-  private reader?: Database
+    private readonly file: SqliteFile
   private initializing?: Promise<void>
   private scanning?: Promise<void>
   private scanController?: AbortController
@@ -280,7 +211,8 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     symbolProviderCalls: 0, discoveryComplete: false, fts5: false
   }
 
-  constructor(private readonly storageUri: vscode.Uri) {
+  constructor(location: SqliteLocation) {
+    this.file = new SqliteFile(location)
     this.listeners.push(
       vscode.workspace.onDidSaveTextDocument((document) => {
         this.dirtyUris.delete(document.uri.toString())
@@ -327,6 +259,10 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       this.update({ status: "disabled" })
       return
     }
+    if (!this.projectAvailable()) {
+      this.update({ status: "not-initialized" })
+      return
+    }
     await this.initialize()
     if (vscode.workspace.getConfiguration("twinny").get<boolean>("indexing.auto", true)) void this.synchronize()
     else this.update({ status: this.state.lastSynchronized ? "paused" : "not-initialized" })
@@ -361,6 +297,10 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
 
   private synchronize(clear = false, repeatAfterCurrent = false): Promise<void> {
     if (this.disposed) return Promise.resolve()
+    if (!this.projectAvailable()) {
+      this.update({ status: "not-initialized" })
+      return Promise.resolve()
+    }
     if (this.synchronizing) {
       logger.info(`[WorkspaceIndex] operation=${this.activeOperationId ?? "unknown"} coalesced request clear=${clear} followup=${repeatAfterCurrent}`)
       if (clear) {
@@ -563,17 +503,12 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
           const batch = [...this.pendingDeletes].slice(0, 64)
           let batchRemoved = 0
           await this.withWrite(async () => {
-            await exec(this.database!, "BEGIN IMMEDIATE")
-            try {
+            transaction(this.database!, () => {
               for (const uri of batch) {
                 this.throwIfSignalAborted(controller.signal)
-                if (await this.removeDocument(uri)) batchRemoved += 1
+                if (this.removeDocument(uri)) batchRemoved += 1
               }
-              await exec(this.database!, "COMMIT")
-            } catch (error) {
-              await exec(this.database!, "ROLLBACK")
-              throw error
-            }
+            })
           })
           for (const uri of batch) this.pendingDeletes.delete(uri)
           removed += batchRemoved
@@ -604,12 +539,13 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   async search(request: WorkspaceSearchRequest, scope?: string, signal?: AbortSignal): Promise<{ results: WorkspaceSearchHit[]; total: number }> {
     if (this.disposed) throw new Error("Workspace index has been disposed.")
     if (!vscode.workspace.getConfiguration("twinny").get<boolean>("indexing.enabled", true)) throw new Error("Workspace indexing is disabled in Twinny settings.")
+    if (!this.projectAvailable()) return { results: [], total: 0 }
     await this.initialize()
     const query = request.query.trim()
     if (!query) return { results: [], total: 0 }
     this.throwIfSignalAborted(signal)
     const mode = request.mode ?? "auto"
-    const database = this.reader!
+    const database = this.database!
     const all = await rows<DocRow>(database, "SELECT uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,'' AS text,indexed_at,skip_reason,error FROM documents WHERE skip_reason IS NULL AND error IS NULL")
     const config = vscode.workspace.getConfiguration("twinny")
     const include = config.get<string[]>("indexing.include", ["**/*"])
@@ -767,35 +703,23 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     this.resetFileWatchers()
     this.emitter.dispose()
     void Promise.allSettled([this.synchronizing, this.updateWorker, this.deletionWorker, this.writer, this.initializing].filter((value): value is Promise<void> => !!value))
-      .then(async () => {
-        const reader = this.reader
-        const database = this.database
-        this.reader = undefined
+      .then(() => {
         this.database = undefined
-        if (reader) await closeDatabase(reader)
-        if (database) await closeDatabase(database)
+        this.file.close()
       })
       .catch((error) => logger.error(`Workspace index database close failed: ${error instanceof Error ? error.message : String(error)}`))
   }
-  private get databasePath(): string {
-    return path.join(this.storageUri.fsPath, "workspace-index.sqlite")
-  }
 
   private async initialize(): Promise<void> {
-    if (this.database && this.reader) return
-    if (!this.initializing) this.initializing = this.open().catch(async (error) => {
+    if (this.database) return
+    if (!this.initializing) this.initializing = this.open().catch((error) => {
       this.initializing = undefined
-      const reader = this.reader
-      const database = this.database
-      this.reader = undefined
-      this.database = undefined
-      if (reader) await closeDatabase(reader).catch((closeError) => logger.error("Workspace index reader close failed: " + String(closeError)))
-      if (database) await closeDatabase(database).catch((closeError) => logger.error("Workspace index database close failed: " + String(closeError)))
+      this.file.close()
       this.reportError("Workspace index initialization failed", error)
       throw error
     })
     await this.initializing
-    if (!this.database || !this.reader) throw new Error("Workspace index database did not finish initializing.")
+    if (!this.database) throw new Error("Workspace index database did not finish initializing.")
   }
 
   private reportError(context: string, error: unknown): void {
@@ -805,34 +729,14 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   }
 
   private async open(): Promise<void> {
-    await fs.mkdir(this.storageUri.fsPath, { recursive: true })
-    const database = await openDatabase(this.databasePath)
-    if (this.disposed) {
-      await closeDatabase(database)
-      return
-    }
-    database.configure("busyTimeout", 5000)
-    await exec(database, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA foreign_keys=ON;")
-    const version = (await get<{ user_version: number }>(database, "PRAGMA user_version"))?.user_version ?? 0
-    if (version > 3) {
-      await closeDatabase(database)
-      throw new Error(`Workspace index database version ${version} is newer than this Twinny version`)
-    }
-    await exec(database, SCHEMA)
-    const columns = await rows<{ name: string }>(database, "PRAGMA table_info(documents)")
-    if (!columns.some((column) => column.name === "symbols_fingerprint")) {
-      await run(database, "ALTER TABLE documents ADD COLUMN symbols_fingerprint TEXT")
-    }
-    if (!columns.some((column) => column.name === "scan_id")) {
-      await run(database, "ALTER TABLE documents ADD COLUMN scan_id TEXT")
-    }
-    try {
-      await exec(database, "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(uri UNINDEXED, relative_path, text)")
-      this.state.fts5 = true
-    } catch (error) {
-      logger.warn(`Workspace index FTS5 unavailable; using literal text search: ${error instanceof Error ? error.message : String(error)}`)
-      this.state.fts5 = false
-    }
+    const database = await this.file.read((connection) => connection)
+    if (this.disposed) return
+    // The shared project connection runs synchronous=FULL; this one is a rebuildable cache.
+    database.pragma("synchronous = NORMAL")
+    database.pragma("cache_size = -8192")
+    database.pragma("mmap_size = 0")
+    database.pragma("temp_store = FILE")
+    this.state.fts5 = true
     this.database = database
     const algorithm = vscode.workspace.getConfiguration("twinny").get<ContentHashAlgorithm>("contentHash.algorithm", "xxh64")
     const stored = (await get<{ value: string }>(database, "SELECT value FROM index_meta WHERE key='hash_algorithm'"))?.value
@@ -846,15 +750,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     })
     const previousConfiguration = (await get<{ value: string }>(database, "SELECT value FROM index_meta WHERE key='indexing_configuration'"))?.value
     if (this.disposed) return
-    const reader = await openDatabase(this.databasePath)
-    if (this.disposed) {
-      await closeDatabase(reader)
-      return
-    }
-    reader.configure("busyTimeout", 5000)
-    await exec(reader, "PRAGMA cache_size=-8192; PRAGMA mmap_size=0; PRAGMA query_only=ON;")
-    this.reader = reader
-    const stats = await get<{ indexed: number; symbols: number; skipped: number; failed: number }>(reader, "SELECT SUM(skip_reason IS NULL AND error IS NULL) AS indexed, (SELECT COUNT(*) FROM symbols) AS symbols, SUM(skip_reason IS NOT NULL) AS skipped, SUM(error IS NOT NULL) AS failed FROM documents")
+    const stats = await get<{ indexed: number; symbols: number; skipped: number; failed: number }>(database, "SELECT SUM(skip_reason IS NULL AND error IS NULL) AS indexed, (SELECT COUNT(*) FROM symbols) AS symbols, SUM(skip_reason IS NOT NULL) AS skipped, SUM(error IS NOT NULL) AS failed FROM documents")
     const storageBytes = await this.measureDatabaseSize()
     this.update({ status: lastSynchronized && previousConfiguration === indexingConfiguration ? "ready" : "not-initialized", lastSynchronized, filesIndexed: stats?.indexed ?? 0, symbolsIndexed: stats?.symbols ?? 0, filesSkipped: stats?.skipped ?? 0, filesFailed: stats?.failed ?? 0, storageBytes })
   }
@@ -985,19 +881,14 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       }
       const activeWorkspaceUris = [...(vscode.workspace.workspaceFolders ?? [])].map((folder) => folder.uri.toString())
       await this.withWrite(async () => {
-        await exec(this.database!, "BEGIN IMMEDIATE")
-        try {
+        transaction(this.database!, () => {
           const stalePredicate = activeWorkspaceUris.length
             ? `(workspace_uri NOT IN (${activeWorkspaceUris.map(() => "?").join(",")}) OR (workspace_uri IN (${activeWorkspaceUris.map(() => "?").join(",")}) AND (scan_id IS NULL OR scan_id<>?)))`
             : "1=1"
           const staleValues: SqlValue[] = activeWorkspaceUris.length ? [...activeWorkspaceUris, ...activeWorkspaceUris, scanId] : []
-          if (this.state.fts5) await run(this.database!, `DELETE FROM documents_fts WHERE uri IN (SELECT uri FROM documents WHERE ${stalePredicate})`, staleValues)
-          await run(this.database!, `DELETE FROM documents WHERE ${stalePredicate}`, staleValues)
-          await exec(this.database!, "COMMIT")
-        } catch (error) {
-          await exec(this.database!, "ROLLBACK")
-          throw error
-        }
+          if (this.state.fts5) run(this.database!, `DELETE FROM documents_fts WHERE uri IN (SELECT uri FROM documents WHERE ${stalePredicate})`, staleValues)
+          run(this.database!, `DELETE FROM documents WHERE ${stalePredicate}`, staleValues)
+        })
       })
       const synchronizedAt = new Date().toISOString()
       await this.withWrite(async () => {
@@ -1060,7 +951,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         }
         const fingerprint = await fingerprintContent(text, algorithm)
         this.throwIfCancelled(signal)
-        const previous = await get<{ fingerprint: string; size: number; mtime_ms: number | null }>(this.reader!, "SELECT fingerprint,size,mtime_ms FROM documents WHERE uri=?", [identity])
+        const previous = await get<{ fingerprint: string; size: number; mtime_ms: number | null }>(this.database!, "SELECT fingerprint,size,mtime_ms FROM documents WHERE uri=?", [identity])
         if (previous?.fingerprint === fingerprint && previous.size === stat.size && previous.mtime_ms === stat.mtime) {
           if (scanId) await run(this.database!, "UPDATE documents SET scan_id=? WHERE uri=?", [scanId, identity])
           if (!openDocument?.isDirty) this.dirtyUris.delete(identity)
@@ -1069,19 +960,14 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         const indexedAt = new Date().toISOString()
         await this.withWrite(async () => {
           this.throwIfCancelled(signal)
-          await exec(this.database!, "BEGIN IMMEDIATE")
-          try {
-            await run(this.database!, "INSERT OR REPLACE INTO documents(uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,text,indexed_at,skip_reason,error,symbols_fingerprint,scan_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?)", [identity, folder.uri.toString(), displayPath, path.posix.basename(uri.path), openDocument?.languageId || path.extname(uri.path).slice(1), fingerprint, algorithm, stat.size, stat.mtime, text, indexedAt, null, scanId ?? null])
-            await run(this.database!, "DELETE FROM symbols WHERE document_uri=?", [identity])
+          transaction(this.database!, () => {
+            run(this.database!, "INSERT OR REPLACE INTO documents(uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,text,indexed_at,skip_reason,error,symbols_fingerprint,scan_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?)", [identity, folder.uri.toString(), displayPath, path.posix.basename(uri.path), openDocument?.languageId || path.extname(uri.path).slice(1), fingerprint, algorithm, stat.size, stat.mtime, text, indexedAt, null, scanId ?? null])
+            run(this.database!, "DELETE FROM symbols WHERE document_uri=?", [identity])
             if (this.state.fts5) {
-              await run(this.database!, "DELETE FROM documents_fts WHERE uri=?", [identity])
-              await run(this.database!, "INSERT INTO documents_fts(uri,relative_path,text) VALUES(?,?,?)", [identity, displayPath, text])
+              run(this.database!, "DELETE FROM documents_fts WHERE uri=?", [identity])
+              run(this.database!, "INSERT INTO documents_fts(uri,relative_path,text) VALUES(?,?,?)", [identity, displayPath, text])
             }
-            await exec(this.database!, "COMMIT")
-          } catch (error) {
-            await exec(this.database!, "ROLLBACK")
-            throw error
-          }
+          })
         })
         if (!openDocument?.isDirty) this.dirtyUris.delete(identity)
         return true
@@ -1134,23 +1020,18 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     await this.withWrite(async () => {
       const current = await get<{ fingerprint: string }>(this.database!, "SELECT fingerprint FROM documents WHERE uri=?", [uri])
       if (current?.fingerprint !== fingerprint || this.dirtyUris.has(uri)) return
-      await exec(this.database!, "BEGIN IMMEDIATE")
-      try {
-        await run(this.database!, "DELETE FROM symbols WHERE document_uri=?", [uri])
-        await this.storeSymbols(uri, symbols)
-        await run(this.database!, "UPDATE documents SET symbols_fingerprint=? WHERE uri=? AND fingerprint=?", [fingerprint, uri, fingerprint])
-        await exec(this.database!, "COMMIT")
-      } catch (error) {
-        await exec(this.database!, "ROLLBACK")
-        throw error
-      }
+      transaction(this.database!, () => {
+        run(this.database!, "DELETE FROM symbols WHERE document_uri=?", [uri])
+        this.storeSymbols(uri, symbols)
+        run(this.database!, "UPDATE documents SET symbols_fingerprint=? WHERE uri=? AND fingerprint=?", [fingerprint, uri, fingerprint])
+      })
     })
     await this.refreshCounts()
   }
 
-  private async storeSymbols(uri: string, symbols: Array<{ name: string; kind: string; range: vscode.Range; container?: string }>): Promise<void> {
+  private storeSymbols(uri: string, symbols: Array<{ name: string; kind: string; range: vscode.Range; container?: string }>): void {
     for (const symbol of symbols) {
-      await run(this.database!, "INSERT OR IGNORE INTO symbols(document_uri,name,kind,line,column_no,end_line,end_column,container) VALUES(?,?,?,?,?,?,?,?)", [uri, symbol.name, symbol.kind, symbol.range.start.line, symbol.range.start.character, symbol.range.end.line, symbol.range.end.character, symbol.container ?? null])
+      run(this.database!, "INSERT OR IGNORE INTO symbols(document_uri,name,kind,line,column_no,end_line,end_column,container) VALUES(?,?,?,?,?,?,?,?)", [uri, symbol.name, symbol.kind, symbol.range.start.line, symbol.range.start.character, symbol.range.end.line, symbol.range.end.character, symbol.container ?? null])
     }
   }
 
@@ -1160,16 +1041,11 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     this.dirtyUris.delete(identity)
     await this.withWrite(async () => {
       if (signal && this.isCancelled(signal)) return
-      await exec(this.database!, "BEGIN IMMEDIATE")
-      try {
-        await run(this.database!, "DELETE FROM symbols WHERE document_uri=?", [identity])
-        if (this.state.fts5) await run(this.database!, "DELETE FROM documents_fts WHERE uri=?", [identity])
-        await run(this.database!, "INSERT OR REPLACE INTO documents(uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,text,indexed_at,skip_reason,error,symbols_fingerprint,scan_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?)", [identity, workspaceUri, relative, path.posix.basename(uri.path), path.extname(uri.path).slice(1), "", "", size, null, "", new Date().toISOString(), reason, scanId ?? null])
-        await exec(this.database!, "COMMIT")
-      } catch (error) {
-        await exec(this.database!, "ROLLBACK")
-        throw error
-      }
+      transaction(this.database!, () => {
+        run(this.database!, "DELETE FROM symbols WHERE document_uri=?", [identity])
+        if (this.state.fts5) run(this.database!, "DELETE FROM documents_fts WHERE uri=?", [identity])
+        run(this.database!, "INSERT OR REPLACE INTO documents(uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,text,indexed_at,skip_reason,error,symbols_fingerprint,scan_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?)", [identity, workspaceUri, relative, path.posix.basename(uri.path), path.extname(uri.path).slice(1), "", "", size, null, "", new Date().toISOString(), reason, scanId ?? null])
+      })
     })
     if (!signal || !this.isCancelled(signal)) this.update({ filesSkipped: this.state.filesSkipped + 1 })
   }
@@ -1181,16 +1057,16 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     await this.refreshCounts()
   }
 
-  private async removeDocument(uri: string): Promise<boolean> {
+  private removeDocument(uri: string): boolean {
     const prefix = uri.endsWith("/") ? uri : `${uri}/`
     const matchesTree = "uri=? OR substr(uri,1,length(?))=?"
     const values = [uri, prefix, prefix]
-    const existing = await get<{ uri: string }>(this.database!, `SELECT uri FROM documents WHERE ${matchesTree} LIMIT 1`, values)
+    const existing = get(this.database!, `SELECT uri FROM documents WHERE ${matchesTree} LIMIT 1`, values)
     if (!existing) return false
     for (const dirtyUri of this.dirtyUris) if (dirtyUri === uri || dirtyUri.startsWith(prefix)) this.dirtyUris.delete(dirtyUri)
-    if (this.state.fts5) await run(this.database!, `DELETE FROM documents_fts WHERE ${matchesTree}`, values)
-    await run(this.database!, `DELETE FROM symbols WHERE document_uri IN (SELECT uri FROM documents WHERE ${matchesTree})`, values)
-    await run(this.database!, `DELETE FROM documents WHERE ${matchesTree}`, values)
+    if (this.state.fts5) run(this.database!, `DELETE FROM documents_fts WHERE ${matchesTree}`, values)
+    run(this.database!, `DELETE FROM symbols WHERE document_uri IN (SELECT uri FROM documents WHERE ${matchesTree})`, values)
+    run(this.database!, `DELETE FROM documents WHERE ${matchesTree}`, values)
     return true
   }
 
@@ -1210,15 +1086,20 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     return vscode.workspace.getWorkspaceFolder(uri)
   }
 
+  /** A window whose first workspace folder is not a local folder has no project database, so the index stays quiet. */
+  private projectAvailable(): boolean {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.scheme === "file"
+  }
+
   private async refreshCounts(): Promise<void> {
-    const stats = await get<{ indexed: number; symbols: number; skipped: number; failed: number }>(this.reader!, "SELECT SUM(skip_reason IS NULL AND error IS NULL) AS indexed, (SELECT COUNT(*) FROM symbols) AS symbols, SUM(skip_reason IS NOT NULL) AS skipped, SUM(error IS NOT NULL) AS failed FROM documents")
+    const stats = await get<{ indexed: number; symbols: number; skipped: number; failed: number }>(this.database!, "SELECT SUM(skip_reason IS NULL AND error IS NULL) AS indexed, (SELECT COUNT(*) FROM symbols) AS symbols, SUM(skip_reason IS NOT NULL) AS skipped, SUM(error IS NOT NULL) AS failed FROM documents")
     this.update({ filesIndexed: stats?.indexed ?? 0, symbolsIndexed: stats?.symbols ?? 0, filesSkipped: stats?.skipped ?? 0, filesFailed: stats?.failed ?? 0, storageBytes: await this.measureDatabaseSize() })
   }
 
   private async measureDatabaseSize(): Promise<number> {
     let total = 0
     for (const suffix of ["", "-wal", "-shm"]) {
-      const file = `${this.databasePath}${suffix}`
+      const file = `${this.file.filePath}${suffix}`
       const stat = await fs.stat(file).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return undefined
         throw error

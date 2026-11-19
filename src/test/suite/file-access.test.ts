@@ -352,7 +352,7 @@ suite("Native file access outside the workspace, in the extension host", functio
       assert.ok(!result.failed, result.output)
       assert.match(result.output, /externalOnlyToken/)
 
-      index = new WorkspaceIntelligenceIndex(vscode.Uri.file(storage))
+      index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
       await index.rebuild()
       assert.equal(index.snapshot.status, "ready")
       assert.ok((await index.search({ query: "positiveControlToken", mode: "literal" }, root)).total > 0, "control: the file inside the folder is indexed")

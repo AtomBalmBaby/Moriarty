@@ -381,6 +381,11 @@ export class SqliteFile {
     openSqliteFiles.add(this)
   }
 
+  /** The resolved database path: the location as given, or the value the resolver answered with on the first open. */
+  get filePath(): string {
+    return this.databasePath
+  }
+
   initialize(): Promise<void> {
     return this.open().then(() => undefined)
   }

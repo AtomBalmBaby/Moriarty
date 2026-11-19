@@ -9,8 +9,9 @@ import { test } from "node:test"
 import { logger } from "../../common/logger"
 import { resolveProjectHome } from "../../extension/todos/project-home"
 import { TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
-import { type LegacyTodoRetirement, prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase } from "../../extension/todos/sqlite"
+import { type LegacyTodoRetirement, prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase, SqliteFile } from "../../extension/todos/sqlite"
 import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
+import { get, run, transaction } from "../../extension/workspace-index/sql"
 
 
 test("the TODO database opens when process.report yields no report, as in some extension-host processes", () => {
@@ -1202,6 +1203,57 @@ test("a failed intent plan transaction rolls back every item, dependency, task, 
     assert.equal((await repository.getIntentTaskPlan(scope))?.revision, 2)
   } finally {
     repository.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("the index tables and the TODO tables coexist in one database and two connections can read and write both", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-index-and-todo-tables-"))
+  try {
+    const databasePath = path.join(directory, "project.sqlite")
+    const repository = new TodoRepository(databasePath)
+    const indexConnection = new SqliteFile(databasePath)
+    const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///coexisting-tables"]), conversationId: "coexist-chat", writer: "coexist-chat" }
+
+    const documentsRow = {
+      uri: "file:///coexist.ts",
+      workspaceUri: "file:///coexist.ts",
+      relativePath: "coexist.ts",
+      filename: "coexist.ts",
+      languageId: "typescript",
+      fingerprint: "xxh64:0",
+      hashAlgorithm: "xxh64",
+      size: 12,
+      mtimeMs: 1,
+      text: "coexist marker text",
+      indexedAt: new Date().toISOString()
+    }
+    await indexConnection.read((database) => transaction(database, () => run(database,
+      "INSERT INTO documents(uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,text,indexed_at,skip_reason,error,symbols_fingerprint,scan_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)",
+      [documentsRow.uri, documentsRow.workspaceUri, documentsRow.relativePath, documentsRow.filename, documentsRow.languageId, documentsRow.fingerprint, documentsRow.hashAlgorithm, documentsRow.size, documentsRow.mtimeMs, documentsRow.text, documentsRow.indexedAt, null]
+    )))
+
+    const item = await repository.createItem(scope, { title: "Shared project database" }, "request-create")
+    const todoRow = await indexConnection.read((database) => get<{ id: string; title: string }>(database, "SELECT id, title FROM todo_items WHERE id = ?", [item.id]))
+    assert.deepEqual(todoRow, { id: item.id, title: "Shared project database" }, "the index connection reads the row the repository wrote")
+
+    // TodoRepository has no raw query, so the row it owns is read through the index side and the index row through a second connection on the same path.
+    const reader = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+    try {
+      assert.deepEqual(
+        reader.prepare("SELECT relative_path, text FROM documents WHERE uri = ?").get([documentsRow.uri]) as { relative_path: string; text: string },
+        { relative_path: documentsRow.relativePath, text: documentsRow.text },
+        "the documents row is visible from another connection on the same database"
+      )
+      const tables = new Set((reader.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name))
+      assert.ok(tables.has("documents") && tables.has("todo_items"), "both table groups are in one schema")
+    } finally {
+      reader.close()
+    }
+
+    indexConnection.close()
+    repository.close()
+  } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })

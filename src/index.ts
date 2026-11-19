@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import * as os from "os"
 import * as path from "path"
 import { v4 as uuidv4 } from "uuid"
@@ -66,7 +67,8 @@ import { TemplateProvider } from "./extension/templates/provider"
 import { terminalHistory } from "./extension/terminal"
 import { runDescribedCommand } from "./extension/terminal/command"
 import { fixTerminalError } from "./extension/terminal/fix"
-import { closeTodoDatabases } from "./extension/todos/sqlite"
+import { currentProjectTodoStorage } from "./extension/todos/project-storage"
+import { closeTodoDatabases, prepareProjectTodoStorage } from "./extension/todos/sqlite"
 import { ContentHashAlgorithm, isContentHashAlgorithm, setContentHashAlgorithmProvider } from "./extension/tools/fingerprint"
 import { delayExecution } from "./extension/utils"
 import { FullScreenProvider } from "./extension/webview/panel"
@@ -252,8 +254,11 @@ export async function activate(context: ExtensionContext) {
   // Every model request runs on the tracker: the spinner, the stop
   // keybinding and the stop command all read it.
   const generations = new GenerationTracker()
-  const workspaceSearchIndex = new WorkspaceIntelligenceIndex(context.globalStorageUri)
+  const workspaceSearchIndex = new WorkspaceIntelligenceIndex(async () => prepareProjectTodoStorage(currentProjectTodoStorage()))
   context.subscriptions.push(workspaceSearchIndex)
+  // The index used to keep its own global database; that file is left in place, unused and deletable.
+  const legacyIndexDatabase = path.join(context.globalStorageUri.fsPath, "workspace-index.sqlite")
+  if (existsSync(legacyIndexDatabase)) logger.info(`${legacyIndexDatabase} is no longer used by the workspace index and can be deleted`)
   void workspaceSearchIndex.start().catch((error) => logger.error("Workspace index initialization failed: " + messageOf(error)))
   context.subscriptions.push(
     generations.onDidChange(({ stoppable }) => {

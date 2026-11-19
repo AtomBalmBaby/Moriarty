@@ -1,4 +1,5 @@
 import * as assert from "assert"
+import BetterSqlite from "better-sqlite3"
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
@@ -9,6 +10,7 @@ import { editorEdits } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits } from "../../extension/edit/line-edit"
 import { GenerationTracker } from "../../extension/generations"
 import { TwinnyStatusBar } from "../../extension/status-bar"
+import { PROJECT_FINGERPRINT, TodoRepository } from "../../extension/todos/repository"
 import { WorkspaceView } from "../../extension/tools/view"
 import { workspaceTools } from "../../extension/tools/workspace"
 import { WorkspaceIntelligenceIndex } from "../../extension/workspace-index"
@@ -77,7 +79,7 @@ suite("Persistent workspace intelligence index", () => {
 
   test("indexes multiple roots, labels skips, finds read_file, and keeps explicit path searches path-only", async function () {
     this.timeout(120000)
-    index = new WorkspaceIntelligenceIndex(vscode.Uri.file(storage))
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
     await index.rebuild()
     const state = index.snapshot
     assert.equal(state.status, "ready")
@@ -192,7 +194,7 @@ suite("Persistent workspace intelligence index", () => {
 
     const lastSync = index.snapshot.lastSynchronized
     index.dispose()
-    index = new WorkspaceIntelligenceIndex(vscode.Uri.file(storage))
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
     const restored = await index.search({ query: "read_file_dirty", mode: "literal" }, root)
     assert.ok(restored.total > 0)
     assert.equal(index.snapshot.lastSynchronized, lastSync)
@@ -200,7 +202,7 @@ suite("Persistent workspace intelligence index", () => {
     await index.clearAndRebuild()
     assert.ok((await index.search({ query: "read_file_dirty", mode: "literal" }, root)).total > 0)
     assert.ok((await index.search({ query: "workspaceSearchAcceptanceMarker = 'after'", mode: "literal" }, root)).total > 0)
-    assert.equal(fs.readFileSync(path.join(storage, "twinny-state.sqlite"), "utf8"), "durable TODO database sentinel")
+    assert.equal(fs.readFileSync(path.join(storage, "twinny-state.sqlite"), "utf8"), "durable TODO database sentinel", "the index leaves unrelated files in its storage directory alone")
 
     fs.mkdirSync(path.join(root, "test"), { recursive: true })
     fs.writeFileSync(path.join(root, "src", "extension", "tools", "registry.ts"), "export function read_file(path: string) { return path }\nexport const tools = [{ name: \"read_file\" }]\n")
@@ -300,6 +302,48 @@ suite("Persistent workspace intelligence index", () => {
       assert.equal(fs.readFileSync(target, "utf8"), "export const x = 1\n")
     } finally {
       await vscode.workspace.getConfiguration("twinny").update("chatToolsAllowedPaths", previous, vscode.ConfigurationTarget.Global)
+    }
+  })
+
+  test("the index lives in the project database: after rebuild the file holds indexed documents and PRAGMA user_version is 20", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(storage, "project.sqlite")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    await index.rebuild()
+    assert.equal(index.snapshot.status, "ready")
+    assert.ok(index.snapshot.filesIndexed > 0)
+    // The index connection is closed first so the read-only open reads a checkpointed database.
+    index.dispose()
+    const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+    try {
+      assert.equal(database.pragma("user_version", { simple: true }), 20, "the schema version belongs to todos/sqlite.ts")
+      const tables = new Set((database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name))
+      assert.ok(tables.has("documents") && tables.has("todo_items"), "one database holds both table groups")
+      assert.ok((database.prepare("SELECT COUNT(*) AS n FROM documents").get() as { n: number }).n > 0, "the rebuilt file holds indexed documents")
+    } finally {
+      database.close()
+    }
+  })
+
+  test("deleting the database files and rebuilding recreates the index tables and the TODO tables", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(storage, "project.sqlite")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    await index.rebuild()
+    assert.ok((await index.search({ query: "multiRootMarker", mode: "literal" }, secondRoot)).total > 0, "the first rebuild wrote the index tables")
+    index.dispose()
+    for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(`${databasePath}${suffix}`, { force: true })
+    assert.equal(fs.existsSync(databasePath), false, "the project database files were deleted")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    await index.rebuild()
+    assert.ok((await index.search({ query: "multiRootMarker", mode: "literal" }, secondRoot)).total > 0, "the index tables were recreated")
+    const repository = new TodoRepository(databasePath)
+    try {
+      const scope = { projectFingerprint: PROJECT_FINGERPRINT, conversationId: "index-suite-conversation", writer: "index-suite-conversation" }
+      const created = await repository.createItem(scope, { title: "TODO work on the same file" }, "index-suite-create")
+      assert.equal((await repository.getList(scope)).items[0]?.id, created.id, "a TodoRepository on the same path works afterwards")
+    } finally {
+      repository.close()
     }
   })
 })
