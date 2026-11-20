@@ -11,6 +11,7 @@ import type { SourceIdentity, TodoCriterionReconciliation, TypedCriterion, Works
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { continuationContext,ExecutionReconciliationController } from "../../extension/chat/execution-reconciliation"
 import { CHILD_TODO_PROTOCOL, ChildTodoReviewer, FEEDBACK_PLAN_PROTOCOL, FeedbackPlanner, identityContradiction, parseFeedbackPlanResponse, userRequestsTodoCreation } from "../../extension/chat/feedback-planner"
+import { recordToolResult } from "../../extension/chat/tool-evidence"
 import { checkDelivery, type DeliveryVerdict } from "../../extension/todos/delivery"
 import { commandDigest, compactArguments, compactEvidenceText, compactToolEvidence, describeGap, evidenceAnchors, evidenceGaps, type EvidenceRecord, excerptEvidence, MAX_EVIDENCE_TEXT, MAX_EXCERPT_CHARS, MAX_RETAINED_EVIDENCE_CHARS, observationArguments, preserveEvidence } from "../../extension/todos/evidence"
 import { EVIDENCE_BUDGET, type EvidenceBudget, projectEvidence, rankPromotionCandidates, renderRecentObservations, renderRequiredEvidence } from "../../extension/todos/evidence-context"
@@ -23,7 +24,9 @@ import { RUNTIME_INVENTORY_TOOL, TodoConflictError } from "../../extension/todos
 import { capabilityOf } from "../../extension/todos/verification-capabilities"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { contentHash, patchedText, planLineEdits } from "../../extension/tools/line-edit"
+import type { ToolCall } from "../../extension/tools/protocol"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
+import { WorkspaceView } from "../../extension/tools/view"
 import { type EditSink, type ToolResult,workspaceTools } from "../../extension/tools/workspace"
 
 type SqliteValue = string | number | bigint | Buffer | null
@@ -2447,8 +2450,232 @@ test("conversation B resolves a path-free tool name from accepted project facts 
     assert.equal(second.criteria[0].reconciliation?.reuse, "accepted")
     assert.deepEqual(second.criteria[0].evidenceRefs, [observation.id], "the origin observation is cited")
     assert.deepEqual(hostReads, [EVIDENCE_FILE], "the host fingerprint check is the only read, and it is not a model tool call")
-    assert.equal(review.observations.length, 0, "conversation B made no source observations of its own")
+    assert.deepEqual(review.observations.map((entry) => entry.id), [observation.id], "the candidates are the project's records: conversation B made no source observation of its own")
     assert.equal(JSON.stringify((await state.repository.getList({ ...state.scope, includeCompleted: true })).items), originItems, "conversation A's TODOs are unchanged")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+/** The result a native tool hands the host, as the tool-result hook receives it. */
+const hookResult = (call: ToolCall, output: string, failed = false): ToolResult => ({ output, summary: call.name, ...(failed ? { failed: true } : {}) })
+
+/** One observation's stored source references, each with the root its path belongs to. */
+const storedSources = (databasePath: string, observationId: string): SqliteValue[][] => withSqlite(databasePath, (database) =>
+  database.prepare(
+    "SELECT source.path, source.role, source.start_line, source.end_line, source.total_lines, source.content_hash, source.observed_version, source.editor_version, root.kind FROM observation_source AS source JOIN source_root AS root ON root.root_id = source.root_id WHERE source.observation_id = ? ORDER BY source.ordinal"
+  ).raw().all(observationId) as SqliteValue[][]
+)
+
+/** Records one result through the recorder the chat hook calls, with no task active. */
+const recordNoTask = async (
+  repository: TodoRepository,
+  scope: TodoWriteRequest,
+  call: ToolCall,
+  output: string,
+  invocationId: string,
+  origin?: (file: string) => { origin: "disk" | "buffer"; editorVersion?: number }
+) => recordToolResult({ repository, scope, ...(origin ? { sourceOrigin: origin } : {}) }, call, hookResult(call, output), { invocationId })
+
+test("a chat with no TODO plan records its tool result as a project observation with no task", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-no-plan-record-"))
+  const databasePath = path.join(directory, "project.sqlite")
+  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///no-plan-record"]), conversationId: "no-plan-record", writer: "no-plan-record" }
+  const repository = new TodoRepository(databasePath, { listChars: 2_000_000 })
+  try {
+    assert.equal(await repository.getActiveIntentContext(scope), undefined, "this chat has no plan and no active task")
+    const call: ToolCall = { name: "read_file", args: { path: EVIDENCE_FILE, start_line: "150", end_line: "200" } }
+    const observation = await recordNoTask(repository, scope, call, await readOutput(EVIDENCE_FILE, 150, sourceLines.slice(149, 200)), "no-plan-invoke")
+    assert.equal(observation.itemId, undefined, "no task is invented to justify the record")
+    assert.deepEqual(withSqlite(databasePath, (database) => sqliteRows(database, "SELECT item_id, tool_name FROM todo_tool_observations")), [[null, "read_file"]], "the stored row belongs to the project alone")
+    assert.deepEqual(storedSources(databasePath, observation.id).map((row) => row.slice(0, 9)), [[EVIDENCE_FILE, "read", 150, 200, 850, await fingerprintContent(workspaceText), "disk", null, "home"]], "the read keeps its path, its shown range and the whole-file hash")
+    const found = await repository.projectObservations({ projectFingerprint: scope.projectFingerprint, writer: scope.writer }, { path: EVIDENCE_FILE })
+    assert.deepEqual(found.map((entry) => entry.observationId), [observation.id], "the project lookup finds the record no task owns")
+    assert.equal(found[0].itemId, undefined, "its task provenance stays empty")
+    assert.equal(found[0].retained, true, "the retained output stands on its own")
+    const storedContent = withSqlite(databasePath, (database) => sqliteRows(database, "SELECT content FROM todo_tool_evidence WHERE retained = 1"))[0][0]
+    assert.ok(typeof storedContent === "string" && storedContent.includes("172:     name: \"read_file\","), "the retained output is the read itself, stored on its own")
+  } finally {
+    repository.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("a full read records the whole file and a partial read records the range its result showed", async () => {
+  const state = await evidenceFixture(semantic("ranges", "Both reads are recorded"))
+  const hash = await fingerprintContent(workspaceText)
+  try {
+    const full: ToolCall = { name: "read_file", args: { path: EVIDENCE_FILE } }
+    const partial: ToolCall = { name: "read_file", args: { path: EVIDENCE_FILE, start_line: "150", end_line: "1000" } }
+    const fullRow = await recordNoTask(state.repository, state.scope, full, await readOutput(EVIDENCE_FILE, 1, sourceLines), "full-invoke")
+    const partialRow = await recordNoTask(state.repository, state.scope, partial, await readOutput(EVIDENCE_FILE, 150, sourceLines.slice(149, 200)), "partial-invoke")
+    assert.deepEqual(storedSources(state.databasePath, fullRow.id).map((row) => row.slice(0, 8)), [[EVIDENCE_FILE, "read", 1, 850, 850, hash, "disk", null]], "the whole-file read keeps the whole range")
+    assert.deepEqual(storedSources(state.databasePath, partialRow.id).map((row) => row.slice(0, 8)), [[EVIDENCE_FILE, "read", 150, 200, 850, hash, "disk", null]], "the clamped read is stored as the range it showed")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a read records the version its text came from: the open editor buffer, or the saved file", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-buffer-origin-"))
+  fs.mkdirSync(path.join(directory, "src"), { recursive: true })
+  const saved = "export const saved = 1\n"
+  const bufferText = "export const saved = 2\n"
+  const opened = path.join(directory, "src", "open.ts")
+  fs.writeFileSync(opened, saved)
+  fs.writeFileSync(path.join(directory, "src", "closed.ts"), saved)
+  const databasePath = path.join(directory, "project.sqlite")
+  const view = new WorkspaceView(directory, [], async (file: string) => (file === opened ? bufferText : undefined), [], [], () => [], (file: string) => (file === opened ? 7 : undefined))
+  const tools = workspaceTools(view)
+  const repository = new TodoRepository(databasePath, { listChars: 2_000_000 })
+  const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${directory}`]), conversationId: "buffer-origin", writer: "buffer-origin" }
+  try {
+    for (const file of ["src/open.ts", "src/closed.ts"]) {
+      const call: ToolCall = { name: "read_file", args: { path: file } }
+      const response = await tools.run({ name: "read_file", args: { path: file } })
+      const observation = await recordNoTask(repository, scope, call, response.output, `origin-${file}`, (target) => view.originOf(target))
+      const text = file === "src/open.ts" ? bufferText : saved
+      assert.deepEqual(storedSources(databasePath, observation.id).map((row) => row.slice(0, 8)), [[file, "read", 1, 1, 1, await fingerprintContent(text), file === "src/open.ts" ? "buffer" : "disk", file === "src/open.ts" ? 7 : null]], `${file} records the version its text came from`)
+    }
+  } finally {
+    repository.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test("a move records both sides with the same hash, a rename records every file it reached, and a failed call records nothing", async () => {
+  const state = await evidenceFixture(semantic("move", "The move and the rename are recorded"))
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-move-reference-"))
+  fs.mkdirSync(path.join(root, "src"), { recursive: true })
+  const movedText = "export const moved = 1\n"
+  fs.writeFileSync(path.join(root, "src", "a.ts"), movedText)
+  try {
+    // The change itself stands in for the editor's rename; the tool and the recorder are the production ones.
+    const tools = workspaceTools(root, [], {
+      edits: {
+        mode: "apply",
+        edit: async () => ({ ok: true, message: "Applied." }),
+        create: async () => ({ ok: true, message: "Created." }),
+        remove: async () => ({ ok: true, message: "Removed." }),
+        move: async (from: string, to: string) => {
+          fs.renameSync(from, to)
+          return { ok: true, message: `Moved ${path.relative(root, from).split(path.sep).join("/")} to ${path.relative(root, to).split(path.sep).join("/")}.`, contentHash: await contentHash(fs.readFileSync(to, "utf8")) }
+        }
+      },
+      git: false,
+      instructions: false
+    })
+    const moveCall: ToolCall = { name: "move_file", args: { from: "src/a.ts", to: "src/b.ts" } }
+    const moved = await tools.run({ name: "move_file", args: { from: "src/a.ts", to: "src/b.ts" } })
+    const hash = await fingerprintContent(movedText)
+    const movedRow = await recordNoTask(state.repository, state.scope, moveCall, moved.output, "move-invoke")
+    assert.deepEqual(storedSources(state.databasePath, movedRow.id).map((row) => [row[0], row[1], row[5], row[6]]), [["src/a.ts", "moved_from", hash, "disk"], ["src/b.ts", "moved_to", hash, "disk"]], "both sides of the move are recorded")
+    const renameCall: ToolCall = { name: "rename_symbol", args: { path: "src/a.ts", symbol: "moved" } }
+    const renamed = await recordNoTask(state.repository, state.scope, renameCall, `Renamed moved.\ncontent_hash(src/a.ts): ${hash}\ncontent_hash(src/b.ts): ${hash}`, "rename-invoke")
+    assert.deepEqual(storedSources(state.databasePath, renamed.id).map((row) => [row[0], row[1], row[5]]), [["src/a.ts", "modified", hash], ["src/b.ts", "modified", hash]], "every file the rename reached is recorded")
+    const failedCall: ToolCall = { name: "create_file", args: { path: "src/c.ts" } }
+    const failed = await recordToolResult({ repository: state.repository, scope: state.scope }, failedCall, hookResult(failedCall, "The file already exists.", true), { invocationId: "failed-invoke" })
+    assert.deepEqual(storedSources(state.databasePath, failed.id), [], "a failed call changed nothing, so it records no reference")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a file outside every root is recorded under the external root, not as a home-relative path", async () => {
+  const state = await evidenceFixture(semantic("external", "The external read is recorded"))
+  const external = "/etc/nginx/nginx.conf"
+  const hash = await fingerprintContent("user nginx;\n")
+  try {
+    const call: ToolCall = { name: "read_file", args: { path: external } }
+    const observation = await recordNoTask(state.repository, state.scope, call, `${external} (lines 1–1 of 1)\ncontent_hash: ${hash}; total_lines: 1\n1: user nginx;`, "external-invoke")
+    const row = storedSources(state.databasePath, observation.id)[0]
+    assert.equal(row[8], "external", "the reference stores the root the file belongs to, not the project home")
+    assert.equal(`/${row[0]}`, external, "the root plus the root-relative path rebuilds the canonical path the tool showed")
+    const inside = await recordNoTask(state.repository, state.scope, { name: "read_file", args: { path: EVIDENCE_FILE } }, await readOutput(EVIDENCE_FILE, 1, sourceLines), "home-invoke")
+    assert.equal(storedSources(state.databasePath, inside.id)[0][8], "home", "a file inside the project stays under the home root")
+    const byCanonical = await state.repository.projectObservations({ projectFingerprint: state.scope.projectFingerprint, writer: state.scope.writer }, { path: external })
+    assert.deepEqual(byCanonical.map((entry) => entry.observationId), [observation.id], "a lookup that names the canonical path finds the record under its own root")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a command that printed a hash records no file reference, and the same tool result replayed is stored once", async () => {
+  const state = await evidenceFixture(semantic("replay", "The run is recorded once"))
+  try {
+    const command: ToolCall = { name: "run_command", args: { command: "sha256sum src/a.ts" } }
+    const run = await recordNoTask(state.repository, state.scope, command, `sha256sum src/a.ts\n${"a".repeat(64)} src/a.ts`, "command-invoke")
+    assert.deepEqual(storedSources(state.databasePath, run.id), [], "a hash a command printed is not a source hash")
+    const call: ToolCall = { name: "read_file", args: { path: EVIDENCE_FILE } }
+    const output = await readOutput(EVIDENCE_FILE, 1, sourceLines)
+    const first = await recordNoTask(state.repository, state.scope, call, output, "replay-invoke")
+    const replay = await recordNoTask(state.repository, state.scope, call, output, "replay-invoke")
+    assert.equal(replay.id, first.id, "the replay answers with the stored record")
+    assert.equal(withSqlite(state.databasePath, (database) => sqliteRows(database, "SELECT COUNT(*) FROM todo_tool_observations WHERE tool_name = 'read_file'"))[0][0], 1, "the replay stored one observation")
+    assert.equal(withSqlite(state.databasePath, (database) => sqliteRows(database, "SELECT COUNT(*) FROM observation_source"))[0][0], 1, "the source reference is stored once too")
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("an unowned project record from another conversation serves a matching criterion, while a failed record and a record naming another file do not", async () => {
+  const mutation = (id: string, operation: WorkspaceMutationOperation): TypedCriterion =>
+    ({ id, description: `${id} is changed in the workspace`, verification: { kind: "workspace_mutation", operation } })
+  const state = await fixture([
+    { id: "creates", criteria: [mutation("creates", "create")] },
+    { id: "edits", criteria: [mutation("edits", "edit")], dependencies: ["creates"] },
+    { id: "located", criteria: [locate("read_file", WORKSPACE_FILE, "registered_tool")] }
+  ], false)
+  try {
+    const item = (id: string) => state.items.find((entry) => entry.title === id)!
+    const other = { ...state.scope, conversationId: "other-chat", writer: "other-chat" }
+    assert.equal(await state.repository.getActiveIntentContext(other), undefined, "the chat that recorded these results has no plan")
+    const record = async (toolName: string, target: string, failed: boolean, invocationId: string) => {
+      const call: ToolCall = { name: toolName, args: { path: target } }
+      return recordToolResult({ repository: state.repository, scope: other }, call, hookResult(call, failed ? "Tool failed." : "Tool returned the expected result.", failed), { invocationId })
+    }
+    const create = await record("create_file", WORKSPACE_FILE, false, "create-from-other-chat")
+    const failedEdit = await record("edit_lines", WORKSPACE_FILE, true, "edit-from-other-chat")
+    const otherFileRead = await record("read_file", "src/other-file.ts", false, "read-from-other-chat")
+    assert.equal(create.itemId, undefined, "the record is the project's, not any task's")
+    assert.deepEqual(storedSources(state.databasePath, failedEdit.id), [], "a failed mutation changed nothing, so it records no reference")
+    const check = async (task: { id: string; version: number }) => {
+      await state.repository.claimCompletion(state.scope, { itemId: task.id, expectedVersion: task.version, requestId: `claim-${task.id}` })
+      const review = (await state.repository.getReviewPackages(state.scope)).find((candidate) => candidate.task.id === task.id)!
+      return { review, outcome: (await reviewReconciliations(review, currentWorkspace))[0] }
+    }
+    const createdCheck = await check(item("creates"))
+    assert.deepEqual(createdCheck.review.dependencies, [], "no edge links these tasks")
+    assert.deepEqual(createdCheck.outcome.supportingObservationIds, [create.id])
+    assert.equal(createdCheck.review.observations.find((entry) => entry.id === create.id)?.itemId, undefined, "the review package shows the project record with no task as owner")
+    assert.deepEqual(createdCheck.outcome.supportingObservationIds, [create.id])
+    assert.deepEqual(createdCheck.review.retainedEvidence.filter((entry) => entry.observationId === create.id).map((entry) => entry.itemId), [undefined], "the record keeps no task as owner")
+    const editedCheck = await check(item("edits"))
+    assert.equal(editedCheck.outcome.outcome, "unknown", "the only record for the edit operation failed, so it proves nothing")
+    const locatedCheck = await check(item("located"))
+    assert.equal(locatedCheck.outcome.outcome, "unknown", "a record naming another file is not this criterion's evidence")
+    assert.deepEqual(locatedCheck.outcome.supportingObservationIds, [], "the mere existence of an observation is no verdict")
+    assert.equal(otherFileRead.itemId, undefined)
+  } finally {
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("the evidence lookup lists project observations from another conversation as candidates without judging them", async () => {
+  const state = await evidenceFixture(semantic("lookup", "The lookup lists candidates"))
+  try {
+    const other = { ...state.scope, conversationId: "candidate-chat", writer: "candidate-chat" }
+    const call: ToolCall = { name: "read_file", args: { path: EVIDENCE_FILE } }
+    const observed = await recordToolResult({ repository: state.repository, scope: other }, call, hookResult(call, await readOutput(EVIDENCE_FILE, 150, sourceLines.slice(149, 220))), { invocationId: "candidate-invoke" })
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: currentWorkspace })
+    const response = await tools.run({ name: "twinny_evidence_lookup", args: { path: EVIDENCE_FILE } })
+    assert.equal(response.failed, undefined)
+    const body = JSON.parse(response.output) as { facts: unknown[]; observations?: Record<string, unknown>[] }
+    assert.equal(body.facts.length, 0, "nothing has been accepted yet")
+    const entries = body.observations ?? []
+    assert.deepEqual(entries.map((entry) => entry.observation_id), [observed.id], "the candidate came from the other conversation")
+    assert.equal("recorded_by_task" in entries[0], false, "the candidate names no task because it belongs to no task")
+    assert.ok(!("verdict" in entries[0]) && !("proven" in entries[0]), "showing a candidate is not a verdict")
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }

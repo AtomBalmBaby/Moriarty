@@ -1709,3 +1709,18 @@ export const evaluateTodoReview = (
   reviewsInFlight.set(key, operation)
   return operation
 }
+
+/**
+ * Candidate observations of one project, as the evidence lookup shows them: whichever task or conversation
+ * produced one, with the task that recorded it as provenance. Showing a candidate is not a verdict; whether
+ * it is enough for a criterion stays Feedback's decision.
+ */
+export const projectCandidateEntries = (records: readonly RetainedObservationEvidence[]): Record<string, unknown>[] =>
+  records.map((record) => ({
+    observation_id: record.observationId,
+    ...(record.itemId ? { recorded_by_task: record.itemId } : {}),
+    tool_name: record.toolName,
+    ...(record.failed ? { failed: true } : {}),
+    recorded_at: record.observedAt,
+    retained: record.retained
+  }))

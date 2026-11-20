@@ -1,6 +1,6 @@
 import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, TypedCriterion } from "../../common/types"
 
-import type { EvidenceHit, EvidenceSource } from "./evidence"
+import type { EvidenceHit, EvidenceSource, ObservedSourceReference } from "./evidence"
 
 export type { TodoAssessmentReaction, TodoAssessmentScoreValue, TodoAssessmentView, TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoObservation, TodoObservationStatus, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
@@ -117,6 +117,15 @@ export interface TodoWriteRequest extends TodoListRequest {
   writer: string
 }
 
+/**
+ * A project-scoped read: it names no conversation, because project knowledge belongs to the project.
+ * `writer` is the conversation making the read, so one chat cannot write another chat's facts.
+ */
+export interface ProjectEvidenceRequest {
+  projectFingerprint: string
+  writer: string
+}
+
 export interface CreateTodoInput {
   title: string
   details?: string
@@ -144,7 +153,8 @@ export interface AddTodoEvidenceInput {
 export const RUNTIME_INVENTORY_TOOL = "twinny_runtime_inventory"
 
 export interface TodoToolObservationInput {
-  itemId: string
+  /** Provenance only: the task active when the result came in. An observation does not need a task or a plan. */
+  itemId?: string
   toolName: string
   arguments: Record<string, string>
   output: string
@@ -155,6 +165,8 @@ export interface TodoToolObservationInput {
   requestId: string
   /** Set only by the host from its own execution state; never taken from model-provided arguments. */
   executionId?: string
+  /** The files the tool actually touched or read, with each one's role and where its text came from. */
+  sources?: ObservedSourceReference[]
 }
 
 /** Stored tool output for one observation, with whatever the store still holds. */

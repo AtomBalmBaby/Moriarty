@@ -176,7 +176,8 @@ export interface TodoToolEvidenceStatus {
 
 export interface TodoToolObservation {
   id: string
-  itemId: string
+  /** The task that recorded it, when a task was active; an observation can belong to the project alone. */
+  itemId?: string
   toolName: string
   arguments: Record<string, string>
   output: string

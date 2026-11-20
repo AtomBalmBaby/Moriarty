@@ -1,5 +1,5 @@
 import { logger } from "../../common/logger"
-import { assessAcceptedFacts, type CurrentSourceReader, evidenceLookupArguments, factNamedBy, resolveAcceptedFacts } from "../todos/feedback"
+import { assessAcceptedFacts, type CurrentSourceReader, evidenceLookupArguments, factNamedBy, projectCandidateEntries, resolveAcceptedFacts } from "../todos/feedback"
 import { TodoRepository } from "../todos/repository"
 import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
 
@@ -199,7 +199,7 @@ export const todoTools = (
           ...(freshness !== "current" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again` } : {})
         }))
         return {
-          ...result({ ok: true, resolution, facts: found, total: found.length, limit: EVIDENCE_LOOKUP_LIMIT }, `found ${found.length} accepted evidence fact(s), resolution ${resolution}`),
+          ...result({ ok: true, resolution, facts: found, total: found.length, limit: EVIDENCE_LOOKUP_LIMIT, ...(path ? { observations: projectCandidateEntries(await repository.projectObservations(scope, { path, limit: EVIDENCE_LOOKUP_LIMIT })) } : {}) }, `found ${found.length} accepted evidence fact(s), resolution ${resolution}`),
           observation: { arguments: evidenceLookupArguments({ symbol, path, resolution, factCount: found.length }) }
         }
       } catch (error) {

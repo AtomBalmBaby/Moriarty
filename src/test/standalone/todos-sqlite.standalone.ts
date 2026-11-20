@@ -1094,6 +1094,63 @@ test("deleting a TODO list retains observations, retained output, source referen
   })
 })
 
+test("deleting a task and its conversation leaves the project observation, its retained output and its source reference searchable", async () => {
+  await withDirectory("twinny-task-retention-", async (directory) => {
+    const databasePath = path.join(directory, "project.sqlite")
+    const scope = { projectFingerprint: "project", conversationId: "chat-task-retention", writer: "chat-task-retention" }
+    const repository = new TodoRepository(databasePath)
+    const plan = {
+      planId: "plan-task-retention", version: 1 as const, revision: 1, goal: "Retain the read",
+      constraints: [], tasks: [{
+        id: "inspect", title: "Inspect parser", description: "Read parser source",
+        criteria: [{ id: "parser-read", description: "Parser source was read", verification: { kind: "semantic_review" as const } }],
+        dependencies: []
+      }]
+    }
+    try {
+      const [item] = (await repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: "Read the parser", plan })).items
+      const observation = await repository.recordToolObservation(scope, {
+        itemId: item.id,
+        toolName: "read_file",
+        arguments: { path: "src/parser.ts", start_line: "1", end_line: "1" },
+        output: "export function parse() {}",
+        failed: false,
+        requestId: "task-retention-observation",
+        evidenceOutput: "src/parser.ts (lines 1–1 of 1)\ncontent_hash: sha256:" + "b".repeat(64) + "; total_lines: 1\n1: export function parse() {}"
+      })
+      const database = new BetterSqlite(databasePath)
+      try {
+        database.pragma("foreign_keys = ON")
+        const list = database.prepare("SELECT id FROM todo_lists WHERE conversation_id = ?").get(scope.conversationId) as { id: string }
+        database.prepare("DELETE FROM todo_items WHERE id = ?").run(item.id)
+        database.prepare("DELETE FROM todo_lists WHERE id = ?").run(list.id)
+      } finally {
+        database.close()
+      }
+      const reopened = new TodoRepository(databasePath)
+      try {
+        assert.deepEqual((await reopened.getList({ ...scope, includeCompleted: true })).items, [], "the task and its conversation are gone")
+        const found = await reopened.projectObservations({ projectFingerprint: scope.projectFingerprint, writer: scope.writer }, { path: "src/parser.ts" })
+        assert.deepEqual(found.map((entry) => entry.observationId), [observation.id], "the project record outlives the task and the conversation that recorded it")
+        assert.equal(found[0].itemId, item.id, "the record still names the task that made it as provenance")
+        assert.equal(found[0].retained, true, "the retained output is still stored for the project")
+        const stored = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+        try {
+          assert.ok((stored.prepare("SELECT content FROM todo_tool_evidence WHERE observation_id = ?").get(observation.id) as { content: string }).content.includes("export function parse() {}"), "the retained output is still readable")
+          assert.deepEqual(stored.prepare("SELECT role, path FROM observation_source WHERE observation_id = ?").raw().get(observation.id), ["read", "src/parser.ts"], "the source reference is still there")
+        } finally {
+          stored.close()
+        }
+      } finally {
+        reopened.close()
+      }
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+
 test("deleting the project database and its sidecars then reopening creates a clean database", async () => {
   await withDirectory("twinny-project-reset-", async (directory) => {
     const root = makeProject(directory)

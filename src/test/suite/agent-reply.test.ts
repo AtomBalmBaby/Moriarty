@@ -1872,6 +1872,29 @@ suite("Read-file acceptance, production controller", function () {
     }, { [file]: source })
   })
 
+  test("a reply with no TODO plan records its tool result as a project observation through the host hook", async () => {
+    await withWorkspace(async (workspace) => {
+      const turn = await runTurn(workspace, {
+        conversationId: "no-plan-hook",
+        planReply: JSON.stringify({ track: false, plan: null }),
+        replies: [call("read_file", { path: "src/tools.ts" }), "The file is read; there is no plan to record against."]
+      })
+      assert.equal(await turn.repository.getActiveIntentContext(turn.scope), undefined, "the reply had no plan, so no task was active")
+      const candidates = await turn.repository.projectObservations(turn.scope, { toolName: "read_file" })
+      assert.equal(candidates.length, 1, "the tool result is recorded for the project")
+      assert.equal(candidates[0].itemId, undefined, "no task is invented to own it")
+      const rows = new BetterSqlite(workspace.databasePath, { fileMustExist: true })
+      try {
+        assert.deepEqual(rows.prepare("SELECT item_id FROM todo_tool_observations WHERE tool_name = 'read_file'").raw().all(), [[null]], "the stored row has no task")
+        const openInEditor = vscode.workspace.textDocuments.some((document) => document.uri.fsPath === path.join(workspace.root, "src/tools.ts"))
+        assert.deepEqual(rows.prepare("SELECT path, role, observed_version FROM observation_source").raw().all(), [["src/tools.ts", "read", openInEditor ? "buffer" : "disk"]], "the reference names the version the read actually came from")
+      } finally {
+        rows.close()
+      }
+    })
+  })
+
+
   const mycroftRequest = "Locate the native read_file tool implementation. Check project-wide accepted evidence first. If no current accepted evidence exists, locate and read the implementation once. Return its filename, implementation line range, and the authoritative source fingerprint supplied by read_file. Do not modify files."
 
   /** The readFile declaration in a repository source file, as 1-based inclusive lines. */

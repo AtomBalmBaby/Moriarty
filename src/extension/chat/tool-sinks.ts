@@ -233,6 +233,12 @@ export const openDocumentText = async (file: string): Promise<string | undefined
   // the same path with a different scheme.
   workspace.textDocuments.find((document) => document.uri.scheme === "file" && document.uri.fsPath === file)?.getText()
 
+/** The editor document's version when the file is open there, undefined otherwise. A recorded read
+ * uses it to say whether its text came from the buffer or from the saved file.
+ */
+export const openDocumentVersion = (file: string): number | undefined =>
+  workspace.textDocuments.find((document) => document.uri.scheme === "file" && document.uri.fsPath === file)?.version
+
 /** The saved file as the index sees it: read back from disk, decoded as UTF-8 with the byte-order mark stripped. Undefined when it cannot be read. */
 const savedFileText = (file: string): string | undefined => {
   try {

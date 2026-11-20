@@ -170,6 +170,11 @@ export interface EvidenceSource {
   /** Fingerprint of the whole document as it was read; absent for outputs that carry none. */
   contentHash?: string
 }
+/** What the tool did to a file, as its own result says. */
+export type SourceRole = "read" | "created" | "modified" | "deleted" | "moved_from" | "moved_to"
+
+/** Where the text a reference describes came from: the saved file, or the open editor buffer. */
+export type ObservedVersion = "disk" | "buffer"
 
 export interface EvidenceHit {
   path: string
@@ -184,6 +189,43 @@ export interface PreservedEvidence {
   complete: boolean
   sources: EvidenceSource[]
   hits: EvidenceHit[]
+}
+
+/** A recorded file reference: what was read or changed, and which version of it the tool saw. */
+export interface ObservedSourceReference extends EvidenceSource {
+  role: SourceRole
+  observedVersion: ObservedVersion
+  /** The editor document's version, recorded only for a reference read from an open buffer. */
+  editorVersion?: number
+}
+
+export interface ObservedSourceInput {
+  name: string
+  args: Record<string, unknown>
+  output: string
+  /** A failed call changed nothing, so it proves no reference. */
+  failed: boolean
+  /** Where a read's text came from, reported by the workspace view, never by the model. */
+  origin?: { origin: ObservedVersion; editorVersion?: number }
+}
+
+const FROM_KEYS = ["from"]
+const TO_KEYS = ["to"]
+const RENAME_HASH_LINE = /^content_hash\((.+?)\): ([a-z0-9_]+:[a-f0-9]+)/gm
+
+const hashOf = (text: string): string | undefined => CONTENT_HASH.exec(text.slice(0, 400))?.[1]
+
+const totalLinesOf = (text: string): number | undefined => {
+  const value = Number(TOTAL_LINES.exec(text.slice(0, 400))?.[1])
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+const jsonOutput = (text: string): Record<string, unknown> | undefined => {
+  try {
+    return JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return undefined
+  }
 }
 
 /** The lines a successful read showed, from its header, so a clamped or cut read is not recorded as the requested range. */
@@ -256,6 +298,51 @@ export const preserveEvidence = (output: string): PreservedEvidence => {
   }
 }
 
+/**
+ * The file references one tool result proves. A failed call changed nothing, so it records no
+ * reference. A read keeps the range it showed; a move records both sides; a rename every file the
+ * language server reached. A hash is recorded only when the tool reported one, so a command with
+ * unknown side effects never gets an invented fingerprint.
+ */
+export const observedSourceReferences = (input: ObservedSourceInput): ObservedSourceReference[] => {
+  if (input.failed) return []
+  let origin: ObservedVersion = input.origin?.origin ?? "disk"
+  const editorVersion = input.origin?.editorVersion
+  const withOrigin = (reference: EvidenceSource & { role: SourceRole }): ObservedSourceReference => ({
+    ...reference,
+    observedVersion: origin,
+    ...(editorVersion === undefined ? {} : { editorVersion })
+  })
+  const read = parseSources(input.output)
+  if (read.length) return read.map((source) => withOrigin({ ...source, role: "read" }))
+  const reference = (file: string, role: SourceRole, hash?: string): ObservedSourceReference => withOrigin({
+    path: file,
+    role,
+    ...(hash === undefined ? {} : { contentHash: hash, totalLines: totalLinesOf(input.output) })
+  })
+  if (input.name === "move_file") {
+    const from = firstValue(input.args, FROM_KEYS)
+    const to = firstValue(input.args, TO_KEYS)
+    const hash = hashOf(input.output)
+    const sides: ObservedSourceReference[] = []
+    if (from) sides.push(withOrigin({ path: from, role: "moved_from", ...(hash ? { contentHash: hash } : {}) }))
+    if (to) sides.push(reference(to, "moved_to", hash))
+    return sides
+  }
+  if (input.name === "rename_symbol") {
+    const renamed = [...input.output.matchAll(RENAME_HASH_LINE)].map((match) => ({ path: match[1], hash: match[2] }))
+    if (renamed.length) return renamed.map(({ path, hash }) => withOrigin({ path, role: "modified", contentHash: hash }))
+    const named = firstValue(input.args, PATH_KEYS)
+    return named ? [reference(named, "modified")] : []
+  }
+  const file = firstValue(input.args, PATH_KEYS)
+  if (!file) return []
+  const role: SourceRole = input.name === "create_file" ? "created" : input.name === "delete_file" ? "deleted" : "modified"
+  // An edit names the version it hashed, so the reference records that version rather than a guess.
+  const outcome = role === "modified" ? jsonOutput(input.output) : undefined
+  if (outcome?.content_source === "buffer") origin = "buffer"
+  return [reference(file, role, hashOf(input.output))]
+}
 export interface EvidenceAnchors {
   paths: string[]
   symbols: string[]

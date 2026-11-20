@@ -7,13 +7,14 @@ import {
   type EvidenceHit,
   type EvidenceSource,
   MAX_EVIDENCE_TEXT,
+  type ObservedSourceReference,
   preserveEvidence,
   redactEvidence,
   samePath
 } from "./evidence"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { rootLabelOf } from "./project-home"
-import { SourceRoots } from "./source-roots"
+import { type SourceLocation, SourceRoots } from "./source-roots"
 import { type Database, SqliteFile, type SqliteLocation } from "./sqlite"
 import {
   type AcceptedFact,
@@ -34,6 +35,7 @@ import {
   type IntentPlanOutline,
   type IntentPlanOutlineChild,
   type IntentTaskPlan,
+  type ProjectEvidenceRequest,
   type RequirementActivation,
   type RetainedObservationEvidence,
   type SymbolAlias,
@@ -751,22 +753,55 @@ const latestActivation = (database: Database, listId: string, itemId: string): R
   return row ? { id: row.id, itemId: row.item_id, kind: row.kind, listRevision: row.list_revision, activatedAt: row.activated_at } : undefined
 }
 
-const retainedEvidenceFor = (database: Database, itemId: string, withContent: boolean, sharedListId?: string): RetainedObservationEvidence[] =>
-  rows<{ observation_id: string; observed_item_id: string; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; observed_at: string; list_revision: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
+/**
+ * Stored tool results: for one task, for one plan, or for the whole project. A project-wide read
+ * takes the records from every task and conversation that produced them, and each record keeps the
+ * task that recorded it as provenance, as §2.2 requires.
+ */
+const retainedEvidenceFor = (
+  database: Database,
+  itemId: string,
+  withContent: boolean,
+  options: { sharedListId?: string; projectId?: string; path?: string; location?: SourceLocation; toolName?: string; limit?: number } = {}
+): RetainedObservationEvidence[] => {
+  const conditions: string[] = []
+  const values: (string | number | null)[] = []
+  if (options.projectId) {
+    conditions.push("observations.project_id = ?")
+    values.push(options.projectId)
+    // Path identity is the root plus the root-relative path (§2.2), so a lookup that names a canonical
+    // path outside the project home finds the same record.
+    if (options.location) {
+      conditions.push("EXISTS (SELECT 1 FROM observation_source AS source WHERE source.observation_id = observations.id AND source.root_id = ? AND source.path = ?)")
+      values.push(options.location.rootId, options.location.path)
+    } else if (options.path) {
+      conditions.push("EXISTS (SELECT 1 FROM observation_source AS source WHERE source.observation_id = observations.id AND source.path = ?)")
+      values.push(options.path)
+    }
+    if (options.toolName) {
+      conditions.push("observations.tool_name = ?")
+      values.push(options.toolName)
+    }
+  } else if (options.sharedListId) {
+    conditions.push("observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1)")
+    values.push(options.sharedListId, options.sharedListId)
+  } else {
+    conditions.push("observations.item_id = ?")
+    values.push(itemId)
+  }
+  return rows<{ observation_id: string; observed_item_id: string | null; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; observed_at: string; list_revision: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
     "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, observations.created_at AS observed_at, observations.list_revision, evidence.retained, " +
     (withContent ? "evidence.content" : "NULL AS content") +
     ", evidence.complete, evidence.original_chars, evidence.preserved_chars, evidence.metadata_json " +
     "FROM todo_tool_observations AS observations LEFT JOIN todo_tool_evidence AS evidence ON evidence.observation_id = observations.id " +
-    (sharedListId
-      ? "WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) "
-      : "WHERE observations.item_id = ? ") +
-    "ORDER BY observations.list_revision, observations.created_at, observations.rowid", sharedListId ? [sharedListId, sharedListId] : [itemId]).map((row) => {
+    `WHERE ${conditions.join(" AND ")} ` +
+    "ORDER BY observations.list_revision, observations.created_at, observations.rowid" + (options.limit ? ` LIMIT ${options.limit}` : ""), values).map((row) => {
       const metadata = row.metadata_json
         ? JSON.parse(row.metadata_json) as { sources: EvidenceSource[]; hits: EvidenceHit[] }
         : { sources: [], hits: [] }
       return {
         observationId: row.observation_id,
-        itemId: row.observed_item_id,
+        ...(row.observed_item_id === null ? {} : { itemId: row.observed_item_id }),
         toolName: row.tool_name,
         arguments: JSON.parse(row.arguments_json) as Record<string, string>,
         failed: row.failed !== 0,
@@ -782,6 +817,7 @@ const retainedEvidenceFor = (database: Database, itemId: string, withContent: bo
         hits: metadata.hits
       }
     })
+  }
 
 const evidenceStatus = (entry: RetainedObservationEvidence | undefined): TodoToolEvidenceStatus => ({
   retained: entry?.retained ?? false,
@@ -1024,7 +1060,7 @@ export class TodoRepository {
         "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 3",
         [current.id]
       )
-      const retainedEvidence = retainedEvidenceFor(database, current.id, false, list.id)
+      const retainedEvidence = retainedEvidenceFor(database, current.id, false, { sharedListId: list.id })
       const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string; executionId: string | null }>(database,
         "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt, execution_id AS executionId FROM todo_tool_observations WHERE item_id = ? ORDER BY created_at DESC, rowid DESC", [current.id]
       ).map((observation) => ({
@@ -1152,12 +1188,13 @@ export class TodoRepository {
       return tasks.filter((task) => reviewable(task.status)).map((row) => {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
-        const retainedEvidence = retainedEvidenceFor(database, row.id, true, list.id)
-        const observations = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed_number: number; exitCode: number | null; createdAt: string }>(database,
-          "SELECT observations.id, observations.item_id AS itemId, observations.tool_name AS toolName, observations.arguments_json, observations.output, observations.failed AS failed_number, observations.exit_code AS exitCode, observations.created_at AS createdAt FROM todo_tool_observations AS observations WHERE observations.list_id = ? AND observations.item_id IN (SELECT item_id FROM todo_intent_tasks WHERE list_id = ? AND active = 1) ORDER BY observations.created_at DESC, observations.rowid DESC", [list.id, list.id]
+        // Candidates are the project's records, not only this plan's: the task that recorded each one stays as its provenance.
+        const retainedEvidence = retainedEvidenceFor(database, row.id, true, { projectId: list.project_id })
+        const observations = rows<{ id: string; itemId: string | null; toolName: string; arguments_json: string; output: string; failed_number: number; exitCode: number | null; createdAt: string }>(database,
+          "SELECT observations.id, observations.item_id AS itemId, observations.tool_name AS toolName, observations.arguments_json, observations.output, observations.failed AS failed_number, observations.exit_code AS exitCode, observations.created_at AS createdAt FROM todo_tool_observations AS observations WHERE observations.project_id = ? ORDER BY observations.created_at DESC, observations.rowid DESC", [list.project_id]
         ).map((observation) => ({
           id: observation.id,
-          itemId: observation.itemId,
+          ...(observation.itemId === null ? {} : { itemId: observation.itemId }),
           toolName: observation.toolName,
           arguments: JSON.parse(observation.arguments_json) as Record<string, string>,
           output: observation.output,
@@ -1202,7 +1239,21 @@ export class TodoRepository {
       if (!project) return []
       const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
       if (!list) return []
-      return retainedEvidenceFor(database, "", true, list.id)
+      return retainedEvidenceFor(database, "", true, { sharedListId: list.id })
+    })
+  }
+  /**
+   * Stored observations anywhere in this project, from whichever task or conversation produced them.
+   * Each record names the task and conversation that recorded it; those are provenance, not the scope of
+   * what a criterion may use.
+   */
+  projectObservations(request: ProjectEvidenceRequest, options: { path?: string; toolName?: string; limit?: number } = {}): Promise<RetainedObservationEvidence[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      // A path is named the way the model names it: a canonical string, resolved through the same roots the writer used.
+      const location = options.path === undefined ? undefined : this.sourceRoots?.fromCanonical(options.path)
+      return retainedEvidenceFor(database, "", false, { projectId: project.id, ...(location === undefined ? {} : { location }), toolName: options.toolName, limit: options.limit })
     })
   }
 
@@ -1234,10 +1285,9 @@ export class TodoRepository {
           }
         }
       }
-      const row = rows<ItemRow>(database, "SELECT * FROM todo_items WHERE id = ? AND list_id = ?", [input.itemId, list.id])[0]
-      if (!row || row.status === "completed" || row.status === "cancelled") throw new Error("Tool observation task is no longer actionable")
-      const intentTask = rows<{ task_id: string }>(database, "SELECT task_id FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [input.itemId, list.id])[0]
-      if (!intentTask) throw new Error("Tool observations are limited to active Intent tasks")
+      // A result is evidence for the project, not for the task that happened to be active: a task ID, a plan or a
+      // TODO list is provenance here, so a chat with no plan still records what its tools actually did.
+      const references: ObservedSourceReference[] = (input.sources ?? preserved?.sources ?? []).map((reference) => ({ role: "read", observedVersion: "disk", ...reference }))
       const retain = preserved !== undefined && preserved.preservedChars <= this.evidenceLimits.listChars
       const evidence: TodoToolEvidenceStatus | undefined = preserved && {
         retained: retain,
@@ -1252,12 +1302,12 @@ export class TodoRepository {
       if (preserved) {
         execute(database, "INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
-        this.sourceRoots?.recordObservationSources(observation.id, preserved.sources, preserved.hits, observation.createdAt)
+        this.sourceRoots?.recordObservationSources(observation.id, references, preserved?.hits ?? [], observation.createdAt)
         enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
       }
       // Evidence does not change the task's content or status, so it does not bump its version: an unrelated observation
       // made during review must not invalidate that review. The list revision above records it for review packages.
-      logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
+      logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId ?? null, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
       return observation
     })
   }

@@ -88,13 +88,17 @@ export class WorkspaceView {
   /** Read on each use, so a grant made during a reply applies to the calls after it. */
   private readonly _granted: () => readonly AuthorizedRoot[]
 
+  /** Reports the editor document's version when the file is open in the editor. */
+  private readonly _openVersion?: (file: string) => number | undefined
+
   constructor(
     readonly root: string,
     ignoredGlobs: string[] = [],
     private readonly _read?: (file: string) => Promise<string | undefined>,
     blockedGlobs: string[] = [],
     authorizedRoots: readonly string[] = [],
-    granted: () => readonly AuthorizedRoot[] = () => []
+    granted: () => readonly AuthorizedRoot[] = () => [],
+    openVersion?: (file: string) => number | undefined
   ) {
     this._realRoot = fs.realpathSync(root)
     this._base = ignore().add([".git", "node_modules", ...ignoredGlobs])
@@ -103,6 +107,7 @@ export class WorkspaceView {
       .filter((entry) => !this.inside(entry))
       .map((entry) => ({ root: entry, real: realPathOf(entry), scope: "folder" }))
     this._granted = granted
+    this._openVersion = openVersion
   }
 
   /** Every folder or file outside the root the tools may use: the settings' folders and the grants in force. */
@@ -452,6 +457,18 @@ export class WorkspaceView {
     }
     await visit(this.root)
     return { files: files.sort(), dirs: dirs.sort() }
+  }
+
+  /**
+   * Where a read of `file` gets its text from: the open editor buffer when the
+   * document is open there, else the saved file. A recorded source reference says
+   * which one it was, so a buffer read is never read back as disk.
+   */
+  originOf(file: string): { origin: "buffer" | "disk"; editorVersion?: number } {
+    const cleaned = file.trim().replace(/^\.\/+/, "")
+    const version = this._openVersion?.(path.resolve(this.root, cleaned))
+    if (version === undefined) return { origin: "disk" }
+    return { origin: "buffer", editorVersion: version }
   }
 
   /**

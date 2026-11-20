@@ -10,6 +10,7 @@
 import { randomUUID } from "node:crypto"
 import path from "node:path"
 
+import type { ObservedSourceReference } from "./evidence"
 import type { Database } from "./sqlite"
 
 export type SourceRootKind = "home" | "workspace" | "external"
@@ -191,13 +192,7 @@ export class SourceRoots {
   /** Persist a source or hit independently of the TODO item and list that originated it. */
   recordObservationSources(
     observationId: string,
-    sources: readonly {
-      readonly path: string
-      readonly startLine?: number
-      readonly endLine?: number
-      readonly totalLines?: number
-      readonly contentHash?: string
-    }[],
+    sources: readonly ObservedSourceReference[],
     hits: readonly { readonly path: string; readonly line?: number }[],
     createdAt: string
   ): void {
@@ -206,8 +201,8 @@ export class SourceRoots {
       if (!source.path.trim()) continue
       const location = this.fromCanonical(source.path.trim())
       this.database.prepare(
-        "INSERT INTO observation_source(observation_id, ordinal, root_id, path, role, start_line, end_line, total_lines, content_hash, observed_version, editor_version, created_at) VALUES (?, ?, ?, ?, 'read', ?, ?, ?, ?, 'disk', NULL, ?)"
-      ).run(observationId, ordinal++, location.rootId, location.path, source.startLine ?? null, source.endLine ?? null, source.totalLines ?? null, source.contentHash ?? null, createdAt)
+        "INSERT INTO observation_source(observation_id, ordinal, root_id, path, role, start_line, end_line, total_lines, content_hash, observed_version, editor_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(observationId, ordinal++, location.rootId, location.path, source.role ?? "read", source.startLine ?? null, source.endLine ?? null, source.totalLines ?? null, source.contentHash ?? null, source.observedVersion ?? "disk", source.editorVersion ?? null, createdAt)
     }
     for (const hit of hits) {
       if (!hit.path.trim()) continue

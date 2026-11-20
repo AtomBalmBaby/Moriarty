@@ -69,7 +69,6 @@ import { describeProviderError, describeProviderErrorPlain, stripThinking } from
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
-import { compactEvidenceText, compactToolEvidence, observationArguments } from "../todos/evidence"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
 import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
@@ -102,6 +101,7 @@ import { ChangeStore, ReplyChanges, viewOf } from "./reply-changes"
 import { ReplyChangesEditor } from "./reply-changes-editor"
 import { type RoleReply, type RoleResolution,structuredReply } from "./role-inference"
 import { DiagnosticRegressionMonitor, SafeEditCheckpoints } from "./safe-edit-recovery"
+import { isRecordableToolResult, recordToolResult, reportRecordFailure, type ToolResultRecorder } from "./tool-evidence"
 import {
   ABSENT_DIGEST,
   ChatCommandMode,
@@ -117,6 +117,7 @@ import {
   isEditOperationInFlight,
   normalCommand,
   openDocumentText,
+  openDocumentVersion,
   terminalCommands
 } from "./tool-sinks"
 import { ToolSteps } from "./tool-steps"
@@ -1346,7 +1347,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         this.config.get<string[]>("chatToolsAllowedPaths", [])
       ),
       // Grants the user made in the chat, read live so a grant made mid-reply counts from the next call.
-      () => this._accessStore.grants().map((grant) => ({ root: grant.root, real: grant.real, scope: grant.scope }))
+      () => this._accessStore.grants().map((grant) => ({ root: grant.root, real: grant.real, scope: grant.scope })),
+      // Which version a read would answer from, so a recorded source reference can name it.
+      openDocumentVersion
     )
   }
 
@@ -2288,57 +2291,31 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onOutOfSteps: () => (outOfSteps = true),
       onToolResult: async (call: ToolCall, result: ToolResult) => {
         // A declined command ran nothing, and todo tools record their own results.
-        if (call.name.startsWith("twinny_todo_") || (call.name === "run_command" && !result.execution)) return
-        const scope = this._todoRepository ? this.activeTodoScope() : undefined
-        if (!this._todoRepository || !scope) {
+        if (!isRecordableToolResult(call, result)) return
+        const repository = this._todoRepository
+        const scope = repository ? this.activeTodoScope() : undefined
+        if (!repository || !scope) {
           execution.markUnrecordedTool()
-          logger.debug(`[Evidence] result of ${call.name} has no task ledger to record in`)
+          logger.debug(`[Evidence] result of ${call.name} has no project store to record in`)
           return
         }
+        const recorder: ToolResultRecorder = {
+          repository,
+          scope,
+          ...(view ? { sourceOrigin: (path: string) => view.originOf(path) } : {})
+        }
         const invocationId = randomUUID()
-        const rawOutput = result.execution?.output ?? result.output
-        const evidence = compactToolEvidence({
-          name: call.name,
-          args: call.args,
-          output: rawOutput,
-          failed: result.failed ?? false,
-          exitCode: result.execution?.exitCode,
-          invocationId
-        })
         let itemId: string | undefined
         try {
-          const active = await this._todoRepository.getActiveIntentContext(scope)
-          if (!active) {
-            execution.markUnrecordedTool()
-            logger.debug(`[Evidence] result of ${call.name} has no active task to record against`)
-            return
-          }
-          itemId = active.task.id
-          await this._todoRepository.recordToolObservation(scope, {
-            itemId,
-            toolName: call.name,
-            arguments: observationArguments(evidence, result.observation?.arguments),
-            output: compactEvidenceText(evidence),
-            evidenceOutput: evidence.failed ? undefined : rawOutput,
-            failed: evidence.failed,
-            exitCode: evidence.exitCode,
-            executionId: execution.executionId,
-            requestId: invocationId
-          })
-          logger.debug(`[Evidence] observation tool=${call.name} task=${itemId} failed=${evidence.failed} invocation=${invocationId}`)
+          // The active task is provenance, never the right to record: a chat with no plan still records
+          // what its tools actually did, and nothing is invented to justify storing it.
+          const active = await repository.getActiveIntentContext(scope)
+          itemId = active?.task.id
+          await recordToolResult(recorder, call, result, { invocationId, executionId: execution.executionId, itemId })
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
           execution.markUnrecordedTool()
-          logger.error(`[Todo] todo.evidence.missing ${JSON.stringify({ tool_name: call.name, invocation_id: invocationId, reason })}`)
-          if (itemId) {
-            await this._todoRepository.addEvidence(scope, {
-              itemId,
-              kind: "evidence_storage_failed",
-              summary: `Result of ${call.name} (${invocationId}) was not recorded as evidence: ${reason}`.slice(0, 400),
-              result: "failed",
-              requestId: randomUUID()
-            }).catch((storageError: unknown) => logger.error("[Todo] could not record the evidence storage failure: " + String(storageError)))
-          }
+          await reportRecordFailure(recorder, call, invocationId, reason, itemId)
         }
       }
     }
