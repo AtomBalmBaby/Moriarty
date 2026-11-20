@@ -32,6 +32,8 @@ const MAX_FOUND_FILES = 100
 const MAX_GIT_OUTPUT = 10_000
 const GIT_TIMEOUT_MS = 20_000
 const MAX_LOCATIONS = 50
+/** How many of a rename's files the tool lists with their hash. */
+const MAX_RENAME_HASH_LINES = 20
 
 /** A place in a file, as the editor reports it. `line` is 1-based. */
 export interface EditorLocation {
@@ -64,8 +66,9 @@ export interface EditorSink {
   /**
    * Rename everywhere the language server knows of; applied or put to the user as the edit mode says.
    * Before anything changes, `authorizeOutside` is asked about the affected files outside the workspace; a message back refuses the whole rename.
+   * Once the change was attempted, every file it reached is caught up with the index; `fileHashes` is the whole-file hash of each, keyed by the same paths as `files`.
    */
-  rename(file: string, line: number, character: number, newName: string, authorizeOutside?: (files: string[]) => Promise<string | undefined>): Promise<EditOutcome & { files?: string[] }>
+  rename(file: string, line: number, character: number, newName: string, authorizeOutside?: (files: string[]) => Promise<string | undefined>): Promise<EditOutcome & { files?: string[]; fileHashes?: Record<string, string> }>
   context(): Promise<EditorContextView>
 }
 
@@ -422,8 +425,11 @@ export const renameSymbol = (view: WorkspaceView, editor: EditorSink, access?: A
       return { output: outcome.message, summary: `\`${at.wanted}\` not renamed · ${outcome.message}`, failed: true }
     }
     const files = outcome.files?.length ?? 0
+    const hashes = Object.entries(outcome.fileHashes ?? {})
+    const lines = hashes.slice(0, MAX_RENAME_HASH_LINES).map(([file, hash]) => `content_hash(${file}): ${hash}`)
+    if (hashes.length > MAX_RENAME_HASH_LINES) lines.push(`… and ${hashes.length - MAX_RENAME_HASH_LINES} more files`)
     return {
-      output: outcome.message,
+      output: outcome.message + (lines.length ? `\n${lines.join("\n")}` : "") + indexChangeNote(outcome),
       summary: `renamed \`${at.wanted}\` → \`${newName}\`${files ? ` · ${plural(files, "file")}` : ""}`,
       final: outcome.pending
     }

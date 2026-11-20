@@ -253,6 +253,28 @@ const applyAndSave = async (edit: WorkspaceEdit): Promise<boolean> => {
   return true
 }
 
+/**
+ * The index is caught up with what a call changed, each path with what happened to it.
+ * A refresh that throws is a failed refresh, not a failed change, and is reported as the model's to read.
+ */
+const refreshed = async (
+  view: WorkspaceView,
+  safety: EditSafetyOptions,
+  changes: readonly IndexChange[],
+  outcome: EditOutcome
+): Promise<EditOutcome> => {
+  if (!safety.refreshIndex) return outcome
+  let indexRefresh: IndexRefreshOutcome
+  try {
+    indexRefresh = await safety.refreshIndex(changes)
+  } catch (error) {
+    indexRefresh = { status: "failed", reason: error instanceof Error ? error.message : String(error) }
+  }
+  if (indexRefresh.status === "failed")
+    logger.warn(`Index refresh failed for ${changes.map((change) => view.relative(change.path)).join(", ")}: ${indexRefresh.reason}`)
+  return outcome.ok ? { ...outcome, indexRefresh } : outcome
+}
+
 const gitSays = (cwd: string, args: string[]) =>
   new Promise<boolean>((resolve) => {
     execFile("git", args, { cwd, timeout: 5000 }, (error) => resolve(!error))
@@ -491,22 +513,6 @@ export const editorEdits = (
     await safety.checkpoints?.commit([file])
     return outcome
   }
-  /**
-   * The index is caught up with what this call changed, each path with what happened to it.
-   * A refresh that throws is a failed refresh, not a failed change, and is reported as the model's to read.
-   */
-  const refreshed = async (changes: readonly IndexChange[], outcome: EditOutcome): Promise<EditOutcome> => {
-    if (!safety.refreshIndex) return outcome
-    let indexRefresh: IndexRefreshOutcome
-    try {
-      indexRefresh = await safety.refreshIndex(changes)
-    } catch (error) {
-      indexRefresh = { status: "failed", reason: error instanceof Error ? error.message : String(error) }
-    }
-    if (indexRefresh.status === "failed")
-      logger.warn(`Index refresh failed for ${changes.map((change) => view.relative(change.path)).join(", ")}: ${indexRefresh.reason}`)
-    return outcome.ok ? { ...outcome, indexRefresh } : outcome
-  }
   const runCommand: EditCommandRunner = safety.runEditCommand ?? ((command, ...args) => commands.executeCommand(command, ...args))
   type PendingEdit = { id: string; ticket?: EditOperationTicket; file: string; preDigest: string }
   /** Records an apply before the editor is asked for it; the edit is refused if the record cannot be written. */
@@ -599,7 +605,7 @@ export const editorEdits = (
         command = outcome
         checked = await checkedOutcome(file, outcome)
         // The saved file is what the index sees, including a checkpoint that restored it.
-        if (command.ok && !command.pending && command.persisted !== false) checked = await refreshed([{ path: file, kind: "write" }], checked)
+        if (command.ok && !command.pending && command.persisted !== false) checked = await refreshed(view, safety, [{ path: file, kind: "write" }], checked)
         await settleEdit(pending, command, checked)
       } finally {
         editOperationsInFlight.delete(pending.id)
@@ -642,7 +648,7 @@ export const editorEdits = (
         )
         command = outcome
         checked = await checkedOutcome(file, outcome)
-        if (modeFor(file) === "apply" && command.ok && !command.pending) checked = await refreshed([{ path: file, kind: "write" }], checked)
+        if (modeFor(file) === "apply" && command.ok && !command.pending) checked = await refreshed(view, safety, [{ path: file, kind: "write" }], checked)
         await settleEdit(pending, command, checked)
       } finally {
         if (pending) editOperationsInFlight.delete(pending.id)
@@ -679,7 +685,7 @@ export const editorEdits = (
         let checked = await checkedOutcome(file, outcome)
         if (modeFor(file) === "apply" && outcome.ok && !outcome.pending) {
           // The saved file is what the index sees, and the hash the model is given is read back from it.
-          checked = await refreshed([{ path: file, kind: "write" }], checked)
+          checked = await refreshed(view, safety, [{ path: file, kind: "write" }], checked)
           const saved = savedFileText(file)
           if (saved !== undefined) checked = { ...checked, contentHash: await contentHash(saved), contentSource: "disk", persisted: true }
         }
@@ -712,7 +718,7 @@ export const editorEdits = (
         const applied = await workspace.applyEdit(edit)
         if (applied) await safety.checkpoints?.markChanged([file])
         if (!applied) return { ok: false, message: `The editor refused to delete ${relative}.` }
-        return await refreshed([{ path: file, kind: "delete" }], { ok: true, message: `Deleted ${relative}.` })
+        return await refreshed(view, safety, [{ path: file, kind: "delete" }], { ok: true, message: `Deleted ${relative}.` })
       })
     },
     async move(from, to, write) {
@@ -736,7 +742,7 @@ export const editorEdits = (
         const applied = await applyAndSave(edit)
         if (applied) await safety.checkpoints?.markChanged([from, to])
         if (!applied) return { ok: false, message: `The editor refused to move ${source}.` }
-        const success = await refreshed([{ path: from, kind: "delete" }, { path: to, kind: "write" }], { ok: true, message: `Moved ${source} to ${target}.` })
+        const success = await refreshed(view, safety, [{ path: from, kind: "delete" }, { path: to, kind: "write" }], { ok: true, message: `Moved ${source} to ${target}.` })
         const saved = savedFileText(to)
         return saved === undefined ? success : { ...success, contentHash: await contentHash(saved) }
       })
@@ -894,9 +900,12 @@ export const editorKnowledge = (
     }
     const absoluteFiles = edit.entries().map(([uri]) => uri.fsPath)
     let renameFailure: string | undefined
+    let attempted = false
     const rename = async () => {
       await safety.checkpoints?.capture(absoluteFiles)
       for (const [uri] of edit!.entries()) await replyChanges?.touch(uri.fsPath)
+      // From here the files may hold whatever the rename did to them, so the index is told about all of them.
+      attempted = true
       const applied = await applyAndSave(edit!)
       if (!applied) {
         return false
@@ -904,13 +913,25 @@ export const editorKnowledge = (
       await safety.checkpoints?.commit(absoluteFiles)
       return true
     }
-    return (await (replyChanges?.hold(rename()) ?? rename()))
+    const done = await (replyChanges?.hold(rename()) ?? rename())
+    const outcome = done
       ? {
           ok: true,
           files,
           message: `Renamed to ${newName}: ${changes} changes in ${files.join(", ")}, saved.`
         }
       : { ok: false, message: renameFailure ?? "The editor refused the rename." }
+    if (!attempted) return outcome
+    // Every file the rename reached, whether it changed or was put back as it was.
+    const caught = await refreshed(view, safety, absoluteFiles.map((absolute): IndexChange => ({ path: absolute, kind: "write" })), outcome)
+    if (!done) return caught
+    const fileHashes: Record<string, string> = {}
+    for (const absolute of absoluteFiles) {
+      const saved = savedFileText(absolute)
+      if (saved === undefined) continue
+      fileHashes[view.relative(absolute)] = await contentHash(saved)
+    }
+    return { ...caught, fileHashes }
   },
   async context() {
     const editor = window.activeTextEditor

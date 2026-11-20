@@ -227,3 +227,95 @@ test("a synced or skipped refresh leaves delete_file and move_file output as it 
   assert.deepStrictEqual(await run({ status: "skipped", reason: "excluded from the index" }), plain)
   assert.strictEqual((await run({ status: "skipped", reason: "indexing is disabled" }))[1].summary, plain[1].summary)
 })
+
+/** The rename tool with a sink answering with the outcome under test; the tool layer only formats what the sink was given. */
+const renameTools = (
+  root: string,
+  outcome: EditOutcome & { files?: string[]; fileHashes?: Record<string, string> }
+) =>
+  workspaceTools(root, [], {
+    edits: {
+      mode: "apply",
+      edit: async () => ({ ok: true, message: "Applied." }),
+      create: async () => ({ ok: true, message: "Created." })
+    },
+    editor: {
+      diagnostics: async () => [],
+      references: async () => [],
+      definition: async () => [],
+      rename: async () => outcome,
+      context: async () => ({ openFiles: [] })
+    }
+  })
+
+const renamedMessage = "Renamed to b: 3 changes in src/a.ts, src/b.ts, saved."
+
+test("rename_symbol prints the whole-file hash of every file the rename reached", async () => {
+  const root = repo()
+  const hashA = await fingerprintContent(fs.readFileSync(path.join(root, "src", "a.ts"), "utf8"))
+  const hashB = await fingerprintContent("renamed b\n")
+  const renamed = await renameTools(root, {
+    ok: true,
+    message: renamedMessage,
+    files: ["src/a.ts", "src/b.ts"],
+    fileHashes: { "src/a.ts": hashA, "src/b.ts": hashB }
+  }).run({ name: "rename_symbol", args: { path: "src/a.ts", symbol: "a", new_name: "b" } })
+  assert.strictEqual(renamed.failed, undefined)
+  assert.strictEqual(
+    renamed.output,
+    `${renamedMessage}\ncontent_hash(src/a.ts): ${hashA}\ncontent_hash(src/b.ts): ${hashB}`
+  )
+  assert.strictEqual(renamed.summary, "renamed `a` → `b` · 2 files", "the step line is as it was")
+})
+
+test("the rename hash lines stop at 20 files and say how many more there are", async () => {
+  const root = repo()
+  const hash = await fingerprintContent("renamed\n")
+  const files: string[] = []
+  const fileHashes: Record<string, string> = {}
+  for (let i = 0; i < 25; i++) {
+    const name = `src/f${i}.ts`
+    files.push(name)
+    fileHashes[name] = hash
+  }
+  const renamed = await renameTools(root, { ok: true, message: "Renamed to b: 25 changes.", files, fileHashes })
+    .run({ name: "rename_symbol", args: { path: "src/a.ts", symbol: "a", new_name: "b" } })
+  const lines = renamed.output.split("\n")
+  assert.strictEqual(lines.length, 22, "the message, 20 hashes and the count of the rest")
+  assert.strictEqual(lines[1], `content_hash(src/f0.ts): ${hash}`)
+  assert.strictEqual(lines[20], `content_hash(src/f19.ts): ${hash}`)
+  assert.strictEqual(lines[21], "… and 5 more files")
+})
+
+test("a rename whose refresh failed is still the change, with the failure sentence after its hashes", async () => {
+  const root = repo()
+  const hash = await fingerprintContent("renamed\n")
+  const reason = "src/a.ts: could not be indexed"
+  const renamed = await renameTools(root, {
+    ok: true,
+    message: renamedMessage,
+    files: ["src/a.ts"],
+    fileHashes: { "src/a.ts": hash },
+    indexRefresh: { status: "failed", reason }
+  }).run({ name: "rename_symbol", args: { path: "src/a.ts", symbol: "a", new_name: "b" } })
+  assert.strictEqual(renamed.failed, undefined, "the change itself is still reported as a success")
+  assert.strictEqual(renamed.output, `${renamedMessage}\ncontent_hash(src/a.ts): ${hash}${failureNote(reason)}`)
+})
+
+test("a rename with no hashes and no failed refresh answers exactly as it did before", async () => {
+  const root = repo()
+  const run = async (extra: Partial<EditOutcome & { files?: string[]; fileHashes?: Record<string, string> }>) =>
+    (await renameTools(root, { ok: true, message: renamedMessage, ...extra })
+      .run({ name: "rename_symbol", args: { path: "src/a.ts", symbol: "a", new_name: "b" } }))
+  const plain = await run({ files: ["src/a.ts"] })
+  assert.strictEqual(plain.output, renamedMessage, "no hash lines, no note")
+  assert.strictEqual(plain.summary, "renamed `a` → `b` · 1 file")
+  assert.strictEqual((await run({ files: ["src/a.ts"], indexRefresh: { status: "synced" } })).output, renamedMessage)
+  assert.strictEqual(
+    (await run({ files: ["src/a.ts"], indexRefresh: { status: "skipped", reason: "excluded from the index" } })).output,
+    renamedMessage
+  )
+  const refused = await run({ ok: false, message: "The editor refused the rename." })
+  assert.strictEqual(refused.failed, true)
+  assert.strictEqual(refused.output, "The editor refused the rename.", "a failure is the message alone")
+})

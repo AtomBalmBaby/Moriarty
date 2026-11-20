@@ -8,7 +8,7 @@ import { TWINNY_COMMAND_NAME } from "../../common/constants"
 import { ChangeStore, ReplyChanges } from "../../extension/chat/reply-changes"
 import { ReplyChangesEditor } from "../../extension/chat/reply-changes-editor"
 import { recoverSignificantEdit, SignificantEditRecoveryResult } from "../../extension/chat/safe-edit-recovery"
-import { createSafeEditCheckpoints, EditCommandRunner, EditOperationLedger, editorEdits, openDocumentText } from "../../extension/chat/tool-sinks"
+import { createSafeEditCheckpoints, EditCommandRunner, EditOperationLedger, editorEdits, editorKnowledge, openDocumentText } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits, revealEditor } from "../../extension/edit/line-edit"
 import { contentHash, LineEditRequest } from "../../extension/tools/line-edit"
 import { WorkspaceView } from "../../extension/tools/view"
@@ -1020,6 +1020,128 @@ suite("Hash-verified native line edits", () => {
     assert.strictEqual(outcome.contentHash, undefined, "and the hash line stays out of the tool output")
     assert.strictEqual(fs.existsSync(target), false, "a pending create writes nothing")
     await vscode.commands.executeCommand(TWINNY_COMMAND_NAME.rejectEdit)
+  })
+
+  const renamePair = (name: string) => {
+    const first = path.join(root, `rename-test-${name}-a.ts`)
+    const second = path.join(root, `rename-test-${name}-b.ts`)
+    fs.writeFileSync(first, "alpha = 1\n")
+    fs.writeFileSync(second, "alpha = 2\n")
+    return { first, second }
+  }
+  /** Stands in for a language server: renames the symbol in the file asked about and in a second test-only file. */
+  const renameProviderFor = (second: string) => vscode.languages.registerRenameProvider(
+    { scheme: "file", pattern: "**/rename-test-*.ts" },
+    {
+      provideRenameEdits(document, position, newName) {
+        const edit = new vscode.WorkspaceEdit()
+        const range = document.getWordRangeAtPosition(position)
+        if (range) edit.replace(document.uri, range, newName)
+        edit.replace(vscode.Uri.file(second), new vscode.Range(0, 0, 0, 5), newName)
+        return edit
+      }
+    }
+  )
+  /** The rename provider needs the document it was asked about open in the host. */
+  const openForRename = async (file: string) =>
+    vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(file)))
+
+  test("the rename refreshes both files the language server reached, with the new text already saved", async function () {
+    this.timeout(20000)
+    const { first, second } = renamePair("refreshed")
+    await openForRename(first)
+    const provider = renameProviderFor(second)
+    const order: string[] = []
+    const { calls, saw, refreshIndex } = changeSpy(order)
+    try {
+      const tools = workspaceTools(root, [], {
+        edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { refreshIndex }, "background"),
+        editor: editorKnowledge(new WorkspaceView(root), "apply", async () => true, undefined, { refreshIndex }),
+        git: false,
+        instructions: false
+      })
+      const result = await tools.run({ name: "rename_symbol", args: { path: "rename-test-refreshed-a.ts", symbol: "alpha", new_name: "beta" } })
+      assert.strictEqual(result.failed, undefined, result.output)
+      assert.deepStrictEqual(
+        calls,
+        [[{ path: first, kind: "write" }, { path: second, kind: "write" }]],
+        "every file the rename reached, as a write"
+      )
+      assert.deepStrictEqual(saw, ["beta = 1\n", "beta = 2\n"], "both files already held the new text when the refresh read them from disk")
+      assert.deepStrictEqual(order, ["refresh"], "the index is caught up before the tool answers")
+      assert.strictEqual(
+        result.output,
+        "Renamed to beta: 2 changes in rename-test-refreshed-a.ts, rename-test-refreshed-b.ts, saved." +
+          `\ncontent_hash(rename-test-refreshed-a.ts): ${await contentHash("beta = 1\n")}` +
+          `\ncontent_hash(rename-test-refreshed-b.ts): ${await contentHash("beta = 2\n")}`,
+        "the message and one hash line per file"
+      )
+    } finally { provider.dispose() }
+  })
+
+  test("a rename the recovery put back refreshes every file it reached as the recovery left it", async function () {
+    this.timeout(20000)
+    const { first, second } = renamePair("restored")
+    await openForRename(first)
+    const provider = renameProviderFor(second)
+    const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
+    // The files as the rename found them. The sink is not given these checkpoints, so what
+    // they hold is still what the recovery puts back.
+    await checkpoints.capture([first, second])
+    const order: string[] = []
+    const { calls, saw, refreshIndex } = changeSpy(order)
+    let recovery: SignificantEditRecoveryResult | undefined
+    const replyChanges = {
+      touch: async () => {},
+      hold: async <T>(work: Promise<T>): Promise<T> => {
+        const applied = await work
+        await checkpoints.markChanged([first, second])
+        recovery = await recoverSignificantEdit({
+          file: "rename-test-restored-a.ts", introducedErrors: 20, diagnosticsObserved: false, diagnosticCheckAvailable: false,
+          rollbackRequested: true, checkpoints
+        })
+        order.push("restored")
+        return applied
+      }
+    }
+    try {
+      const outcome = await editorKnowledge(new WorkspaceView(root), "apply", async () => true, replyChanges, { refreshIndex })
+        .rename(first, 0, 0, "beta")
+      assert.ok(recovery?.restored, recovery?.reason)
+      assert.ok(recovery?.fileVerified, recovery?.reason)
+      assert.deepStrictEqual(order, ["restored", "refresh"], "the refresh runs on what the recovery left, not on the change")
+      assert.deepStrictEqual(calls, [[{ path: first, kind: "write" }, { path: second, kind: "write" }]], "every file it reached")
+      assert.deepStrictEqual(saw, ["alpha = 1\n", "alpha = 2\n"], "the content the recovery restored")
+      assert.deepStrictEqual(outcome.fileHashes, {
+        "rename-test-restored-a.ts": await contentHash("alpha = 1\n"),
+        "rename-test-restored-b.ts": await contentHash("alpha = 2\n")
+      }, "and the hashes the model is given are the restored ones")
+      assert.strictEqual(fs.readFileSync(second, "utf8"), "alpha = 2\n", "the second file is back as it was on disk")
+    } finally {
+      provider.dispose()
+      await checkpoints.clear()
+    }
+  })
+
+  test("a rename refused before anything was attempted is not caught up with the index", async function () {
+    this.timeout(20000)
+    const { first, second } = renamePair("refused")
+    await openForRename(first)
+    const provider = renameProviderFor(second)
+    const order: string[] = []
+    const { calls, saw, refreshIndex } = changeSpy(order)
+    try {
+      const outcome = await editorKnowledge(new WorkspaceView(root), "review", async () => false, undefined, { refreshIndex })
+        .rename(first, 0, 0, "beta")
+      assert.strictEqual(outcome.ok, false, outcome.message)
+      assert.strictEqual(outcome.message, "The user chose not to rename it.")
+      assert.deepStrictEqual(calls, [], "nothing was attempted, so nothing is caught up")
+      assert.deepStrictEqual(saw, [])
+      assert.deepStrictEqual(order, [])
+      assert.strictEqual(outcome.fileHashes, undefined)
+      assert.strictEqual(fs.readFileSync(first, "utf8"), "alpha = 1\n")
+      assert.strictEqual(fs.readFileSync(second, "utf8"), "alpha = 2\n")
+    } finally { provider.dispose() }
   })
 
 })
