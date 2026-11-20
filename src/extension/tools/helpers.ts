@@ -6,6 +6,8 @@
  */
 import { posix as posixPath } from "path"
 
+import type { EditOutcome } from "./workspace"
+
 const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
 /**
@@ -284,3 +286,14 @@ export const isProtectedPath = (relative: string): boolean =>
   // A workspace file holds settings and tasks too.
   /\.code-workspace$/i.test(relative) ||
   /^(CLAUDE\.md|\.github\/copilot-instructions\.md)$/i.test(relative)
+
+/**
+ * What the model is told when a change reached disk but the index could not be told
+ * about it: the change stands and is not to be repeated, and a failed refresh is
+ * reported, not the change. Empty when there is nothing to say.
+ */
+export const indexChangeNote = (outcome: EditOutcome): string => {
+  const refresh = outcome.indexRefresh
+  if (!refresh || refresh.status !== "failed") return ""
+  return ` Saved, but the search index could not be refreshed (${refresh.reason}); the change is complete and must not be repeated.`
+}

@@ -11,6 +11,7 @@ import { applyDocumentLineEdits } from "../../extension/edit/line-edit"
 import { GenerationTracker } from "../../extension/generations"
 import { TwinnyStatusBar } from "../../extension/status-bar"
 import { PROJECT_FINGERPRINT, TodoRepository } from "../../extension/todos/repository"
+import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { WorkspaceView } from "../../extension/tools/view"
 import { workspaceTools } from "../../extension/tools/workspace"
 import { WorkspaceIntelligenceIndex } from "../../extension/workspace-index"
@@ -503,6 +504,79 @@ suite("Persistent workspace intelligence index", () => {
     assert.ok(hits.results.some((hit) => hit.path.endsWith("immediate-visibility.ts") && hit.source === "index"), "and from the index, not from a live read: " + search.output)
     const gone = await tools.run({ name: "search_workspace", args: { query: "stageEightToken = 'before'", mode: "literal" } })
     assert.equal(JSON.parse(gone.output).total, 0, "the replaced token is gone at once")
+  })
+
+  /** The real tool dispatcher, with the real index bound to the real sinks. */
+  const indexTools = (search: WorkspaceIntelligenceIndex) =>
+    workspaceTools(root, [], {
+      workspaceSearch: search,
+      edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { refreshIndex: search.refresh.bind(search) }),
+      git: false,
+      instructions: false
+    })
+
+  /** The test host has no trash on this filesystem, so the editor deletes straight away. */
+  const withoutTrash = async (run: () => Promise<void>) => {
+    const filesConfig = vscode.workspace.getConfiguration("files")
+    const original = filesConfig.inspect("enableTrash")?.globalValue
+    try {
+      await filesConfig.update("enableTrash", false, vscode.ConfigurationTarget.Global)
+      await run()
+    } finally {
+      await filesConfig.update("enableTrash", original, vscode.ConfigurationTarget.Global)
+    }
+  }
+
+  test("create_file is searchable at once, by path and by content, and returns the hash of the saved file", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const content = "export const stageNineCreatedMarker = 1\n"
+    const tools = indexTools(index)
+    const created = await tools.run({ name: "create_file", args: { path: "src/stage-nine-create.ts", content } })
+    assert.ok(!created.failed, created.output)
+    assert.ok(created.output.includes(`\ncontent_hash: ${await fingerprintContent(content)}; total_lines: 1`), "the tool answers with the hash of the file it saved: " + created.output)
+    assert.ok((await index.search({ query: "stage-nine-create.ts", mode: "path" }, root)).total > 0, "the path search finds the new file at once")
+    const found = JSON.parse((await tools.run({ name: "search_workspace", args: { query: "stageNineCreatedMarker", mode: "literal" } })).output) as { results: Array<{ path: string; source: string }> }
+    assert.ok(found.results.some((hit) => hit.path.endsWith("stage-nine-create.ts") && hit.source === "index"), "the content search finds it at once, from the index: " + JSON.stringify(found))
+  })
+
+  test("delete_file removes the entry at once and no documents row remains", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(storage, "project.sqlite")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    const target = path.join(root, "src", "stage-nine-delete.ts")
+    fs.writeFileSync(target, "export const stageNineDeletedMarker = 1\n")
+    assert.deepEqual(await index.refresh([{ path: target, kind: "write" }]), { status: "synced" }, "the file starts in the index")
+    await withoutTrash(async () => {
+      const deleted = await indexTools(index).run({ name: "delete_file", args: { path: "src/stage-nine-delete.ts" } })
+      assert.ok(!deleted.failed, deleted.output)
+    })
+    assert.equal((await index.search({ query: "stageNineDeletedMarker", mode: "literal" }, root)).total, 0, "the content search is empty at once")
+    assert.equal((await index.search({ query: "stage-nine-delete.ts", mode: "path" }, root)).total, 0, "the path search is empty at once")
+    // The index connection is closed first so the read-only open reads a checkpointed database.
+    index.dispose()
+    const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+    try {
+      assert.equal((database.prepare("SELECT COUNT(*) AS n FROM documents WHERE uri = ?").get(vscode.Uri.file(target).toString()) as { n: number }).n, 0, "no documents row remains")
+    } finally {
+      database.close()
+    }
+  })
+
+  test("move_file: the old path and content are gone and the new path and content are found at once, and the returned hash equals the file's hash", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const source = path.join(root, "src", "stage-nine-move.ts")
+    const content = "export const stageNineMovedMarker = 1\n"
+    fs.writeFileSync(source, content)
+    assert.deepEqual(await index.refresh([{ path: source, kind: "write" }]), { status: "synced" }, "the file starts in the index")
+    const moved = await indexTools(index).run({ name: "move_file", args: { from: "src/stage-nine-move.ts", to: "src/stage-nine-moved.ts" } })
+    assert.ok(!moved.failed, moved.output)
+    assert.ok(moved.output.includes(`\ncontent_hash: ${await fingerprintContent(content)} (unchanged by the move)`), "the hash is the same file, moved: " + moved.output)
+    assert.equal((await index.search({ query: "stage-nine-move.ts", mode: "path" }, root)).total, 0, "the old path is gone at once")
+    assert.ok((await index.search({ query: "stage-nine-moved.ts", mode: "path" }, root)).total > 0, "the new path is found at once")
+    const found = JSON.parse((await indexTools(index).run({ name: "search_workspace", args: { query: "stageNineMovedMarker", mode: "literal" } })).output) as { results: Array<{ path: string; source: string }> }
+    assert.ok(found.results.length > 0 && found.results.every((hit) => hit.path.endsWith("stage-nine-moved.ts")), "the content is found at the new path and nowhere else: " + JSON.stringify(found))
   })
 
 })

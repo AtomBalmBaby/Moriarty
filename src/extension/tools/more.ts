@@ -17,6 +17,7 @@ import type { AccessPreflight, AccessTarget } from "./access-preflight"
 import {
   gitNamedPaths,
   globToRegExp,
+  indexChangeNote,
   locateSymbol,
   readOnlyGitArgs,
   tidyGitPath,
@@ -466,7 +467,7 @@ export const deleteFile = (view: WorkspaceView, ops: FileOpsSink): Tool => ({
     const outcome = await ops.remove(absolute, context?.write)
     view.forgetFiles()
     return outcome.ok
-      ? { output: outcome.message, summary: `deleted \`${rel}\`` }
+      ? { output: outcome.message + indexChangeNote(outcome), summary: `deleted \`${rel}\`` }
       : { output: outcome.message, summary: `\`${rel}\` not deleted · ${outcome.message}`, failed: true }
   }
 })
@@ -486,8 +487,9 @@ export const moveFile = (view: WorkspaceView, ops: FileOpsSink): Tool => ({
     const outcome = await ops.move(source, target, context?.write)
     view.forgetFiles()
     const summary = `\`${view.relative(source)}\` → \`${view.relative(target)}\``
+    const hash = outcome.contentHash ? `\ncontent_hash: ${outcome.contentHash} (unchanged by the move)` : ""
     return outcome.ok
-      ? { output: outcome.message, summary: `moved ${summary}` }
+      ? { output: outcome.message + hash + indexChangeNote(outcome), summary: `moved ${summary}` }
       : { output: outcome.message, summary: `not moved ${summary} · ${outcome.message}`, failed: true }
   }
 })

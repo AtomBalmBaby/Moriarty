@@ -14,6 +14,7 @@ import { TodoWriteRequest } from "../todos/types"
 
 import { AccessPreflight,accessTargetsOf } from "./access-preflight"
 import { planReplacement, Replacement } from "./edit"
+import { indexChangeNote } from "./helpers"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
 import { contentHash, ContentSource, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
 import { coerceArguments, JsonSchema, McpToolSpec } from "./mcp"
@@ -126,7 +127,7 @@ export interface EditOutcome {
 /** ` · 2 new errors`, for a step's line, when the change left any. */
 const errorsNote = (outcome: EditOutcome) =>
   outcome.newErrors ? ` · ${plural(outcome.newErrors, "new error")}` : ""
-/** What the model is told when a change landed but the index could not be told about it: the edit stands and is not to be repeated. */
+/** What the model is told when a change landed but the index could not be told about it: the edit stands and is not to be repeated. Failed calls are logged by the loop. */
 const indexRefreshNote = (outcome: EditOutcome) => {
   const refresh = outcome.indexRefresh
   if (!refresh || refresh.status !== "failed") return ""
@@ -504,8 +505,9 @@ const createFile = (view: WorkspaceView, sink: EditSink): Tool => ({
       return { output: outcome.message, summary: `\`${rel}\` not created · ${outcome.message}`, failed: true }
     }
     view.forgetFiles()
+    const hash = outcome.contentHash ? `\ncontent_hash: ${outcome.contentHash}; total_lines: ${linesOf(content).length}` : ""
     return {
-      output: outcome.message,
+      output: outcome.message + hash + indexChangeNote(outcome),
       summary: `${outcome.pending ? "proposed a new file" : "created"} \`${rel}\` · ${plural(linesOf(content).length, "line")}${errorsNote(outcome)}`,
       final: outcome.pending
     }

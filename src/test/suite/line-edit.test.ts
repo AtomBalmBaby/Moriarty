@@ -4,6 +4,7 @@ import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
 
+import { TWINNY_COMMAND_NAME } from "../../common/constants"
 import { ChangeStore, ReplyChanges } from "../../extension/chat/reply-changes"
 import { ReplyChangesEditor } from "../../extension/chat/reply-changes-editor"
 import { recoverSignificantEdit, SignificantEditRecoveryResult } from "../../extension/chat/safe-edit-recovery"
@@ -169,6 +170,32 @@ suite("Hash-verified native line edits", () => {
     }
     return { calls, saw, refreshIndex }
   }
+  /** What the fake refresh was told, keeping the kind of each path; a delete names a file that is already gone. */
+  const changeSpy = (order: string[], saw: string[] = []) => {
+    const calls: IndexChange[][] = []
+    const refreshIndex = async (changes: readonly IndexChange[]): Promise<IndexRefreshOutcome> => {
+      calls.push([...changes])
+      order.push("refresh")
+      for (const change of changes) {
+        if (change.kind !== "write") continue
+        saw.push(fs.readFileSync(change.path, "utf8"))
+      }
+      return { status: "synced" }
+    }
+    return { calls, saw, refreshIndex }
+  }
+  /** The test host has no trash on this filesystem, so the editor deletes straight away. */
+  const withoutTrash = async (run: () => Promise<void>) => {
+    const filesConfig = vscode.workspace.getConfiguration("files")
+    const original = filesConfig.inspect("enableTrash")?.globalValue
+    try {
+      await filesConfig.update("enableTrash", false, vscode.ConfigurationTarget.Global)
+      await run()
+    } finally {
+      await filesConfig.update("enableTrash", original, vscode.ConfigurationTarget.Global)
+    }
+  }
+
   /** The same recorder as `ledgerRecording`, keeping the order the calls happened in. */
   const orderRecording = () => {
     const order: string[] = []
@@ -903,6 +930,96 @@ suite("Hash-verified native line edits", () => {
     assert.strictEqual(result.contentHash, await contentHash("one\nTWO\nadded\nthree\n"))
     assert.strictEqual(result.contentSource, "disk")
     assert.strictEqual(result.persisted, true)
+  })
+
+  test("the create sink catches the index up with the file it saved before the record settles, and reports its hash", async function () {
+    this.timeout(20000)
+    const target = path.join(root, "created-by-the-sink.txt")
+    const content = "created\nsecond\n"
+    const { order, recorded, ledger } = orderRecording()
+    const { calls, saw, refreshIndex } = changeSpy(order)
+    const outcome = await refreshSinkFor(ledger, refreshIndex).create(target, content)
+    assert.ok(outcome.ok, outcome.message)
+    assert.deepStrictEqual(order, ["recorded", "refresh", "settled"], "the saved file is caught up before the record settles")
+    assert.deepStrictEqual(calls, [[{ path: target, kind: "write" }]], "the new file, as the tool layer passes it to the index")
+    assert.deepStrictEqual(saw, [content], "the file was already saved when the refresh ran")
+    assert.strictEqual(outcome.contentHash, await contentHash(content), "the hash is the saved file read back from disk")
+    assert.strictEqual(outcome.contentSource, "disk")
+    assert.strictEqual(outcome.persisted, true)
+    assert.deepStrictEqual(outcome.indexRefresh, { status: "synced" })
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]])
+  })
+
+  test("a create whose saved file cannot be read back is still the change, with no hash", async function () {
+    this.timeout(20000)
+    const target = path.join(root, "unreadable-create.txt")
+    const { order, recorded, ledger } = orderRecording()
+    const { calls, refreshIndex } = changeSpy(order)
+    // The fake refresh takes the file away, so the read-back has nothing to read.
+    const sink = editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, {
+      recordEditOperation: ledger,
+      refreshIndex: async (changes: readonly IndexChange[]) => {
+        const answer = await refreshIndex(changes)
+        fs.rmSync(changes[0].path)
+        return answer
+      }
+    }, "background")
+    const outcome = await sink.create(target, "created\n")
+    assert.ok(outcome.ok, outcome.message)
+    assert.strictEqual(outcome.contentHash, undefined, "no hash is invented for a file that could not be read")
+    assert.strictEqual(outcome.contentSource, undefined)
+    assert.strictEqual(outcome.persisted, undefined)
+    assert.deepStrictEqual(calls, [[{ path: target, kind: "write" }]])
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]], "the record settles as a successful change")
+  })
+
+  test("the delete sink reports the path as a delete and carries the refresh on the success outcome", async function () {
+    this.timeout(20000)
+    const target = path.join(root, "deleted-by-the-sink.txt")
+    fs.writeFileSync(target, "deleted\n")
+    const order: string[] = []
+    const { calls, refreshIndex } = changeSpy(order)
+    await withoutTrash(async () => {
+      const outcome = await refreshSinkFor(undefined, refreshIndex).remove(target)
+      assert.ok(outcome.ok, outcome.message)
+      assert.deepStrictEqual(calls, [[{ path: target, kind: "delete" }]], "the path as gone, not as changed")
+      assert.deepStrictEqual(order, ["refresh"], "a delete is not recorded in the ledger, so nothing settles")
+      assert.strictEqual(fs.existsSync(target), false, "the file is gone from disk")
+      assert.deepStrictEqual(outcome.indexRefresh, { status: "synced" }, "the success outcome carries what the refresh answered")
+    })
+  })
+
+  test("the move sink reports both paths, the old one as gone and the new one as written, and its hash is the moved file's", async function () {
+    this.timeout(20000)
+    const source = path.join(root, "moved-by-the-sink.txt")
+    const target = path.join(root, "moved-into.txt")
+    const content = "moved\n"
+    fs.writeFileSync(source, content)
+    const order: string[] = []
+    const { calls, saw, refreshIndex } = changeSpy(order)
+    const outcome = await refreshSinkFor(undefined, refreshIndex).move(source, target)
+    assert.ok(outcome.ok, outcome.message)
+    assert.deepStrictEqual(calls, [[{ path: source, kind: "delete" }, { path: target, kind: "write" }]], "old path gone, new path written")
+    assert.deepStrictEqual(saw, [content], "the file at the new path was on disk when the refresh ran")
+    assert.strictEqual(outcome.contentHash, await contentHash(content), "the same file, unchanged by the move")
+    assert.deepStrictEqual(outcome.indexRefresh, { status: "synced" })
+  })
+
+  test("a review-mode create does not refresh", async function () {
+    this.timeout(20000)
+    const target = path.join(root, "proposed-by-the-sink.txt")
+    const order: string[] = []
+    const { calls, saw, refreshIndex } = changeSpy(order)
+    const outcome = await editorEdits(new WorkspaceView(root), "review", async () => true, undefined, { refreshIndex }, "background")
+      .create(target, "proposed\n")
+    assert.ok(outcome.ok, outcome.message)
+    assert.ok(outcome.pending, "the file is put to the user as a pending diff, unsaved")
+    assert.deepStrictEqual(calls, [], "nothing is on disk for a pending create, so the index is not told")
+    assert.deepStrictEqual(saw, [])
+    assert.strictEqual(outcome.indexRefresh, undefined)
+    assert.strictEqual(outcome.contentHash, undefined, "and the hash line stays out of the tool output")
+    assert.strictEqual(fs.existsSync(target), false, "a pending create writes nothing")
+    await vscode.commands.executeCommand(TWINNY_COMMAND_NAME.rejectEdit)
   })
 
 })

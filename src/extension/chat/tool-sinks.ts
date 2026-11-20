@@ -233,6 +233,16 @@ export const openDocumentText = async (file: string): Promise<string | undefined
   // the same path with a different scheme.
   workspace.textDocuments.find((document) => document.uri.scheme === "file" && document.uri.fsPath === file)?.getText()
 
+/** The saved file as the index sees it: read back from disk, decoded as UTF-8 with the byte-order mark stripped. Undefined when it cannot be read. */
+const savedFileText = (file: string): string | undefined => {
+  try {
+    const text = readFileSync(file).toString("utf8")
+    return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
+  } catch {
+    return undefined
+  }
+}
+
 /** Apply a workspace edit and save what it touched, so later reads and searches of the disk agree. */
 const applyAndSave = async (edit: WorkspaceEdit): Promise<boolean> => {
   if (!(await workspace.applyEdit(edit))) return false
@@ -482,12 +492,11 @@ export const editorEdits = (
     return outcome
   }
   /**
-   * The index is caught up with the files this call saved. A refresh that throws
-   * is a failed refresh, not a failed change, and is reported as the model's to read.
+   * The index is caught up with what this call changed, each path with what happened to it.
+   * A refresh that throws is a failed refresh, not a failed change, and is reported as the model's to read.
    */
-  const refreshed = async (files: string[], outcome: EditOutcome): Promise<EditOutcome> => {
+  const refreshed = async (changes: readonly IndexChange[], outcome: EditOutcome): Promise<EditOutcome> => {
     if (!safety.refreshIndex) return outcome
-    const changes: IndexChange[] = files.map((file) => ({ path: file, kind: "write" }))
     let indexRefresh: IndexRefreshOutcome
     try {
       indexRefresh = await safety.refreshIndex(changes)
@@ -495,7 +504,7 @@ export const editorEdits = (
       indexRefresh = { status: "failed", reason: error instanceof Error ? error.message : String(error) }
     }
     if (indexRefresh.status === "failed")
-      logger.warn(`Index refresh failed for ${files.map((file) => view.relative(file)).join(", ")}: ${indexRefresh.reason}`)
+      logger.warn(`Index refresh failed for ${changes.map((change) => view.relative(change.path)).join(", ")}: ${indexRefresh.reason}`)
     return outcome.ok ? { ...outcome, indexRefresh } : outcome
   }
   const runCommand: EditCommandRunner = safety.runEditCommand ?? ((command, ...args) => commands.executeCommand(command, ...args))
@@ -590,7 +599,7 @@ export const editorEdits = (
         command = outcome
         checked = await checkedOutcome(file, outcome)
         // The saved file is what the index sees, including a checkpoint that restored it.
-        if (command.ok && !command.pending && command.persisted !== false) checked = await refreshed([file], checked)
+        if (command.ok && !command.pending && command.persisted !== false) checked = await refreshed([{ path: file, kind: "write" }], checked)
         await settleEdit(pending, command, checked)
       } finally {
         editOperationsInFlight.delete(pending.id)
@@ -633,7 +642,7 @@ export const editorEdits = (
         )
         command = outcome
         checked = await checkedOutcome(file, outcome)
-        if (modeFor(file) === "apply" && command.ok && !command.pending) checked = await refreshed([file], checked)
+        if (modeFor(file) === "apply" && command.ok && !command.pending) checked = await refreshed([{ path: file, kind: "write" }], checked)
         await settleEdit(pending, command, checked)
       } finally {
         if (pending) editOperationsInFlight.delete(pending.id)
@@ -667,7 +676,13 @@ export const editorEdits = (
           }),
           async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
         )
-        const checked = await checkedOutcome(file, outcome)
+        let checked = await checkedOutcome(file, outcome)
+        if (modeFor(file) === "apply" && outcome.ok && !outcome.pending) {
+          // The saved file is what the index sees, and the hash the model is given is read back from it.
+          checked = await refreshed([{ path: file, kind: "write" }], checked)
+          const saved = savedFileText(file)
+          if (saved !== undefined) checked = { ...checked, contentHash: await contentHash(saved), contentSource: "disk", persisted: true }
+        }
         await settleEdit(pending, outcome, checked)
         return checked
       } finally {
@@ -696,9 +711,8 @@ export const editorEdits = (
         edit.deleteFile(Uri.file(file), { ignoreIfNotExists: false })
         const applied = await workspace.applyEdit(edit)
         if (applied) await safety.checkpoints?.markChanged([file])
-        return applied
-          ? { ok: true, message: `Deleted ${relative}.` }
-          : { ok: false, message: `The editor refused to delete ${relative}.` }
+        if (!applied) return { ok: false, message: `The editor refused to delete ${relative}.` }
+        return await refreshed([{ path: file, kind: "delete" }], { ok: true, message: `Deleted ${relative}.` })
       })
     },
     async move(from, to, write) {
@@ -721,9 +735,10 @@ export const editorEdits = (
         edit.renameFile(Uri.file(from), Uri.file(to), { overwrite: false })
         const applied = await applyAndSave(edit)
         if (applied) await safety.checkpoints?.markChanged([from, to])
-        return applied
-          ? { ok: true, message: `Moved ${source} to ${target}.` }
-          : { ok: false, message: `The editor refused to move ${source}.` }
+        if (!applied) return { ok: false, message: `The editor refused to move ${source}.` }
+        const success = await refreshed([{ path: from, kind: "delete" }, { path: to, kind: "write" }], { ok: true, message: `Moved ${source} to ${target}.` })
+        const saved = savedFileText(to)
+        return saved === undefined ? success : { ...success, contentHash: await contentHash(saved) }
       })
     }
   }

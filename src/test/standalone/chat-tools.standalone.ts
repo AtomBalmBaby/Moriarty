@@ -18,7 +18,7 @@ import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { toolModeFor, withTools } from "../../extension/tools/loop"
 import { displayableLength, findToolCall, nameArguments, repairJson } from "../../extension/tools/protocol"
 import { WorkspaceView } from "../../extension/tools/view"
-import { IndexRefreshOutcome, workspaceTools } from "../../extension/tools/workspace"
+import { EditOutcome, IndexRefreshOutcome, workspaceTools } from "../../extension/tools/workspace"
 
 test("reads the JSON form as soon as its object closes, and not before", () => {
   const text = "Let me look.\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"foo\"}}\n</tool_call>"
@@ -525,6 +525,53 @@ test("create_file writes new files only, inside the workspace and outside .gitig
     assert.match(refused.output, why, bad)
   }
   assert.strictEqual(created.length, 1)
+})
+
+test("create_file prints the hash of the file it made only when the sink gives one", async () => {
+  const root = makeWorkspace()
+  const content = "export const a = 1\nexport const b = 2\n"
+  const hash = await fingerprintContent(content)
+  const run = (extra: Partial<EditOutcome>) => workspaceTools(root, [], { edits: {
+    mode: "apply",
+    edit: async () => ({ ok: true, message: "Applied." }),
+    create: async () => ({ ok: true, message: "Created.", ...extra })
+  } }).run({ name: "create_file", args: { path: "src/new/util.ts", content } })
+  const made = await run({ contentHash: hash, contentSource: "disk", persisted: true })
+  assert.strictEqual(made.output, `Created.\ncontent_hash: ${hash}; total_lines: 2`)
+  assert.strictEqual(made.summary, "created `src/new/util.ts` · 2 lines", "the step line says what happened to the file, not what the index did")
+  assert.strictEqual((await run({})).output, "Created.", "a create whose saved file cannot be read back prints no hash line")
+})
+
+test("create_file reports a failed index refresh as a completed change and tells the model not to repeat it", async () => {
+  const root = makeWorkspace()
+  const content = "export const a = 1\n"
+  const hash = await fingerprintContent(content)
+  const reason = "src/new/util.ts: could not be indexed"
+  const tools = workspaceTools(root, [], { edits: {
+    mode: "apply",
+    edit: async () => ({ ok: true, message: "Applied." }),
+    create: async () => ({ ok: true, message: "Created.", contentHash: hash, indexRefresh: { status: "failed", reason } })
+  } })
+  const result = await tools.run({ name: "create_file", args: { path: "src/new/util.ts", content } })
+  assert.strictEqual(result.failed, undefined, "the change itself is still reported as a success")
+  assert.strictEqual(result.output, `Created.\ncontent_hash: ${hash}; total_lines: 1 Saved, but the search index could not be refreshed (${reason}); the change is complete and must not be repeated.`)
+  assert.strictEqual(result.summary, "created `src/new/util.ts` · 1 line", "the step line does not claim the index agreed")
+})
+
+test("a synced or skipped refresh leaves create_file output unchanged", async () => {
+  const root = makeWorkspace()
+  const content = "export const a = 1\n"
+  const hash = await fingerprintContent(content)
+  const run = async (indexRefresh?: IndexRefreshOutcome) => workspaceTools(root, [], { edits: {
+    mode: "apply",
+    edit: async () => ({ ok: true, message: "Applied." }),
+    create: async () => ({ ok: true, message: "Created.", contentHash: hash, indexRefresh })
+  } }).run({ name: "create_file", args: { path: "src/new/util.ts", content } })
+  const plain = await run(undefined)
+  assert.strictEqual(plain.output, `Created.\ncontent_hash: ${hash}; total_lines: 1`, "nothing to say about the index, so no sentence")
+  assert.deepStrictEqual(await run({ status: "synced" }), plain)
+  assert.deepStrictEqual(await run({ status: "skipped", reason: "excluded from the index" }), plain)
+  assert.strictEqual((await run({ status: "skipped", reason: "indexing is disabled" })).summary, plain.summary)
 })
 
 test("run_command reports the exit code and output, or that the user skipped it", async () => {

@@ -9,8 +9,10 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
 
+import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { globToRegExp, locateSymbol, readOnlyGitArgs, splitArgs } from "../../extension/tools/helpers"
-import { workspaceTools } from "../../extension/tools/workspace"
+import { FileOpsSink } from "../../extension/tools/more"
+import { EditOutcome, IndexRefreshOutcome, workspaceTools } from "../../extension/tools/workspace"
 
 test("globs match relative paths; a bare pattern matches the name anywhere", () => {
   const match = (glob: string, file: string) => globToRegExp(glob).test(file)
@@ -150,4 +152,78 @@ test("grep tries the pattern as plain text when it matches nothing as a regex", 
   assert.match(found.output, /^\(Nothing matched as a regular expression; these match the text as written\.\)\nkeys.json\n1: /)
   assert.strictEqual((await tools.run({ name: "grep", args: { pattern: "f(x)" } })).output.split("\n").length, 3)
   assert.strictEqual((await tools.run({ name: "grep", args: { pattern: "nothing+here" } })).output, "No matches.")
+})
+
+/** The tools with a sink for the change itself, so what the model reads is the outcome under test. */
+const fileOpsTools = (root: string, ops: FileOpsSink) =>
+  workspaceTools(root, [], {
+    edits: {
+      mode: "apply",
+      edit: async () => ({ ok: true, message: "Applied." }),
+      create: async () => ({ ok: true, message: "Created." }),
+      remove: ops.remove,
+      move: ops.move
+    }
+  })
+
+const failureNote = (reason: string) =>
+  ` Saved, but the search index could not be refreshed (${reason}); the change is complete and must not be repeated.`
+
+test("move_file prints the moved file's hash only when the sink gives one", async () => {
+  const root = repo()
+  const hash = await fingerprintContent(fs.readFileSync(path.join(root, "src", "a.ts"), "utf8"))
+  const run = async (extra: Partial<EditOutcome>) => (await fileOpsTools(root, {
+    remove: async () => ({ ok: true, message: "" }),
+    move: async () => ({ ok: true, message: "Moved src/a.ts to src/b.ts.", ...extra })
+  }).run({ name: "move_file", args: { from: "src/a.ts", to: "src/b.ts" } }))
+  assert.strictEqual((await run({ contentHash: hash })).output, `Moved src/a.ts to src/b.ts.\ncontent_hash: ${hash} (unchanged by the move)`)
+  assert.strictEqual((await run({})).output, "Moved src/a.ts to src/b.ts.", "a sink that read nothing back leaves the line out")
+})
+
+test("delete_file reports a failed index refresh as a completed change and tells the model not to repeat it", async () => {
+  const root = repo()
+  const reason = "src/a.ts: could not be indexed"
+  const tools = fileOpsTools(root, {
+    remove: async () => ({ ok: true, message: "Deleted src/a.ts.", indexRefresh: { status: "failed", reason } }),
+    move: async () => ({ ok: true, message: "" })
+  })
+  const deleted = await tools.run({ name: "delete_file", args: { path: "src/a.ts" } })
+  assert.strictEqual(deleted.failed, undefined, "the change itself is still reported as a success")
+  assert.strictEqual(deleted.output, `Deleted src/a.ts.${failureNote(reason)}`)
+  assert.strictEqual(deleted.summary, "deleted `src/a.ts`", "the step line does not claim the index agreed")
+})
+
+test("move_file reports a failed index refresh the same way", async () => {
+  const root = repo()
+  const reason = "the database is busy"
+  const tools = fileOpsTools(root, {
+    remove: async () => ({ ok: true, message: "" }),
+    move: async () => ({ ok: true, message: "Moved src/a.ts to src/b.ts.", indexRefresh: { status: "failed", reason } })
+  })
+  const moved = await tools.run({ name: "move_file", args: { from: "src/a.ts", to: "src/b.ts" } })
+  assert.strictEqual(moved.failed, undefined, "the change itself is still reported as a success")
+  assert.strictEqual(moved.output, `Moved src/a.ts to src/b.ts.${failureNote(reason)}`)
+  assert.strictEqual(moved.summary, "moved `src/a.ts` → `src/b.ts`", "the step line does not claim the index agreed")
+})
+
+test("a synced or skipped refresh leaves delete_file and move_file output as it was", async () => {
+  const root = repo()
+  const run = async (indexRefresh?: IndexRefreshOutcome) => {
+    const tools = fileOpsTools(root, {
+      remove: async () => ({ ok: true, message: "Deleted src/a.ts.", indexRefresh }),
+      move: async () => ({ ok: true, message: "Moved src/a.ts to src/b.ts.", indexRefresh })
+    })
+    return [
+      await tools.run({ name: "delete_file", args: { path: "src/a.ts" } }),
+      await tools.run({ name: "move_file", args: { from: "src/a.ts", to: "src/b.ts" } })
+    ]
+  }
+  const plain = await run(undefined)
+  assert.deepStrictEqual(plain, [
+    { output: "Deleted src/a.ts.", summary: "deleted `src/a.ts`" },
+    { output: "Moved src/a.ts to src/b.ts.", summary: "moved `src/a.ts` → `src/b.ts`" }
+  ], "a success with nothing to say about the index is byte for byte as it was")
+  assert.deepStrictEqual(await run({ status: "synced" }), plain)
+  assert.deepStrictEqual(await run({ status: "skipped", reason: "excluded from the index" }), plain)
+  assert.strictEqual((await run({ status: "skipped", reason: "indexing is disabled" }))[1].summary, plain[1].summary)
 })
