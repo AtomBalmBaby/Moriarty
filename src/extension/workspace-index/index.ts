@@ -7,11 +7,13 @@ import * as vscode from "vscode"
 import { logger } from "../../common/logger"
 import { type Database, SqliteFile, type SqliteLocation } from "../todos/sqlite"
 import { ContentHashAlgorithm, fingerprintContent } from "../tools/fingerprint"
+import type { IndexChange, IndexRefreshOutcome } from "../tools/workspace"
 
 import { eachRow, get, rows, run, type SqlValue, transaction } from "./sql"
 
 type IndexStatus = "disabled" | "not-initialized" | "scanning" | "indexing" | "ready" | "paused" | "error"
 type SearchMode = "auto" | "path" | "symbol" | "literal" | "regex"
+type IndexFileStatus = "indexed" | "skipped" | "failed" | "cancelled"
 
 export interface WorkspaceIndexState {
   status: IndexStatus
@@ -179,6 +181,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   private initializing?: Promise<void>
   private scanning?: Promise<void>
   private scanController?: AbortController
+  private activeScanId?: string
   private synchronizing?: Promise<void>
   private activeOperationId?: string
   private repeatAfterCurrent = false
@@ -293,6 +296,73 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
 
   async clearAndRebuild(): Promise<void> {
     await this.rebuild()
+  }
+
+  /**
+   * Catch the index up with a file a dedicated native mutation just saved.
+   * The path is absolute, the row is written from the bytes on disk, and the call
+   * never waits for a running scan: the rows it writes carry that scan's id, so
+   * its end-of-scan sweep keeps them. Watcher events for the same files keep
+   * working and become no-ops through the fingerprint fast path.
+   */
+  async refresh(changes: readonly IndexChange[]): Promise<IndexRefreshOutcome> {
+    try {
+      if (this.disposed) return { status: "failed", reason: "the workspace index has been disposed" }
+      const config = vscode.workspace.getConfiguration("twinny")
+      if (!config.get<boolean>("indexing.enabled", true)) return { status: "skipped", reason: "indexing is disabled" }
+      if (!this.projectAvailable()) return { status: "skipped", reason: "no project database" }
+      await this.initialize()
+      const algorithm = config.get<ContentHashAlgorithm>("contentHash.algorithm", "xxh64")
+      const controller = new AbortController()
+      const results: Array<{ path: string; status: "synced" | "skipped" | "failed"; reason?: string }> = []
+      const seen = new Set<string>()
+      const drop = async (identity: string): Promise<void> => {
+        await this.withWrite(async () => {
+          transaction(this.database!, () => {
+            this.removeDocument(identity)
+          })
+        })
+      }
+      for (const change of changes) {
+        if (seen.has(change.path)) continue
+        seen.add(change.path)
+        const uri = vscode.Uri.file(change.path)
+        if (!this.folderFor(uri)) {
+          results.push({ path: change.path, status: "skipped", reason: "outside the indexed workspace folders" })
+          continue
+        }
+        const identity = uri.toString()
+        if (change.kind === "delete") {
+          await drop(identity)
+          results.push({ path: change.path, status: "synced" })
+          continue
+        }
+        if (!this.isEligibleUri(uri)) {
+          await drop(identity)
+          results.push({ path: change.path, status: "skipped", reason: "excluded from the index" })
+          continue
+        }
+        const status = await this.indexFile(uri, algorithm, controller.signal, this.activeScanId)
+        if (status === "indexed" || status === "skipped") {
+          results.push({ path: change.path, status: "synced" })
+          continue
+        }
+        if (status === "cancelled") {
+          results.push({ path: change.path, status: "failed", reason: "the refresh was cancelled" })
+          continue
+        }
+        const failure = await get<{ error: string | null }>(this.database!, "SELECT error FROM documents WHERE uri=?", [identity])
+        results.push({ path: change.path, status: "failed", reason: failure?.error ?? "could not be indexed" })
+      }
+      if (!results.length) return { status: "skipped", reason: "no file was named" }
+      await this.refreshCounts()
+      const failed = results.filter((entry) => entry.status === "failed")
+      if (failed.length) return { status: "failed", reason: failed.map((entry) => `${entry.path}: ${entry.reason ?? "could not be indexed"}`).join("; ") }
+      if (results.some((entry) => entry.status === "synced")) return { status: "synced" }
+      return { status: "skipped", reason: results[0]?.reason ?? "nothing was refreshed" }
+    } catch (error) {
+      return { status: "failed", reason: error instanceof Error ? error.message : String(error) }
+    }
   }
 
   private synchronize(clear = false, repeatAfterCurrent = false): Promise<void> {
@@ -808,6 +878,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       const exclude = [...DEFAULT_EXCLUDES, ...config.get<string[]>("indexing.exclude", []), ...vscodeExcludePatterns()]
       this.symbolProviderCalls = 0
       const scanId = randomUUID()
+      this.activeScanId = scanId
       this.update({ status: "scanning", error: undefined, filesDiscovered: 0, filesPending: 0, filesSkipped: 0, filesFailed: 0, queueDepth: 0, activeWorkers: 0, activeSourceBytes: 0, peakSourceBytes: 0, currentIndexDurationMs: 0, symbolProviderCalls: 0, discoveryComplete: false })
       const folders = vscode.workspace.workspaceFolders ?? []
       const excludeGlob = `{${exclude.join(",")}}`
@@ -861,7 +932,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
               const stat = await vscode.workspace.fs.stat(uri).then((stat) => stat, () => undefined)
               this.throwIfCancelled(signal)
               await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat?.size ?? 0, skipReason ?? "ignored by .gitignore", signal, scanId)
-            } else if (await this.indexFile(uri, currentAlgorithm, signal, scanId)) indexed += 1
+            } else if (await this.indexFile(uri, currentAlgorithm, signal, scanId) === "indexed") indexed += 1
           } finally {
             completed += 1
             this.update({ activeWorkers: Math.max(0, this.state.activeWorkers - 1), filesDiscovered: discovered, filesIndexed: indexed, currentIndexDurationMs: Date.now() - startedAt })
@@ -913,12 +984,14 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       const message = error instanceof Error ? error.message : String(error)
       logger.error(`[WorkspaceIndex] operation=${operationId} scan=${scanId} failed: ${message}`)
       this.update({ status: "error", error: message, activeWorkers: 0, activeSourceBytes: 0, currentIndexDurationMs: undefined })
+    } finally {
+      this.activeScanId = undefined
     }
   }
 
-  private async indexFile(uri: vscode.Uri, algorithm: ContentHashAlgorithm, signal: AbortSignal, scanId?: string): Promise<boolean> {
+  private async indexFile(uri: vscode.Uri, algorithm: ContentHashAlgorithm, signal: AbortSignal, scanId?: string): Promise<IndexFileStatus> {
     const folder = this.folderFor(uri)
-    if (!folder || this.isCancelled(signal)) return false
+    if (!folder || this.isCancelled(signal)) return "cancelled"
     const identity = uri.toString()
     const relative = path.posix.relative(folder.uri.path, uri.path)
     const folders = vscode.workspace.workspaceFolders ?? []
@@ -928,8 +1001,8 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       this.throwIfCancelled(signal)
       const maxBytes = vscode.workspace.getConfiguration("twinny").get<number>("indexing.maxFileSize", 1048576)
       if (stat.size > maxBytes) {
-        await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat.size, "file exceeds configured size limit", signal)
-        return false
+        await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat.size, "file exceeds configured size limit", signal, scanId)
+        return "skipped"
       }
       const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === identity)
       if (openDocument?.isDirty) this.dirtyUris.add(identity)
@@ -942,12 +1015,12 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         try {
           text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
         } catch {
-          await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat.size, "file is not valid UTF-8 text", signal)
-          return false
+          await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat.size, "file is not valid UTF-8 text", signal, scanId)
+          return "skipped"
         }
         if (text.includes("\0")) {
-          await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat.size, "binary content", signal)
-          return false
+          await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat.size, "binary content", signal, scanId)
+          return "skipped"
         }
         const fingerprint = await fingerprintContent(text, algorithm)
         this.throwIfCancelled(signal)
@@ -955,12 +1028,15 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         if (previous?.fingerprint === fingerprint && previous.size === stat.size && previous.mtime_ms === stat.mtime) {
           if (scanId) await run(this.database!, "UPDATE documents SET scan_id=? WHERE uri=?", [scanId, identity])
           if (!openDocument?.isDirty) this.dirtyUris.delete(identity)
-          return true
+          return "indexed"
         }
         const indexedAt = new Date().toISOString()
         await this.withWrite(async () => {
           this.throwIfCancelled(signal)
           transaction(this.database!, () => {
+            // A slower scan must not overwrite a fresher refresh: the newer row wins.
+            const row = get<{ mtime_ms: number | null }>(this.database!, "SELECT mtime_ms FROM documents WHERE uri=?", [identity])
+            if (row && row.mtime_ms !== null && row.mtime_ms > stat.mtime) return
             run(this.database!, "INSERT OR REPLACE INTO documents(uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,text,indexed_at,skip_reason,error,symbols_fingerprint,scan_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?)", [identity, folder.uri.toString(), displayPath, path.posix.basename(uri.path), openDocument?.languageId || path.extname(uri.path).slice(1), fingerprint, algorithm, stat.size, stat.mtime, text, indexedAt, null, scanId ?? null])
             run(this.database!, "DELETE FROM symbols WHERE document_uri=?", [identity])
             if (this.state.fts5) {
@@ -970,17 +1046,17 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
           })
         })
         if (!openDocument?.isDirty) this.dirtyUris.delete(identity)
-        return true
+        return "indexed"
       } finally {
         this.activeSourceBytes = Math.max(0, this.activeSourceBytes - bytes.byteLength)
         this.update({ activeSourceBytes: this.activeSourceBytes })
       }
     } catch (error) {
-      if (this.isCancelled(signal)) return false
+      if (this.isCancelled(signal)) return "cancelled"
       const message = error instanceof Error ? error.message : String(error)
       await this.recordFailure(uri, folder.uri.toString(), displayPath, message, scanId)
       logger.warn(`Could not index ${displayPath}: ${message}`)
-      return false
+      return "failed"
     }
   }
 

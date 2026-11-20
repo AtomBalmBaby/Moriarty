@@ -102,6 +102,11 @@ export interface EditSink {
   create(file: string, content: string, write?: OperationAuthorization): Promise<EditOutcome>
 }
 
+/** One file the index should catch up with: an absolute file-system path, and what happened to it. */
+export interface IndexChange { path: string; kind: "write" | "delete" }
+/** How a `refresh` answered for the whole batch: the rows are current, there was nothing to do, or why it could not be done. */
+export type IndexRefreshOutcome = { status: "synced" } | { status: "skipped"; reason: string } | { status: "failed"; reason: string }
+
 export interface EditOutcome {
   ok: boolean
   error?: LineEditFailure
@@ -110,6 +115,8 @@ export interface EditOutcome {
   contentSource?: ContentSource
   /** Whether the edit is saved to disk; `false` when it was left unsaved on purpose. */
   persisted?: boolean
+  /** What the index refresh did for this change, when the tool refreshed it. */
+  indexRefresh?: IndexRefreshOutcome
   message: string
   pending?: boolean
   /** Errors the editor reports in the file since the change; the message names them. */
@@ -978,4 +985,6 @@ export type WorkspaceSearchMode = "auto" | "path" | "symbol" | "literal" | "rege
 export interface WorkspaceSearchHit { uri?: string; path: string; line?: number; column?: number; category: "path" | "symbol" | "content"; symbol?: string; kind?: string; preview: string; source: "index" | "live" }
 export interface WorkspaceSearchProvider {
   search(request: { query: string; mode?: WorkspaceSearchMode; path?: string; limit?: number; offset?: number }, scope?: string, signal?: AbortSignal): Promise<{ results: WorkspaceSearchHit[]; total: number }>
+  /** Catch the index up with the files a dedicated native mutation just saved. */
+  refresh?(changes: readonly IndexChange[]): Promise<IndexRefreshOutcome>
 }

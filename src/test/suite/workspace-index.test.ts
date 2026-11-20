@@ -346,4 +346,136 @@ suite("Persistent workspace intelligence index", () => {
       repository.close()
     }
   })
+  test("refresh makes an edited file searchable immediately, with no polling", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const file = path.join(root, "refresh-search.ts")
+    fs.writeFileSync(file, "export const refreshToken = 'before'\n")
+    assert.deepEqual(await index.refresh([{ path: file, kind: "write" }]), { status: "synced" })
+    const before = await index.search({ query: "refreshToken = 'before'", mode: "literal" }, root)
+    assert.ok(before.results.some((hit) => hit.path.endsWith("refresh-search.ts") && hit.source === "index"), JSON.stringify(before))
+    fs.writeFileSync(file, "export const refreshToken = 'after'\n")
+    assert.deepEqual(await index.refresh([{ path: file, kind: "write" }]), { status: "synced" })
+    const after = await index.search({ query: "refreshToken = 'after'", mode: "literal" }, root)
+    assert.ok(after.results.some((hit) => hit.path.endsWith("refresh-search.ts")), JSON.stringify(after))
+    assert.equal((await index.search({ query: "refreshToken = 'before'", mode: "literal" }, root)).total, 0, "the replaced token is gone at once, with no polling")
+  })
+
+  test("refresh of a created file finds it at once and refresh of a deleted file removes it at once", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const file = path.join(root, "src", "created-by-refresh.ts")
+    fs.writeFileSync(file, "export const created_by_refresh = 1\n")
+    assert.deepEqual(await index.refresh([{ path: file, kind: "write" }]), { status: "synced" })
+    assert.ok((await index.search({ query: "created-by-refresh", mode: "path" }, root)).total > 0, "the path search finds the new file at once")
+    assert.ok((await index.search({ query: "created_by_refresh", mode: "literal" }, root)).total > 0, "the content search finds it at once")
+    fs.rmSync(file)
+    assert.deepEqual(await index.refresh([{ path: file, kind: "delete" }]), { status: "synced" })
+    assert.equal((await index.search({ query: "created-by-refresh", mode: "path" }, root)).total, 0, "the path search is empty at once")
+    assert.equal((await index.search({ query: "created_by_refresh", mode: "literal" }, root)).total, 0, "the content search is empty at once")
+    assert.deepEqual(await index.refresh([{ path: path.join(root, "src", "never-indexed.ts"), kind: "delete" }]), { status: "synced" }, "a delete with no row is a synced no-op")
+  })
+
+  test("refresh does not wait for a running scan and a refreshed new file survives that scan's sweep", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const config = vscode.workspace.getConfiguration("twinny")
+    const previousAuto = config.get<boolean>("indexing.auto", true)
+    // The watchers are turned off for this test so the only row for the extra file is the one refresh writes.
+    try {
+      await config.update("indexing.auto", false, vscode.ConfigurationTarget.Global)
+      // Let the configuration event settle before the scan starts, so the change handler cannot cancel it.
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      const load = path.join(root, "scanload")
+      fs.mkdirSync(load, { recursive: true })
+      for (let file = 0; file < 300; file++) fs.writeFileSync(path.join(load, `load${file}.ts`), `export const scanLoad${file} = 1\n`)
+      const scan = index.rebuild()
+      // Workers still active means the scan is mid-discovery, so the survivor is ahead of that sweep.
+      await waitUntil(async () => (index.snapshot.status === "scanning" || index.snapshot.status === "indexing") && index.snapshot.filesDiscovered >= 300 && index.snapshot.activeWorkers > 0 && !index.snapshot.discoveryComplete)
+      assert.ok(!index.snapshot.discoveryComplete, "the scan was still running when the extra file was created")
+      const survivor = path.join(load, "survivor.ts")
+      fs.writeFileSync(survivor, "export const survivesTheSweep = 1\n")
+      assert.deepEqual(await index.refresh([{ path: survivor, kind: "write" }]), { status: "synced" })
+      assert.ok(!index.snapshot.discoveryComplete, "the refresh answered while that scan was still running")
+      await scan
+      assert.ok((await index.search({ query: "survivor.ts", mode: "path" }, root)).total > 0, "the refreshed row survived the end-of-scan sweep")
+      assert.ok((await index.search({ query: "survivesTheSweep", mode: "literal" }, root)).total > 0)
+    } finally {
+      await config.update("indexing.auto", previousAuto, vscode.ConfigurationTarget.Global)
+    }
+  })
+
+  test("refresh is skipped with a reason outside the indexed workspace folders and when indexing is disabled", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    assert.deepEqual(await index.refresh([{ path: path.join(storage, "outside.ts"), kind: "write" }]), { status: "skipped", reason: "outside the indexed workspace folders" })
+    const config = vscode.workspace.getConfiguration("twinny")
+    const previous = config.get<boolean>("indexing.enabled", true)
+    try {
+      await config.update("indexing.enabled", false, vscode.ConfigurationTarget.Global)
+      assert.deepEqual(await index.refresh([{ path: path.join(root, "src", "native.ts"), kind: "write" }]), { status: "skipped", reason: "indexing is disabled" })
+    } finally {
+      await config.update("indexing.enabled", previous, vscode.ConfigurationTarget.Global)
+    }
+  })
+
+  test("a refresh of a missing file written as \"write\" reports failed with a reason", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const missing = path.join(root, "src", "missing-for-refresh.ts")
+    const outcome = await index.refresh([{ path: missing, kind: "write" }])
+    assert.equal(outcome.status, "failed", JSON.stringify(outcome))
+    const reason = outcome.status === "failed" ? outcome.reason : ""
+    assert.match(reason, /missing-for-refresh\.ts/, "the reason names the file")
+    assert.match(reason, /FileNotFound|ENOENT|could not be indexed/, "and says why")
+  })
+
+  test("oversized, binary and non-UTF-8 files keep their skip rows after a full scan", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(storage, "project.sqlite")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    fs.writeFileSync(path.join(root, "oversized.txt"), "x".repeat(1_100_000))
+    fs.writeFileSync(path.join(root, "binary.bin"), new Uint8Array([0x6e, 0x6f, 0x00]))
+    fs.writeFileSync(path.join(root, "invalid-utf8.bin"), new Uint8Array([0xff, 0xfe, 0x0a]))
+    await index.rebuild()
+    const reported = index.snapshot.filesSkipped
+    assert.ok(reported >= 4, `the scan reported ${reported} skipped files`)
+    // The index connection is closed first so the read-only open reads a checkpointed database.
+    index.dispose()
+    const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
+    try {
+      const rows = database.prepare("SELECT filename, skip_reason FROM documents WHERE skip_reason IS NOT NULL ORDER BY filename").all() as Array<{ filename: string; skip_reason: string }>
+      assert.equal(rows.length, reported, "the scan's sweep left every skip row alone")
+      const reasons = new Map(rows.map((row) => [row.filename, row.skip_reason]))
+      assert.equal(reasons.get("oversized.txt"), "file exceeds configured size limit")
+      assert.equal(reasons.get("binary.bin"), "binary content")
+      assert.equal(reasons.get("invalid-utf8.bin"), "file is not valid UTF-8 text")
+    } finally {
+      database.close()
+    }
+  })
+
+  test("a slower scan never overwrites a newer refreshed entry", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(storage, "project.sqlite")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    const file = path.join(root, "src", "newer-row.ts")
+    fs.writeFileSync(file, "export const newerRowMarker = 1\n")
+    assert.deepEqual(await index.refresh([{ path: file, kind: "write" }]), { status: "synced" })
+    const uri = vscode.Uri.file(file).toString()
+    const database = new BetterSqlite(databasePath)
+    try {
+      database.pragma("busy_timeout = 5000")
+      const select = "SELECT mtime_ms FROM documents WHERE uri = ?"
+      const row = database.prepare(select).get(uri) as { mtime_ms: number | null } | undefined
+      assert.ok(row, "the refresh wrote the row")
+      const newer = (row?.mtime_ms ?? 0) + 60_000
+      database.prepare("UPDATE documents SET mtime_ms = ? WHERE uri = ?").run(newer, uri)
+      assert.deepEqual(await index.refresh([{ path: file, kind: "write" }]), { status: "synced" })
+      assert.equal((database.prepare(select).get(uri) as { mtime_ms: number | null }).mtime_ms, newer, "the newer row was left alone")
+    } finally {
+      database.close()
+    }
+  })
+
 })
