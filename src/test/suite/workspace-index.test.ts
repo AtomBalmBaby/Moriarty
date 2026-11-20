@@ -478,4 +478,31 @@ suite("Persistent workspace intelligence index", () => {
     }
   })
 
+  test("edit_lines is visible to search_workspace immediately after it returns", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const target = path.join(root, "src", "immediate-visibility.ts")
+    fs.writeFileSync(target, "export const stageEightToken = 'before'\n")
+    assert.deepEqual(await index.refresh([{ path: target, kind: "write" }]), { status: "synced" }, "the file starts in the index")
+    const tools = workspaceTools(root, [], {
+      workspaceSearch: index,
+      edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { refreshIndex: index.refresh.bind(index) }),
+      git: false,
+      instructions: false
+    })
+    const read = await tools.run({ name: "read_file", args: { path: "src/immediate-visibility.ts" } })
+    const expectedHash = read.output.match(/content_hash: ([^;]+);/)?.[1]
+    assert.ok(expectedHash, read.output)
+    const edit = await tools.run({ name: "edit_lines", args: { path: "src/immediate-visibility.ts", expected_hash: expectedHash, edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const stageEightToken = 'after'"] }]) } })
+    assert.ok(!edit.failed, edit.output)
+    const found = JSON.parse(edit.output)
+    assert.equal(found.index_refresh, undefined, "the sink refreshed this file through the wired provider")
+    const search = await tools.run({ name: "search_workspace", args: { query: "stageEightToken = 'after'", mode: "literal" } })
+    const hits = JSON.parse(search.output) as { total: number; results: Array<{ path: string; source: string }> }
+    assert.ok(hits.total > 0, "search_workspace finds the new token at once, with no polling: " + search.output)
+    assert.ok(hits.results.some((hit) => hit.path.endsWith("immediate-visibility.ts") && hit.source === "index"), "and from the index, not from a live read: " + search.output)
+    const gone = await tools.run({ name: "search_workspace", args: { query: "stageEightToken = 'before'", mode: "literal" } })
+    assert.equal(JSON.parse(gone.output).total, 0, "the replaced token is gone at once")
+  })
+
 })

@@ -6,11 +6,12 @@ import * as vscode from "vscode"
 
 import { ChangeStore, ReplyChanges } from "../../extension/chat/reply-changes"
 import { ReplyChangesEditor } from "../../extension/chat/reply-changes-editor"
-import { createSafeEditCheckpoints, EditOperationLedger, editorEdits, openDocumentText } from "../../extension/chat/tool-sinks"
+import { recoverSignificantEdit, SignificantEditRecoveryResult } from "../../extension/chat/safe-edit-recovery"
+import { createSafeEditCheckpoints, EditCommandRunner, EditOperationLedger, editorEdits, openDocumentText } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits, revealEditor } from "../../extension/edit/line-edit"
 import { contentHash, LineEditRequest } from "../../extension/tools/line-edit"
 import { WorkspaceView } from "../../extension/tools/view"
-import { workspaceTools } from "../../extension/tools/workspace"
+import { IndexChange, IndexRefreshOutcome, workspaceTools } from "../../extension/tools/workspace"
 
 suite("Hash-verified native line edits", () => {
   let root: string
@@ -157,6 +158,33 @@ suite("Hash-verified native line edits", () => {
     }
     return { ledger, recorded }
   }
+  /** What the fake refresh was told and in what order. It reads the file from disk, as the index does. */
+  const refreshSpy = (order: string[], saw: string[] = []) => {
+    const calls: IndexChange[][] = []
+    const refreshIndex = async (changes: readonly IndexChange[]): Promise<IndexRefreshOutcome> => {
+      calls.push([...changes])
+      order.push("refresh")
+      for (const change of changes) saw.push(fs.readFileSync(change.path, "utf8"))
+      return { status: "synced" }
+    }
+    return { calls, saw, refreshIndex }
+  }
+  /** The same recorder as `ledgerRecording`, keeping the order the calls happened in. */
+  const orderRecording = () => {
+    const order: string[] = []
+    const recorded: Array<{ settled: string[] }> = []
+    const ledger: EditOperationLedger = async () => {
+      const entry = { settled: [] as string[] }
+      recorded.push(entry)
+      order.push("recorded")
+      return { settle: async (status) => { entry.settled.push(status); order.push("settled") } }
+    }
+    return { order, recorded, ledger }
+  }
+  /** The real sink with the fake refresh and the fake ledger. */
+  const refreshSinkFor = (ledger?: EditOperationLedger, refreshIndex?: (changes: readonly IndexChange[]) => Promise<IndexRefreshOutcome>) => editorEdits(
+    new WorkspaceView(root), "apply", async () => true, undefined, { recordEditOperation: ledger, refreshIndex }, "background"
+  )
   const tabFor = (uri: vscode.Uri) => vscode.window.tabGroups.all
     .flatMap((group) => group.tabs)
     .find((tab) => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString())
@@ -604,6 +632,108 @@ suite("Hash-verified native line edits", () => {
       diagnostics.dispose()
       await checkpoints.clear()
     }
+  })
+
+  test("refreshIndex runs once with the edited file after a successful edit_lines and before the ledger settles", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const { order, recorded, ledger } = orderRecording()
+    const { calls, saw, refreshIndex } = refreshSpy(order)
+    const outcome = await refreshSinkFor(ledger, refreshIndex).editLines!(file, await request(original, [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }]), true)
+    assert.ok(outcome.ok, outcome.message)
+    assert.deepStrictEqual(order, ["recorded", "refresh", "settled"], "the saved file is caught up before the record settles")
+    assert.deepStrictEqual(calls, [[{ path: file, kind: "write" }]], "the edited file, as the tool layer passes it to the index")
+    assert.deepStrictEqual(saw, ["first\nSECOND\nthird\nfourth\n"], "the file was already saved when the refresh ran")
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]], "the ledger settles as it always did")
+    assert.deepStrictEqual(outcome.indexRefresh, { status: "synced" }, "the outcome carries what the refresh answered")
+  })
+
+  test("a stale expected_hash does not refresh and leaves file and index untouched", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const { order, recorded, ledger } = orderRecording()
+    const { calls, saw, refreshIndex } = refreshSpy(order)
+    const result = await refreshSinkFor(ledger, refreshIndex).editLines!(file, { expected_hash: await contentHash("not this document"), edits: [{ operation: "replace", start_line: 1, end_line: 2, content: ["x"] }] }, true)
+    assert.strictEqual(result.ok, false)
+    assert.strictEqual(result.error?.code, "hash_mismatch")
+    assert.strictEqual(result.error?.current_hash, await contentHash(original))
+    assert.deepStrictEqual(order, [], "the edit was refused before it was recorded")
+    assert.deepStrictEqual(recorded, [])
+    assert.deepStrictEqual(calls, [], "a refused edit never reaches the index")
+    assert.deepStrictEqual(saw, [])
+    assert.strictEqual(document.getText(), original, "the buffer is as it was")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), original, "nothing was saved")
+  })
+
+  test("two edit_lines from the same expected_hash: the second conflicts and only one refresh happens", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const hash = await contentHash(original)
+    const { calls, saw, refreshIndex } = refreshSpy([])
+    const sink = refreshSinkFor(undefined, refreshIndex)
+    const first = await sink.editLines!(file, { expected_hash: hash, edits: [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }] }, true)
+    assert.ok(first.ok, first.message)
+    const second = await sink.editLines!(file, { expected_hash: hash, edits: [{ operation: "delete", start_line: 3, end_line: 3 }] }, true)
+    assert.strictEqual(second.ok, false)
+    assert.strictEqual(second.error?.code, "hash_mismatch")
+    assert.deepStrictEqual(calls, [[{ path: file, kind: "write" }]], "only the edit that reached the file was refreshed")
+    assert.deepStrictEqual(saw, ["first\nSECOND\nthird\nfourth\n"])
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nSECOND\nthird\nfourth\n", "the second edit changed nothing")
+  })
+
+  test("after a catastrophic-edit rollback refreshIndex sees the restored content on disk", async function () {
+    this.timeout(20000)
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const checkpoints = createSafeEditCheckpoints(vscode.Uri.file(path.join(root, "storage")))
+    const { order, recorded, ledger } = orderRecording()
+    const { calls, saw, refreshIndex } = refreshSpy(order)
+    let recovery: SignificantEditRecoveryResult | undefined
+    // Diagnostics alone never ask for a rollback, so the recovery is requested here. Its content
+    // check is recorded by `markChanged` after the simulated change, and the fake refresh
+    // reads the file back from disk and compares it with the original.
+    const runEditCommand: EditCommandRunner = async <T>(command: string, ...args: unknown[]): Promise<T | undefined> => {
+      const outcome = await vscode.commands.executeCommand<T>(command, ...args)
+      await checkpoints.markChanged([file])
+      recovery = await recoverSignificantEdit({
+        file: "source.txt", introducedErrors: 20, diagnosticsObserved: false, diagnosticCheckAvailable: false,
+        rollbackRequested: true, checkpoints, checkpointPath: file
+      })
+      order.push("restored")
+      return outcome
+    }
+    const outcome = await editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { recordEditOperation: ledger, refreshIndex, runEditCommand, checkpoints }, "background")
+      .editLines!(file, await request(original, [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }]), true)
+    assert.ok(recovery?.restored, recovery?.reason)
+    assert.ok(recovery?.fileVerified, recovery?.reason)
+    assert.deepStrictEqual(order, ["recorded", "restored", "refresh", "settled"])
+    assert.deepStrictEqual(saw, [original], "the fake refresh read the file back and saw the content the rollback put there")
+    assert.deepStrictEqual(calls, [[{ path: file, kind: "write" }]], "the restored file, as the tool layer passes it to the index")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), original, "the file on disk holds the restored content")
+    assert.strictEqual(document.getText(), original, "the buffer holds the restored content too")
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]], "the ledger settles as it always did")
+    assert.strictEqual(outcome.ok, false, "the hash the command reported no longer matches the restored buffer")
+    assert.strictEqual(outcome.error?.code, "application_failed")
+    assert.match(outcome.message, /The document changed while diagnostics were checked/, "the hash precondition still holds after the recovery, so the model is told to reread")
+    await checkpoints.clear()
+  })
+
+  test("an unsaved edit (save false) does not refresh", async () => {
+    const document = await vscode.workspace.openTextDocument(file)
+    const original = document.getText()
+    const { order, recorded, ledger } = orderRecording()
+    const { calls, saw, refreshIndex } = refreshSpy(order)
+    const outcome = await editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { recordEditOperation: ledger, refreshIndex }, "visible")
+      .editLines!(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]), false)
+    assert.ok(outcome.ok, outcome.message)
+    assert.strictEqual(outcome.persisted, false, "the edit was left unsaved on purpose")
+    assert.deepStrictEqual(order, ["recorded", "settled"], "nothing was written to disk, so the index was not told")
+    assert.deepStrictEqual(calls, [])
+    assert.deepStrictEqual(saw, [])
+    assert.strictEqual(outcome.indexRefresh, undefined)
+    assert.strictEqual(document.getText(), "first\nthird\nfourth\n")
+    assert.strictEqual(fs.readFileSync(file, "utf8"), original, "the disk file is unchanged")
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]])
   })
 
   test("a dirty UTF-16 document keeps the user's change and saves the complete result in its encoding", async () => {

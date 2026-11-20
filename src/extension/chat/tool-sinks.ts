@@ -52,7 +52,7 @@ import { changedSpan, contentHash, LineEditError, lineEditFailure, patchedText, 
 import { EditorDiagnostic, EditorLocation, EditorSink, FileOpsSink } from "../tools/more"
 import { claimWrites, coversWrites, type OperationAuthorization, type WriteOperation, type WriteRequest } from "../tools/operation-authorization"
 import { WorkspaceView } from "../tools/view"
-import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink } from "../tools/workspace"
+import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink, IndexChange, IndexRefreshOutcome } from "../tools/workspace"
 
 import { changesBetween, MAX_COMMAND_CHANGES, snapshotTree, TreeSnapshot } from "./command-snapshot"
 import { forbiddenDeleteReason } from "./execution-reconciliation"
@@ -121,6 +121,8 @@ export interface EditSafetyOptions {
   cumulativeErrorThreshold?: number
   diagnosticMonitor?: DiagnosticRegressionMonitor
   onCatastrophic?(notice: EditRecoveryNotice): Promise<void> | void
+  /** Tells the workspace index about the files this call just saved, before the change is reported. */
+  refreshIndex?: (changes: readonly IndexChange[]) => Promise<IndexRefreshOutcome>
   mutations?: Map<string, boolean>
   canMutate?(file?: string): boolean
   blockMutations?(files: string[], reconcileOnFreshBaseline: boolean): void
@@ -479,6 +481,23 @@ export const editorEdits = (
     await safety.checkpoints?.commit([file])
     return outcome
   }
+  /**
+   * The index is caught up with the files this call saved. A refresh that throws
+   * is a failed refresh, not a failed change, and is reported as the model's to read.
+   */
+  const refreshed = async (files: string[], outcome: EditOutcome): Promise<EditOutcome> => {
+    if (!safety.refreshIndex) return outcome
+    const changes: IndexChange[] = files.map((file) => ({ path: file, kind: "write" }))
+    let indexRefresh: IndexRefreshOutcome
+    try {
+      indexRefresh = await safety.refreshIndex(changes)
+    } catch (error) {
+      indexRefresh = { status: "failed", reason: error instanceof Error ? error.message : String(error) }
+    }
+    if (indexRefresh.status === "failed")
+      logger.warn(`Index refresh failed for ${files.map((file) => view.relative(file)).join(", ")}: ${indexRefresh.reason}`)
+    return outcome.ok ? { ...outcome, indexRefresh } : outcome
+  }
   const runCommand: EditCommandRunner = safety.runEditCommand ?? ((command, ...args) => commands.executeCommand(command, ...args))
   type PendingEdit = { id: string; ticket?: EditOperationTicket; file: string; preDigest: string }
   /** Records an apply before the editor is asked for it; the edit is refused if the record cannot be written. */
@@ -570,6 +589,8 @@ export const editorEdits = (
         }), async () => { await safety.checkpoints?.markChanged([file]) })
         command = outcome
         checked = await checkedOutcome(file, outcome)
+        // The saved file is what the index sees, including a checkpoint that restored it.
+        if (command.ok && !command.pending && command.persisted !== false) checked = await refreshed([file], checked)
         await settleEdit(pending, command, checked)
       } finally {
         editOperationsInFlight.delete(pending.id)
@@ -612,6 +633,7 @@ export const editorEdits = (
         )
         command = outcome
         checked = await checkedOutcome(file, outcome)
+        if (modeFor(file) === "apply" && command.ok && !command.pending) checked = await refreshed([file], checked)
         await settleEdit(pending, command, checked)
       } finally {
         if (pending) editOperationsInFlight.delete(pending.id)

@@ -126,6 +126,12 @@ export interface EditOutcome {
 /** ` · 2 new errors`, for a step's line, when the change left any. */
 const errorsNote = (outcome: EditOutcome) =>
   outcome.newErrors ? ` · ${plural(outcome.newErrors, "new error")}` : ""
+/** What the model is told when a change landed but the index could not be told about it: the edit stands and is not to be repeated. */
+const indexRefreshNote = (outcome: EditOutcome) => {
+  const refresh = outcome.indexRefresh
+  if (!refresh || refresh.status !== "failed") return ""
+  return ` Saved, but the search index could not be refreshed (${refresh.reason}); the edit is complete and must not be repeated. search_workspace may show stale results for this file until the index recovers.`
+}
 
 const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
@@ -604,7 +610,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
     if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))
     return {
-      output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: outcome.contentHash.split(":")[0], content_source: outcome.contentSource, persisted: outcome.persisted ?? false, message: outcome.message }),
+      output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: outcome.contentHash.split(":")[0], content_source: outcome.contentSource, persisted: outcome.persisted ?? false, index_refresh: outcome.indexRefresh?.status === "failed" ? { status: "failed", reason: outcome.indexRefresh.reason } : undefined, message: outcome.message + indexRefreshNote(outcome) }),
       summary: `edited \`${view.relative(absolute)}\` by lines${errorsNote(outcome)}`
     }
   }
@@ -638,7 +644,7 @@ const editFile = (view: WorkspaceView, sink: EditSink): Tool => ({
       return { output: outcome.message, summary: `\`${rel}\` not changed · ${outcome.message}`, failed: true }
     }
     return {
-      output: outcome.message,
+      output: outcome.message + indexRefreshNote(outcome),
       summary: `${outcome.pending ? "proposed an edit to" : "edited"} \`${rel}:${lines}\`${errorsNote(outcome)}`,
       final: outcome.pending
     }

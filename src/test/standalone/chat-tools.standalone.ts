@@ -18,7 +18,7 @@ import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { toolModeFor, withTools } from "../../extension/tools/loop"
 import { displayableLength, findToolCall, nameArguments, repairJson } from "../../extension/tools/protocol"
 import { WorkspaceView } from "../../extension/tools/view"
-import { workspaceTools } from "../../extension/tools/workspace"
+import { IndexRefreshOutcome, workspaceTools } from "../../extension/tools/workspace"
 
 test("reads the JSON form as soon as its object closes, and not before", () => {
   const text = "Let me look.\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"foo\"}}\n</tool_call>"
@@ -413,6 +413,57 @@ test("edit_file plans against the open buffer and hands the change to the sink",
   assert.match(ignored.output, /ignored by \.gitignore/)
   assert.strictEqual(edited.length, 1)
   assert.strictEqual(workspaceTools(root).tools.some((t) => t.name === "edit_file"), false)
+})
+
+const warmerText = "export class ModelWarmer {\n  public async warm() {\n    return 1\n  }\n}\n"
+
+test("edit_lines reports an index refresh failure as a completed edit and tells the model not to repeat it", async () => {
+  const root = makeWorkspace()
+  const hash = await fingerprintContent(warmerText)
+  const reason = "src/warmer.ts: could not be indexed"
+  const tools = workspaceTools(root, [], { edits: {
+    mode: "apply",
+    edit: async () => ({ ok: true, message: "Applied." }),
+    editLines: async () => ({ ok: true, message: "Applied.", contentHash: hash, contentSource: "disk", persisted: true, indexRefresh: { status: "failed", reason } }),
+    create: async () => ({ ok: true, message: "Created." })
+  } })
+  const result = await tools.run({ name: "edit_lines", args: { path: "src/warmer.ts", expected_hash: hash, edits: "[{\"operation\":\"delete\",\"start_line\":1,\"end_line\":1}]" } })
+  assert.strictEqual(result.failed, undefined, "the change itself is still reported as a success")
+  const json = JSON.parse(result.output)
+  assert.strictEqual(json.ok, true)
+  assert.deepStrictEqual(json.index_refresh, { status: "failed", reason })
+  assert.strictEqual(json.message, `Applied. Saved, but the search index could not be refreshed (${reason}); the edit is complete and must not be repeated. search_workspace may show stale results for this file until the index recovers.`)
+  assert.strictEqual(result.summary, "edited `src/warmer.ts` by lines", "the step line does not claim the index agreed")
+})
+
+test("a synced or skipped refresh leaves the edit_lines output unchanged", async () => {
+  const root = makeWorkspace()
+  const hash = await fingerprintContent(warmerText)
+  const run = async (indexRefresh?: IndexRefreshOutcome) => workspaceTools(root, [], { edits: {
+    mode: "apply",
+    edit: async () => ({ ok: true, message: "Applied." }),
+    editLines: async () => ({ ok: true, message: "Applied.", contentHash: hash, contentSource: "disk", persisted: true, indexRefresh }),
+    create: async () => ({ ok: true, message: "Created." })
+  } }).run({ name: "edit_lines", args: { path: "src/warmer.ts", expected_hash: hash, edits: "[{\"operation\":\"delete\",\"start_line\":1,\"end_line\":1}]" } })
+  const plain = await run(undefined)
+  assert.strictEqual(JSON.parse(plain.output).index_refresh, undefined, "a result with nothing to say about the index is as it was")
+  assert.deepStrictEqual(await run({ status: "synced" }), plain)
+  assert.deepStrictEqual(await run({ status: "skipped", reason: "excluded from the index" }), plain)
+  assert.strictEqual((await run({ status: "synced" })).output, plain.output, "byte for byte, with no index_refresh key")
+  assert.strictEqual((await run({ status: "skipped", reason: "indexing is disabled" })).summary, plain.summary)
+})
+test("edit_file appends the same sentence on a failed refresh", async () => {
+  const root = makeWorkspace()
+  const reason = "src/warmer.ts: the database is busy"
+  const tools = workspaceTools(root, [], { legacyEditFile: true, edits: {
+    mode: "apply",
+    edit: async () => ({ ok: true, message: "Applied.", indexRefresh: { status: "failed", reason } }),
+    create: async () => ({ ok: true, message: "Created." })
+  } })
+  const result = await tools.run({ name: "edit_file", args: { path: "src/warmer.ts", find: "return 1", replace: "return 2" } })
+  assert.ok(!result.failed, result.output)
+  assert.strictEqual(result.output, `Applied. Saved, but the search index could not be refreshed (${reason}); the edit is complete and must not be repeated. search_workspace may show stale results for this file until the index recovers.`)
+  assert.strictEqual(result.summary, "edited `src/warmer.ts:3`")
 })
 
 test("the reply's notes keep each call and what it returned for the next turn", async () => {

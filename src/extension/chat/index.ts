@@ -2618,6 +2618,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         }
       },
       onCatastrophic,
+      refreshIndex: this._workspaceSearch?.refresh?.bind(this._workspaceSearch),
       runEditCommand: this._editCommands,
       recordEditOperation: this.editOperationLedger(this.activeTodoScope())
     }
