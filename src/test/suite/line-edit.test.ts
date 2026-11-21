@@ -1148,4 +1148,114 @@ suite("Hash-verified native line edits", () => {
     } finally { provider.dispose() }
   })
 
+  const rowText = "| Stage | " + "x".repeat(4_200) + " scratch logs in `/tmp` only. |"
+
+  test("a substring inside a long table row is edited in the real editor without retyping the row", async () => {
+    const target = orderingFile("plan-row.md", "heading\n" + rowText + "\nfooter\n")
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(target))
+    const expected = "heading\n" + rowText.replace("only.", "only. Closing verification completed.") + "\nfooter\n"
+    const result = await applyDocumentLineEdits(target, await request(document.getText(), [{ operation: "replace_text", line: 2, old_text: "scratch logs in `/tmp` only.", new_text: "scratch logs in `/tmp` only. Closing verification completed." }]))
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(document.getText(), expected, "only the matched substring changed; the rest of the row and its neighbouring lines are as they were")
+    assert.strictEqual(fs.readFileSync(target, "utf8"), expected, "the saved file is the same")
+    assert.strictEqual(result.contentHash, await contentHash(expected), "the hash is the actual final content, so the next hash-verified edit can use it")
+    assert.strictEqual(result.contentSource, "disk")
+    assert.strictEqual(result.persisted, true)
+  })
+
+  for (const eol of ["\n", "\r\n"]) test(`a substring edit retains ${eol === "\n" ? "LF" : "CRLF"} and the lines around it`, async () => {
+    fs.writeFileSync(file, ["one", "two|target|three", "four", ""].join(eol))
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const expected = ["one", "two|replaced|three", "four", ""].join(eol)
+    const result = await applyDocumentLineEdits(file, await request(document.getText(), [{ operation: "replace_text", line: 2, old_text: "target", new_text: "replaced" }]))
+    assert.ok(result.ok, result.message)
+    assert.strictEqual(document.getText(), expected)
+    assert.strictEqual(fs.readFileSync(file, "utf8"), expected, "the persisted bytes keep the line endings")
+  })
+
+  test("a refused replace_text batch never reaches the editor", async () => {
+    const ambiguous = orderingFile("ambiguous-row.txt", "one\ntwo two\nthree\n")
+    let events = 0
+    const listener = vscode.workspace.onDidChangeTextDocument((event) => { if (event.contentChanges.length) events++ })
+    try {
+      for (const [target, edits, code, named] of [
+        [file, [{ operation: "replace_text", line: 2, old_text: "first", new_text: "FIRST" }], "invalid_range", /Edit 1/],
+        [file, [{ operation: "replace_text", line: 1, old_text: "first", new_text: "F" }, { operation: "replace_text", line: 3, old_text: "nobody", new_text: "x" }], "invalid_range", /Edit 2/],
+        [ambiguous, [{ operation: "replace_text", line: 2, old_text: "two", new_text: "TWO" }], "invalid_range", /Edit 1/],
+        [file, [{ operation: "replace_text", line: 1, old_text: "first", new_text: "F" }, { operation: "delete", start_line: 1, end_line: 1 }], "overlapping_edits", /overlap/]
+      ] as const) {
+        const text = fs.readFileSync(target, "utf8")
+        const result = await applyDocumentLineEdits(target, await request(text, edits))
+        assert.strictEqual(result.ok, false, result.message)
+        assert.strictEqual(result.error?.code, code)
+        assert.match(result.error?.message, named, "the failed edit is named")
+        assert.strictEqual(fs.readFileSync(target, "utf8"), text, "nothing was written")
+      }
+      assert.strictEqual(events, 0, "a refused batch changes nothing in the buffer or on disk")
+    } finally { listener.dispose() }
+  })
+
+  test("a substring edit whose save fails keeps the recovery guarantees", async function () {
+    if (process.getuid?.() === 0) this.skip()
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const original = document.getText()
+    const { ledger, recorded } = ledgerRecording()
+    fs.chmodSync(file, 0o444)
+    try {
+      const result = await sinkFor("background", ledger).editLines!(file, await request(original, [{ operation: "replace_text", line: 2, old_text: "second", new_text: "SECOND" }]), true)
+      assert.strictEqual(result.ok, false, result.message)
+      assert.strictEqual(result.error?.code, "save_failed", result.message)
+      assert.strictEqual(result.error?.current_hash, await contentHash(document.getText()))
+      assert.strictEqual(document.getText(), "first\nSECOND\nthird\nfourth\n", "the edit stays in the editor buffer")
+      assert.ok(document.isDirty, "the edit is not saved")
+      assert.strictEqual(fs.readFileSync(file, "utf8"), original, "the file on disk is unchanged")
+      assert.strictEqual(recorded.length, 1)
+      assert.ok(!recorded[0].settled.includes("succeeded"), "a failed save is not settled as a successful edit")
+    } finally {
+      fs.chmodSync(file, 0o644)
+    }
+  })
+
+  test("the index is caught up with a saved substring edit and not with one refused before the change", async function () {
+    this.timeout(20000)
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const original = document.getText()
+    const { order, recorded, ledger } = orderRecording()
+    const { calls, saw, refreshIndex } = refreshSpy(order)
+    const sink = refreshSinkFor(ledger, refreshIndex)
+    const changed = await sink.editLines!(file, await request(original, [{ operation: "replace_text", line: 2, old_text: "second", new_text: "SECOND" }]), true)
+    assert.ok(changed.ok, changed.message)
+    assert.deepStrictEqual(order, ["recorded", "refresh", "settled"], "the saved file is caught up before the record settles")
+    assert.deepStrictEqual(calls, [[{ path: file, kind: "write" }]], "the edited file, as the tool layer passes it to the index")
+    assert.deepStrictEqual(saw, ["first\nSECOND\nthird\nfourth\n"], "the file was already saved when the refresh ran")
+    assert.strictEqual(changed.contentHash, await contentHash("first\nSECOND\nthird\nfourth\n"), "and the hash is the actual final content")
+    const refused = await sink.editLines!(file, await request("first\nSECOND\nthird\nfourth\n", [{ operation: "replace_text", line: 2, old_text: "no such text", new_text: "x" }]), true)
+    assert.strictEqual(refused.ok, false, refused.message)
+    assert.strictEqual(refused.error?.code, "invalid_range")
+    assert.deepStrictEqual(order, ["recorded", "refresh", "settled"], "the refused edit was never recorded or caught up with")
+    assert.deepStrictEqual(calls, [[{ path: file, kind: "write" }]], "only the edit that reached the file was refreshed")
+    assert.deepStrictEqual(saw, ["first\nSECOND\nthird\nfourth\n"])
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nSECOND\nthird\nfourth\n", "the refused edit changed nothing")
+    assert.deepStrictEqual(recorded.map((entry) => entry.settled), [["succeeded"]], "the ledger settles as it always did")
+  })
+
+  test("a batch mixing a substring edit with ranges of different sizes leaves the same content in either input order", async () => {
+    const source = "one\ntwo\nthree\nfour\nfive\nsix\n"
+    const expected = "one\nTWO\nthree\nFOUR\nextra\nfive\nsix\nlast\n"
+    const batch = [
+      { operation: "replace_text", line: 2, old_text: "two", new_text: "TWO" },
+      { operation: "replace", start_line: 4, end_line: 4, content: ["FOUR", "extra"] },
+      { operation: "insert_after", line: 6, content: ["last"] }
+    ]
+    const ascending = orderingFile("substring-ascending.txt", source)
+    const descending = orderingFile("substring-descending.txt", source)
+    const up = await applyDocumentLineEdits(ascending, await request(source, batch))
+    assert.ok(up.ok, up.message)
+    const down = await applyDocumentLineEdits(descending, await request(source, [...batch].reverse()))
+    assert.ok(down.ok, down.message)
+    assert.strictEqual(fs.readFileSync(ascending, "utf8"), expected, "the batch read top-to-bottom")
+    assert.strictEqual(fs.readFileSync(descending, "utf8"), expected, "the same batch read bottom-to-top, with the substring still on the line it named")
+    assert.strictEqual(up.contentHash, down.contentHash, "both orders answer with the same hash")
+  })
+
 })

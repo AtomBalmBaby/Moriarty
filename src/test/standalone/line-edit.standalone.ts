@@ -8,7 +8,7 @@ import { test } from "node:test"
 import { parseReadFile } from "../../common/tool-output"
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { buildStreamingRequest } from "../../extension/inference/adapters/fluency"
-import { contentHash, patchedText, planLineEdits } from "../../extension/tools/line-edit"
+import { contentHash, LINE_EDIT_OPERATIONS, patchedText, planLineEdits } from "../../extension/tools/line-edit"
 import { findToolCall, toolDefinition } from "../../extension/tools/protocol"
 import { EditSink, workspaceTools } from "../../extension/tools/workspace"
 
@@ -325,5 +325,143 @@ for (const [name, edits, code] of orderRejections) {
     assert.equal(f.transactions(), 0)
   })
 }
+
+const substringCases: [string, string, unknown[], string][] = [
+  ["replaces the substring on the line it names", "first\nsecond\nthird\n", [{ operation: "replace_text", line: 2, old_text: "second", new_text: "SECOND" }], "first\nSECOND\nthird\n"],
+  ["accepts an empty new_text and removes the match", "first\nsecond\nthird\n", [{ operation: "replace_text", line: 2, old_text: "second", new_text: "" }], "first\n\nthird\n"],
+  ["leaves the prefix, the suffix and the neighbouring lines alone", "keep|target|keep\nneighbour\n", [{ operation: "replace_text", line: 1, old_text: "target", new_text: "replaced" }], "keep|replaced|keep\nneighbour\n"],
+  ["keeps CRLF endings and the terminal newline", "one\r\ntwo three\r\nfour\r\n", [{ operation: "replace_text", line: 2, old_text: "three", new_text: "THREE" }], "one\r\ntwo THREE\r\nfour\r\n"],
+  ["takes two independently identified targets on one line", "one two three\nsecond\n", [{ operation: "replace_text", line: 1, old_text: "one", new_text: "ONE" }, { operation: "replace_text", line: 1, old_text: "three", new_text: "THREE" }], "ONE two THREE\nsecond\n"],
+  ["takes two touching targets on one line", "abcdef\n", [{ operation: "replace_text", line: 1, old_text: "abc", new_text: "ABC" }, { operation: "replace_text", line: 1, old_text: "def", new_text: "DEF" }], "ABCDEF\n"],
+  ["mixed ranges of different sizes in one batch", "one\ntwo\nthree\nfour\nfive\n", [{ operation: "replace_text", line: 2, old_text: "two", new_text: "TWO" }, { operation: "delete", start_line: 3, end_line: 4 }, { operation: "insert_after", line: 5, content: ["last"] }], "one\nTWO\nfive\nlast\n"],
+  ["stays compatible with insert, replace and delete in one batch", "a\nb\nc\n", [{ operation: "replace_text", line: 1, old_text: "a", new_text: "A" }, { operation: "delete", start_line: 2, end_line: 2 }, { operation: "insert_after", line: 3, content: ["end"] }], "A\nc\nend\n"]
+]
+for (const [name, before, edits, after] of substringCases) test(`replace_text ${name}`, async () => {
+  const f = fixture(before)
+  const result = await f.edit(edits)
+  assert.equal(result.failed, undefined, result.output)
+  assert.equal(f.text(), after)
+  assert.equal(f.transactions(), 1)
+  assert.deepEqual(JSON.parse(result.output), { ok: true, path: "panel.tsx", content_hash: await contentHash(after), hash_algorithm: "xxh64", persisted: true, message: "applied" })
+})
+
+const substringRejections: [string, string, unknown[], string][] = [
+  ["line 0", "a\nb\nc\n", [{ operation: "replace_text", line: 0, old_text: "a", new_text: "A" }], "invalid_range"],
+  ["a line past the snapshot", "a\nb\nc\n", [{ operation: "replace_text", line: 4, old_text: "a", new_text: "A" }], "invalid_range"],
+  ["no line at all", "a\nb\nc\n", [{ operation: "replace_text", old_text: "a", new_text: "A" }], "invalid_range"],
+  ["a string line", "a\nb\nc\n", [{ operation: "replace_text", line: "1", old_text: "a", new_text: "A" }], "invalid_range"],
+  ["a fractional line", "a\nb\nc\n", [{ operation: "replace_text", line: 2.5, old_text: "b", new_text: "B" }], "invalid_range"],
+  ["a substring that is on another line", "a\nb\nc\n", [{ operation: "replace_text", line: 1, old_text: "b", new_text: "B" }], "invalid_range"],
+  ["an ambiguous substring on the line named", "x x\ny\n", [{ operation: "replace_text", line: 1, old_text: "x", new_text: "z" }], "invalid_range"],
+  ["a case that does not match exactly", "b\n", [{ operation: "replace_text", line: 1, old_text: "B", new_text: "z" }], "invalid_range"],
+  ["an empty old_text", "a\n", [{ operation: "replace_text", line: 1, old_text: "", new_text: "z" }], "invalid_range"],
+  ["an old_text holding a newline", "a\nb\n", [{ operation: "replace_text", line: 1, old_text: "a\nb", new_text: "z" }], "invalid_range"],
+  ["a new_text holding a newline", "a\nb\n", [{ operation: "replace_text", line: 1, old_text: "a", new_text: "z\ny" }], "invalid_range"],
+  ["an operand holding a carriage return", "a\r\nb\r\n", [{ operation: "replace_text", line: 1, old_text: "a\r", new_text: "z" }], "invalid_range"],
+  ["a new_text that is not a string", "a\n", [{ operation: "replace_text", line: 1, old_text: "a", new_text: 3 }], "invalid_range"],
+  ["content instead of old_text and new_text", "a\n", [{ operation: "replace_text", line: 1, content: ["z"] }], "invalid_range"],
+  ["start_line and end_line with replace_text", "a\n", [{ operation: "replace_text", start_line: 1, end_line: 1, old_text: "a", new_text: "A" }], "invalid_range"],
+  ["two overlapping substring targets on one line", "ab\n", [{ operation: "replace_text", line: 1, old_text: "a", new_text: "A" }, { operation: "replace_text", line: 1, old_text: "ab", new_text: "B" }], "overlapping_edits"],
+  ["a substring inside a full-line replace", "a\nb\n", [{ operation: "replace", start_line: 1, end_line: 1, content: ["X"] }, { operation: "replace_text", line: 1, old_text: "a", new_text: "A" }], "overlapping_edits"],
+  ["a substring inside a deleted line", "a\nb\n", [{ operation: "delete", start_line: 1, end_line: 1 }, { operation: "replace_text", line: 1, old_text: "a", new_text: "A" }], "overlapping_edits"],
+  ["an invalid edit later in the batch", "a\nb\nc\n", [{ operation: "replace_text", line: 1, old_text: "a", new_text: "A" }, { operation: "replace_text", line: 9, old_text: "z", new_text: "y" }], "invalid_range"]
+]
+for (const [name, before, edits, code] of substringRejections) test(`rejects replace_text ${name} without modification`, async () => {
+  const f = fixture(before)
+  const result = await f.edit(edits)
+  assert.equal(result.failed, true, result.output)
+  assert.equal(JSON.parse(result.output).error.code, code)
+  assert.equal(f.text(), before)
+  assert.equal(f.transactions(), 0, "nothing was applied")
+})
+
+test("replace_text names the line it was asked for and the edit that failed", async () => {
+  const source = "one\ntwo two\nthree\n"
+  const f = fixture(source)
+  const absent = await f.edit([{ operation: "replace_text", line: 1, old_text: "two", new_text: "TWO" }])
+  assert.equal(absent.failed, true, absent.output)
+  const message = JSON.parse(absent.output).error.message
+  assert.match(message, /Edit 1/, "the failed edit is named")
+  assert.match(message, /not on line 1/)
+  assert.match(message, /line 2/, "it says where the text actually is, without using that line")
+  const ambiguous = await f.edit([{ operation: "replace_text", line: 2, old_text: "two", new_text: "TWO" }])
+  assert.equal(ambiguous.failed, true, ambiguous.output)
+  assert.match(JSON.parse(ambiguous.output).error.message, /Edit 1.*occurs 2 times on line 2/)
+  assert.equal(f.text(), source)
+})
+
+test("a stale expected_hash refuses a replace_text batch before anything is planned", async () => {
+  const f = fixture("first\nsecond\n")
+  const stale = hash(f.text())
+  f.change("dirty buffer\nsecond\n")
+  const result = await f.edit([{ operation: "replace_text", line: 1, old_text: "first", new_text: "FIRST" }], stale)
+  assert.equal(result.failed, true)
+  assert.equal(JSON.parse(result.output).error.code, "hash_mismatch")
+  assert.equal(JSON.parse(result.output).error.current_hash, await contentHash("dirty buffer\nsecond\n"))
+  assert.equal(f.text(), "dirty buffer\nsecond\n")
+  assert.equal(f.transactions(), 0)
+})
+
+test("a substring inside a 4,000 character table row is changed without retyping the row", async () => {
+  const row = "| Stage | " + "x".repeat(4_200) + " scratch logs in `/tmp` only. |"
+  assert.ok(row.length > 4_000, "the row is the long one the failure was about")
+  const source = "heading\n" + row + "\nfooter\n"
+  const f = fixture(source)
+  const edits = [{ operation: "replace_text", line: 2, old_text: "scratch logs in `/tmp` only.", new_text: "scratch logs in `/tmp` only. Closing verification completed." }]
+  assert.ok(JSON.stringify(edits).length < 200, "the call names the substring, not the whole 4,000 character row")
+  const result = await f.edit(edits)
+  assert.equal(result.failed, undefined, result.output)
+  const expected = "heading\n" + row.replace("only.", "only. Closing verification completed.") + "\nfooter\n"
+  assert.equal(f.text(), expected, "the row's other text is untouched")
+  assert.equal(JSON.parse(result.output).content_hash, await contentHash(expected), "the hash is the actual final content")
+  const read = await f.tools.run({ name: "read_file", args: { path: "panel.tsx", start_line: "2", end_line: "2" } })
+  assert.ok(read.output.includes(await contentHash(expected)), "and the hash read_file gives for the next edit is current")
+  assert.equal(f.transactions(), 1)
+})
+
+test("replace_text patches address the original snapshot and are planned bottom-to-top", async () => {
+  const source = "one\ntwo\nthree\nfour\nfive\n"
+  const substringEdit = { operation: "replace_text", line: 2, old_text: "two", new_text: "TWO" }
+  const edits = [substringEdit, { operation: "replace", start_line: 4, end_line: 4, content: ["FOUR", "extra"] }, { operation: "insert_after", line: 5, content: ["five-b"] }]
+  const expected = "one\nTWO\nthree\nFOUR\nextra\nfive\nfive-b\n"
+  for (const order of [edits, [...edits].reverse()]) {
+    const patches = await planLineEdits(source, { expected_hash: hash(source), edits: order })
+    const starts = patches.map((patch) => patch.start)
+    assert.deepEqual(starts, [...starts].sort((a, b) => b - a), "planned from the bottom up whatever order the call supplied")
+    const patch = patches.find((entry) => entry.text === substringEdit.new_text)
+    assert.ok(patch, `the patch for ${substringEdit.old_text}`)
+    assert.equal(source.slice(patch.start, patch.end), substringEdit.old_text, "the range still addresses the line it named in the snapshot")
+    assert.equal(patchedText(source, patches), expected)
+  }
+})
+
+test("two replace_text targets on one line stay separately identified", async () => {
+  const source = "one two three\n"
+  const edits = [{ operation: "replace_text", line: 1, old_text: "two", new_text: "TWO" }, { operation: "replace_text", line: 1, old_text: "three", new_text: "THREE" }]
+  assert.equal(patchedText(source, await planLineEdits(source, { expected_hash: hash(source), edits })), "one TWO THREE\n")
+})
+
+
+test("the edit_lines schema and instructions advertise replace_text with its own fields", async () => {
+  const f = fixture("a\n")
+  const tool = f.tools.tools.find((entry) => entry.name === "edit_lines")!
+  const advertised = "Do not reproduce the complete line."
+  assert.ok(tool.description.includes(advertised), "the description tells the model not to retype a long line")
+  assert.ok(tool.guidance?.includes(advertised), "and so do the instructions")
+  const items = (tool.schema!.properties as Record<string, Record<string, unknown>>).edits.items as {
+    properties: Record<string, unknown>
+    oneOf: Array<{ required: string[]; properties: Record<string, unknown>; additionalProperties?: boolean }>
+  }
+  assert.deepEqual((items.properties.operation as { enum: string[] }).enum, LINE_EDIT_OPERATIONS)
+  const branchFor = (operation: string) => items.oneOf.find((entry) => (entry.properties.operation as { enum: string[] }).enum[0] === operation)!
+  const substring = branchFor("replace_text")
+  assert.deepEqual(substring.required, ["operation", "line", "old_text", "new_text"])
+  assert.equal(substring.additionalProperties, false)
+  assert.ok(!substring.properties.content, "replace_text takes no content")
+  assert.ok(items.properties.old_text && items.properties.new_text, "the fields are described for the model")
+  const deletion = branchFor("delete")
+  assert.deepEqual(deletion.required, ["operation", "start_line", "end_line"])
+  assert.ok(!deletion.properties.content, "delete neither requires nor accepts content")
+})
 
 

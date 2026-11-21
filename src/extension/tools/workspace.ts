@@ -17,7 +17,7 @@ import { AccessPreflight,accessTargetsOf } from "./access-preflight"
 import { planReplacement, Replacement } from "./edit"
 import { indexChangeNote } from "./helpers"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
-import { contentHash, ContentSource, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
+import { contentHash, ContentSource, LINE_EDIT_OPERATIONS, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
 import { coerceArguments, JsonSchema, McpToolSpec } from "./mcp"
 import {
   deleteFile,
@@ -543,16 +543,18 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     "replace/delete use inclusive start_line/end_line. insert_before accepts 1 through total_lines+1; insert_after accepts 1 through total_lines. " +
     "For an empty document only insert_before line=1 or insert_after line=0 is valid. EOF insertion preserves the final-newline convention. " +
     "content is an array of complete lines without newline characters (use [''] for a blank line). " +
+    "Use `replace_text` for small modifications within an existing line, especially long lines. Supply the whole-file `expected_hash`, the original 1-based line number, and the exact substring to replace. Do not reproduce the complete line. Its fields are line, old_text and new_text: old_text must occur exactly once on that line, matching is literal and case-sensitive with no fallback to another line, an empty new_text removes the match, and neither operand may hold a newline. A missing or ambiguous match refuses the whole batch before anything changes. " +
     "Overlaps, same-boundary insertions and insertions touching a replaced/deleted boundary are rejected. " +
     "Hash mismatch leaves everything unchanged and returns current_hash; reread, never retry blindly. " +
     "Uses existing edit permissions; review/protected files require approval. Edits apply to the editor buffer, so the user's unsaved changes in the file are kept (and saved with it when save is true). The document is shown in an editor so diagnostics are checked: in background mode (the default) it is used in place if already open, otherwise shown as a preview tab without taking focus; in visible mode it is shown in a persistent tab that takes focus. By default (save true) the complete document is saved and read back: persisted is true, content_source is disk, and content_hash is the saved file's fingerprint, the expected_hash for the next edit to the same file. save false is only for when the task instructions ask for it and the editor mode is visible; otherwise it is refused with permission_denied and nothing changes. A save false edit is left unsaved for review: persisted is false, the file on disk is unchanged, and a build from disk does not include it. If saving fails the error code is save_failed: the edit stays in the unsaved editor buffer, the file on disk may not have it, and current_hash is the buffer's fingerprint.",
   guidance:
     "To change existing source: read_file for its numbered lines and content_hash, then call edit_lines with that expected_hash and the line operations. " +
-    "Use the content_hash it returns for the next edit to the same file. Reread only after a hash_mismatch, or when the lines you need were not in the last read.",
+    "Use the content_hash it returns for the next edit to the same file. Reread only after a hash_mismatch, or when the lines you need were not in the last read. " +
+    "Use `replace_text` for small modifications within an existing line, especially long lines. Supply the whole-file `expected_hash`, the original 1-based line number, and the exact substring to replace. Do not reproduce the complete line.",
   parameters: [
     { name: "path", description: "Workspace-relative file path." },
     { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted." },
-    { name: "edits", description: "Array of line operations in any order, all against the original snapshot. Each has operation: replace {operation,start_line,end_line,content} or delete {operation,start_line,end_line}, or insert_before/insert_after {operation,line,content}." },
+    { name: "edits", description: "Array of line operations in any order, all against the original snapshot. Each has operation: replace {operation,start_line,end_line,content} or delete {operation,start_line,end_line}, insert_before/insert_after {operation,line,content}, or replace_text {operation,line,old_text,new_text} for one exact substring inside one line." },
     { name: "save", description: "Optional, default true. false leaves the edit unsaved for review; only allowed when the editor mode is visible and the task instructions say so." }
   ],
   schema: {
@@ -565,29 +567,36 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       save: { type: "boolean", description: "Default true: save the complete document to disk. false: leave the edit unsaved in the editor; only allowed when the editor mode is visible and the task instructions ask for it." },
       edits: {
         type: "array", minItems: 1,
-        description: "Line operations in any order, all against the original snapshot. Each object's key is operation, set to replace, delete, insert_before or insert_after; not type, op or action.",
+        description: "Line operations in any order, all against the original snapshot. Each object's key is operation, set to replace, delete, insert_before, insert_after or replace_text; not type, op or action.",
         items: {
           type: "object",
-          description: "replace and delete use start_line and end_line (inclusive, 1-based). insert_before and insert_after use line. replace and inserts require content, an array of complete lines.",
+          description: "replace and delete use start_line and end_line (inclusive, 1-based). insert_before and insert_after use line. replace_text uses line plus the exact old_text and new_text, so a long line does not have to be retyped. replace and inserts require content, an array of complete lines.",
           required: ["operation"],
           properties: {
-            operation: { type: "string", enum: ["replace", "delete", "insert_before", "insert_after"], description: "The change to make; this key is required." },
+            operation: { type: "string", enum: LINE_EDIT_OPERATIONS, description: "The change to make; this key is required." },
             start_line: { type: "integer", minimum: 1, description: "replace or delete: first line, 1-based." },
             end_line: { type: "integer", minimum: 1, description: "replace or delete: last line, 1-based, inclusive." },
-            line: { type: "integer", minimum: 0, description: "insert_before: insert before this line (1 or more). insert_after: insert after this line (0 inserts at the top)." },
-            content: { type: "array", minItems: 1, items: { type: "string" }, description: "replace or insert: the new complete lines, without newline characters." }
+            line: { type: "integer", minimum: 0, description: "insert_before: insert before this line (1 or more). insert_after: insert after this line (0 inserts at the top). replace_text: the line to search, 1-based, in the snapshot expected_hash names." },
+            content: { type: "array", minItems: 1, items: { type: "string" }, description: "replace or insert: the new complete lines, without newline characters." },
+            old_text: { type: "string", minLength: 1, pattern: "^[^\\r\\n]+$", description: "replace_text: the exact substring to replace, copied from the line as read_file printed it. It must occur once on that line." },
+            new_text: { type: "string", pattern: "^[^\\r\\n]*$", description: "replace_text: what that substring becomes. An empty string removes it." }
           },
-          oneOf: ["replace", "delete", "insert_before", "insert_after"].map((operation) => {
+          oneOf: LINE_EDIT_OPERATIONS.map((operation) => {
             const insertion = operation.startsWith("insert_")
+            const substring = operation === "replace_text"
             return {
               type: "object", additionalProperties: false,
-              required: ["operation", ...(insertion ? ["line"] : ["start_line", "end_line"]), ...(operation === "delete" ? [] : ["content"])],
+              required: ["operation", ...(substring ? ["line", "old_text", "new_text"] : insertion ? ["line"] : ["start_line", "end_line"]), ...(operation === "delete" || substring ? [] : ["content"])],
               properties: {
                 operation: { type: "string", enum: [operation] },
-                ...(insertion ? { line: { type: "integer", minimum: operation === "insert_after" ? 0 : 1 } } : {
+                ...(substring ? {
+                  line: { type: "integer", minimum: 1 },
+                  old_text: { type: "string", minLength: 1, pattern: "^[^\\r\\n]+$" },
+                  new_text: { type: "string", pattern: "^[^\\r\\n]*$" }
+                } : insertion ? { line: { type: "integer", minimum: operation === "insert_after" ? 0 : 1 } } : {
                   start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 1 }
                 }),
-                ...(operation === "delete" ? {} : { content: { type: "array", minItems: 1, items: { type: "string", pattern: "^[^\\r\\n]*$" } } })
+                ...(operation === "delete" || substring ? {} : { content: { type: "array", minItems: 1, items: { type: "string", pattern: "^[^\\r\\n]*$" } } })
               }
             }
           })
