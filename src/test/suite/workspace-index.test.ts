@@ -6,6 +6,7 @@ import * as path from "path"
 import * as vscode from "vscode"
 
 import { TWINNY_COMMAND_NAME } from "../../common/constants"
+import { logger } from "../../common/logger"
 import { editorEdits } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits } from "../../extension/edit/line-edit"
 import { GenerationTracker } from "../../extension/generations"
@@ -22,6 +23,15 @@ suite("Persistent workspace intelligence index", () => {
   let storage: string
   let originalFolders: Array<{ uri: vscode.Uri; name: string }>
   let index: WorkspaceIntelligenceIndex
+  const requestSynchronization = (
+    target: WorkspaceIntelligenceIndex,
+    clear = false,
+    followup = false,
+    source = "test",
+    eventPath = "test-path"
+  ): Promise<void> => (target as unknown as {
+    synchronize: (clear?: boolean, followup?: boolean, source?: string, eventPath?: string) => Promise<void>
+  }).synchronize(clear, followup, source, eventPath)
   const waitUntil = async (condition: () => Promise<boolean>) => {
     for (let attempt = 0; attempt < 50 && !(await condition()); attempt++) await new Promise((resolve) => setTimeout(resolve, 200))
   }
@@ -348,6 +358,125 @@ suite("Persistent workspace intelligence index", () => {
       repository.close()
     }
   })
+  test("WorkspaceIndex routine diagnostics require twinny.debug.workspaceindex", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const config = vscode.workspace.getConfiguration("twinny")
+    const previous = config.get<boolean>("debug.workspaceindex", false)
+    const debug = logger.debug
+    const messages: string[] = []
+    logger.debug = (message) => messages.push(message)
+    try {
+      await config.update("debug.workspaceindex", false, vscode.ConfigurationTarget.Global)
+      await index.rebuild()
+      assert.equal(messages.some((message) => message.includes("[WorkspaceIndex]")), false)
+      messages.length = 0
+      await config.update("debug.workspaceindex", true, vscode.ConfigurationTarget.Global)
+      await index.rebuild()
+      assert.equal(messages.some((message) => message.includes("[WorkspaceIndex] operation=")), true)
+    } finally {
+      logger.debug = debug
+      await config.update("debug.workspaceindex", previous, vscode.ConfigurationTarget.Global)
+    }
+  })
+
+  test("a burst of identical synchronization requests is one idle operation and one pass", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    await index.rebuild()
+    const synchronized = index.snapshot.lastSynchronized
+    const requests = Array.from({ length: 12 }, () => requestSynchronization(index, false, false, "test-burst"))
+    await Promise.all(requests)
+    assert.equal(index.snapshot.syncRequests, 13, "the explicit rebuild and burst requests are counted")
+    assert.equal(index.snapshot.syncCoalesced, 11, "all idle burst calls start one operation")
+    assert.equal(index.snapshot.syncScanPasses, 2, "the rebuild and coalesced idle request do not add scans")
+    assert.ok(index.snapshot.lastSynchronized && index.snapshot.lastSynchronized >= synchronized!)
+  })
+
+  test("a burst during an active scan coalesces to at most one follow-up pass", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const scan = index.rebuild()
+    await waitUntil(async () => (index.snapshot.status === "scanning" || index.snapshot.status === "indexing") && index.snapshot.filesDiscovered >= 1)
+    const passBefore = index.snapshot.syncScanPasses
+    await Promise.all(Array.from({ length: 20 }, () => requestSynchronization(index, false, true, "test-active-burst")))
+    await scan
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(index.snapshot.syncScanPasses - passBefore, 1, "active burst produces at most one follow-up pass")
+  })
+
+  test("a file change during a scan is reflected after the scan", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    const file = path.join(root, "src", "arrives-during-scan.ts")
+    const scan = index.rebuild()
+    await waitUntil(async () => (index.snapshot.status === "scanning" || index.snapshot.status === "indexing") && index.snapshot.filesDiscovered >= 1)
+    fs.writeFileSync(file, "export const arrivesDuringScan = true\n")
+    assert.deepEqual(await index.refresh([{ path: file, kind: "write" }]), { status: "synced" })
+    await scan
+    assert.ok((await index.search({ query: "arrivesDuringScan", mode: "literal" }, root)).total > 0)
+  })
+
+  test("internal SQLite WAL SHM and journal events do not queue synchronization", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    await index.rebuild()
+    const before = index.snapshot.syncRequests
+    const database = new BetterSqlite(path.join(storage, "project.sqlite"))
+    try {
+      database.pragma("journal_mode = WAL")
+      database.exec("CREATE TABLE IF NOT EXISTS workspace_index_watcher_probe(id INTEGER)")
+      database.exec("INSERT INTO workspace_index_watcher_probe(id) VALUES (1)")
+    } finally {
+      database.close()
+    }
+    for (const suffix of ["-wal", "-shm", "-journal", ".tmp", ".bak"]) {
+      const uri = vscode.Uri.file(path.join(storage, `project.sqlite${suffix}`))
+      const isInternal = (index as unknown as { isInternalStorageArtifact: (uri: vscode.Uri) => boolean }).isInternalStorageArtifact(uri)
+      assert.equal(isInternal, true, `internal artifact ${suffix} is recognized`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(index.snapshot.syncRequests, before, "internal SQLite events add no synchronization requests")
+  })
+
+  test("disposal cancels scheduling and starts no new synchronization", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    await index.rebuild()
+    index.dispose()
+    const passCount = index.snapshot.syncScanPasses
+    await requestSynchronization(index, false, true, "after-dispose")
+    await index.rebuild()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(index.snapshot.syncScanPasses, passCount)
+  })
+
+  test("multiple independent file changes remain searchable after targeted refresh", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    await index.rebuild()
+    const files = [
+      path.join(root, "src", "independent-a.ts"),
+      path.join(root, "src", "independent-b.ts")
+    ]
+    fs.writeFileSync(files[0], "export const independentChangeA = 1\n")
+    fs.writeFileSync(files[1], "export const independentChangeB = 2\n")
+    await index.refresh(files.map((file) => ({ path: file, kind: "write" as const })))
+    assert.ok((await index.search({ query: "independentChangeA", mode: "literal" }, root)).total > 0)
+    assert.ok((await index.search({ query: "independentChangeB", mode: "literal" }, root)).total > 0)
+  })
+
+  test("explicit clear rebuild retains clear semantics and searches rebuilt content", async function () {
+    this.timeout(120000)
+    index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))
+    await index.rebuild()
+    const file = path.join(root, "src", "clear-rebuild.ts")
+    fs.writeFileSync(file, "export const clearRebuildMarker = true\n")
+    await index.clearAndRebuild()
+    assert.equal(index.snapshot.status, "ready")
+    assert.ok((await index.search({ query: "clearRebuildMarker", mode: "literal" }, root)).total > 0)
+  })
+
   test("refresh makes an edited file searchable immediately, with no polling", async function () {
     this.timeout(120000)
     index = new WorkspaceIntelligenceIndex(path.join(storage, "project.sqlite"))

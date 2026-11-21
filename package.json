@@ -563,6 +563,11 @@
           "default": true,
           "markdownDescription": "Automatically synchronize the workspace index on activation and relevant workspace changes."
         },
+        "twinny.debug.workspaceindex": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable detailed debug diagnostics for WorkspaceIndex synchronization operations."
+        },
         "twinny.indexing.include": {
           "type": "array",
           "items": { "type": "string" },

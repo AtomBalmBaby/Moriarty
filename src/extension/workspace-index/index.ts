@@ -36,6 +36,9 @@ export interface WorkspaceIndexState {
   lastSynchronized?: string
   fts5: boolean
   error?: string
+  syncRequests: number
+  syncCoalesced: number
+  syncScanPasses: number
 }
 
 export interface WorkspaceSearchRequest {
@@ -186,6 +189,11 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   private activeOperationId?: string
   private repeatAfterCurrent = false
   private clearAfterCurrent = false
+  private syncRequests = 0
+  private syncCoalesced = 0
+  private syncScanPasses = 0
+  private readonly syncRequestSources = new Set<string>()
+  private operationSyncSources = new Set<string>()
   private paused = false
   private disposed = false
   private readonly dirtyUris = new Set<string>()
@@ -211,7 +219,8 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     symbolsIndexed: 0, filesPending: 0, filesSkipped: 0, filesFailed: 0,
     storageBytes: 0, sqliteCacheLimitBytes: 16 * 1024 * 1024,
     activeSourceBytes: 0, peakSourceBytes: 0, activeWorkers: 0, queueDepth: 0,
-    symbolProviderCalls: 0, discoveryComplete: false, fts5: false
+    symbolProviderCalls: 0, discoveryComplete: false, fts5: false,
+    syncRequests: 0, syncCoalesced: 0, syncScanPasses: 0
   }
 
   constructor(location: SqliteLocation) {
@@ -219,18 +228,18 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     this.listeners.push(
       vscode.workspace.onDidSaveTextDocument((document) => {
         this.dirtyUris.delete(document.uri.toString())
-        this.handleFileChange(document.uri)
+        this.handleFileChange(document.uri, "text-document-save")
       }),
       vscode.workspace.onDidChangeTextDocument((event) => {
         if (this.isEligibleUri(event.document.uri)) this.dirtyUris.add(event.document.uri.toString())
       }),
       vscode.workspace.onDidCloseTextDocument((document) => {
         this.dirtyUris.delete(document.uri.toString())
-        if (this.automaticSyncEnabled()) this.scheduleUris([document.uri])
+        if (this.automaticSyncEnabled()) this.scheduleUris([document.uri], "text-document-close")
       }),
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
         this.resetFileWatchers()
-        if (this.automaticSyncEnabled()) void this.synchronize(false, true)
+        if (this.automaticSyncEnabled()) void this.synchronize(false, true, "workspace-folders")
       }),
       vscode.workspace.onDidChangeConfiguration((event) => {
         const watcherConfigurationChanged = event.affectsConfiguration("twinny.indexing.enabled") ||
@@ -246,7 +255,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         if (watcherConfigurationChanged || event.affectsConfiguration("twinny.contentHash.algorithm") ||
           event.affectsConfiguration("twinny.indexing.exclude") || event.affectsConfiguration("twinny.indexing.maxFileSize") ||
           event.affectsConfiguration("files.exclude") || event.affectsConfiguration("search.exclude")) {
-          void this.synchronize(false, true)
+          void this.synchronize(false, true, "configuration")
         }
       })
     )
@@ -267,7 +276,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       return
     }
     await this.initialize()
-    if (vscode.workspace.getConfiguration("twinny").get<boolean>("indexing.auto", true)) void this.synchronize()
+    if (vscode.workspace.getConfiguration("twinny").get<boolean>("indexing.auto", true)) void this.synchronize(false, false, "startup")
     else this.update({ status: this.state.lastSynchronized ? "paused" : "not-initialized" })
   }
 
@@ -283,7 +292,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       this.update({ status: "indexing" })
       return
     }
-    void this.synchronize()
+    void this.synchronize(false, false, "resume")
   }
 
   async rebuild(): Promise<void> {
@@ -291,7 +300,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       this.update({ status: "disabled" })
       return
     }
-    await this.synchronize(true)
+    await this.synchronize(true, false, "explicit-rebuild")
   }
 
   async clearAndRebuild(): Promise<void> {
@@ -365,50 +374,87 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     }
   }
 
-  private synchronize(clear = false, repeatAfterCurrent = false): Promise<void> {
+  private synchronize(clear = false, repeatAfterCurrent = false, source = "unknown", eventPath = "none"): Promise<void> {
     if (this.disposed) return Promise.resolve()
     if (!this.projectAvailable()) {
       this.update({ status: "not-initialized" })
       return Promise.resolve()
     }
+    const operationRequestStart = this.syncRequests
+    const operationCoalescedStart = this.syncCoalesced
+    this.syncRequests += 1
+    this.syncRequestSources.add(source)
+    this.update({ syncRequests: this.syncRequests, syncCoalesced: this.syncCoalesced, syncScanPasses: this.syncScanPasses })
     if (this.synchronizing) {
-      logger.info(`[WorkspaceIndex] operation=${this.activeOperationId ?? "unknown"} coalesced request clear=${clear} followup=${repeatAfterCurrent}`)
+      this.syncCoalesced += 1
+      this.update({ syncRequests: this.syncRequests, syncCoalesced: this.syncCoalesced, syncScanPasses: this.syncScanPasses })
+      this.operationSyncSources.add(source)
+      this.workspaceIndexDebug(`[WorkspaceIndex] operation=${this.activeOperationId ?? "unknown"} coalesced request clear=${clear} followup=${repeatAfterCurrent} source=${source} event_path=${eventPath}`)
       if (clear) {
         this.clearAfterCurrent = true
-        this.scanController?.abort()
-      } else if (repeatAfterCurrent) this.repeatAfterCurrent = true
+      } else if (repeatAfterCurrent && this.scanning) {
+        this.repeatAfterCurrent = true
+      }
       return this.synchronizing
     }
     const operationId = randomUUID()
     const operationStartedAt = Date.now()
+    let operationPassCount = 0
     this.activeOperationId = operationId
-    logger.info(`[WorkspaceIndex] operation=${operationId} start clear=${clear} active_operations=1 inference_requests=0`)
+    this.operationSyncSources = new Set([source])
+    this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} start clear=${clear} source=${source} active_operations=1 inference_requests=0`)
     const operation = (async () => {
       let clearNext = clear
       let pass = 0
+      let clearTaken = clear
+      let followupTaken = false
+      let followupPassCount = 0
+      let anotherPass = false
       do {
         pass += 1
+        operationPassCount = pass
         this.repeatAfterCurrent = false
         this.clearAfterCurrent = false
         const controller = new AbortController()
         this.scanController = controller
         const scanId = randomUUID()
-        logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} pass=${pass} start`)
-        const scan = this.scan(clearNext, controller.signal, operationId, scanId)
+        this.syncScanPasses += 1
+        this.update({ syncRequests: this.syncRequests, syncCoalesced: this.syncCoalesced, syncScanPasses: this.syncScanPasses })
+        this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} scan=${scanId} pass=${pass} start source=${source}`)
+        const clearThisPass = clearNext
+        const scan = this.scan(clearThisPass, controller.signal, operationId, scanId)
         this.scanning = scan
         try {
           await scan
-          logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} terminal=${controller.signal.aborted ? "cancelled" : this.state.status} duration_ms=${Date.now() - operationStartedAt}`)
+          this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} scan=${scanId} terminal=${controller.signal.aborted ? "cancelled" : this.state.status} duration_ms=${Date.now() - operationStartedAt}`)
         } finally {
           if (this.scanning === scan) this.scanning = undefined
           if (this.scanController === controller) this.scanController = undefined
         }
-        clearNext = this.clearAfterCurrent
-      } while (!this.disposed && (clearNext || (!this.paused && this.automaticSyncEnabled() && this.repeatAfterCurrent)))
+        const clearRequested = this.clearAfterCurrent
+        const followupRequested = this.repeatAfterCurrent
+        if (clearRequested && !clearTaken) {
+          clearTaken = true
+          clearNext = true
+          anotherPass = true
+        } else if (followupRequested && !followupTaken) {
+          followupTaken = true
+          followupPassCount += 1
+          clearNext = false
+          anotherPass = true
+        } else if (followupRequested && followupPassCount < 1) {
+          followupPassCount += 1
+          clearNext = false
+          anotherPass = true
+        } else {
+          clearNext = false
+          anotherPass = false
+        }
+      } while (!this.disposed && !this.paused && this.automaticSyncEnabled() && anotherPass)
     })().finally(() => {
       if (this.synchronizing === operation) this.synchronizing = undefined
       if (this.activeOperationId === operationId) this.activeOperationId = undefined
-      logger.info(`[WorkspaceIndex] operation=${operationId} terminal=${this.disposed ? "disposed" : this.state.status} duration_ms=${Date.now() - operationStartedAt} active_operations=0 inference_requests=0`)
+      this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} terminal=${this.disposed ? "disposed" : this.state.status} duration_ms=${Date.now() - operationStartedAt} requests=${this.syncRequests - operationRequestStart} coalesced=${this.syncCoalesced - operationCoalescedStart} scan_passes=${operationPassCount} sources=${[...this.operationSyncSources].join(",")} active_operations=0 inference_requests=0`)
     })
     this.synchronizing = operation
     return operation
@@ -427,12 +473,18 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     this.updateTimer = undefined
     this.pendingUris.clear()
     this.update({ status, filesPending: 0, queueDepth: 0 })
-    logger.info(`Workspace indexing ${status}; queued file work cancelled`)
+    this.workspaceIndexDebug(`Workspace indexing ${status}; queued file work cancelled`)
   }
 
   private automaticSyncEnabled(): boolean {
     const config = vscode.workspace.getConfiguration("twinny")
     return !this.disposed && !this.paused && config.get<boolean>("indexing.enabled", true) && config.get<boolean>("indexing.auto", true)
+  }
+
+  private workspaceIndexDebug(message: string): void {
+    if (vscode.workspace.getConfiguration("twinny").get<boolean>("debug.workspaceindex", false)) {
+      logger.debug(message)
+    }
   }
 
   private resetFileWatchers(): void {
@@ -456,30 +508,42 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     }
   }
 
-  private handleFileChange(uri: vscode.Uri): void {
+  private handleFileChange(uri: vscode.Uri, source = "file-watcher"): void {
     if (!this.automaticSyncEnabled()) return
+    if (this.isInternalStorageArtifact(uri)) {
+      this.workspaceIndexDebug(`[WorkspaceIndex] ignored internal storage file event path=${uri.fsPath || uri.path} type=change`)
+      return
+    }
     if (uri.path.endsWith("/.gitignore")) {
-      void this.synchronize(false, true)
+      void this.synchronize(false, true, "gitignore-change")
       return
     }
     void vscode.workspace.fs.stat(uri).then((stat) => {
       if (!this.automaticSyncEnabled()) return
-      if (stat.type & vscode.FileType.Directory) void this.synchronize(false, true)
-      else this.scheduleUris([uri])
+      if (this.isInternalStorageArtifact(uri)) return
+      if (stat.type & vscode.FileType.Directory) {
+        this.workspaceIndexDebug(`[WorkspaceIndex] ignored directory file event path=${uri.fsPath || uri.path} type=directory`)
+        return
+      }
+      else this.scheduleUris([uri], source)
     }, (error) => {
       const message = error instanceof Error ? error.message : String(error)
-      if (/FileNotFound|ENOENT/i.test(message)) logger.debug(`Workspace file changed then disappeared: ${uri.toString()}`)
+      if (/FileNotFound|ENOENT/i.test(message)) this.workspaceIndexDebug(`Workspace file changed then disappeared: ${uri.toString()}`)
       else this.reportError(`Could not stat changed workspace file ${uri.toString()}`, error)
     })
   }
 
   private handleFileDelete(uri: vscode.Uri): void {
     if (!this.automaticSyncEnabled()) return
-    if (uri.path.endsWith("/.gitignore")) void this.synchronize(false, true)
+    if (this.isInternalStorageArtifact(uri)) {
+      this.workspaceIndexDebug(`[WorkspaceIndex] ignored internal storage file event path=${uri.fsPath || uri.path} type=delete`)
+      return
+    }
+    if (uri.path.endsWith("/.gitignore")) void this.synchronize(false, true, "gitignore-delete")
     else void this.deleteUris([uri.toString()]).catch((error) => this.reportError("Workspace index deletion failed", error))
   }
 
-  private scheduleUris(uris: readonly vscode.Uri[]): void {
+  private scheduleUris(uris: readonly vscode.Uri[], source = "file-watcher"): void {
     if (!this.automaticSyncEnabled()) return
     let added = 0
     for (const uri of uris) {
@@ -490,8 +554,9 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       added += 1
     }
     if (!added) return
+    this.workspaceIndexDebug(`[WorkspaceIndex] queued targeted file updates source=${source} count=${added} unique_pending=${this.pendingUris.size}`)
     this.update({ queueDepth: this.pendingUris.size, filesPending: this.pendingUris.size })
-    if (this.pendingUris.size === added || this.pendingUris.size % 100 === 0) logger.debug(`Workspace index change queue: ${this.pendingUris.size} unique files`)
+    if (this.pendingUris.size === added || this.pendingUris.size % 100 === 0) this.workspaceIndexDebug(`Workspace index change queue: ${this.pendingUris.size} unique files`)
     if (this.updateTimer) clearTimeout(this.updateTimer)
     this.updateTimer = setTimeout(() => {
       this.updateTimer = undefined
@@ -529,7 +594,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
           await this.refreshCounts()
           const duration = Date.now() - startedAt
           this.update({ status: "ready", discoveryComplete: true, lastSynchronized: synchronizedAt, lastIndexDurationMs: duration, storageBytes: await this.measureDatabaseSize() })
-          logger.info(`Workspace incremental sync completed: ${processed} coalesced file updates in ${duration}ms`)
+          this.workspaceIndexDebug(`Workspace incremental sync completed: ${processed} coalesced file updates in ${duration}ms`)
         }
       } catch (error) {
         if (!controller.signal.aborted) this.reportError("Workspace incremental synchronization failed", error)
@@ -669,7 +734,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
           }
           if (source === "index") await this.cacheSymbols(candidate.uri, candidate.fingerprint, symbols)
           const elapsed = Date.now() - startedAt
-          if (elapsed >= 1000) logger.info(`Workspace symbol lookup took ${elapsed}ms for ${doc.relative_path}`)
+          if (elapsed >= 1000) this.workspaceIndexDebug(`Workspace symbol lookup took ${elapsed}ms for ${doc.relative_path}`)
         }
       }
       for (const document of vscode.workspace.textDocuments) {
@@ -717,7 +782,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         await eachRow<{ uri: string; text: string }>(database, sql, values, visitContent)
       } catch (error) {
         if (mode !== "auto" || !this.state.fts5) throw error
-        logger.debug(`Workspace FTS query fell back to literal matching: ${error instanceof Error ? error.message : String(error)}`)
+        this.workspaceIndexDebug(`Workspace FTS query fell back to literal matching: ${error instanceof Error ? error.message : String(error)}`)
         await eachRow<{ uri: string; text: string }>(database, "SELECT uri,text FROM documents WHERE skip_reason IS NULL AND error IS NULL AND instr(lower(text),lower(?))>0", [firstTerm], visitContent)
       }
       for (const document of vscode.workspace.textDocuments) {
@@ -873,6 +938,15 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     try {
       await this.initialize()
       this.throwIfCancelled(signal)
+      if (_clear) {
+        await this.withWrite(async () => {
+          transaction(this.database!, () => {
+            if (this.state.fts5) run(this.database!, "DELETE FROM documents_fts")
+            run(this.database!, "DELETE FROM symbols")
+            run(this.database!, "DELETE FROM documents")
+          })
+        })
+      }
       const config = vscode.workspace.getConfiguration("twinny")
       const include = config.get<string[]>("indexing.include", ["**/*"])
       const exclude = [...DEFAULT_EXCLUDES, ...config.get<string[]>("indexing.exclude", []), ...vscodeExcludePatterns()]
@@ -908,7 +982,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       let indexed = 0
       let lastProgressUpdate = 0
       this.update({ status: "indexing", filesIndexed: 0, filesPending: 0, queueDepth: 0 })
-      logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} discovered workspace_folders=${folders.length}`)
+      this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} scan=${scanId} discovered workspace_folders=${folders.length}`)
       const work = (async function* (index: WorkspaceIntelligenceIndex): AsyncGenerator<{ uri: vscode.Uri; folder: vscode.WorkspaceFolder; ignored: boolean; skipReason?: string }> {
         for (const folder of folders) {
           for await (const item of index.discoverFiles(folder, include, exclude, signal)) yield { ...item, folder }
@@ -947,7 +1021,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
         throw error
       }
       if (this.isCancelled(signal)) {
-        logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} cancelled completed_files=${completed} queued_work=stopped`)
+        this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} scan=${scanId} cancelled completed_files=${completed} queued_work=stopped`)
         return
       }
       const activeWorkspaceUris = [...(vscode.workspace.workspaceFolders ?? [])].map((folder) => folder.uri.toString())
@@ -975,10 +1049,10 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       await this.refreshCounts()
       const duration = Date.now() - startedAt
       this.update({ status: this.paused ? "paused" : "ready", filesPending: 0, queueDepth: 0, activeWorkers: 0, activeSourceBytes: 0, currentIndexDurationMs: undefined, lastIndexDurationMs: duration, storageBytes: await this.measureDatabaseSize(), lastSynchronized: synchronizedAt, discoveryComplete: true, filesDiscovered: discovered })
-      logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} completed indexed=${indexed} discovered=${discovered} duration_ms=${duration} database_bytes=${this.state.storageBytes} peak_source_bytes=${this.state.peakSourceBytes} inference_requests=0`)
+      this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} scan=${scanId} completed indexed=${indexed} discovered=${discovered} duration_ms=${duration} database_bytes=${this.state.storageBytes} peak_source_bytes=${this.state.peakSourceBytes} inference_requests=0`)
     } catch (error) {
       if (this.isCancelled(signal)) {
-        logger.info(`[WorkspaceIndex] operation=${operationId} scan=${scanId} cancelled before completion`)
+        this.workspaceIndexDebug(`[WorkspaceIndex] operation=${operationId} scan=${scanId} cancelled before completion`)
         return
       }
       const message = error instanceof Error ? error.message : String(error)
@@ -1082,7 +1156,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       }
       walk(symbols)
       const elapsed = Date.now() - startedAt
-      if (elapsed >= 1000) logger.info(`Workspace symbol provider took ${elapsed}ms for ${uri.toString()}`)
+      if (elapsed >= 1000) this.workspaceIndexDebug(`Workspace symbol provider took ${elapsed}ms for ${uri.toString()}`)
       return result
     } catch (error) {
       if (signal?.aborted || this.disposed) throw error
@@ -1153,9 +1227,26 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     const config = vscode.workspace.getConfiguration("twinny")
     const include = config.get<string[]>("indexing.include", ["**/*"])
     const exclude = [...DEFAULT_EXCLUDES, ...config.get<string[]>("indexing.exclude", []), ...vscodeExcludePatterns()]
-    return include.some((pattern) => matches(localPath, pattern)) &&
+    return !this.isInternalStorageArtifact(uri) &&
+      include.some((pattern) => matches(localPath, pattern)) &&
       !exclude.some((pattern) => matches(localPath, pattern)) &&
       !isGitIgnored(localPath, this.ignoredRules.get(folder.uri.toString()) ?? [])
+  }
+
+  private isInternalStorageArtifact(uri: vscode.Uri): boolean {
+    const fsPath = path.resolve(uri.fsPath)
+    const databasePath = this.file.filePath ? path.resolve(this.file.filePath) : ""
+    if (databasePath) {
+      if (fsPath === databasePath || fsPath.startsWith(databasePath + "-") ||
+        fsPath === `${databasePath}-journal` || fsPath.endsWith(".tmp") || fsPath.endsWith(".bak")) return true
+      const storageDirectory = path.dirname(databasePath)
+      if (path.dirname(fsPath) === storageDirectory) {
+        const basename = path.basename(fsPath)
+        if (/^(?:project\.sqlite|[^/]+\.sqlite)(?:-(?:wal|shm|journal)|\.tmp|\.bak)?$/i.test(basename)) return true
+      }
+    }
+    const normalized = fsPath.replace(/\\/g, "/")
+    return /\/\.twinny\/project\.sqlite(?:-(?:wal|shm|journal)|\.tmp|\.bak)?$/i.test(normalized)
   }
 
   private folderFor(uri: vscode.Uri): vscode.WorkspaceFolder | undefined {
