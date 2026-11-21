@@ -17,6 +17,7 @@ import {
   isOpenAICompatibleProvider
 } from "../../../common/provider-validation"
 import { TwinnyProvider } from "../../../common/types"
+import { diagnosticEvent } from "../../diagnostics"
 import {
   activeInferenceRequestSnapshot,
   createInferenceAttemptId,
@@ -658,6 +659,16 @@ export async function* fluencyChat(
   const trace = createInferenceTrace(options?.trace)
   if (supportsStreaming(config)) {
     const body = buildStreamingRequest(config, messages, request)
+    diagnosticEvent("prompts", "provider.boundary.request", {
+      operationId: trace.operationId,
+      requestId: trace.requestId,
+      step: trace.toolLoopStep
+    }, { provider: config.provider, model: body.model, payload: body })
+    diagnosticEvent("transport", "provider.boundary.raw_request", {
+      operationId: trace.operationId,
+      requestId: trace.requestId,
+      step: trace.toolLoopStep
+    }, { provider: config.provider, model: body.model, payload: body })
     logRequest(`${config.provider}/chat.completions (stream)`, body)
     let attemptNumber = 1
     if (options?.signal?.aborted) {
@@ -755,6 +766,11 @@ export async function* fluencyChat(
     let terminalState = "completed"
     try {
       for await (const part of parts) {
+        diagnosticEvent("transport", "provider.raw_event", {
+          operationId: trace.operationId,
+          requestId: trace.requestId,
+          step: trace.toolLoopStep
+        }, { part })
         if (options?.signal?.aborted) {
           inferenceEvent(
             "provider_attempt.late_stream_chunk",
@@ -781,16 +797,41 @@ export async function* fluencyChat(
           })
         }
         const delta = part.choices[0]?.delta?.content
+        if (delta) diagnosticEvent("transport", "provider.assistant.delta", {
+          operationId: trace.operationId,
+          requestId: trace.requestId,
+          step: trace.toolLoopStep
+        }, { delta })
         toolCalls.add(
           (part.choices[0]?.delta as { tool_calls?: unknown } | undefined)
             ?.tool_calls
         )
         const reasoning = reasoningOf(part.choices[0]?.delta)
+        if (reasoning) diagnosticEvent("thinking", "provider.reasoning.delta", {
+          operationId: trace.operationId,
+          requestId: trace.requestId,
+          step: trace.toolLoopStep
+        }, { delta: reasoning })
         const usage = usageFromResponse(
           part as unknown as { usage?: StreamResponse["usage"] }
         )
+        if (usage) diagnosticEvent("transport", "provider.usage", {
+          operationId: trace.operationId,
+          requestId: trace.requestId,
+          step: trace.toolLoopStep
+        }, usage)
         const finishReason = finishReasonOf(part.choices[0]?.finish_reason)
         const calls = finishReason ? toolCalls.take() : undefined
+        if (finishReason) diagnosticEvent("transport", "provider.finish", {
+          operationId: trace.operationId,
+          requestId: trace.requestId,
+          step: trace.toolLoopStep
+        }, { finishReason })
+        if (calls) diagnosticEvent("transport", "provider.tool_calls.delta", {
+          operationId: trace.operationId,
+          requestId: trace.requestId,
+          step: trace.toolLoopStep
+        }, { toolCalls: calls })
         const extras = {
           ...(reasoning ? { reasoning } : {}),
           ...(finishReason ? { finishReason } : {}),

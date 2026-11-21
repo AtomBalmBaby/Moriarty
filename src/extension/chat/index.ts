@@ -51,6 +51,7 @@ import { composeAgentPrompt } from "../agents/prompt"
 import type { LoadedAgent } from "../agents/registry"
 import { AgentRegistry } from "../agents/registry"
 import { agentToolSelectionDiagnostic, projectTaskRelevantTools, resolveAgentToolSelection } from "../agents/tool-selection"
+import { diagnosticCategoryEnabled, diagnosticEvent, setDiagnosticStorageDirectory } from "../diagnostics"
 import type { EditorVisibility } from "../edit/line-edit"
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
@@ -401,6 +402,7 @@ export class Chat extends Base {
     editOwnerId: string = hostEditOwnerId
   ) {
     super(extensionContext)
+    setDiagnosticStorageDirectory(extensionContext.globalStorageUri.fsPath)
     this._generations = generations
     this._extensionContext = extensionContext
     this._todoRepository = todoRepository
@@ -449,7 +451,18 @@ export class Chat extends Base {
         ...(this._generation.cancellationReason ? { cancellationReason: this._generation.cancellationReason } : {}),
         ...(operationId !== undefined && this._interrupted === operationId ? { paused: true } : {})
       }),
-      (event, operationId, detail) => logger.debug(`[Operation] ${event} operation=${operationId} conversation=${this._activeConversationId ?? "-"}${detail ? " " + detail : ""}`)
+      (event, operationId, detail) => {
+        logger.debug(`[Operation] ${event} operation=${operationId} conversation=${this._activeConversationId ?? "-"}${detail ? " " + detail : ""}`)
+        diagnosticEvent("agent", event, {
+          conversationId: this._activeConversationId,
+          operationId,
+          agentId: this._activeAgent?.summary.id
+        }, {
+          detail,
+          provider: this._activeProviderIdentity(),
+          terminalReason: event === "operation.terminal" ? detail ?? "completed" : undefined
+        })
+      }
     )
     this._context = new ChatContextBuilder(extensionContext, bridge, new TemplateProvider(templateDir), search)
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
@@ -884,6 +897,23 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     this._evidencePreflight = undefined
     this._evidencePreflightCheck = undefined
     const provider = this.start()
+    const executionId = `execution-${randomUUID()}`
+    const initialRequestId = `request-${randomUUID()}`
+    const initialRequestText = messages.map((message) => message.prompt ?? message.content).filter((entry): entry is string => typeof entry === "string").join("\n\n")
+    const initialRequestSha256 = createHash("sha256").update(initialRequestText).digest("hex")
+    diagnosticEvent("agent", "agent.execution.started", {
+      conversationId,
+      operationId: this._lifecycle.operationId,
+      requestId: initialRequestId,
+      executionId,
+      agentId: requestedSelection
+    }, {
+      provider: provider?.provider,
+      model: provider?.modelName,
+      initialUserRequestSha256: initialRequestSha256,
+      ...(diagnosticCategoryEnabled("prompts") ? { initialUserRequest: initialRequestText } : {}),
+      continuation: continuation ?? null
+    })
     // Run even without a provider, so the webview receives a terminal and the user sees why nothing ran.
     return this.operate(async () => {
       if (!provider) {
@@ -1247,6 +1277,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    */
   private agentMode(): boolean {
     return !currentTeamPolicy()?.agent?.off && isAgentSelectionEnabled(this._requestAgentSelection)
+  }
+
+  private _activeProviderIdentity(): { provider?: string; model?: string } {
+    const provider = this.getProvider()
+    return provider
+      ? { provider: provider.provider, model: provider.modelName }
+      : {}
   }
 
   private async currentAgentSelection(requested?: AgentSelection): Promise<AgentSelection> {

@@ -568,6 +568,55 @@
           "default": false,
           "markdownDescription": "Enable detailed debug diagnostics for WorkspaceIndex synchronization operations."
         },
+        "twinny.debug.agent": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable Moriarty agent lifecycle diagnostic tracing."
+        },
+        "twinny.debug.prompts": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable complete Moriarty prompt and provider request payload tracing."
+        },
+        "twinny.debug.thinking": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable reasoning and thinking content tracing returned by providers."
+        },
+        "twinny.debug.toolcalls": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable complete native and MCP tool invocation and result tracing."
+        },
+        "twinny.debug.transport": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable provider transport event, stream delta, usage and parser tracing."
+        },
+        "twinny.debug.traceDirectory": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional local directory for Moriarty JSONL diagnostic traces. When empty, Twinny uses its user-scoped extension storage."
+        },
+        "twinny.debug.traceRetentionDays": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 365,
+          "default": 7,
+          "markdownDescription": "Retain Moriarty diagnostic trace files for this many days."
+        },
+        "twinny.debug.traceMaxBytes": {
+          "type": "integer",
+          "minimum": 1048576,
+          "maximum": 1073741824,
+          "default": 104857600,
+          "markdownDescription": "Maximum Moriarty diagnostic storage in bytes before oldest traces are removed."
+        },
+        "twinny.debug.unredacted": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Disabled by default. Unredacted diagnostics explicitly allow sensitive prompt, tool and reasoning content; known credentials are still never written."
+        },
         "twinny.indexing.include": {
           "type": "array",
           "items": { "type": "string" },

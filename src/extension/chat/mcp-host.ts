@@ -7,6 +7,7 @@
  * server did.
  */
 import { logger } from "../../common/logger"
+import { diagnosticEvent } from "../diagnostics"
 import { MANY_MCP_TOOLS, McpClient, McpServerConfig, McpToolSpec, mcpToolSpecs } from "../tools/mcp"
 import type { McpSink, ToolResult } from "../tools/workspace"
 
@@ -186,22 +187,56 @@ export class McpHost {
       tools: permitted,
       call: async (tool, args, context): Promise<ToolResult> => {
         const label = `${tool.server}/${tool.tool}`
+        const startedAt = Date.now()
         if (!allowed.has(label)) {
-          return { output: `The MCP capability ${label} is not permitted for this agent.`, summary: `\`${label}\` failed · not permitted`, failed: true }
+          const result = { output: `The MCP capability ${label} is not permitted for this agent.`, summary: `\`${label}\` failed · not permitted`, failed: true }
+          diagnosticEvent("toolcalls", "tool.approval_or_execution", context?.diagnostic ?? {}, {
+            toolName: label,
+            implementationType: "mcp",
+            server: tool.server,
+            mcpTool: tool.tool,
+            parsedArguments: args,
+            authorizationDecision: "not-permitted",
+            result,
+            durationMs: Date.now() - startedAt
+          })
+          return result
         }
         if (!isServerEnabled(this._servers()?.[tool.server])) {
-          return {
+          const result = {
             output: `The MCP server ${tool.server} is disabled or not configured.`,
             summary: `\`${label}\` failed · server disabled`,
             failed: true
           }
+          diagnosticEvent("toolcalls", "tool.approval_or_execution", context?.diagnostic ?? {}, {
+            toolName: label,
+            implementationType: "mcp",
+            server: tool.server,
+            mcpTool: tool.tool,
+            parsedArguments: args,
+            authorizationDecision: "server-disabled",
+            result,
+            durationMs: Date.now() - startedAt
+          })
+          return result
         }
         if (!autoApprove() && !(await approve(`${label} ${JSON.stringify(args)}`, tool))) {
-          return {
+          const result = {
             output: "The user chose not to run this tool. Carry on without it, or ask the user.",
             summary: `\`${label}\` skipped`,
             failed: true
           }
+          diagnosticEvent("toolcalls", "tool.approval_or_execution", context?.diagnostic ?? {}, {
+            toolName: label,
+            implementationType: "mcp",
+            server: tool.server,
+            mcpTool: tool.tool,
+            parsedArguments: args,
+            authorizationDecision: "denied",
+            result,
+            durationMs: Date.now() - startedAt
+          })
+          return result
         }
         const running = this._running.get(tool.server)
         if (!running) {
@@ -210,14 +245,37 @@ export class McpHost {
         try {
           const result = await running.client.callTool(tool.tool, args, context?.signal)
           const output = result.text.trim() || "(no output)"
-          return {
+          const toolResult: ToolResult = {
             output: result.isError ? `The tool reported an error:\n${output}` : output,
             summary: `\`${label}\` · ${result.isError ? `error · ${firstLine(output)}` : firstLine(output) || "done"}`,
             ...(result.isError ? { failed: true } : {})
           }
+          diagnosticEvent("toolcalls", "tool.approval_or_execution", context?.diagnostic ?? {}, {
+            toolName: label,
+            implementationType: "mcp",
+            server: tool.server,
+            mcpTool: tool.tool,
+            parsedArguments: args,
+            authorizationDecision: "approved",
+            result: toolResult,
+            durationMs: Date.now() - startedAt
+          })
+          return toolResult
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
-          return { output: message, summary: `\`${label}\` failed · ${firstLine(message)}`, failed: true }
+          const result = { output: message, summary: `\`${label}\` failed · ${firstLine(message)}`, failed: true }
+          diagnosticEvent("toolcalls", "tool.approval_or_execution", context?.diagnostic ?? {}, {
+            toolName: label,
+            implementationType: "mcp",
+            server: tool.server,
+            mcpTool: tool.tool,
+            parsedArguments: args,
+            authorizationDecision: "approved",
+            result,
+            error: error instanceof Error ? { name: error.name, message: error.message } : { message },
+            durationMs: Date.now() - startedAt
+          })
+          return result
         }
       }
     }

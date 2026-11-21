@@ -19,6 +19,7 @@
 import { API_PROVIDERS, ASSISTANT, DEFAULT_AGENT_STEPS, OPEN_AI_COMPATIBLE_PROVIDERS, SYSTEM, USER } from "../../common/constants"
 import { logger } from "../../common/logger"
 import { HOSTED_PROVIDERS } from "../../common/provider-validation"
+import { diagnosticEvent } from "../diagnostics"
 import {
   ChatChunk,
   ChatFinishReason,
@@ -738,6 +739,28 @@ class ToolLoop {
       const breakdown = this.measure(sent, context, closing, tools ? definitionChars : 0)
       this._options.onRequest?.(promptChars, step, this._mode, this._estimator.tokens(promptChars), breakdown)
       this._options.onRequestPayload?.(step, { mode: this._mode, messages: sent, tools: tools ?? [] })
+      const limitsBeforeRequest = this._options.generationLimits?.() ?? NO_GENERATION_LIMITS
+      const configuredOutputBeforeRequest = limitsBeforeRequest.maxOutputTokens > 0 ? limitsBeforeRequest.maxOutputTokens : undefined
+      const maxOutputTokensBeforeRequest = configuredOutputBeforeRequest && this._plan
+        ? Math.min(configuredOutputBeforeRequest, Math.max(1, this._plan.reserved))
+        : configuredOutputBeforeRequest
+      const requestId = `${operationId}-request-${++requestSequence}`
+      diagnosticEvent("prompts", "provider.request.effective", {
+        operationId,
+        requestId,
+        step: step + 1
+      }, {
+        provider: this._options.provider,
+        model: request.model,
+        mode: this._mode,
+        messages: sent,
+        tools: tools ?? [],
+        maxOutputTokens: maxOutputTokensBeforeRequest,
+        reasoningEffort: this._effort,
+        temperature: request.temperature,
+        responseFormat: request.responseFormat,
+        closing
+      })
 
       // A step of our own to cut short when a text call closes, without it
       // looking like the user pressed stop.
@@ -745,7 +768,6 @@ class ToolLoop {
       const forward = () => stepAbort.abort(outer?.reason)
       if (outer?.aborted) forward()
       else outer?.addEventListener("abort", forward, { once: true })
-      const requestId = `${operationId}-request-${++requestSequence}`
 
       const limits = this._options.generationLimits?.() ?? NO_GENERATION_LIMITS
       const monitor = new GenerationMonitor(limits)
@@ -793,13 +815,42 @@ class ToolLoop {
           reply.text += chunk.content
           if (typeof chunk.reasoning === "string" && chunk.reasoning) {
             reply.reasoning += chunk.reasoning
+            diagnosticEvent("thinking", "provider.reasoning.delta", {
+              operationId,
+              requestId,
+              step: step + 1
+            }, { delta: chunk.reasoning })
             // Passed on as it arrives, so the chat can show the thinking while it happens.
             yield { content: "", reasoning: chunk.reasoning, reasoningStep: step }
           }
-          if (chunk.toolCalls) reply.toolCalls = [...(reply.toolCalls ?? []), ...chunk.toolCalls]
+          if (chunk.content) diagnosticEvent("transport", "provider.assistant.delta", {
+            operationId,
+            requestId,
+            step: step + 1
+          }, { delta: chunk.content })
+          if (chunk.toolCalls) {
+            reply.toolCalls = [...(reply.toolCalls ?? []), ...chunk.toolCalls]
+            diagnosticEvent("transport", "provider.tool_calls.delta", {
+              operationId,
+              requestId,
+              step: step + 1
+            }, { toolCalls: chunk.toolCalls })
+          }
           if (chunk.usage?.promptTokens) promptTokens = chunk.usage.promptTokens
           if (chunk.usage?.completionTokens) completionTokens = chunk.usage.completionTokens
-          if (chunk.finishReason) finishReason = chunk.finishReason
+          if (chunk.usage) diagnosticEvent("transport", "provider.usage", {
+            operationId,
+            requestId,
+            step: step + 1
+          }, chunk.usage)
+          if (chunk.finishReason) {
+            finishReason = chunk.finishReason
+            diagnosticEvent("transport", "provider.finish", {
+              operationId,
+              requestId,
+              step: step + 1
+            }, { finishReason: chunk.finishReason })
+          }
           // Native mode reads text calls too: qwen3-coder sometimes writes its
           // own call syntax as prose, and Ollama passes it through untouched.
           if (!last) {
@@ -912,6 +963,27 @@ class ToolLoop {
 
       this.count(promptChars, promptTokens, completionTokens)
       if (promptTokens) this._options.onRequestCounted?.(step, breakdown, promptTokens)
+      diagnosticEvent("transport", "provider.response.summary", {
+        operationId,
+        requestId,
+        step: step + 1
+      }, {
+        finishReason,
+        responseClassification: reply.text.trim()
+          ? "visible-text"
+          : reply.reasoning.trim()
+            ? "reasoning-only"
+            : reply.toolCalls?.length
+              ? "tool-calls-only"
+              : "empty",
+        assistantTextLength: reply.text.length,
+        assistantText: reply.text,
+        reasoningLength: reply.reasoning.length,
+        reasoning: reply.reasoning,
+        toolCallCount: reply.toolCalls?.length ?? 0,
+        promptTokens,
+        completionTokens
+      })
       // A reply the output cap cut short may hold half a call: nothing it
       // says is run, and it is not presented as finished.
       if (finishReason === "length") {
@@ -968,6 +1040,36 @@ class ToolLoop {
       for (const [i, pending] of calls.entries()) {
         const id = `${step}.${i}`
         const name = pending.call?.name ?? pending.raw?.name ?? "unknown"
+        const toolCallId = pending.raw?.id
+        const rawArguments = pending.written ?? pending.raw?.arguments
+        const startedAt = Date.now()
+        diagnosticEvent("transport", "tool_call.arguments.repaired", {
+          operationId,
+          requestId,
+          step: step + 1
+        }, {
+          toolCallId,
+          toolName: name,
+          rawArguments,
+          parsedArguments: pending.call?.args ?? null,
+          repairClassification: pending.error ? "invalid" : rawArguments === undefined ? "empty" : "parsed",
+          validationResult: pending.error ? "failed" : "passed",
+          parserDetail: pending.detail
+        })
+        diagnosticEvent("toolcalls", "tool.execution.start", {
+          operationId,
+          requestId,
+          step: step + 1
+        }, {
+          invocationId: id,
+          toolCallId,
+          toolName: name,
+          implementationType: pending.raw ? "native-or-text" : "native-or-text",
+          provider: this._options.provider,
+          model: request.model,
+          rawArguments,
+          parsedArguments: pending.call?.args ?? null
+        })
         this._options.onToolStart?.({ id, name, args: pending.call?.args ?? {} })
         const key = pending.call ? this.answerKey(pending.call) : undefined
         // Anything that may change the workspace makes every earlier read stale.
@@ -1000,7 +1102,7 @@ class ToolLoop {
                   "so it was not run again: its result is above. Use that, or try something different.",
                 summary: `${repeated.summary} · repeated, not run again`
               }
-            : await this.runCall(pending.call, outer)
+            : await this.runCall(pending.call, outer, { operationId, requestId, step: step + 1 })
         if (pending.call && !repeated) await this._options.onToolResult?.(pending.call, ran)
         // A read that failed (a search that ran out of time, a language
         // server still starting) is worth trying again, so it is not kept.
@@ -1047,6 +1149,22 @@ class ToolLoop {
         // A folder's instructions go ahead of the output, where a cut to
         // fit the context does not reach them; the step shows the output.
         const sent = preface ? { ...result, output: `${preface}\n\n${result.output}` } : result
+        diagnosticEvent("toolcalls", "tool.execution.finish", {
+          operationId,
+          requestId,
+          step: step + 1
+        }, {
+          invocationId: id,
+          toolCallId,
+          toolName: name,
+          durationMs: Date.now() - startedAt,
+          rawResult: ran,
+          modelVisibleResult: sent.output,
+          transformation: fitted.length < ran.output.length ? "per-result-cap" : preface ? "preface-added" : "none",
+          failed: !!sent.failed,
+          summary: sent.summary,
+          continuationDecision: settled ? "settled" : this._stuck ? "stuck" : "continue"
+        })
         results.push(sent)
         // The next turn's notes keep what the tool returned; the folder's
         // instructions come again when that turn's tools reach the folder.
@@ -1133,10 +1251,14 @@ class ToolLoop {
   }
 
   /** A tool's result, or a cancellation the moment the user stops the reply: no tool is waited on past that. */
-  private async runCall(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+  private async runCall(
+    call: ToolCall,
+    signal?: AbortSignal,
+    diagnostic?: { operationId?: string; requestId?: string; step?: number }
+  ): Promise<ToolResult> {
     // Checked before dispatch: a stop during an earlier call must not start a later one.
     if (signal?.aborted) throw cancelled(signal.reason)
-    const work = this._workspace.run(call, { signal })
+    const work = this._workspace.run(call, { signal, diagnostic })
     if (!signal) return work
     work.catch(() => undefined)
     let onAbort = () => undefined as void
@@ -1199,6 +1321,13 @@ class ToolLoop {
         if (estimate() <= plan.limit) break
       }
       if (trimmed) this._options.onTrim?.(trimmed, estimate())
+      if (trimmed) diagnosticEvent("agent", "context.compaction", {}, {
+        reason: "context-limit",
+        beforeTokens: this._estimator.tokens(charsOf(this._messages) + extraChars),
+        afterTokens: estimate(),
+        trimmedResults: trimmed,
+        retainedInstructions: this._sections
+      })
       for (const slot of this._results) {
         if (slot.trimmed || slot.step !== newest) continue
         const over = estimate() - plan.limit

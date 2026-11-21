@@ -108,7 +108,15 @@ test("Feedback and Prompt Compiler settings are contributed to the VS Code Setti
     "twinny.promptCompiler.model": { type: "string", default: "" },
     "twinny.promptCompiler.maxTurns": { type: "integer", default: 3 },
     "twinny.promptCompiler.trace": { type: "boolean", default: false },
-    "twinny.toolTrace.fullRequests": { type: "boolean", default: false }
+    "twinny.toolTrace.fullRequests": { type: "boolean", default: false },
+    "twinny.debug.agent": { type: "boolean", default: false },
+    "twinny.debug.prompts": { type: "boolean", default: false },
+    "twinny.debug.thinking": { type: "boolean", default: false },
+    "twinny.debug.toolcalls": { type: "boolean", default: false },
+    "twinny.debug.transport": { type: "boolean", default: false },
+    "twinny.debug.traceRetentionDays": { type: "integer", default: 7 },
+    "twinny.debug.traceMaxBytes": { type: "integer", default: 104857600 },
+    "twinny.debug.unredacted": { type: "boolean", default: false }
   }
   for (const [key, { type, default: fallback }] of Object.entries(expected)) {
     const property = properties[key]

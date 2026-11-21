@@ -9,6 +9,7 @@
  * (see `view.ts`). Every result is capped, and says so, because a small
  * model's context fills after a couple of whole files.
  */
+import { diagnosticEvent } from "../diagnostics"
 import { TodoRepository } from "../todos/repository"
 import { TodoWriteRequest } from "../todos/types"
 
@@ -63,6 +64,11 @@ export interface ToolResult {
 export interface ToolContext {
   signal?: AbortSignal
   write?: OperationAuthorization
+  diagnostic?: {
+    operationId?: string
+    requestId?: string
+    step?: number
+  }
 }
 
 export interface Tool extends ToolSpec {
@@ -957,10 +963,28 @@ export const workspaceTools = (
 
   async function runTool(tool: Tool, call: ToolCall, context?: ToolContext): Promise<ToolResult> {
     let write: OperationAuthorization | undefined
+    const startedAt = Date.now()
+    diagnosticEvent("toolcalls", "tool.native.execution.start", context?.diagnostic ?? {}, {
+      toolName: call.name,
+      implementationType: "native",
+      parsedArguments: call.args,
+      authorizationDecision: "checking"
+    })
     try {
       if (extras.access) {
         const outcome = await extras.access.authorize(accessTargetsOf(call.name, call.args), call.name, context?.signal)
-        if (!outcome.ok) return { output: outcome.message, summary: `${call.name} refused · access not granted`, failed: true }
+        if (!outcome.ok) {
+          const refused = { output: outcome.message, summary: `${call.name} refused · access not granted`, failed: true }
+          diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
+            toolName: call.name,
+            implementationType: "native",
+            parsedArguments: call.args,
+            authorizationDecision: "denied",
+            durationMs: Date.now() - startedAt,
+            result: refused
+          })
+          return refused
+        }
         write = outcome.write
       }
       const run = () => {
@@ -968,19 +992,64 @@ export const workspaceTools = (
         // The write approval comes only from this call's authorization, never from the caller's context.
         return tool.run(call.args, { ...context, write })
       }
-      return withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
+      const result = withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
+      diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
+        toolName: call.name,
+        implementationType: "native",
+        parsedArguments: call.args,
+        authorizationDecision: write ? "approved-with-write" : "approved",
+        durationMs: Date.now() - startedAt,
+        rawResult: result,
+        modelVisibleResult: result.output
+      })
+      return result
     } catch (error) {
       // Whatever goes wrong inside a tool is the model's to read and work
       // around; it never ends the reply. A refusal of the model's input is
       // given whole (it may show the lines to use instead); anything else,
       // and the step's summary, keeps to the first line.
-      if (error instanceof LineEditError) return lineEditErrorResult(error.detail)
-      if (call.name === "edit_lines") return lineEditErrorResult(lineEditFailure("application_failed", error instanceof Error ? error.message : String(error)))
+      if (error instanceof LineEditError) {
+        const result = lineEditErrorResult(error.detail)
+        diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
+          toolName: call.name,
+          implementationType: "native",
+          parsedArguments: call.args,
+          authorizationDecision: "approved",
+          durationMs: Date.now() - startedAt,
+          result,
+          error: { name: error.name, message: error.message }
+        })
+        return result
+      }
+      if (call.name === "edit_lines") {
+        const message = error instanceof Error ? error.message : String(error)
+        const result = lineEditErrorResult(lineEditFailure("application_failed", message))
+        diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
+          toolName: call.name,
+          implementationType: "native",
+          parsedArguments: call.args,
+          authorizationDecision: "approved",
+          durationMs: Date.now() - startedAt,
+          result,
+          error: { name: error instanceof Error ? error.name : "Error", message }
+        })
+        return result
+      }
       const full = error instanceof Error ? error.message : String(error)
       const message = full.split("\n")[0]
-      return error instanceof ToolInputError
+      const result = error instanceof ToolInputError
         ? { output: full, summary: `${call.name} failed · ${message}`, failed: true }
         : { output: `${call.name} could not run: ${message}`, summary: `${call.name} failed · ${message}`, failed: true }
+      diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
+        toolName: call.name,
+        implementationType: "native",
+        parsedArguments: call.args,
+        authorizationDecision: "approved",
+        durationMs: Date.now() - startedAt,
+        result,
+        error: { name: error instanceof Error ? error.name : "Error", message: full }
+      })
+      return result
     } finally {
       // A once grant was for this call alone, and so is its write approval.
       extras.access?.endCall()

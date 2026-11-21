@@ -10,6 +10,7 @@
  */
 import { getProviderOrigin } from "../../../common/provider-validation"
 import { TwinnyProvider } from "../../../common/types"
+import { diagnosticEvent } from "../../diagnostics"
 import { createInferenceTrace, startInferenceAttempt } from "../trace"
 import {
   ChatChunk,
@@ -79,6 +80,16 @@ export async function* responsesChat(
   const url = `${baseUrl(config)}/responses`
   logRequest(url, body)
   const trace = createInferenceTrace(options?.trace)
+  diagnosticEvent("prompts", "provider.boundary.request", {
+    operationId: trace.operationId,
+    requestId: trace.requestId,
+    step: trace.toolLoopStep
+  }, { provider: config.provider, model: body.model, url, payload: body })
+  diagnosticEvent("transport", "provider.boundary.raw_request", {
+    operationId: trace.operationId,
+    requestId: trace.requestId,
+    step: trace.toolLoopStep
+  }, { provider: config.provider, model: body.model, url, payload: body })
   const attempt = startInferenceAttempt(trace, {
     provider: config.provider,
     endpoint: url,
@@ -105,6 +116,11 @@ export async function* responsesChat(
     const reasoning: string[] = []
     for await (const event of responseEvents(response.body)) {
       attempt.firstResponse(event.type)
+      diagnosticEvent("transport", "provider.raw_event", {
+        operationId: trace.operationId,
+        requestId: trace.requestId,
+        step: trace.toolLoopStep
+      }, { event })
       if (options?.signal?.aborted) {
         state = "cancelled"
         return
@@ -113,13 +129,32 @@ export async function* responsesChat(
         // A refusal is the model's answer too; left out, the reply would be blank.
         case "response.output_text.delta":
         case "response.refusal.delta":
+          if (event.delta) diagnosticEvent("transport", "provider.assistant.delta", {
+            operationId: trace.operationId,
+            requestId: trace.requestId,
+            step: trace.toolLoopStep
+          }, { delta: event.delta })
           if (event.delta) text.push(event.delta)
           break
         case "response.reasoning_summary_text.delta":
+          if (event.delta) diagnosticEvent("thinking", "provider.reasoning.delta", {
+            operationId: trace.operationId,
+            requestId: trace.requestId,
+            step: trace.toolLoopStep
+          }, { delta: event.delta })
           if (event.delta) reasoning.push(event.delta)
           break
         case "response.output_item.done":
           if (event.item?.type === "function_call" && event.item.name) {
+            diagnosticEvent("transport", "provider.tool_call.delta", {
+              operationId: trace.operationId,
+              requestId: trace.requestId,
+              step: trace.toolLoopStep
+            }, {
+              callId: event.item.call_id,
+              name: event.item.name,
+              rawArguments: event.item.arguments ?? ""
+            })
             calls.push({
               id: event.item.call_id || `call_${calls.length}`,
               name: event.item.name,
@@ -140,6 +175,17 @@ export async function* responsesChat(
             yield { content: "", reasoning: reasoning.join("") }
           }
           const finishReason: ChatFinishReason = "stop"
+          diagnosticEvent("transport", "provider.response.completed", {
+            operationId: trace.operationId,
+            requestId: trace.requestId,
+            step: trace.toolLoopStep
+          }, {
+            finishReason,
+            usage,
+            assistantTextLength: text.join("").length,
+            reasoningLength: reasoning.join("").length,
+            toolCallCount: calls.length
+          })
           yield {
             content: "",
             finishReason,

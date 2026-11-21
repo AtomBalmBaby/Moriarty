@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto"
 import { ASSISTANT, EVENT_NAME } from "../../common/constants"
 import { formatCount, logger } from "../../common/logger"
 import { ChatCompletionMessage, ReplyChangesView, ReplyMeta, TwinnyProvider } from "../../common/types"
+import { diagnosticEvent } from "../diagnostics"
 import { GenerationRun, GenerationTracker, StopInitiator } from "../generations"
 import { ChatRequest, InferenceClient, isCancelled } from "../inference"
 import { InferenceError } from "../inference/errors"
@@ -159,6 +160,12 @@ export class ChatGeneration {
       model: provider.modelName,
       kind: "chat"
     })
+    diagnosticEvent("agent", "agent.provider.request.started", {
+      operationId: trace.operationId,
+      requestId: trace.requestId,
+      provider: provider.provider,
+      model: provider.modelName
+    }, { messageCount: request.messages.length, toolCount: request.tools?.length ?? 0 })
     let text = prefix
     // Round ids are unique per request, so a continuation never reuses an earlier round.
     const reasoningRun = randomUUID()
@@ -221,6 +228,18 @@ export class ChatGeneration {
       }
 
       const reply = text.trim()
+      diagnosticEvent("agent", "agent.provider.completed", {
+        operationId: trace.operationId,
+        requestId: trace.requestId,
+        provider: provider.provider,
+        model: provider.modelName
+      }, {
+        finishReason,
+        streamChunks,
+        visibleTextLength: reply.length,
+        reasoningChars,
+        stopped: run.signal.aborted
+      })
       logger.debug(
         `Chat ← ${elapsed()} · ${formatCount(reply.length)} chars` +
           (run.signal.aborted ? " · stopped by the user" : "")
@@ -239,6 +258,17 @@ export class ChatGeneration {
       // A discarded reply is nobody's: not shown, and not part of the conversation.
       if (this._discarded.has(run)) return ""
       if (reply || extras.keepEmpty?.()) this.present(holding, reply, finish(), extras.toolNotes?.(), extras.changes?.(), extras.toolTranscript?.())
+      diagnosticEvent("agent", "agent.final_answer.persisted", {
+        operationId: trace.operationId,
+        requestId: trace.requestId,
+        provider: provider.provider,
+        model: provider.modelName
+      }, {
+        hasVisibleText: !!reply,
+        held: holding,
+        finishReason,
+        terminalReason: operationState
+      })
       return reply
     } catch (error) {
       operationState = run.signal.aborted ? "cancelled" : "failed"
@@ -254,6 +284,22 @@ export class ChatGeneration {
       return partial
     } finally {
       run.finish()
+      diagnosticEvent("agent", "agent.execution.terminal", {
+        operationId: trace.operationId,
+        requestId: trace.requestId,
+        provider: provider.provider,
+        model: provider.modelName
+      }, {
+        terminalReason: run.signal.aborted ? "cancelled" : operationState,
+        visibleFinalAnswerProduced: !!text.trim(),
+        responseClassification: text.trim()
+          ? "visible-text"
+          : reasoningChars > 0
+            ? "reasoning-only"
+            : "empty",
+        finishReason,
+        durationMs: Date.now() - started
+      })
       finishInferenceOperation(trace, operationState, {
         duration_ms: Date.now() - started,
         provider: provider.provider,
@@ -291,6 +337,15 @@ export class ChatGeneration {
   }
 
   private addMessage(content: string, meta?: ReplyMeta, toolNotes?: string, changes?: ReplyChangesView, toolTranscript?: ChatCompletionMessage[]) {
+    diagnosticEvent("agent", "agent.final_answer.delivered", {
+      operationId: this._trace?.operationId,
+      requestId: this._trace?.requestId
+    }, {
+      hasVisibleText: !!content,
+      contentLength: content.length,
+      deliveryChannel: "webview",
+      heldReleased: !!this._held
+    })
     this._bridge.emit(EVENT_NAME.twinnyAddMessage, {
       content,
       role: ASSISTANT,
@@ -310,6 +365,23 @@ export class ChatGeneration {
     provider: TwinnyProvider
   ) {
     const chars = messages.reduce((sum, m) => sum + contentLength(m.content), 0)
+    diagnosticEvent("prompts", "provider.request.initial", {
+      operationId: this._trace?.operationId,
+      requestId: this._trace?.requestId,
+      provider: provider.provider,
+      model: provider.modelName
+    }, {
+      messages,
+      model: provider.modelName,
+      provider: provider.provider,
+      effectiveParameters: {
+        model: provider.modelName,
+        contextSize: undefined,
+        maxOutputTokens: undefined,
+        temperature: undefined,
+        reasoningEffort: undefined
+      }
+    })
     logger.debug(
       `Chat → ${provider.modelName} (${provider.label}) · ` +
         `${messages.length} message${messages.length === 1 ? "" : "s"}, ` +
