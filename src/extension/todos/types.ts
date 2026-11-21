@@ -1,6 +1,7 @@
 import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, TypedCriterion } from "../../common/types"
 
-import type { EvidenceHit, EvidenceSource, ObservedSourceReference } from "./evidence"
+import type { EvidenceHit, EvidenceSource, ObservedSourceReference, ObservedVersion } from "./evidence"
+import type { SourceValidity, SourceValidityAssessment } from "./source-validity"
 
 export type { TodoAssessmentReaction, TodoAssessmentScoreValue, TodoAssessmentView, TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoObservation, TodoObservationStatus, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
 export type TodoActor = "user" | "model"
@@ -189,6 +190,14 @@ export interface RetainedObservationEvidence {
   content?: string
   sources: EvidenceSource[]
   hits: EvidenceHit[]
+  /** Each reference this result recorded, checked by the repository's validity boundary, with the aggregate for them. */
+  validity?: SourceValidityAssessment
+}
+
+/** A stored observation, with the validity the boundary decided for the references it recorded. */
+export interface RecordedObservation extends TodoToolObservation {
+  /** Each reference the observation recorded, checked when it was stored. */
+  validity?: SourceValidityAssessment
 }
 
 /**
@@ -222,6 +231,12 @@ export interface AcceptedFact extends TodoSourceFact {
   /** Set when a later accepted fact for the same path and symbol replaced this one. The row is kept for audit. */
   supersededBy?: string
   acceptedAt: string
+  /** What the validity boundary says about the reference this fact was recorded from. */
+  validity?: SourceValidity
+  /** The source version this fact was proven from, as it was recorded: the saved file, or the open editor document. It is part of the reference's identity, so a buffer fact is judged against that buffer while it is open. */
+  observedVersion?: ObservedVersion
+  /** The editor document's version at that read, recorded only for a buffer read. */
+  editorVersion?: number
 }
 
 /**

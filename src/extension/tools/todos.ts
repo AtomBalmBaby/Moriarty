@@ -1,6 +1,7 @@
 import { logger } from "../../common/logger"
-import { assessAcceptedFacts, type CurrentSourceReader, evidenceLookupArguments, factNamedBy, projectCandidateEntries, resolveAcceptedFacts } from "../todos/feedback"
+import { assessAcceptedFacts, type CurrentSource, evidenceLookupArguments, factNamedBy, projectCandidateEntries, resolveAcceptedFacts } from "../todos/feedback"
 import { TodoRepository } from "../todos/repository"
+import { aggregateValidity } from "../todos/source-validity"
 import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
 
 import { Tool, ToolContext, ToolResult } from "./workspace"
@@ -10,9 +11,8 @@ export interface TodoToolOptions {
   review?: ChildTodoReview
   /** Whether the user's own message directly asked for TODO creation. Read from trusted conversation state. */
   isUserAuthorized?: () => boolean
-  /** Reads the authoritative workspace source, so accepted facts can be judged current or historical. */
-  readCurrentSource?: CurrentSourceReader
-  /** Host-generated execution that performs these calls. Absent outside an execution, so no use is counted. */
+  /** The boundary the repository owns, or a host override of the current text. A consumer that supplies neither still gets validity decided by the repository. */
+  readCurrentSource?: CurrentSource
   executionId?: string
 }
 
@@ -180,7 +180,7 @@ export const todoTools = (
         logger.debug(`[Evidence] lookup project=${scope.projectFingerprint.slice(0, 12)} symbol=${symbol ?? "-"} path=${path ?? "-"} matches=${statuses.length} resolution=${resolution}`)
         if (!statuses.length) logger.trace("[Evidence] lookup found no accepted fact for this project; facts are recorded only after a deterministic proof, so a missing fact means none was proven yet")
         await recordEvidenceUse(repository, scope, options, "lookup", statuses.filter((status) => status.freshness === "current").map((status) => status.fact.id))
-        const found = statuses.map(({ fact, freshness, reason }) => ({
+        const found = statuses.map(({ fact, freshness, reason, validity, reference }) => ({
           evidence_id: fact.id,
           symbol: fact.symbol,
           tool_name: fact.toolName,
@@ -195,11 +195,13 @@ export const todoTools = (
           plan_revision: fact.planRevision,
           accepted_at: fact.acceptedAt,
           freshness,
+          validity, reference,
           ...(reason ? { reason } : {}),
           ...(freshness !== "current" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again` } : {})
         }))
+        const referenceValidity = aggregateValidity(statuses.map((status) => status.reference))
         return {
-          ...result({ ok: true, resolution, facts: found, total: found.length, limit: EVIDENCE_LOOKUP_LIMIT, ...(path ? { observations: projectCandidateEntries(await repository.projectObservations(scope, { path, limit: EVIDENCE_LOOKUP_LIMIT })) } : {}) }, `found ${found.length} accepted evidence fact(s), resolution ${resolution}`),
+          ...result({ ok: true, resolution, ...(referenceValidity === undefined ? {} : { referenceValidity }), facts: found, total: found.length, limit: EVIDENCE_LOOKUP_LIMIT, ...(path ? { observations: projectCandidateEntries(await repository.projectObservations(scope, { path, limit: EVIDENCE_LOOKUP_LIMIT })) } : {}) }, `found ${found.length} accepted evidence fact(s), resolution ${resolution}`),
           observation: { arguments: evidenceLookupArguments({ symbol, path, resolution, factCount: found.length }) }
         }
       } catch (error) {

@@ -21,16 +21,19 @@ import { ChatCompletionMessage, ReplyChangesView, TodoListSnapshot, ToolStepView
 import { AgentRegistry } from "../../extension/agents/registry"
 import { CHILD_TODO_PROTOCOL, FEEDBACK_PLAN_ATTEMPTS } from "../../extension/chat/feedback-planner"
 import { Chat } from "../../extension/chat/index"
-import { createSafeEditCheckpoints, type EditCommandRunner } from "../../extension/chat/tool-sinks"
+import { createSafeEditCheckpoints, type EditCommandRunner, openDocumentText, openDocumentVersion } from "../../extension/chat/tool-sinks"
 import { GenerationTracker } from "../../extension/generations"
 import { ChatRequest, InferenceError, InferenceProvider, providerRegistry } from "../../extension/inference"
 import { ExtensionBridge } from "../../extension/messaging/bridge"
-import { commandDigest } from "../../extension/todos/evidence"
+import { commandDigest, observedSourceReferences } from "../../extension/todos/evidence"
 import { todoReviewSystemPrompt } from "../../extension/todos/feedback"
 import { PROJECT_TODO_DATABASE_NAME, PROJECT_TODO_DIRECTORY } from "../../extension/todos/project-home"
-import { PROJECT_FINGERPRINT, TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { DEFAULT_EVIDENCE_STORAGE_LIMITS, PROJECT_FINGERPRINT, TodoRepository, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { contentHash } from "../../extension/tools/line-edit"
-import { BaseProvider } from "../../extension/webview/base"
+import { WorkspaceView } from "../../extension/tools/view"
+import { workspaceTools } from "../../extension/tools/workspace"
+import { BaseProvider, openEditorDocument } from "../../extension/webview/base"
 
 /** A model that answers each request with the next scripted reply. */
 class ScriptedModel implements InferenceProvider {
@@ -3641,5 +3644,56 @@ suite("Read-file acceptance, production controller", function () {
         assert.ok(JSON.stringify(refused.agent.requests).includes("cannot be recorded"), "the refusal names the missing record")
       })
     })
+  })
+})
+
+suite("Stage 12: the host hands the boundary the repository owns the document the editor has open", function () {
+  this.timeout(60000)
+
+  test("a buffer reference is decided against the real open document, and a reference for a file that is not open falls back to the saved file", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-stage12-editor-"))
+    const databasePath = path.join(root, ".twinny", "project.sqlite")
+    fs.mkdirSync(path.dirname(databasePath), { recursive: true })
+    const openedFile = "src/open.ts"
+    const closedFile = "src/closed.ts"
+    const saved = "export const value = 1\n"
+    for (const file of [openedFile, closedFile]) {
+      fs.mkdirSync(path.join(root, "src"), { recursive: true })
+      fs.writeFileSync(path.join(root, file), saved)
+    }
+    // Built the way the extension builds it: the project database under the project home, the boundary gets the host's open document, and no consumer supplies a reader.
+    const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root], { openDocument: openEditorDocument })
+    await repository.initialize()
+    const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${root}`]), conversationId: "stage12-editor", writer: "stage12-editor" }
+    try {
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(root, openedFile)))
+      const bufferText = `${saved}// an unsaved change the saved file does not have\n`
+      const edit = new vscode.WorkspaceEdit()
+      edit.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), bufferText)
+      assert.equal(await vscode.workspace.applyEdit(edit), true, "the change is applied to the editor buffer")
+      assert.equal(document.isDirty, true, "the change is not saved")
+      assert.equal(openEditorDocument(path.join(root, openedFile))?.text, bufferText, "the production host lookup answers with the open document")
+      assert.equal(openEditorDocument(path.join(root, openedFile))?.version, document.version, "and reports the editor version it read")
+      const view = new WorkspaceView(root, [], openDocumentText, [], [], () => [], openDocumentVersion)
+      const tools = workspaceTools(view)
+
+      const record = async (file: string) => {
+        const args = { path: file }
+        const response = await tools.run({ name: "read_file", args })
+        return repository.recordToolObservation(scope, { toolName: "read_file", arguments: args, output: response.output, failed: false, requestId: `stage12-${file}`, sources: observedSourceReferences({ name: "read_file", args, output: response.output, failed: false, origin: view.originOf(file) }) })
+      }
+
+      const opened = await record(openedFile)
+      assert.deepEqual([opened.validity?.references[0].observedVersion, opened.validity?.references[0].checkedAgainst, opened.validity?.references[0].persistedSource, opened.validity?.references[0].editorVersion], ["buffer", "buffer", false, document.version], "the boundary read the real open document and says which version it read")
+      assert.equal(opened.validity?.validity, "valid", "the reference matches the document it was read from")
+      assert.equal(opened.validity?.references[0].contentHash, await fingerprintContent(bufferText), "the recorded fingerprint is the open document's, not the saved file's")
+
+      const closed = await record(closedFile)
+      assert.equal(openEditorDocument(path.join(root, closedFile)), undefined, "the host lookup answers undefined for a file the editor does not have open, which is why the boundary read disk")
+      assert.deepEqual([closed.validity?.references[0].observedVersion, closed.validity?.references[0].checkedAgainst, closed.validity?.references[0].persistedSource], ["disk", "disk", true], "a reference read from a file that is not open is decided from the saved file")
+    } finally {
+      repository.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 })

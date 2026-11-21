@@ -70,9 +70,10 @@ import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
-import { type AcceptedFactStatus, assessProvenTodo, type CurrentSourceReader, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
+import { type AcceptedFactStatus, assessProvenTodo, type CurrentSource, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { editDigest, PROJECT_FINGERPRINT, TodoRepository } from "../todos/repository"
+import { SourceValidityBoundary } from "../todos/source-validity"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
 import { AccessStore } from "../tools/access-grants"
 import { currentAccessHostKey } from "../tools/access-host"
@@ -1484,7 +1485,30 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
-  private currentSourceReader(): CurrentSourceReader | undefined {
+  /**
+   * The boundary the project repository owns, which is where file validity is decided. A chat with no
+   * repository has no boundary, and that does not make its evidence unverifiable: the paths below read
+   * the source through the workspace view instead.
+   */
+  private evidenceBoundary(): SourceValidityBoundary | undefined {
+    const repository = this._todoRepository
+    if (!repository) return undefined
+    // Before the database is open there is no boundary to read through.
+    try {
+      return repository.sourceValidity()
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * The source the evidence paths read through: the boundary the repository owns. A workspace view is used
+   * only when there is no repository to read through, so the text a criterion is judged against is the same
+   * text validity was decided from.
+   */
+  private currentSourceReader(): CurrentSource | undefined {
+    const boundary = this.evidenceBoundary()
+    if (boundary) return boundary
     const view = this.readableWorkspaceView()
     if (!view) return undefined
     return async (path) => {

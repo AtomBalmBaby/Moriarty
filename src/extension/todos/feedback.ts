@@ -2,10 +2,10 @@ import { createHash, randomUUID } from "node:crypto"
 
 import { logger, redact } from "../../common/logger"
 import type { CriterionFailureReason, ReplyChangesView, SourceIdentity, TodoAssessmentScore, TodoAssessmentScoreValue, TodoCriterionReconciliation, TodoEvaluation, TodoEvaluationCriterion, TodoObservation, TypedCriterion, WorkspaceMutationOperation } from "../../common/types"
-import { verifyContentFingerprint } from "../tools/fingerprint"
 
-import { codeIdentifiers, commandDigest, samePath } from "./evidence"
+import { codeIdentifiers, commandDigest, type ObservedVersion, samePath } from "./evidence"
 import { analyzeSource, isAnalysableSource, type RegistrationImplementation, type SourceAnalysis } from "./source-analysis"
+import { aggregateValidity, type CheckedSourceReference, type RecordedSourceReference, type SourceRead, type SourceValidity, SourceValidityBoundary } from "./source-validity"
 import { type AcceptedFact, type CriterionVerification, type IntentPlanContext, type RequirementActivation, type RetainedObservationEvidence, type TodoReviewPackage } from "./types"
 import { capabilityOf } from "./verification-capabilities"
 
@@ -189,6 +189,9 @@ export const criterionProvenBy = (
 /** Returns the current text of a workspace file, or undefined when it cannot be read. */
 export type CurrentSourceReader = (path: string) => Promise<string | undefined>
 
+/** The source a consumer reads through: the repository's boundary, or the host's own reader for it. */
+export type CurrentSource = CurrentSourceReader | SourceValidityBoundary
+
 /** Bumped when the deterministic rules change, so stored outcomes can be told apart. */
 export const RECONCILIATION_VERSION = 1
 
@@ -197,6 +200,16 @@ export const DETERMINISTIC_EVALUATOR = "host:deterministic"
 
 /** A criterion's outcome before the host attaches the criterion ID it answers. */
 type CriterionOutcome = Omit<TodoCriterionReconciliation, "criterionId">
+
+export interface AcceptedFactStatus {
+  fact: AcceptedFact
+  /** A superseded fact, or one whose stored hash no longer matches, is historical. */
+  freshness: "current" | "historical" | "unverifiable" | "invalid"
+  /** The state the boundary gave the fact's own reference. `unverifiable` is the existing error path, not one of §2.6's states. */
+  validity: SourceValidity
+  reference: CheckedSourceReference
+  reason?: string
+}
 
 const reconciled = (
   outcome: TodoCriterionReconciliation["outcome"],
@@ -224,24 +237,20 @@ const NUMBERED_SOURCE_LINE = /^(\d+): (.*)$/
 export const factMatchesSymbol = (candidate: AcceptedFact, symbol: string): boolean =>
   candidate.symbol === symbol || candidate.registeredTool === symbol
 
-const cachedCurrentReader = (readCurrent?: CurrentSourceReader): ((path: string) => Promise<string | undefined>) => {
-  const cache = new Map<string, Promise<string | undefined>>()
-  return (path: string) => {
-    if (!readCurrent) return Promise.resolve(undefined)
-    let text = cache.get(path)
-    if (!text) {
-      text = readCurrent(path).catch(() => undefined)
-      cache.set(path, text)
-    }
-    return text
-  }
+/** What a consumer reads through: the boundary decides the state, and a host that reads through its own view supplies the text. */
+export interface SourceReader {
+  read: (path: string) => Promise<string | undefined>
+  check: (reference: RecordedSourceReference) => Promise<CheckedSourceReference>
 }
 
-export interface AcceptedFactStatus {
-  fact: AcceptedFact
-  freshness: "current" | "historical" | "unverifiable"
-  /** Why the fact no longer proves the current source; absent when current. */
-  reason?: string
+/** The boundary a consumer reads through: the one the repository owns, or one built from the host's own source. One authoritative read is shared per path, so a file is not read twice. */
+export const sourceReaderFor = (source?: CurrentSource): SourceReader => {
+  const boundary = source instanceof SourceValidityBoundary ? source : new SourceValidityBoundary({ readText: source })
+  const cache = new Map<string, SourceRead>()
+  return {
+    read: (path: string) => boundary.read(path, "buffer", cache).then((read) => "text" in read ? read.text : undefined),
+    check: (reference: RecordedSourceReference) => boundary.check(reference, cache)
+  }
 }
 
 /**
@@ -260,26 +269,48 @@ export const resolveAcceptedFacts = (statuses: AcceptedFactStatus[]): AcceptedRe
 }
 
 /**
- * Classifies accepted facts without changing them. Superseded and source-changed facts
- * stay in the repository as historical evidence with an explanation.
+ * Classifies accepted facts without changing them, through the boundary the repository owns.
+ * Superseded and source-changed facts stay in the repository as historical evidence with an
+ * explanation. A caller that supplies no source does not opt out of correctness: the boundary reads
+ * the authoritative source itself, and an override stays for hosts that read through their own view.
  */
-export const assessAcceptedFacts = async (facts: AcceptedFact[], readCurrent?: CurrentSourceReader): Promise<AcceptedFactStatus[]> => {
-  const current = cachedCurrentReader(readCurrent)
+export const assessAcceptedFacts = async (
+  facts: AcceptedFact[],
+  source?: CurrentSource
+): Promise<AcceptedFactStatus[]> => {
+  const reader = source === undefined ? undefined : sourceReaderFor(source)
   return Promise.all(facts.map(async (fact): Promise<AcceptedFactStatus> => {
-    if (fact.supersededBy) return { fact, freshness: "historical", reason: `superseded by accepted fact ${fact.supersededBy}` }
-    const text = await current(fact.path)
-    if (text === undefined) return { fact, freshness: "unverifiable", reason: `${fact.path} could not be read to confirm its fingerprint` }
-    if (!(await verifyContentFingerprint(text, fact.sourceHash).catch(() => false))) {
-      return { fact, freshness: "historical", reason: `${fact.path} changed after this fact was accepted` }
-    }
-    return { fact, freshness: "current" }
+    const reference = reader ? await reader.check(recordedReference(fact)) : decidedReference(fact)
+    const reason = factReason(fact, reference)
+    return { fact, freshness: fact.supersededBy ? "historical" : FRESHNESS_OF[reference.validity], validity: reference.validity, reference, ...(reason ? { reason } : {}) }
   }))
+}
+
+/** The reference an accepted fact records: the read it was proven from. */
+const recordedReference = (fact: AcceptedFact): RecordedSourceReference => ({ path: fact.path, role: "read", contentHash: fact.sourceHash, observedVersion: fact.observedVersion ?? "disk", ...(fact.editorVersion === undefined ? {} : { editorVersion: fact.editorVersion }) })
+
+/** With no source supplied, the state the repository's own boundary decided for that reference stands. */
+const decidedReference = (fact: AcceptedFact): CheckedSourceReference => {
+  const validity = fact.validity ?? "unverifiable"
+  const observedVersion = fact.observedVersion ?? "disk"
+  return { ...recordedReference(fact), checkedAgainst: observedVersion, persistedSource: observedVersion === "disk", validity, decidedBy: "source-boundary", reason: validity === "unverifiable" ? `${fact.path} was not read by a boundary that could resolve it` : "the state the repository's boundary decided for the fact's own reference" }
+}
+
+/** The fact-level explanation, in the words callers already show. */
+const factReason = (fact: AcceptedFact, reference: CheckedSourceReference): string | undefined => {
+  if (fact.supersededBy) return `superseded by accepted fact ${fact.supersededBy}`
+  if (reference.validity === "stale") return `${fact.path} changed after this fact was accepted`
+  if (reference.validity === "invalid") return `${fact.path} no longer exists, so the accepted fact names a file that is gone`
+  if (reference.validity === "unverifiable") return `${fact.path} could not be read to confirm its fingerprint`
+  return undefined
 }
 
 const RELEVANCE_SYMBOL = 4
 const RELEVANCE_PATH = 3
 const RELEVANCE_PLAN = 2
-const FRESHNESS_ORDER: Record<AcceptedFactStatus["freshness"], number> = { current: 0, historical: 1, unverifiable: 2 }
+const FRESHNESS_ORDER: Record<AcceptedFactStatus["freshness"], number> = { current: 0, historical: 1, invalid: 2, unverifiable: 3 }
+/** The state the boundary decided, shown through the existing freshness field. */
+const FRESHNESS_OF: Record<SourceValidity, AcceptedFactStatus["freshness"]> = { valid: "current", stale: "historical", invalid: "invalid", unverifiable: "unverifiable" }
 
 /**
  * Chooses the accepted facts shown for this request, within a fixed budget. Relevance decides what is kept: an exact
@@ -289,7 +320,7 @@ const FRESHNESS_ORDER: Record<AcceptedFactStatus["freshness"], number> = { curre
 export const selectAcceptedFacts = async (
   request: { text: string; planItemIds: string[] },
   facts: AcceptedFact[],
-  readCurrent: CurrentSourceReader | undefined,
+  readCurrent: CurrentSource,
   budget: number
 ): Promise<{ selected: AcceptedFactStatus[]; omitted: number }> => {
   const live = facts.filter((fact) => !fact.supersededBy)
@@ -329,10 +360,14 @@ export interface EvidencePreflightFact {
   conversationId?: string
   planRevision: number
   verification: "verified" | "changed" | "unreadable"
+  /** The state the boundary gave this fact's own reference. */
+  validity: SourceValidity
 }
 
 export interface EvidencePreflight {
   status: EvidencePreflightStatus
+  /** The aggregate the boundary gave the facts' references, invalid over stale over valid. */
+  validity?: SourceValidity
   reason: string
   subjects: string[]
   facts: EvidencePreflightFact[]
@@ -345,13 +380,13 @@ export interface EvidencePreflight {
 export const evidencePreflight = async (
   text: string,
   facts: AcceptedFact[],
-  readCurrent?: CurrentSourceReader
+  source?: CurrentSource
 ): Promise<EvidencePreflight> => {
   const subjects = [...new Set(codeIdentifiers(text))].slice(0, 12)
   const matched = facts.filter((fact) => !fact.supersededBy && (subjects.some((subject) => factMatchesSymbol(fact, subject)) || text.includes(fact.path)))
   if (!matched.length) return { status: "missing", reason: "no live accepted fact names this request's symbols or paths", subjects, facts: [] }
-  const statuses = await assessAcceptedFacts(matched, readCurrent)
-  const projected = statuses.map(({ fact, freshness }): EvidencePreflightFact => ({
+  const statuses = await assessAcceptedFacts(matched, source)
+  const projected = statuses.map(({ fact, freshness, validity }): EvidencePreflightFact => ({
     symbol: fact.symbol,
     ...(fact.registeredTool ? { registeredTool: fact.registeredTool } : {}),
     toolName: fact.toolName,
@@ -363,19 +398,21 @@ export const evidencePreflight = async (
     itemId: fact.itemId,
     conversationId: fact.conversationId,
     planRevision: fact.planRevision,
-    verification: freshness === "current" ? "verified" : freshness === "unverifiable" ? "unreadable" : "changed"
+    verification: freshness === "current" ? "verified" : freshness === "unverifiable" ? "unreadable" : "changed",
+    validity
   }))
   const resolution = resolveAcceptedFacts(statuses)
+  const validity = aggregateValidity(statuses.map((status) => status.reference))
   if (resolution === "ambiguous") {
     const locations = new Set(matched.map((fact) => `${fact.path}:${fact.startLine}-${fact.endLine}`)).size
-    return { status: "ambiguous", reason: `${locations} accepted source locations match; the request does not select one`, subjects, facts: projected }
+    return { validity, status: "ambiguous", reason: `${locations} accepted source locations match; the request does not select one`, subjects, facts: projected }
   }
   if (resolution === "unique" && statuses.some((status) => status.freshness === "current")) {
-    return { status: "fresh", reason: "the accepted source fingerprint matches the current source", subjects, facts: projected }
+    return { validity, status: "fresh", reason: "the accepted source fingerprint matches the current source", subjects, facts: projected }
   }
   const unreadable = statuses.find((status) => status.freshness === "unverifiable")
-  if (unreadable) return { status: "unverifiable", reason: unreadable.reason ?? "source could not be read", subjects, facts: projected }
-  return { status: "stale", reason: statuses.find((status) => status.reason)?.reason ?? "accepted source changed", subjects, facts: projected }
+  if (unreadable) return { validity, status: "unverifiable", reason: unreadable.reason ?? "source could not be read", subjects, facts: projected }
+  return { validity, status: "stale", reason: statuses.find((status) => status.reason)?.reason ?? "accepted source changed", subjects, facts: projected }
 }
 
 const PREFLIGHT_GUIDANCE: Record<EvidencePreflightStatus, string> = {
@@ -546,6 +583,10 @@ const readMatchesText = (content: string, text: string): boolean => {
   })
 }
 
+/** The version a stored reference names, so the boundary checks the buffer or the saved file as the read took it. */
+const originOf = (record: RetainedObservationEvidence, path: string): ObservedVersion =>
+  record.validity?.references.find((reference) => samePath(reference.path, path))?.observedVersion ?? "disk"
+
 /**
  * Authenticates the current document at a path. A retained read or accepted fact counts only when its whole-document
  * fingerprint matches the current text, and a read's captured lines match that text. Analysis then runs over that complete
@@ -555,7 +596,7 @@ const authenticateSource = async (
   path: string,
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
-  current: (path: string) => Promise<string | undefined>
+  current: SourceReader
 ): Promise<SourceAuthentication> => {
   const reads: Array<{ record: RetainedObservationEvidence; hash: string }> = []
   for (const record of records) {
@@ -565,20 +606,30 @@ const authenticateSource = async (
   }
   const facts = accepted.filter((fact) => !fact.supersededBy && samePath(fact.path, path))
   if (!reads.length && !facts.length) return { status: "unobserved" }
-  const text = await current(path)
+  const text = await current.read(path)
   if (text === undefined) return { status: "unreadable" }
   const matchedReads: Array<{ record: RetainedObservationEvidence; hash: string }> = []
   const staleObservationIds: string[] = []
   for (const read of reads) {
-    if (!(await verifyContentFingerprint(text, read.hash).catch(() => false))) {
+    const state = await current.check({ path, role: "read", contentHash: read.hash, observedVersion: originOf(read.record, path) })
+    if (state.validity === "valid") {
+      if (readMatchesText(read.record.content ?? "", text)) matchedReads.push(read)
+      continue
+    }
+    if (state.validity === "stale") {
       staleObservationIds.push(read.record.observationId)
       continue
     }
-    if (readMatchesText(read.record.content ?? "", text)) matchedReads.push(read)
+    return { status: "unreadable" }
   }
   const matchedFacts: AcceptedFact[] = []
   for (const fact of facts) {
-    if (await verifyContentFingerprint(text, fact.sourceHash).catch(() => false)) matchedFacts.push(fact)
+    const state = await current.check(recordedReference(fact))
+    if (state.validity === "valid") {
+      matchedFacts.push(fact)
+      continue
+    }
+    if (state.validity !== "stale") return { status: "unreadable" }
   }
   const sourceHash = matchedReads[0]?.hash ?? matchedFacts[0]?.sourceHash
   if (sourceHash === undefined) return { status: "changed", observationIds: reads.map(({ record }) => record.observationId) }
@@ -716,7 +767,7 @@ const acceptedFactOutcome = async (
   subject: { identity?: SourceIdentity; symbol: string; path?: string },
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
-  current: (path: string) => Promise<string | undefined>
+  current: SourceReader
 ): Promise<CriterionOutcome> => {
   const matching = accepted.filter((fact) => !fact.supersededBy && factNamedBy(subject.identity, subject.symbol, fact) && (subject.path === undefined || samePath(fact.path, subject.path)))
   const live: AcceptedFact[] = []
@@ -902,7 +953,7 @@ const sourceContractOutcome = async (
   subject: SourceSubject,
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
-  current: (path: string) => Promise<string | undefined>
+  current: SourceReader
 ): Promise<CriterionOutcome> => {
   const needsRange = subject.kind === "source_range"
   const auth = await authenticateSource(subject.path, records, accepted, current)
@@ -940,7 +991,7 @@ const sourceOutcome = async (
   subject: { kind: "source_location" | "source_range" | "source_fingerprint"; identity?: SourceIdentity; symbol: string; path?: string },
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
-  current: (path: string) => Promise<string | undefined>
+  current: SourceReader
 ): Promise<CriterionOutcome> => {
   if (subject.path !== undefined) return sourceContractOutcome({ ...subject, path: subject.path }, records, accepted, current)
   const proven: CriterionOutcome[] = []
@@ -983,7 +1034,7 @@ const typedOutcome = async (
   verification: CriterionVerification,
   records: RetainedObservationEvidence[],
   accepted: AcceptedFact[],
-  current: (path: string) => Promise<string | undefined>,
+  current: SourceReader,
   activation: RequirementActivation | undefined
 ): Promise<CriterionOutcome> => {
   const capability = capabilityOf(verification.kind)
@@ -1018,9 +1069,9 @@ const typedOutcome = async (
 /** The single source of criterion outcomes for a review, decided by each criterion's typed descriptor. */
 export const reviewReconciliations = async (
   review: Pick<TodoReviewPackage, "criteria" | "retainedEvidence" | "acceptedEvidence" | "symbolAliases" | "requirementActivation"> & { task: Pick<TodoReviewPackage["task"], "id"> },
-  readCurrentSource?: CurrentSourceReader
+  readCurrentSource?: CurrentSource
 ): Promise<TodoCriterionReconciliation[]> => {
-  const current = cachedCurrentReader(readCurrentSource)
+  const current = sourceReaderFor(readCurrentSource)
   const outcomes: TodoCriterionReconciliation[] = []
   for (const criterion of review.criteria) {
     const outcome = await typedOutcome(criterion.verification, review.retainedEvidence, review.acceptedEvidence, current, review.requirementActivation).catch((error: unknown) => {
@@ -1537,7 +1588,7 @@ export const reviewCandidates = (reviews: TodoReviewPackage[], itemId?: string):
  */
 export const provenTodoEvaluation = async (
   review: TodoReviewPackage,
-  readCurrentSource?: CurrentSourceReader
+  readCurrentSource?: CurrentSource
 ): Promise<TodoEvaluation | undefined> => {
   const reconciliations = await reviewReconciliations(review, readCurrentSource)
   const evaluation = deterministicTodoEvaluation(review, reconciliations)
@@ -1556,7 +1607,7 @@ export interface EvidenceAssessment {
 
 export const assessProvenTodo = async (
   review: TodoReviewPackage,
-  readCurrentSource?: CurrentSourceReader
+  readCurrentSource?: CurrentSource
 ): Promise<EvidenceAssessment | undefined> => {
   if (!dependenciesComplete(review) || taskRequiresWorkspaceChanges(review.criteria)) return undefined
   const evaluation = await provenTodoEvaluation(review, readCurrentSource)
@@ -1569,7 +1620,7 @@ export const assessProvenTodo = async (
  * Whether the host can decide a review from its own trusted observations alone, so no Feedback model is needed.
  * True when no criterion is semantic, even when some remain unproven and the decision is needs_evidence.
  */
-export const hostDecidesReview = async (review: TodoReviewPackage, readCurrentSource?: CurrentSourceReader): Promise<boolean> => {
+export const hostDecidesReview = async (review: TodoReviewPackage, readCurrentSource?: CurrentSource): Promise<boolean> => {
   const reconciliations = await reviewReconciliations(review, readCurrentSource)
   return deterministicTodoEvaluation(review, reconciliations) !== undefined
 }
@@ -1641,7 +1692,7 @@ export const evaluateTodoReview = (
   review: TodoReviewPackage,
   evaluator: (correction?: string, reconciliations?: TodoCriterionReconciliation[]) => Promise<string>,
   evaluatorName: string,
-  requirements: { hasVerifiedFileChanges?: boolean; readCurrentSource?: CurrentSourceReader; observer?: TodoObserverIdentity; observation?: TodoObservationRequest } = {}
+  requirements: { hasVerifiedFileChanges?: boolean; readCurrentSource?: CurrentSource; observer?: TodoObserverIdentity; observation?: TodoObservationRequest } = {}
 ): Promise<TodoEvaluation> => {
   const key = `${scope.projectFingerprint}\n${scope.conversationId}\n${review.task.id}\n${review.task.version}`
   const inFlight = reviewsInFlight.get(key)
@@ -1722,5 +1773,9 @@ export const projectCandidateEntries = (records: readonly RetainedObservationEvi
     tool_name: record.toolName,
     ...(record.failed ? { failed: true } : {}),
     recorded_at: record.observedAt,
-    retained: record.retained
+    retained: record.retained,
+    ...(record.validity === undefined ? {} : {
+      validity: record.validity.validity,
+      references: record.validity.references.map((reference) => ({ path: reference.path, role: reference.role, validity: reference.validity, checked_against: reference.checkedAgainst }))
+    })
   }))

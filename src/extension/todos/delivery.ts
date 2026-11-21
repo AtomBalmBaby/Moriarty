@@ -1,5 +1,5 @@
 import { samePath } from "./evidence"
-import { assessAcceptedFacts, type CurrentSourceReader, factNamedBy } from "./feedback"
+import { assessAcceptedFacts, type CurrentSource, factNamedBy } from "./feedback"
 import { type AcceptedFact, type AnswerField, type AnswerRequirement } from "./types"
 
 /** An objective value the answer must state, taken from a current accepted fact. */
@@ -54,7 +54,7 @@ type Resolution = { values: RequiredValue[] } | { unresolved: string }
 const resolveRequirement = async (
   requirement: AnswerRequirement,
   facts: AcceptedFact[],
-  readCurrent: CurrentSourceReader | undefined
+  readCurrent: CurrentSource | undefined
 ): Promise<Resolution> => {
   const { identity, symbol, path } = requirement.source
   const subject = `${identity} ${symbol} in ${path ?? "any file"}`
@@ -110,7 +110,7 @@ export const checkDelivery = async (
   reply: string,
   requirements: AnswerRequirement[],
   facts: AcceptedFact[],
-  readCurrent: CurrentSourceReader | undefined
+  readCurrent: CurrentSource | undefined
 ): Promise<DeliveryVerdict> => {
   if (requirements.length === 0) return { outcome: "delivered" }
   const values: RequiredValue[] = []

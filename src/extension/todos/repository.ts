@@ -8,13 +8,16 @@ import {
   type EvidenceSource,
   MAX_EVIDENCE_TEXT,
   type ObservedSourceReference,
+  type ObservedVersion,
   preserveEvidence,
   redactEvidence,
-  samePath
+  samePath,
+  type SourceRole
 } from "./evidence"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { rootLabelOf } from "./project-home"
-import { type SourceLocation, SourceRoots } from "./source-roots"
+import { SourceLocation, SourceRoots } from "./source-roots"
+import { type RecordedSourceReference, type SourceBoundaryOptions, SourceValidityBoundary } from "./source-validity"
 import { type Database, SqliteFile, type SqliteLocation } from "./sqlite"
 import {
   type AcceptedFact,
@@ -36,6 +39,7 @@ import {
   type IntentPlanOutlineChild,
   type IntentTaskPlan,
   type ProjectEvidenceRequest,
+  type RecordedObservation,
   type RequirementActivation,
   type RetainedObservationEvidence,
   type SymbolAlias,
@@ -754,6 +758,33 @@ const latestActivation = (database: Database, listId: string, itemId: string): R
 }
 
 /**
+ * The references a set of observations recorded, resolved back to canonical paths through the roots
+ * they were written under. They are the recorded identity; the boundary decides their state.
+ */
+const recordedSourceReferences = (
+  database: Database,
+  roots: SourceRoots,
+  observationIds: string[]
+): Map<string, RecordedSourceReference[]> => {
+  const found = new Map<string, RecordedSourceReference[]>()
+  if (!observationIds.length) return found
+  const placeholders = observationIds.map(() => "?").join(", ")
+  for (const row of rows<{ observation_id: string; root_id: string; path: string; role: SourceRole; content_hash: string | null; observed_version: string; editor_version: number | null }>(database,
+    `SELECT observation_id, root_id, path, role, content_hash, observed_version, editor_version FROM observation_source WHERE observation_id IN (${placeholders}) ORDER BY observation_id, ordinal`,
+    observationIds
+  )) {
+    found.set(row.observation_id, [...(found.get(row.observation_id) ?? []), {
+      path: roots.canonicalPath({ rootId: row.root_id, path: row.path }),
+      role: row.role,
+      ...(row.content_hash === null ? {} : { contentHash: row.content_hash }),
+      observedVersion: row.observed_version as ObservedVersion,
+      ...(row.editor_version === null ? {} : { editorVersion: row.editor_version })
+    }])
+  }
+  return found
+}
+
+/**
  * Stored tool results: for one task, for one plan, or for the whole project. A project-wide read
  * takes the records from every task and conversation that produced them, and each record keeps the
  * task that recorded it as provenance, as §2.2 requires.
@@ -843,17 +874,23 @@ export class TodoRepository {
   private readonly sqlite: SqliteFile
   private readonly evidenceLimits: EvidenceStorageLimits
   private sourceRoots: SourceRoots | undefined
+  private boundary: SourceValidityBoundary | undefined
+  /** What the host can tell the boundary: the documents its editor has open. A plain Node process has none, so every reference is disk content there. */
+  private readonly hostSource: SourceBoundaryOptions
   // In-memory only: a scoring request in flight. Restarts clear it, and unscored items then read as not evaluated.
   private readonly pendingObservations = new Map<string, Set<string>>()
 
   constructor(
     databasePath: SqliteLocation,
     evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS,
-    roots: () => readonly string[] = () => []
+    roots: () => readonly string[] = () => [],
+    source: SourceBoundaryOptions = {}
   ) {
+    this.hostSource = source
     this.sqlite = new SqliteFile(databasePath, (database, home) => {
       const sourceRoots = new SourceRoots(database, home)
       this.sourceRoots = sourceRoots
+      this.boundary = new SourceValidityBoundary({ ...source, roots: sourceRoots })
       sourceRoots.home()
       for (const root of roots()) sourceRoots.register(root, rootLabelOf(root))
     })
@@ -867,6 +904,36 @@ export class TodoRepository {
   close(): void {
     this.sqlite.close()
     this.sourceRoots = undefined
+    this.boundary = undefined
+  }
+
+  /**
+   * The one place file validity is decided for this project's evidence. A reference is checked when it
+   * is stored and again when it is read back, so no consumer decides validity with a reader of its own.
+   */
+  sourceValidity(): SourceValidityBoundary {
+    if (!this.boundary) throw new Error("the project database is not open, so the validity boundary is unavailable")
+    return this.boundary
+  }
+
+  /**
+   * Gives the records and facts a caller is about to return the states the boundary decided for the
+   * references they recorded. A result that recorded no reference keeps no file validity.
+   */
+  private async assess(records: RetainedObservationEvidence[], facts: AcceptedFact[]): Promise<void> {
+    const observationIds = [...new Set([...records.map((record) => record.observationId), ...facts.map((fact) => fact.observationId)])]
+    if (!observationIds.length) return
+    const references = await this.sqlite.read((database) => recordedSourceReferences(database, this.sourceRoots!, observationIds))
+    const boundary = this.sourceValidity()
+    for (const record of records) record.validity = await boundary.assess(references.get(record.observationId) ?? [])
+    for (const fact of facts) {
+      const recorded = (references.get(fact.observationId) ?? []).find((reference) => samePath(reference.path, fact.path))
+      // The version the read saw is part of the reference's identity, so the fact is judged against that same version.
+      const observedVersion = recorded?.observedVersion ?? "disk"
+      fact.observedVersion = observedVersion
+      if (recorded?.editorVersion !== undefined) fact.editorVersion = recorded.editorVersion
+      fact.validity = (await boundary.check({ path: fact.path, role: recorded?.role ?? "read", contentHash: fact.sourceHash, observedVersion })).validity
+    }
   }
 
   getIntentTaskPlan(request: TodoListRequest): Promise<IntentTaskPlan | undefined> {
@@ -1169,11 +1236,11 @@ export class TodoRepository {
   getReviewPackages(request: TodoListRequest, options: { includeOpen?: boolean } = {}): Promise<TodoReviewPackage[]> {
     return this.sqlite.read((database) => {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
-      if (!project) return []
+      if (!project) return { packages: [], records: [], facts: [] }
       const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
-      if (!list) return []
+      if (!list) return { packages: [], records: [], facts: [] }
       const plan = rows<{ plan_id: string; revision: number; goal: string; constraints_json: string }>(database, "SELECT plan_id, revision, goal, constraints_json FROM todo_intent_plans WHERE list_id = ?", [list.id])[0]
-      if (!plan) return []
+      if (!plan) return { packages: [], records: [], facts: [] }
       const tasks = rows<ItemRow & { task_id: string; dependencies_json: string; criteria_json: string | null }>(
         database,
         "SELECT items.id, items.list_id, items.parent_id, items.title, items.details, items.status, items.verification, items.priority, items.created_by, items.source, items.sort_order, items.blocked_reason, items.version, items.created_at, items.updated_at, tasks.task_id, tasks.dependencies_json, tasks.criteria_json " +
@@ -1185,11 +1252,13 @@ export class TodoRepository {
       const acceptedEvidence = acceptedFactsFor(database, list.project_id)
       const symbolAliases = symbolAliasesFor(database, list.project_id)
       const reviewable = (status: string) => status === "in_review" || (options.includeOpen === true && (status === "pending" || status === "in_progress"))
-      return tasks.filter((task) => reviewable(task.status)).map((row) => {
+      const records: RetainedObservationEvidence[] = []
+      const packages = tasks.filter((task) => reviewable(task.status)).map((row) => {
         const evidence = rows<TodoEvidence>(database,
           "SELECT id, item_id AS itemId, kind, summary, result, created_at AS createdAt FROM todo_evidence WHERE item_id = ? ORDER BY created_at DESC LIMIT 10", [row.id])
         // Candidates are the project's records, not only this plan's: the task that recorded each one stays as its provenance.
         const retainedEvidence = retainedEvidenceFor(database, row.id, true, { projectId: list.project_id })
+        records.push(...retainedEvidence)
         const observations = rows<{ id: string; itemId: string | null; toolName: string; arguments_json: string; output: string; failed_number: number; exitCode: number | null; createdAt: string }>(database,
           "SELECT observations.id, observations.item_id AS itemId, observations.tool_name AS toolName, observations.arguments_json, observations.output, observations.failed AS failed_number, observations.exit_code AS exitCode, observations.created_at AS createdAt FROM todo_tool_observations AS observations WHERE observations.project_id = ? ORDER BY observations.created_at DESC, observations.rowid DESC", [list.project_id]
         ).map((observation) => ({
@@ -1229,6 +1298,10 @@ export class TodoRepository {
           lastEvaluation: lastEvaluation ? JSON.parse(lastEvaluation.evaluation_json) as TodoEvaluation : undefined
         }
       })
+      return { packages, records, facts: acceptedEvidence }
+    }).then(async (found) => {
+      await this.assess(found.records, found.facts)
+      return found.packages
     })
   }
 
@@ -1240,7 +1313,7 @@ export class TodoRepository {
       const list = rows<ListRow>(database, "SELECT id, project_id, conversation_id, revision FROM todo_lists WHERE project_id = ? AND conversation_id = ?", [project.id, request.conversationId.trim()])[0]
       if (!list) return []
       return retainedEvidenceFor(database, "", true, { sharedListId: list.id })
-    })
+    }).then(async (records) => this.assess(records, []).then(() => records))
   }
   /**
    * Stored observations anywhere in this project, from whichever task or conversation produced them.
@@ -1254,10 +1327,10 @@ export class TodoRepository {
       // A path is named the way the model names it: a canonical string, resolved through the same roots the writer used.
       const location = options.path === undefined ? undefined : this.sourceRoots?.fromCanonical(options.path)
       return retainedEvidenceFor(database, "", false, { projectId: project.id, ...(location === undefined ? {} : { location }), toolName: options.toolName, limit: options.limit })
-    })
+    }).then(async (records) => this.assess(records, []).then(() => records))
   }
 
-  recordToolObservation(request: TodoWriteRequest, input: TodoToolObservationInput): Promise<TodoToolObservation> {
+  recordToolObservation(request: TodoWriteRequest, input: TodoToolObservationInput): Promise<RecordedObservation> {
     assertWriter(request)
     validateRequestId(input.requestId)
     const toolName = input.toolName.trim()
@@ -1272,17 +1345,21 @@ export class TodoRepository {
       if (prior) {
         const priorEvidence = rows<{ retained: number; complete: number; original_chars: number; preserved_chars: number }>(database,
           "SELECT retained, complete, original_chars, preserved_chars FROM todo_tool_evidence WHERE observation_id = ?", [prior.id])[0]
+        // A replayed result is checked against the source it names, as every stored reference is.
         return {
-          ...prior,
-          arguments: JSON.parse(prior.arguments_json) as Record<string, string>,
-          failed: prior.failed !== 0,
-          exitCode: prior.exitCode ?? undefined,
-          evidence: priorEvidence && {
-            retained: priorEvidence.retained === 1,
-            complete: priorEvidence.complete === 1,
-            originalChars: priorEvidence.original_chars,
-            preservedChars: priorEvidence.preserved_chars
-          }
+          observation: {
+            ...prior,
+            arguments: JSON.parse(prior.arguments_json) as Record<string, string>,
+            failed: prior.failed !== 0,
+            exitCode: prior.exitCode ?? undefined,
+            evidence: priorEvidence && {
+              retained: priorEvidence.retained === 1,
+              complete: priorEvidence.complete === 1,
+              originalChars: priorEvidence.original_chars,
+              preservedChars: priorEvidence.preserved_chars
+            }
+          },
+          references: recordedSourceReferences(database, this.sourceRoots!, [prior.id]).get(prior.id) ?? []
         }
       }
       // A result is evidence for the project, not for the task that happened to be active: a task ID, a plan or a
@@ -1308,8 +1385,9 @@ export class TodoRepository {
       // Evidence does not change the task's content or status, so it does not bump its version: an unrelated observation
       // made during review must not invalidate that review. The list revision above records it for review packages.
       logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId ?? null, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
-      return observation
-    })
+      // Storage is where a reference is first checked; a fingerprint that does not match the source it names is reported as stale, and the record is kept as history.
+      return { observation, references }
+    }).then(async (stored) => ({ ...stored.observation, validity: await this.sourceValidity().assess(stored.references) }))
   }
 
   /**
@@ -1514,6 +1592,9 @@ export class TodoRepository {
       const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
       if (!project) return []
       return acceptedFactsFor(database, project.id, { ...options, includeSuperseded: true })
+    }).then(async (facts) => {
+      await this.assess([], facts)
+      return facts
     })
   }
 

@@ -7,10 +7,13 @@ import path from "node:path"
 import { test } from "node:test"
 
 import { logger } from "../../common/logger"
+import { observedSourceReferences } from "../../extension/todos/evidence"
 import { resolveProjectHome } from "../../extension/todos/project-home"
-import { TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { DEFAULT_EVIDENCE_STORAGE_LIMITS, TodoRepository, TodoWriteDeniedError, trustedTodoPanelApproval, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { type SourceBoundaryOptions } from "../../extension/todos/source-validity"
 import { type LegacyTodoRetirement, prepareProjectTodoStorage, resolveProjectTodoStorage, retireLegacyTodoDatabase, SqliteFile } from "../../extension/todos/sqlite"
 import { type TodoCompletionClaim, TodoConflictError } from "../../extension/todos/types"
+import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { get, run, transaction } from "../../extension/workspace-index/sql"
 
 
@@ -1315,3 +1318,330 @@ test("the index tables and the TODO tables coexist in one database and two conne
   }
 })
 
+/** A file inside the project home, which is the source the repository's boundary reads. */
+const homeSource = (root: string, file: string, text: string): string => {
+  const target = path.join(root, file)
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+  fs.writeFileSync(target, text)
+  return target
+}
+
+/** One native read_file output as the tool writes it, so the recorded reference carries the whole-file hash it showed. */
+const shownRead = async (file: string, text: string): Promise<string> => {
+  const lines = text.endsWith("\n") ? text.slice(0, -1).split("\n") : text.split("\n")
+  const hash = await fingerprintContent(text)
+  return `${file} (lines 1–${lines.length} of ${lines.length})\ncontent_hash: ${hash}; total_lines: ${lines.length}\n${lines.map((line, index) => `${index + 1}: ${line}`).join("\n")}`
+}
+
+/** The references one result proves, from the production parser, as the chat hook hands them to the repository. */
+const referencesFor = (name: string, args: Record<string, string>, output: string, origin?: { origin: "disk" | "buffer"; editorVersion?: number }) =>
+  observedSourceReferences({ name, args, output, failed: false, ...(origin === undefined ? {} : { origin }) })
+
+const boundaryRepository = (root: string, source: SourceBoundaryOptions) =>
+  new TodoRepository(projectLocation([{ scheme: "file", fsPath: root }]), DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root], source)
+
+/** Records one result through the repository with no task active, the way the chat hook does. */
+const recordRead = async (repository: TodoRepository, scope: ReturnType<typeof projectScope>, file: string, text: string, requestId: string, itemId?: string) => {
+  const output = await shownRead(file, text)
+  return repository.recordToolObservation(scope, {
+    ...(itemId === undefined ? {} : { itemId }),
+    toolName: "read_file",
+    arguments: { path: file },
+    output: `read ${file}`,
+    failed: false,
+    requestId,
+    evidenceOutput: output,
+    sources: referencesFor("read_file", { path: file }, output)
+  })
+}
+test("the boundary checks each reference as it is stored and again on every later retrieval, and matching content restored makes the same record valid again", async () => {
+  await withDirectory("twinny-validity-boundary-", async (directory) => {
+    const root = makeProject(directory)
+    const file = "src/parser.ts"
+    const original = "export function parse() {}\n"
+    homeSource(root, file, original)
+    const repository = boundaryRepository(root, {})
+    const scope = projectScope(root)
+    try {
+      const stored = await recordRead(repository, scope, file, original, "boundary-store")
+      assert.equal(stored.validity?.validity, "valid", "the reference is checked against the source at the moment it is stored")
+      assert.deepEqual(stored.validity?.references.map((reference) => [reference.path, reference.role, reference.validity, reference.checkedAgainst]), [[file, "read", "valid", "disk"]])
+      assert.equal(stored.validity?.references[0].persistedSource, true, "the check read the saved file")
+
+      fs.writeFileSync(path.join(root, file), `${original}// changed\n`)
+      const stale = await repository.projectObservations(scope, { path: file })
+      assert.equal(stale[0].validity?.validity, "stale", "the same record reads stale once the file changes")
+      assert.equal(stale[0].validity?.references[0].contentHash, await fingerprintContent(original), "the recorded fingerprint is kept as history and never rewritten")
+
+      fs.rmSync(path.join(root, file))
+      const gone = await repository.projectObservations(scope, { path: file })
+      assert.equal(gone[0].validity?.validity, "invalid", "a file that is gone is invalid")
+
+      homeSource(root, file, original)
+      const restored = await repository.projectObservations(scope, { path: file })
+      assert.equal(restored[0].validity?.validity, "valid", "matching content restored makes the same record valid again on the next retrieval")
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+test("every public evidence path reports the same state for the same record, decided by the repository's own boundary with no reader supplied by the caller", async () => {
+  await withDirectory("twinny-validity-paths-", async (directory) => {
+    const root = makeProject(directory)
+    const file = "src/parser.ts"
+    const original = "export function parse() {}\n"
+    homeSource(root, file, original)
+    const repository = boundaryRepository(root, {})
+    const scope = projectScope(root)
+    const plan = {
+      planId: "plan-validity-paths", version: 1 as const, revision: 1, goal: "Report validity on every path", constraints: [],
+      tasks: [{ id: "inspect", title: "Inspect parser", description: "Read parser source", criteria: [{ id: "read", description: "Parser source was read", verification: { kind: "semantic_review" as const } }], dependencies: [] }]
+    }
+    try {
+      const [item] = (await repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: "Read the parser", plan })).items
+      const stored = await recordRead(repository, scope, file, original, "paths-store", item.id)
+      assert.equal(stored.validity?.validity, "valid", "no caller supplied a reader")
+      fs.writeFileSync(path.join(root, file), `${original}// changed\n`)
+      const throughLookup = await repository.projectObservations(scope, { path: file })
+      const throughPlan = await repository.listIntentEvidence(scope)
+      const review = (await repository.getReviewPackages(scope, { includeOpen: true }))[0]
+      assert.deepEqual(
+        [throughLookup[0].validity?.validity, throughPlan[0].validity?.validity, review.retainedEvidence[0].validity?.validity],
+        ["stale", "stale", "stale"],
+        "every path answers with the state the same boundary decided"
+      )
+      assert.deepEqual(review.retainedEvidence[0].validity?.references.map((reference) => [reference.path, reference.validity]), [[file, "stale"]], "the Feedback package carries the per-reference state, not only an aggregate")
+      assert.equal(throughLookup[0].itemId, item.id, "the record still names the task that made it as provenance")
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+test("several references of one result get their own states and one aggregate, invalid over stale over valid", async () => {
+  await withDirectory("twinny-validity-aggregate-", async (directory) => {
+    const root = makeProject(directory)
+    const from = "src/a.ts"
+    const to = "src/b.ts"
+    const kept = "src/c.ts"
+    const movedText = "export const a = 1\n"
+    const keptText = "export const c = 3\n"
+    const repository = boundaryRepository(root, {})
+    const scope = projectScope(root)
+    try {
+      const movedHash = await fingerprintContent(movedText)
+      homeSource(root, from, movedText)
+      homeSource(root, kept, keptText)
+      fs.renameSync(path.join(root, from), path.join(root, to))
+      const moveOutput = `moved ${from} to ${to}\ncontent_hash: ${movedHash} (unchanged by the move)`
+      const moved = await repository.recordToolObservation(scope, {
+        toolName: "move_file",
+        arguments: { from, to },
+        output: `moved ${from} to ${to}`,
+        failed: false,
+        requestId: "aggregate-move",
+        evidenceOutput: moveOutput,
+        sources: referencesFor("move_file", { from, to }, moveOutput)
+      })
+      assert.deepEqual(moved.validity?.references.map((reference) => [reference.role, reference.path, reference.validity]), [["moved_from", from, "invalid"], ["moved_to", to, "valid"]], "the reference for the path that is gone is invalid while the one that matches is valid")
+      assert.equal(moved.validity?.validity, "invalid", "invalid beats every other state in the aggregate")
+
+      const allMatch = await recordRead(repository, scope, kept, keptText, "aggregate-read")
+      assert.equal(allMatch.validity?.validity, "valid", "a result whose references all match is valid")
+
+      fs.writeFileSync(path.join(root, kept), `${keptText}// changed\n`)
+      const renameOutput = `renamed across two files\ncontent_hash(${kept}): ${await fingerprintContent(keptText)}\ncontent_hash(${to}): ${movedHash}`
+      const renamed = await repository.recordToolObservation(scope, {
+        toolName: "rename_symbol",
+        arguments: { name: "thing" },
+        output: "renamed thing across two files",
+        failed: false,
+        requestId: "aggregate-rename",
+        evidenceOutput: renameOutput,
+        sources: referencesFor("rename_symbol", { name: "thing" }, renameOutput)
+      })
+      assert.deepEqual(renamed.validity?.references.map((reference) => [reference.path, reference.validity]), [[kept, "stale"], [to, "valid"]], "the per-reference states stay separate")
+      assert.equal(renamed.validity?.validity, "stale", "stale beats valid when nothing is invalid")
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+test("a reference recorded under an authorized external root is checked at that root, not the project home", async () => {
+  await withDirectory("twinny-validity-external-", async (directory) => {
+    const root = makeProject(directory)
+    const target = path.join(directory, "authorized", "nginx.conf")
+    const text = "worker_processes 4;\n"
+    homeSource(root, "src/keep.ts", "export const keep = 1\n")
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, text)
+    const repository = boundaryRepository(root, {})
+    const scope = projectScope(root)
+    try {
+      const stored = await recordRead(repository, scope, target, text, "external-store")
+      assert.equal(stored.validity?.validity, "valid", "the file is judged at the root it belongs to")
+      assert.equal(stored.validity?.references[0].path, target, "the reference keeps its absolute canonical path")
+      const rows = new BetterSqlite(path.join(root, ".twinny", "project.sqlite"), { readonly: true, fileMustExist: true })
+      try {
+        assert.ok(rows.prepare("SELECT root_id FROM source_root WHERE kind = 'external'").get(), "the reference was stored under its own external root")
+      } finally {
+        rows.close()
+      }
+      fs.writeFileSync(target, "worker_processes 8;\n")
+      const changed = await repository.projectObservations(scope, { path: target })
+      assert.equal(changed[0].validity?.validity, "stale", "the same record is judged against the file at its own root")
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+test("a buffer reference is judged against the document the editor has open, and against the saved file after that document closes", async () => {
+  await withDirectory("twinny-validity-buffer-", async (directory) => {
+    const root = makeProject(directory)
+    const file = "src/parser.ts"
+    const saved = "export function parse() {}\n"
+    const bufferText = `${saved}// an unsaved change\n`
+    const documents = new Map<string, { text: string; version: number }>()
+    const repository = boundaryRepository(root, { openDocument: (absolute) => documents.get(absolute) })
+    const scope = projectScope(root)
+    try {
+      homeSource(root, file, saved)
+      const absolute = path.join(root, file)
+      documents.set(absolute, { text: bufferText, version: 7 })
+      const output = await shownRead(file, bufferText)
+      const stored = await repository.recordToolObservation(scope, {
+        toolName: "read_file",
+        arguments: { path: file },
+        output: `read ${file}`,
+        failed: false,
+        requestId: "buffer-store",
+        evidenceOutput: output,
+        sources: referencesFor("read_file", { path: file }, output, { origin: "buffer", editorVersion: 7 })
+      })
+      assert.equal(stored.validity?.validity, "valid", "the open buffer still matches the fingerprint it was read at")
+      assert.equal(stored.validity?.references[0].checkedAgainst, "buffer", "the open document decided the state")
+      assert.equal(stored.validity?.references[0].persistedSource, false, "a buffer check says nothing about the saved file, so a buffer read cannot certify a persisted write")
+      const rows = new BetterSqlite(path.join(root, ".twinny", "project.sqlite"), { readonly: true, fileMustExist: true })
+      try {
+        assert.deepEqual(rows.prepare("SELECT observed_version, editor_version FROM observation_source").raw().get(), ["buffer", 7], "the stored reference names the version it was read from")
+      } finally {
+        rows.close()
+      }
+
+      documents.set(absolute, { text: `${bufferText}// a later unsaved change\n`, version: 8 })
+      const changedBuffer = await repository.projectObservations(scope, { path: file })
+      assert.deepEqual([changedBuffer[0].validity?.validity, changedBuffer[0].validity?.references[0].checkedAgainst], ["stale", "buffer"], "the open buffer changed, so the reference is stale while the document is open")
+
+      documents.delete(absolute)
+      const closed = await repository.projectObservations(scope, { path: file })
+      assert.deepEqual([closed[0].validity?.validity, closed[0].validity?.references[0].checkedAgainst], ["stale", "disk"], "after the buffer closes the saved file decides")
+
+      fs.writeFileSync(absolute, bufferText)
+      const reopened = await repository.projectObservations(scope, { path: file })
+      assert.deepEqual([reopened[0].validity?.validity, reopened[0].validity?.references[0].checkedAgainst], ["valid", "disk"], "matching content saved makes it valid again")
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+test("a file that is gone is invalid while a file that cannot be read stays on the existing error path", async () => {
+  await withDirectory("twinny-validity-unreadable-", async (directory) => {
+    const root = makeProject(directory)
+    const file = "src/parser.ts"
+    const text = "export function parse() {}\n"
+    const target = homeSource(root, file, text)
+    const repository = boundaryRepository(root, {})
+    const scope = projectScope(root)
+    try {
+      const stored = await recordRead(repository, scope, file, text, "unreadable-store")
+      assert.equal(stored.validity?.validity, "valid")
+      fs.chmodSync(target, 0)
+      try {
+        const unreadable = await repository.projectObservations(scope, { path: file })
+        assert.equal(unreadable[0].validity?.validity, "unverifiable", "a file that exists but cannot be read is not reported as invalid")
+        assert.match(unreadable[0].validity?.references[0].reason ?? "", /could not be read/)
+      } finally {
+        fs.chmodSync(target, 0o600)
+      }
+      fs.rmSync(target)
+      const gone = await repository.projectObservations(scope, { path: file })
+      assert.equal(gone[0].validity?.validity, "invalid", "once the file is gone the same record is invalid, not unreadable")
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+test("a result that recorded no fingerprint gets no invented hash and no file validity", async () => {
+  await withDirectory("twinny-validity-command-", async (directory) => {
+    const root = makeProject(directory)
+    const repository = boundaryRepository(root, {})
+    const scope = projectScope(root)
+    try {
+      const output = `sha256 ${"a".repeat(64)}  src/parser.ts`
+      const stored = await repository.recordToolObservation(scope, {
+        toolName: "run_command",
+        arguments: { command: "sha256sum src/parser.ts" },
+        output: "the command exited 0",
+        failed: false,
+        exitCode: 0,
+        requestId: "command-store",
+        evidenceOutput: output
+      })
+      assert.equal(stored.validity?.validity, undefined, "a result with no recorded reference has no file state")
+      assert.deepEqual(stored.validity?.references ?? [], [])
+      const rows = new BetterSqlite(path.join(root, ".twinny", "project.sqlite"), { readonly: true, fileMustExist: true })
+      try {
+        assert.equal((rows.prepare("SELECT COUNT(*) AS n FROM observation_source").get() as { n: number }).n, 0, "no file reference was invented for the command")
+      } finally {
+        rows.close()
+      }
+      const found = await repository.projectObservations(scope, { toolName: "run_command" })
+      assert.equal(found[0].validity?.validity, undefined, "the lookup reports no file state either")
+    } finally {
+      repository.close()
+    }
+  })
+})
+
+test("project evidence survives the deletion of the task and the list that recorded it, and its source state is read again on every later retrieval", async () => {
+  await withDirectory("twinny-validity-deletion-", async (directory) => {
+    const root = makeProject(directory)
+    const file = "src/parser.ts"
+    const text = "export function parse() {}\n"
+    homeSource(root, file, text)
+    const repository = boundaryRepository(root, {})
+    const scope = projectScope(root)
+    const plan = {
+      planId: "plan-validity-deletion", version: 1 as const, revision: 1, goal: "Keep evidence after deletion", constraints: [],
+      tasks: [{ id: "inspect", title: "Inspect parser", description: "Read parser source", criteria: [{ id: "read", description: "Parser source was read", verification: { kind: "semantic_review" as const } }], dependencies: [] }]
+    }
+    try {
+      const [item] = (await repository.synchronizeIntentPlan(scope, plan, { objective: plan.goal, prompt: "Read the parser", plan })).items
+      const stored = await recordRead(repository, scope, file, text, "deletion-store", item.id)
+      assert.equal(stored.validity?.validity, "valid")
+      fs.rmSync(path.join(root, file))
+      const rows = new BetterSqlite(path.join(root, ".twinny", "project.sqlite"), { fileMustExist: true })
+      try {
+        rows.prepare("PRAGMA foreign_keys = ON").run()
+        const list = rows.prepare("SELECT id FROM todo_lists WHERE conversation_id = ?").get(scope.conversationId) as { id: string }
+        rows.prepare("DELETE FROM todo_items WHERE id = ?").run(item.id)
+        rows.prepare("DELETE FROM todo_lists WHERE id = ?").run(list.id)
+      } finally {
+        rows.close()
+      }
+      const after = await repository.projectObservations(scope, { path: file })
+      assert.deepEqual(after.map((entry) => entry.observationId), [stored.id], "the project record outlives the task and the conversation that recorded it")
+      assert.equal(after[0].itemId, item.id, "its task provenance is still recorded")
+      assert.equal(after[0].validity?.validity, "invalid", "the reference the record made for a file that is gone is invalid")
+      homeSource(root, file, text)
+      assert.equal((await repository.projectObservations(scope, { path: file }))[0].validity?.validity, "valid", "the same record is valid again once its content is restored")
+    } finally {
+      repository.close()
+    }
+  })
+})

@@ -64,6 +64,16 @@ const LEGACY_TODO_RETIRED_KEY = "twinny.legacyTodoDatabaseRetired"
 
 let legacyTodoRetirement: Promise<void> | undefined
 
+/**
+ * Editor state, nothing more: the document the editor has open at an absolute path. The repository's
+ * boundary decides validity; this only tells it which version the editor holds, so a buffer reference is
+ * judged against the buffer while it is open and against the saved file after it closes.
+ */
+export const openEditorDocument = (absolutePath: string): { text: string; version?: number } | undefined => {
+  const open = vscode.workspace.textDocuments.find((document) => document.uri.fsPath === absolutePath)
+  return open === undefined ? undefined : { text: open.getText(), version: open.version }
+}
+
 export class BaseProvider {
   private _workspaceIndex: WorkspaceIndex | undefined
   private _embeddingService: EmbeddingService | undefined
@@ -108,7 +118,7 @@ export class BaseProvider {
     workspaceSearch?: WorkspaceSearchProvider
   ) {
     this.context = context
-    this._todoRepository = new TodoRepository(async () => prepareProjectTodoStorage(currentProjectTodoStorage()), DEFAULT_EVIDENCE_STORAGE_LIMITS, () => currentProjectTodoStorage().roots)
+    this._todoRepository = new TodoRepository(async () => prepareProjectTodoStorage(currentProjectTodoStorage()), DEFAULT_EVIDENCE_STORAGE_LIMITS, () => currentProjectTodoStorage().roots, { openDocument: openEditorDocument })
     this._agentRegistry = new AgentRegistry(context)
     this._fileTreeProvider = new FileTreeProvider()
     this._workspaceIndex = index

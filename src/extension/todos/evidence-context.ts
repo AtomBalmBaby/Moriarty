@@ -1,7 +1,7 @@
 import type { SourceIdentity, TodoToolObservation, TypedCriterion } from "../../common/types"
 
 import { codeIdentifiers } from "./evidence"
-import { type AcceptedFactStatus, assessAcceptedFacts, type CurrentSourceReader, factMatchesSymbol, factNamedBy } from "./feedback"
+import { type AcceptedFactStatus, assessAcceptedFacts, type CurrentSource, factMatchesSymbol, factNamedBy } from "./feedback"
 import { acceptedFactEntry } from "./plan-context"
 import type { AcceptedFact, AcceptedFactUsage } from "./types"
 
@@ -140,7 +140,7 @@ export interface EvidenceInput {
   /** The active item's observations, newest first. */
   observations: TodoToolObservation[]
   observationText: (observation: TodoToolObservation) => string
-  readCurrent?: CurrentSourceReader
+  readCurrent?: CurrentSource
   budget?: EvidenceBudget
 }
 
