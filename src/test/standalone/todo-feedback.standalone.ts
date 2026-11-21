@@ -29,6 +29,7 @@ import type { ToolCall } from "../../extension/tools/protocol"
 import { todoWorkspaceTools } from "../../extension/tools/todos"
 import { WorkspaceView } from "../../extension/tools/view"
 import { type EditSink, type ToolResult,workspaceTools } from "../../extension/tools/workspace"
+import { run, transaction } from "../../extension/workspace-index/sql"
 
 type SqliteValue = string | number | bigint | Buffer | null
 
@@ -3008,6 +3009,166 @@ test("twinny_evidence_lookup requires a symbol or a path and fails without one",
   }
 })
 
+
+/** A tool registration: the shape the deterministic reconciler proves and records as a fact. */
+const registrationText = (name: string): string => `const tool = {\n  name: "${name}",\n  async run() { return 1 }\n}\n`
+/** The file: URI the index stores for a path, as vscode.Uri.file(path).toString() writes it. */
+const fileUriOf = (absolute: string): string => `file://${absolute.split("/").map((segment) => encodeURIComponent(segment)).join("/")}`
+
+type RelocationFixture = { directory: string; root: string; databasePath: string; scope: TodoWriteRequest; repository: TodoRepository; itemIds: string[] }
+
+/** A project home with a real file on disk, so the repository's own boundary judges that file. */
+const relocationFixture = async (symbol: string, file: string, text: string): Promise<RelocationFixture> => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-relocation-"))
+  const root = path.join(directory, "project")
+  fs.mkdirSync(path.join(root, "src"), { recursive: true })
+  fs.writeFileSync(path.join(root, file), text)
+  const databasePath = path.join(root, ".twinny", "project.sqlite")
+  const scope = { projectFingerprint: workspaceProjectFingerprint(["file:///relocation-project"]), conversationId: "relocation-chat", writer: "relocation-chat" }
+  const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+  const criterion = sourceLocation("registered", `\`${symbol}\` is registered in ${file}`, symbol, "registered_tool", file)
+  const items = await repository.synchronizeIntentPlan(scope, plan([{ id: "inspect", criteria: [criterion] }]), { prompt: `Locate ${symbol}` })
+  return { directory, root, databasePath, scope, repository, itemIds: items.items.map((item) => item.id) }
+}
+
+/** A read of the whole file as read_file writes it, so the reference carries that file's own fingerprint. */
+const wholeFileRead = async (state: RelocationFixture, file: string, text: string, requestId: string) => {
+  const lines = text.endsWith("\n") ? text.slice(0, -1).split("\n") : text.split("\n")
+  const output = `${file} (lines 1–${lines.length} of ${lines.length})\ncontent_hash: ${await fingerprintContent(text)}; total_lines: ${lines.length}\n${numbered(1, lines)}`
+  return state.repository.recordToolObservation(state.scope, {
+    itemId: state.itemIds[0],
+    toolName: "read_file",
+    arguments: { path: file },
+    output: `read ${file}`,
+    failed: false,
+    requestId,
+    evidenceOutput: output,
+    sources: observedSourceReferences({ name: "read_file", args: { path: file }, output, failed: false })
+  })
+}
+
+/** One documents row as the index writes it, through the Stage 5 facade. */
+const indexDocumentRow = async (state: RelocationFixture, file: string, fingerprint: string, skipReason?: string) => {
+  const database = new BetterSqlite(state.databasePath, { fileMustExist: true })
+  try {
+    await transaction(database, () => run(database,
+      "INSERT INTO documents(uri,workspace_uri,relative_path,filename,language_id,fingerprint,hash_algorithm,size,mtime_ms,text,indexed_at,skip_reason,error,symbols_fingerprint,scan_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+      [fileUriOf(path.join(state.root, file)), fileUriOf(state.root), file, path.posix.basename(file), "typescript", fingerprint, "xxh64", 24, 1, "", new Date().toISOString(), skipReason ?? null]
+    ))
+  } finally {
+    database.close()
+  }
+}
+
+/** The fact the deterministic reconciler accepts for the fixture's file, with no Feedback call. */
+const acceptedRelocationFact = async (state: RelocationFixture, file: string, text: string, requestId: string) => {
+  const item = state.itemIds[0]
+  await startItemInReview(state.repository, state.scope, item)
+  const observed = await wholeFileRead(state, file, text, requestId)
+  const evaluation = await evaluateTodoReview(state.repository, state.scope, await reviewFor(state, item), countingEvaluator({ count: 0 }), "mock-reviewer", { readCurrentSource: state.repository.sourceValidity(), hasVerifiedFileChanges: false })
+  assert.equal(evaluation.decision, "accept", JSON.stringify(evaluation.problems))
+  assert.equal((await state.repository.listAcceptedEvidence(state.scope, { path: file })).length, 1, "the deterministic reconciler recorded the fact without a Feedback call")
+  return observed
+}
+
+test("a moved file's evidence keeps its original reference, becomes invalid, and the new path is offered as a relocation candidate", async () => {
+  const symbol = "parse"
+  const file = "src/parser.ts"
+  const text = registrationText(symbol)
+  const hash = await fingerprintContent(text)
+  const state = await relocationFixture(symbol, file, text)
+  try {
+    const observed = await acceptedRelocationFact(state, file, text, "relocation-move-read")
+    const recorded = storedSources(state.databasePath, observed.id)
+    fs.renameSync(path.join(state.root, file), path.join(state.root, "src", "moved.ts"))
+    await indexDocumentRow(state, "src/moved.ts", hash)
+    const lookup = await lookupEvidence(state, { symbol })
+    assert.equal(lookup.failed, false)
+    const [fact] = lookup.body!.facts
+    assert.equal(fact.freshness, "invalid", "the file the fact names is gone")
+    assert.equal(fact.path, file, "the fact keeps the path it was recorded at")
+    assert.deepEqual(fact.relocation_candidates, [{ path: "src/moved.ts", source: "matching_hash" }], "the index row at the new path is offered as a candidate")
+    assert.match(String(fact.refresh), /if the file moved, read a candidate to confirm; this fact keeps its original path as history/)
+    assert.deepEqual(storedSources(state.databasePath, observed.id), recorded, "the stored reference is not rewritten")
+  } finally {
+    state.repository.close()
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("identical files at different paths are separate candidates and none is selected", async () => {
+  const symbol = "marker"
+  const file = "src/a.ts"
+  const text = registrationText(symbol)
+  const hash = await fingerprintContent(text)
+  const state = await relocationFixture(symbol, file, text)
+  try {
+    await acceptedRelocationFact(state, file, text, "relocation-duplicates-read")
+    for (const copy of ["src/b.ts", "src/c.ts", "src/d.ts", "src/skip.ts"]) fs.writeFileSync(path.join(state.root, copy), text)
+    await indexDocumentRow(state, file, hash)
+    for (const copy of ["src/b.ts", "src/c.ts", "src/d.ts"]) await indexDocumentRow(state, copy, hash)
+    await indexDocumentRow(state, "src/skip.ts", hash, "binary content")
+    assert.deepEqual(await state.repository.findRelocationCandidates({ path: file, contentHash: hash }), [
+      { path: "src/b.ts", source: "matching_hash" },
+      { path: "src/c.ts", source: "matching_hash" },
+      { path: "src/d.ts", source: "matching_hash" }
+    ], "every identical file stays its own candidate, and a skipped row is not one")
+    for (const copy of ["src/e.ts", "src/f.ts"]) await indexDocumentRow(state, copy, hash)
+    assert.equal((await state.repository.findRelocationCandidates({ path: file, contentHash: hash })).length, 5, "at most five are offered, and nothing is picked from them")
+  } finally {
+    state.repository.close()
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("a recorded move links the old and new paths even when the index has no row", async () => {
+  const symbol = "parse"
+  const from = "src/parser.ts"
+  const to = "src/moved.ts"
+  const text = registrationText(symbol)
+  const hash = await fingerprintContent(text)
+  const state = await relocationFixture(symbol, from, text)
+  try {
+    await acceptedRelocationFact(state, from, text, "recorded-move-read")
+    const output = `moved ${from} to ${to}\ncontent_hash: ${hash} (unchanged by the move)`
+    await state.repository.recordToolObservation(state.scope, {
+      toolName: "move_file",
+      arguments: { from, to },
+      output: `moved ${from} to ${to}`,
+      failed: false,
+      requestId: "recorded-move",
+      evidenceOutput: output,
+      sources: observedSourceReferences({ name: "move_file", args: { from, to }, output, failed: false })
+    })
+    fs.rmSync(path.join(state.root, from))
+    assert.deepEqual(await state.repository.findRelocationCandidates({ path: from, contentHash: hash }), [{ path: to, source: "recorded_move" }], "the move the observation recorded answers with no index row at all")
+    const lookup = await lookupEvidence(state, { symbol })
+    assert.deepEqual(lookup.body!.facts[0].relocation_candidates, [{ path: to, source: "recorded_move" }], "the lookup offers the recorded move")
+  } finally {
+    state.repository.close()
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
+test("the reference's own path is never its own candidate", async () => {
+  const symbol = "parse"
+  const file = "src/parser.ts"
+  const text = registrationText(symbol)
+  const hash = await fingerprintContent(text)
+  const state = await relocationFixture(symbol, file, text)
+  try {
+    await acceptedRelocationFact(state, file, text, "own-row-read")
+    await indexDocumentRow(state, file, hash)
+    assert.deepEqual(await state.repository.findRelocationCandidates({ path: file, contentHash: hash }), [], "the row for the recorded path does not offer it as a candidate")
+    fs.writeFileSync(path.join(state.root, "src", "copy.ts"), text)
+    await indexDocumentRow(state, "src/copy.ts", hash)
+    assert.deepEqual(await state.repository.findRelocationCandidates({ path: file, contentHash: hash }), [{ path: "src/copy.ts", source: "matching_hash" }], "a matching row at another path is")
+  } finally {
+    state.repository.close()
+    fs.rmSync(state.directory, { recursive: true, force: true })
+  }
+})
+
 test("a read that misses the definition's line range or names a different symbol never proves it, and needs no Feedback call", async () => {
   const criterion = sourceLocation("defined", "`read_file` is defined in src/extension/tools/workspace.ts", "read_file", "registered_tool")
   const cases = [
@@ -5795,7 +5956,7 @@ test("an inline registered-tool implementation is proven without naming a declar
   const state = await evidenceFixture(todoLocation("implementation", "twinny_todo_update"))
   try {
     const item = await startInvestigation(state)
-    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, 291, 372)
+    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, 291, 376)
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, todosReader)
     assert.equal(reconciliation.outcome, "proven", JSON.stringify(reconciliation))
@@ -5874,7 +6035,7 @@ test("one retained read of the registration span proves every criterion that it 
   }])
   try {
     const item = await startInvestigation(state)
-    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, 291, 372)
+    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, 291, 376)
     const review = await reviewFor(state, item.id)
     const reconciliations = await reviewReconciliations(review, todosReader)
     for (const criterionId of ["registration", "implementation"]) {

@@ -40,6 +40,8 @@ import {
   type IntentTaskPlan,
   type ProjectEvidenceRequest,
   type RecordedObservation,
+  type RelocationCandidate,
+  type RelocationSource,
   type RequirementActivation,
   type RetainedObservationEvidence,
   type SymbolAlias,
@@ -870,6 +872,22 @@ const enforceEvidenceBudget = (database: Database, listId: string, keepId: strin
   }
 }
 
+const MAX_RELOCATION_CANDIDATES = 5
+const MAX_HASH_MATCH_ROWS = 20
+
+/** A documents.uri is a file: URI; decoding it without the editor gives the POSIX path the index stored. */
+const recordedPathOfUri = (uri: string): string | undefined => {
+  try {
+    const parsed = new URL(uri)
+    if (parsed.protocol !== "file:") return undefined
+    // A drive root appears in a URI path as /C:/, which SourceRoots reads as the drive form.
+    const path = decodeURIComponent(parsed.pathname)
+    return /^\/([A-Za-z]:\/)/.test(path) ? path.slice(1) : path
+  } catch {
+    return undefined
+  }
+}
+
 export class TodoRepository {
   private readonly sqlite: SqliteFile
   private readonly evidenceLimits: EvidenceStorageLimits
@@ -1328,6 +1346,40 @@ export class TodoRepository {
       const location = options.path === undefined ? undefined : this.sourceRoots?.fromCanonical(options.path)
       return retainedEvidenceFor(database, "", false, { projectId: project.id, ...(location === undefined ? {} : { location }), toolName: options.toolName, limit: options.limit })
     }).then(async (records) => this.assess(records, []).then(() => records))
+  }
+
+  /**
+   * Where the content a reference names may be now, proposed by the shared database. Nothing here
+   * rewrites history: the paths a move observation named stay as they were recorded, and an index row
+   * with the same fingerprint is only a candidate. Identical content at different paths stays separate,
+   * candidates are deduplicated, none is chosen over another, and the reference's own path is never its
+   * own candidate.
+   */
+  findRelocationCandidates(reference: { path: string; contentHash: string }): Promise<RelocationCandidate[]> {
+    const canonical = reference.path.trim()
+    if (!canonical) return Promise.resolve([])
+    return this.sqlite.read((database) => {
+      const roots = this.sourceRoots!
+      const location = roots.fromCanonical(canonical)
+      const own = roots.canonicalPath(location)
+      const seen = new Set<string>()
+      const candidates: RelocationCandidate[] = []
+      const add = (path: string, source: RelocationSource): void => {
+        if (path === own || seen.has(path)) return
+        seen.add(path)
+        candidates.push({ path, source })
+      }
+      for (const row of rows<{ root_id: string; path: string }>(database,
+        "SELECT moved_to.root_id, moved_to.path FROM observation_source AS moved_from JOIN observation_source AS moved_to ON moved_to.observation_id = moved_from.observation_id WHERE moved_from.role = 'moved_from' AND moved_from.root_id = ? AND moved_from.path = ? AND moved_to.role = 'moved_to' ORDER BY moved_from.observation_id, moved_to.ordinal",
+        [location.rootId, location.path])) add(roots.canonicalPath({ rootId: row.root_id, path: row.path }), "recorded_move")
+      const hash = reference.contentHash.trim()
+      if (hash) for (const row of rows<{ uri: string }>(database,
+        `SELECT uri FROM documents WHERE fingerprint = ? AND skip_reason IS NULL AND error IS NULL ORDER BY uri LIMIT ${MAX_HASH_MATCH_ROWS}`, [hash])) {
+        const absolute = recordedPathOfUri(row.uri)
+        if (absolute !== undefined) add(roots.canonicalPath(roots.locate(absolute)), "matching_hash")
+      }
+      return candidates.slice(0, MAX_RELOCATION_CANDIDATES)
+    })
   }
 
   recordToolObservation(request: TodoWriteRequest, input: TodoToolObservationInput): Promise<RecordedObservation> {

@@ -239,6 +239,14 @@ export interface AcceptedFact extends TodoSourceFact {
   editorVersion?: number
 }
 
+/** Where the shared database thinks a recorded file's content may be now. A proposal only: the recorded reference is never rewritten and no candidate is chosen over another. */
+export type RelocationSource = "recorded_move" | "matching_hash"
+
+export interface RelocationCandidate {
+  path: string
+  source: RelocationSource
+}
+
 /**
  * How an execution used a current accepted fact. `lookup` is an explicit successful lookup that returned the fact;
  * `reuse` is an accepted attach of the fact to a criterion. Automatic context injection is never a use.

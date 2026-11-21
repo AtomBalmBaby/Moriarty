@@ -1494,7 +1494,8 @@ const planningRequests = (model: ScriptedModel) =>
 const treeOf = (root: string, dir = root): Record<string, string> => Object.fromEntries(
   fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry): Array<[string, string]> => {
     const full = path.join(dir, entry.name)
-    return entry.isDirectory() ? Object.entries(treeOf(root, full)) : [[path.relative(root, full), fs.readFileSync(full, "utf8")]]
+    if (entry.isDirectory()) return entry.name === ".twinny" ? [] : Object.entries(treeOf(root, full))
+    return [[path.relative(root, full), fs.readFileSync(full, "utf8")]]
   })
 )
 
@@ -1561,6 +1562,7 @@ suite("Read-file acceptance, production controller", function () {
       fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
       fs.writeFileSync(path.join(root, file), text)
     }
+    fs.mkdirSync(path.join(root, ".twinny"), { recursive: true })
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-acceptance-storage-"))
     const closeWorkspace = await openWorkspace(root)
     const settings = vscode.workspace.getConfiguration("twinny")
@@ -1570,7 +1572,7 @@ suite("Read-file acceptance, production controller", function () {
       await run({
         root,
         storage,
-        databasePath: path.join(storage, "todos.sqlite"),
+        databasePath: path.join(root, ".twinny", "todos.sqlite"),
         projectFingerprint: PROJECT_FINGERPRINT
       })
     } finally {
@@ -1597,7 +1599,12 @@ suite("Read-file acceptance, production controller", function () {
     onWaiting?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
     onStoppable?: (step: ToolStepView, chat: ChatIn, agent: ScriptedModel) => void
   }) => {
-    const repository = new TodoRepository(workspace.databasePath)
+    const repository = new TodoRepository(
+      workspace.databasePath,
+      DEFAULT_EVIDENCE_STORAGE_LIMITS,
+      () => [workspace.root],
+      { openDocument: openEditorDocument }
+    )
     await repository.initialize()
     options.onRepository?.(repository)
     const agentId = `${options.conversationId}-agent`
@@ -1758,7 +1765,12 @@ suite("Read-file acceptance, production controller", function () {
       assert.equal(facts[0].endLine, 4)
       assert.equal(facts[0].planId, "read-file-plan-first")
 
-      const reopened = new TodoRepository(workspace.databasePath)
+      const reopened = new TodoRepository(
+        workspace.databasePath,
+        DEFAULT_EVIDENCE_STORAGE_LIMITS,
+        () => [workspace.root],
+        { openDocument: openEditorDocument }
+      )
       await reopened.initialize()
       const persisted = await reopened.listAcceptedEvidence({ projectFingerprint: workspace.projectFingerprint, conversationId: first.scope.conversationId })
       assert.deepEqual(persisted.map((fact) => fact.id), facts.map((fact) => fact.id))
@@ -2541,7 +2553,12 @@ suite("Read-file acceptance, production controller", function () {
           "the stale predicate is named to the implementer"
         )
 
-        const origin = new TodoRepository(workspace.databasePath)
+        const origin = new TodoRepository(
+          workspace.databasePath,
+          DEFAULT_EVIDENCE_STORAGE_LIMITS,
+          () => [workspace.root],
+          { openDocument: openEditorDocument }
+        )
         await origin.initialize()
         const originScope = { projectFingerprint: workspace.projectFingerprint, conversationId: "read-file-recorded", writer: "read-file-recorded" }
         const originItems = (await origin.getList({ ...originScope, includeCompleted: true })).items
@@ -2558,7 +2575,12 @@ suite("Read-file acceptance, production controller", function () {
     await withWorkspace(async (workspace) => {
       const conversationId = "read-file-approval"
       const scope = { projectFingerprint: workspace.projectFingerprint, conversationId, writer: conversationId }
-      const seed = new TodoRepository(workspace.databasePath)
+      const seed = new TodoRepository(
+        workspace.databasePath,
+        DEFAULT_EVIDENCE_STORAGE_LIMITS,
+        () => [workspace.root],
+        { openDocument: openEditorDocument }
+      )
       await seed.initialize()
       const reviewed = await seed.createItem(scope, { title: "Confirm the read_file note" }, "seed-approval-item", "user")
 
@@ -2622,7 +2644,12 @@ suite("Read-file acceptance, production controller", function () {
   }
 
   const reopenedStatus = async (workspace: Workspace, turn: Turn, title: string) => {
-    const reopened = new TodoRepository(workspace.databasePath)
+    const reopened = new TodoRepository(
+      workspace.databasePath,
+      DEFAULT_EVIDENCE_STORAGE_LIMITS,
+      () => [workspace.root],
+      { openDocument: openEditorDocument }
+    )
     await reopened.initialize()
     const { items } = await reopened.getList({ ...turn.scope, includeCompleted: true })
     return items.find((item) => item.title === title)?.status

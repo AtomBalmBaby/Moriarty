@@ -89,6 +89,9 @@ const feedbackUnavailable = (parentId: string, reason: string): ToolResult => ({
 const priorities = new Set<TodoPriority>(["low", "normal", "high", "urgent"])
 const statuses = new Set<TodoStatus>(["pending", "in_progress", "in_review", "blocked", "completed", "cancelled"])
 const EVIDENCE_LOOKUP_LIMIT = 20
+/** A candidate is a proposal, never a verdict: the model confirms one by reading it, and the fact keeps its recorded path. */
+const MOVED_FILE_HINT = "if the file moved, read a candidate to confirm; this fact keeps its original path as history"
+
 
 const requestId = (args: Record<string, string>) => {
   const value = args.request_id?.trim()
@@ -180,24 +183,29 @@ export const todoTools = (
         logger.debug(`[Evidence] lookup project=${scope.projectFingerprint.slice(0, 12)} symbol=${symbol ?? "-"} path=${path ?? "-"} matches=${statuses.length} resolution=${resolution}`)
         if (!statuses.length) logger.trace("[Evidence] lookup found no accepted fact for this project; facts are recorded only after a deterministic proof, so a missing fact means none was proven yet")
         await recordEvidenceUse(repository, scope, options, "lookup", statuses.filter((status) => status.freshness === "current").map((status) => status.fact.id))
-        const found = statuses.map(({ fact, freshness, reason, validity, reference }) => ({
-          evidence_id: fact.id,
-          symbol: fact.symbol,
-          tool_name: fact.toolName,
-          ...(fact.registeredTool ? { registered_tool: fact.registeredTool } : {}),
-          path: fact.path,
-          start_line: fact.startLine,
-          end_line: fact.endLine,
-          source_hash: fact.sourceHash,
-          observation_id: fact.observationId,
-          conversation_id: fact.conversationId,
-          item_id: fact.itemId,
-          plan_revision: fact.planRevision,
-          accepted_at: fact.acceptedAt,
-          freshness,
-          validity, reference,
-          ...(reason ? { reason } : {}),
-          ...(freshness !== "current" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again` } : {})
+        const found = await Promise.all(statuses.map(async (status) => {
+          const { fact, freshness, reason, validity, reference } = status
+          const candidates = validity === "invalid" || validity === "stale" ? await repository.findRelocationCandidates({ path: fact.path, contentHash: fact.sourceHash }) : []
+          return {
+            evidence_id: fact.id,
+            symbol: fact.symbol,
+            tool_name: fact.toolName,
+            ...(fact.registeredTool ? { registered_tool: fact.registeredTool } : {}),
+            path: fact.path,
+            start_line: fact.startLine,
+            end_line: fact.endLine,
+            source_hash: fact.sourceHash,
+            observation_id: fact.observationId,
+            conversation_id: fact.conversationId,
+            item_id: fact.itemId,
+            plan_revision: fact.planRevision,
+            accepted_at: fact.acceptedAt,
+            freshness,
+            validity, reference,
+            ...(candidates.length ? { relocation_candidates: candidates } : {}),
+            ...(reason ? { reason } : {}),
+            ...(freshness !== "current" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again${candidates.length ? `; ${MOVED_FILE_HINT}` : ""}` } : {})
+          }
         }))
         const referenceValidity = aggregateValidity(statuses.map((status) => status.reference))
         return {

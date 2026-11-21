@@ -25,8 +25,8 @@ test("the native todo update tool is located by its exact registered name, and n
   const file = "src/extension/tools/todos.ts"
   const analysis = analysed(file, fs.readFileSync(path.join(process.cwd(), file), "utf8"))
   const tool = registrationOf(analysis, "twinny_todo_update")
-  assert.equal(tool.nameLine, 293)
-  assert.ok(tool.startLine <= 293 && tool.endLine > 293, JSON.stringify(tool))
+  assert.equal(tool.nameLine, 301)
+  assert.ok(tool.startLine <= 301 && tool.endLine > 301, JSON.stringify(tool))
   assert.equal(declarationsNamed(analysis, "twinnyTodoUpdate").length, 0)
   assert.ok(analysis.registrations.every((registration) => registration.toolName !== "twinnyTodoUpdate"))
 })
