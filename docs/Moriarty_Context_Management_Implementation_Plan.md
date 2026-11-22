@@ -133,6 +133,8 @@ Do not mark ordinary implementation TODOs complete by hand. A completion claim g
 
 ### 0.6 Handoff prompt template
 
+Every stage has its own **copy/paste prompt at the end of its section**. Use that stage-specific prompt in a fresh conversation rather than editing a generic Stage 0 prompt. Each prompt is an entry point; the full stage requirements and verification gates remain authoritative.
+
 Paste as the first message of a fresh conversation:
 
 ```
@@ -884,6 +886,20 @@ export interface EvidenceStore {
 
 **Cannot be declared complete if:** any existing assertion was weakened or skipped; a completeness state is claimed without a test; the schema version was changed without the refusal-path test passing; any code path deletes a database by itself; the VS Code suite pass was claimed without observing it.
 
+**Copy/paste prompt for Stage 1 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 1 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 1 section, and only the referenced design/contract sections needed for this stage. Confirm Stage 0 is marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 1 scope: Implement the complete v21 SQLite schema and durable byte-preserving invocation/outcome/BLOB capture, config.json storage policy, honest completeness and synthetic independent stdout/stderr and PTY cases. Stage 10, not this stage, owns real run_command stream capture. Keep existing evidence/feedback behavior intact.
+
+Follow every Stage 1 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 1; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 1 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 1 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 2.
+```
+
 ---
 
 ### Stage 2 — Read-only evidence access service
@@ -937,6 +953,20 @@ export interface EvidenceStore {
 **Acceptance criteria:** every state in §4.3 is reachable by at least one test; the reproduction case answers beginning/middle/end without a reread; no code path reruns a tool for retrieval.
 
 **Cannot be declared complete if:** any state is asserted without a test; the service reads current source instead of stored evidence without labelling it; a zero-match search is reported as failure; an existing lookup test changed.
+
+**Copy/paste prompt for Stage 2 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 2 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 2 section, and only the referenced design/contract sections needed for this stage. Confirm Stage 1 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 2 scope: Build the authorized read-only evidence access service over Stage 1 storage, including range/line/byte retrieval, long-line fragments, stream selection, literal/search/filter, deterministic cursors, missing/evicted/inaccessible states and no re-execution.
+
+Follow every Stage 2 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 2; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 2 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 2 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 3.
+```
 
 ---
 
@@ -998,6 +1028,20 @@ Rules for the tool surface: read-only; `readOnly: true` so repeat suppression ap
 **Acceptance criteria:** every tool call a response recommends is a registered tool; every "recoverable" claim is backed by stored data and authorization; existing header parsers and step-view tests pass unmodified.
 
 **Cannot be declared complete if:** an unregistered tool is referenced in any message; any response claims completeness the storage does not have; an existing GUI/export test needed a weakened assertion.
+
+**Copy/paste prompt for Stage 3 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 3 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 3 section, and only the referenced design/contract sections needed for this stage. Confirm Stage 2 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 3 scope: Register the single native query_evidence tool (range/search/filter/continuation), wire actual observation IDs and sparse integrity/retrieval envelopes through the production loop and GUI/export, and ensure repeat reads reuse retained results rather than rerun.
+
+Follow every Stage 3 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 3; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 3 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 3 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 4.
+```
 
 ---
 
@@ -1078,6 +1122,20 @@ Preserve the existing per-reference states (`valid`/`stale`/`invalid`/`unverifia
 
 **Cannot be declared complete if:** any existing assertion was changed except those this stage names; `unknown` is collapsed into a default; a dependency was inferred rather than recorded.
 
+**Copy/paste prompt for Stage 4 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 4 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 4 section, and only the referenced design/contract sections needed for this stage. Confirm Stage 1 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 4 scope: Extend the existing validity boundary and recorded dependency/lineage edges; handle verified save/edit/external/Git/rename/delete events without leaking a replacement fingerprint or inventing dependencies. No new DDL: v21 schema belongs to Stage 1.
+
+Follow every Stage 4 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 4; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 4 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 4 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 5.
+```
+
 ---
 
 ### Stage 5 — Explicit stale-to-current resolution (`resolve_current_evidence`)
@@ -1134,6 +1192,20 @@ Preserve the existing per-reference states (`valid`/`stale`/`invalid`/`unverifia
 
 **Cannot be declared complete if:** the resolver can answer from the index alone; it can infer identity from a matching hash; it can bypass an authorization check; it reruns a side-effecting command; any test asserts a hash without verifying it against the source.
 
+**Copy/paste prompt for Stage 5 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 5 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 5 section, and only the referenced design/contract sections needed for this stage. Confirm Stages 2 and 4 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 5 scope: Implement explicit resolve_current_evidence with authorization and current-source verification, including disk/buffer distinctions, verified rename handling and race checks. Never return a fresh hash from passive invalidation or bypass edit_lines expected_hash.
+
+Follow every Stage 5 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 5; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 5 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 5 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 6.
+```
+
 ---
 
 ### Stage 6 — Model-controlled favourites and protected user intent
@@ -1187,6 +1259,20 @@ Preserve the existing per-reference states (`valid`/`stale`/`invalid`/`unverifia
 
 **Cannot be declared complete if:** a single call can change multiple observations; replay after unmark is not deterministic; a favourite can influence validity, permission or the hard cap; the model can unprotect user input; ordinary outputs carry `favourite:false`.
 
+**Copy/paste prompt for Stage 6 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 6 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 6 section, and only the referenced design/contract sections needed for this stage. Confirm Stages 1 and 4 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 6 scope: Implement exactly one observation UUID per set_evidence_favourite call, authorized idempotent mark/unmark with persistent request replay, and protected immutable user intent. Reject arrays/batches. Do not import or implement the Stage 8 projector.
+
+Follow every Stage 6 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 6; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 6 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 6 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 7.
+```
+
 ---
 
 ### Stage 7 — Context sizing, token accounting and provider diagnostics
@@ -1236,6 +1322,20 @@ Preserve the existing per-reference states (`valid`/`stale`/`invalid`/`unverifia
 **Acceptance criteria:** every listed issue has a failing-without-the-fix test; existing context-usage tests pass unmodified; no warning text calls an estimate a physical measurement.
 
 **Cannot be declared complete if:** a count is claimed without running it; a warning path was changed without a test; the threshold math reads raw capacity.
+
+**Copy/paste prompt for Stage 7 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 7 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 7 section, and only the referenced design/contract sections needed for this stage. Confirm Stages 0 and 2 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 7 scope: Correct provider capacity discovery, token estimates, reserves and utilization diagnostics for 64K/128K/256K+ windows. Ensure repeat suppression does not re-execute prior reads or commands. Preserve real provider hard limits.
+
+Follow every Stage 7 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 7; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 7 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 7 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 8.
+```
 
 ---
 
@@ -1306,6 +1406,20 @@ Removal means "replace the body with a bounded reference": `observation_id`, ori
 
 **Cannot be declared complete if:** determinism is not proven by a repeat run; any test asserts pruning happened without checking the database stayed intact; pairing is asserted rather than tested.
 
+**Copy/paste prompt for Stage 8 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 8 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 8 section, and only the referenced design/contract sections needed for this stage. Confirm Stages 2, 4, 6 and 7 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 8 scope: Implement the pure deterministic validity/favourite-aware two-tier context projector with protected user intent, threshold/hysteresis, budget diagnostics, references and valid tool-call/result pairing. No GUI or host wiring in this stage.
+
+Follow every Stage 8 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 8; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 8 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 8 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 9.
+```
+
 ---
 
 ### Stage 9 — Projector wiring, inline chat settings and utilization display
@@ -1352,6 +1466,20 @@ Removal means "replace the body with a bounded reference": `observation_id`, ori
 **Acceptance criteria:** the settings exist with the stated default/range/step; the projector is actually used in both chat paths; no existing loop test changed; display wording distinguishes estimate from physical memory.
 
 **Cannot be declared complete if:** a control was added without wiring it to the projector; the hard limit can be bypassed when pruning is off; the suite pass was claimed without observing a Mocha summary.
+
+**Copy/paste prompt for Stage 9 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 9 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 9 section, and only the referenced design/contract sections needed for this stage. Confirm Stage 8 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 9 scope: Wire the existing projector into real chat/request construction and inline settings: pruning toggle, percentage slider, estimated capacity/utilization/threshold display and next-request application. Preserve old behavior if disabled and hard provider limits.
+
+Follow every Stage 9 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 9; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 9 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 9 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 10.
+```
 
 ---
 
@@ -1407,6 +1535,20 @@ Removal means "replace the body with a bounded reference": `observation_id`, ori
 **Acceptance criteria:** one launch per command is proven; the **default ordinary execution path** captures distinct stdout/stderr from process creation, not after merging or truncation. In synthetic shared-session tests, three separate commands using one `sessionId` produce three independent observation/execution IDs and independently retrievable outcomes; real persistent-session attribution must satisfy the same contract when that mode is implemented. A deliberately selected PTY mode may produce only a labelled `terminal` transcript, with no claim of separated streams. **If current VS Code terminal APIs cannot meet the ordinary pipe-capture requirement, Stage 10 is BLOCKED until the single-launch host-owned pipe transport from the managed-command rework is available; documenting a capability gap does not satisfy this acceptance gate.** Exit/control events are distinct from output, and approval/timeout/cwd/termination safeguards remain intact. The managed-command implementation can consume the schema without redesign.
 
 **Cannot be declared complete if:** separate stdout/stderr for ordinary commands are absent or were inferred by splitting merged text; one command executed twice; several commands in a persistent terminal are stored as one observation; attribution is guessed from prompt/marker text; or approval/timeout semantics change. Full sessions/batches/polling remain in managed-command work, but the **minimum host-managed capture/attribution transport may be brought forward** if needed to pass this gate. An ordinary-mode capture limitation is a prerequisite for the separate managed-command transport implementation, not a waiver.
+
+**Copy/paste prompt for Stage 10 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 10 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 10 section, and only the referenced design/contract sections needed for this stage. Confirm Stages 1, 2 and 3 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 10 scope: Implement the run_command evidence adapter against the Stage 1/2 contracts. Capture one process launch once, with actual independent stdout and stderr from creation in ordinary pipe mode, honest merged PTY metadata, per-command observation/execution identity, exit/timeout/control state and no reruns. If the existing transport prevents mandatory capture, report the blocker and implement only the minimum supervised managed-command transport prerequisite, respecting approvals and timeouts.
+
+Follow every Stage 10 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 10; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 10 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 10 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 11.
+```
 
 ---
 
@@ -1465,6 +1607,20 @@ Rules: keep a fresh-read requirement for a stale source before mutation; never u
 
 **Cannot be declared complete if:** the audit's numbers are estimated rather than measured; any message can claim retrievability that the service does not have; the update changes behaviour of a tool rather than its wording.
 
+**Copy/paste prompt for Stage 11 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 11 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 11 section, and only the referenced design/contract sections needed for this stage. Confirm Stages 3, 4, 8, 9 and 10 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 11 scope: Audit and correct model-facing tool responses and guidance so commands/reads are only suggested again when evidence truly cannot be retrieved; centralize truthful status/coverage/recovery messages and measure sparse payload savings. Stage 10 must already be done.
+
+Follow every Stage 11 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 11; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 11 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 11 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 12.
+```
+
 ---
 
 ### Stage 12 — Integration, adversarial matrix and design handoff
@@ -1488,6 +1644,20 @@ Rules: keep a fresh-read requirement for a stale source before mutation; never u
 **Acceptance criteria:** all gates green or each exception recorded with its exact error; no unexplained audit match; the reproduction case passes without a reread; every rule has a named test; the design's §13 open questions are answered with evidence or listed as unresolved.
 
 **Cannot be declared complete if:** any stage's own gate was claimed without observed counts; a timed-out integration run is counted as a pass; an assertion was weakened to make the matrix pass.
+
+**Copy/paste prompt for Stage 12 (new Moriarty conversation):**
+
+```text
+You are implementing Stage 12 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny on branch context-management. Do not commit.
+
+Read §0, §1, §2, §3, §4, §5, the Progress Log, the full Stage 12 section, and only the referenced design/contract sections needed for this stage. Confirm Stages 0–11 are marked done with recorded verification before editing. Check current branch/status and existing accepted evidence first; do not trust historical line numbers.
+
+Stage 12 scope: Run the complete integration/adversarial matrix and all mandatory verification gates, including the full VS Code suite with captured final exit and Mocha summary. Reproduce beginning/middle/end evidence retrieval without reread, confirm Rules 0–7, report remaining managed-command interfaces/deviations and implement no new features.
+
+Follow every Stage 12 instruction, acceptance criterion, negative/adversarial test, authorization boundary and no-go condition. Do only Stage 12; do not implement later stages or change stage contracts. Run §0.3 verification gates and this stage's focused tests, report actual exit codes and test totals. A timed-out or incomplete VS Code test run is NOT a pass. Preserve unrelated working-tree changes and development database safety policy.
+
+Update only the Stage 12 Progress Log row with actual measured results and deviations. Finish with the complete §0.5 Stage 12 report, including changed files, commands/results, acceptance status, negative tests, blockers and remaining work. Do not start Stage 13.
+```
 
 ---
 
