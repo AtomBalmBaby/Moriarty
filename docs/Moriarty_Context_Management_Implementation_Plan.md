@@ -254,14 +254,14 @@ export interface ResultCapture {
 }
 
 export interface ResultGap {
-  stream: "stdout" | "stderr" | "payload" | "output"
+  stream: "stdout" | "stderr" | "terminal" | "payload" | "output"
   reason: "capture_limit" | "storage_limit" | "eviction" | "redaction" | "failure" | "inaccessible" | "not_captured"
   fromByte?: number              // where coverage stops
   toByte?: number
 }
 
 export interface DeliveryCoverage {
-  stream: "stdout" | "stderr" | "payload" | "output"
+  stream: "stdout" | "stderr" | "terminal" | "payload" | "output"
   ranges: { fromByte: number; toByte: number }[]   // retained coverage, in order
   deliveredRanges?: { fromByte: number; toByte: number }[]
 }
@@ -284,7 +284,7 @@ export interface EvidenceAccess {
 }
 
 export interface RangeRequest {
-  stream?: "stdout" | "stderr" | "payload" | "output"   // default "output" for non-command results
+  stream?: "stdout" | "stderr" | "terminal" | "payload" | "output"   // default "output" for non-command results
   startLine?: number; endLine?: number                  // 1-based, inclusive
   startChar?: number; endChar?: number                  // 1-based character offsets on one line
   startByte?: number; endByte?: number                  // exact byte offsets for arbitrary output
@@ -292,7 +292,7 @@ export interface RangeRequest {
 
 export interface RetrievedSpan {
   observationId: string
-  stream: "stdout" | "stderr" | "payload" | "output"
+  stream: "stdout" | "stderr" | "terminal" | "payload" | "output"
   requested: RangeRequest
   coverage: { fromLine?: number; toLine?: number; fromByte: number; toByte: number }
   text?: string
@@ -307,7 +307,7 @@ export interface SearchPage {
   observationId: string
   query: string
   mode: "literal" | "regex"
-  stream: "stdout" | "stderr" | "payload" | "output"
+  stream: "stdout" | "stderr" | "terminal" | "payload" | "output"
   matchCount: number               // 0 is a successful result
   matches: { line?: number; byte?: number; preview: string }[]
   contextLines?: number
@@ -422,8 +422,10 @@ export interface CommandEvidence {
   cwd?: string; hostKey?: string
   state: ExecutionState
   exitCode?: number; signal?: string; terminationReason?: "exit" | "signal" | "timeout" | "cancel" | "lost" | "spawn_error"
-  streams?: { stdout?: string; stderr?: string }     // blob IDs
-  chunkOrder?: { stream: "stdout" | "stderr"; seq: number }[]
+  streams?: { stdout?: string; stderr?: string; terminal?: string } // PTY output is merged
+  captureMode?: "pipes" | "pty" | "terminal_merged" | "unknown" | "not_applicable"
+  inputEventRefs?: string[] // stdin writes/control; raw secret input excluded by default
+  chunkOrder?: { stream: "stdout" | "stderr" | "terminal"; seq: number }[]
   capturedComplete?: boolean; storedComplete?: boolean
 }
 ```
@@ -480,6 +482,8 @@ CREATE TABLE evidence_outcomes (
   termination_reason TEXT CHECK (termination_reason IS NULL OR termination_reason IN ('exit','signal','timeout','cancel','lost','spawn_error')),
   stdout_blob_id TEXT REFERENCES evidence_blobs(id),
   stderr_blob_id TEXT REFERENCES evidence_blobs(id),
+  terminal_blob_id TEXT REFERENCES evidence_blobs(id), -- merged PTY transcript; never invent stderr
+  capture_mode TEXT NOT NULL DEFAULT 'unknown' CHECK (capture_mode IN ('pipes','pty','terminal_merged','unknown','not_applicable')),
   payload_blob_id TEXT REFERENCES evidence_blobs(id),
   captured_complete INTEGER NOT NULL DEFAULT 0 CHECK (captured_complete IN (0,1)),
   storage_complete INTEGER NOT NULL DEFAULT 0 CHECK (storage_complete IN (0,1)),
@@ -493,10 +497,10 @@ CREATE TABLE evidence_blobs (
   content_digest TEXT NOT NULL,                         -- sha256 of stored bytes, content-addressed
   storage_kind TEXT NOT NULL CHECK (storage_kind IN ('inline','file')),
   relative_path TEXT,                                   -- storage_kind = 'file': under .twinny/blobs/
-  inline_text TEXT,                                     -- storage_kind = 'inline'
+  inline_bytes BLOB,                                    -- inline exact original bytes incl binary/NUL
   original_bytes INTEGER NOT NULL,
   stored_bytes INTEGER NOT NULL,
-  encoding TEXT NOT NULL DEFAULT 'utf8' CHECK (encoding IN ('utf8','bytes','mixed')),
+  encoding TEXT NOT NULL DEFAULT 'bytes' CHECK (encoding IN ('utf8','bytes','mixed')),
   byte_preservation TEXT NOT NULL DEFAULT 'lossless' CHECK (byte_preservation IN ('lossless','normalized','excluded')),
   redaction TEXT NOT NULL DEFAULT 'none' CHECK (redaction IN ('none','applied','excluded_by_policy')),
   created_at TEXT NOT NULL,
@@ -506,12 +510,25 @@ CREATE TABLE evidence_blobs (
 
 CREATE TABLE evidence_chunks (
   outcome_id TEXT NOT NULL REFERENCES evidence_outcomes(id) ON DELETE CASCADE,
-  stream TEXT NOT NULL CHECK (stream IN ('stdout','stderr','payload')),
+  stream TEXT NOT NULL CHECK (stream IN ('stdout','stderr','terminal','payload')),
   seq INTEGER NOT NULL,
-  byte_start INTEGER NOT NULL,
-  byte_end INTEGER NOT NULL,
+  byte_start INTEGER NOT NULL,                          -- inclusive
+  byte_end INTEGER NOT NULL,                            -- exclusive [start,end)
   received_at TEXT NOT NULL,
   PRIMARY KEY (outcome_id, stream, seq)
+);
+
+-- stdin writes and process control remain distinct from child output.
+CREATE TABLE evidence_io_events (
+  id TEXT PRIMARY KEY,
+  outcome_id TEXT NOT NULL REFERENCES evidence_outcomes(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('stdin_write','stdin_close','spawn','exit','signal','cancel','timeout','pty_control','capture_gap')),
+  byte_count INTEGER,
+  result TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  details_json TEXT,                                   -- bounded/redacted; raw secret stdin excluded by default
+  UNIQUE (outcome_id, seq)
 );
 
 CREATE TABLE evidence_lines (
@@ -519,8 +536,8 @@ CREATE TABLE evidence_lines (
   line_no INTEGER NOT NULL,                             -- 1-based
   char_start INTEGER NOT NULL,
   char_end INTEGER NOT NULL,
-  byte_start INTEGER NOT NULL,
-  byte_end INTEGER NOT NULL,
+  byte_start INTEGER NOT NULL,                          -- inclusive
+  byte_end INTEGER NOT NULL,                            -- exclusive [start,end)
   PRIMARY KEY (blob_id, line_no)
 );
 
@@ -759,8 +776,10 @@ export interface CapturedResult {          // before fitting, straight from the 
   args: Record<string, unknown>              // typed original arguments, preserved as sent
   executed: boolean
   status: ExecutionState                     // §4.8 enumeration
-  streams: { stdout?: Buffer; stderr?: Buffer }
-  chunks: { stream: "stdout" | "stderr"; seq: number; bytes: Buffer; receivedAt: string }[]
+  streams: { stdout?: Buffer; stderr?: Buffer; terminal?: Buffer }
+  captureMode: "pipes" | "pty" | "terminal_merged" | "unknown" | "not_applicable"
+  chunks: { stream: "stdout" | "stderr" | "terminal"; seq: number; bytes: Buffer; receivedAt: string }[]
+  inputEvents?: { kind: "stdin_write" | "stdin_close"; byteCount: number; result: string; receivedAt: string }[]
   exitCode?: number
   signal?: string
   terminationReason?: TerminationReason
