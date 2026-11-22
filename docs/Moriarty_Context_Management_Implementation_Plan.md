@@ -1,0 +1,1568 @@
+# Moriarty: Evidence Reuse, Validity-Aware Context Management and Automatic Context Pruning — Implementation Plan
+
+**Audience:** any coding agent (Moriarty or a successor model) working in fresh conversations, one stage at a time.
+**Repository:** `/home/stark/source/twinny` · **Work branch:** `context-management` (checked out at planning time; HEAD `3937f58`).
+**Status of this document:** implementation plan. Nothing here has been implemented. It is the execution translation of two designs, verified against the current tree.
+
+**Authoritative references**
+
+| Document | Role |
+|---|---|
+| `docs/Moriarty_Context_Management_and_Evidence_Reuse_Design.md` | The primary design specification. Its rules are non-negotiable; where this plan conflicts with it, the design wins and the conflict must be reported, not silently resolved. |
+| `docs/Moriarty_Managed_Run_Command_Design.md` | Related future functionality. Defines the shared execution/evidence interfaces Stage 11 must support. Not implemented here. |
+| `docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md` | The reference for plan structure and rigour (staged execution, prerequisites, exact files, test requirements, acceptance criteria, progress log). Its architectural assumptions are historical: the completed unified-database work is described there as unimplemented. Do not re-implement what it already delivered; do treat its line numbers as current. |
+
+> **This is a planning document.** Stage 0 has not been executed. Do not skip stages, reorder them, or start a stage whose prerequisites are not `done`.
+
+---
+
+## Progress Log (the only cross-conversation memory; update at the end of every stage)
+
+Status values: `todo` · `in-progress` · `in_review` · `done` · `blocked`. A stage is `done` only when every acceptance criterion in its section is met **and** its verification numbers are recorded here with actual exit statuses and pass/fail/pending counts.
+
+| Stage | Title | Status | Date | Verification (command → actual counts) | Notes / deviations |
+|---|---|---|---|---|---|
+| 0 | Current-code audit, storage contract, baseline reproductions | todo | | | |
+| 1 | Complete durable evidence capture (invocation/outcome/blob) | todo | | | |
+| 2 | Read-only evidence access service (range, offsets, search, pagination) | todo | | | |
+| 3 | `query_evidence` native tool + sparse result envelope | todo | | | |
+| 4 | Validity classes, dependency edges, invalidation events | todo | | | |
+| 5 | Explicit stale-to-current resolution | todo | | | |
+| 6 | Model-controlled favourites + protected user intent | todo | | | |
+| 7 | Context sizing and provider diagnostics corrections | todo | | | |
+| 8 | Deterministic two-tier context projector core | todo | | | |
+| 9 | Projector wiring + inline chat settings (toggle, slider, display) | todo | | | |
+| 10 | Response-guidance catalogue and model-facing payload audit | todo | | | |
+| 11 | `run_command` evidence adapter against the shared contract | todo | | | |
+| 12 | Integration, adversarial matrix, managed-command handoff | todo | | | |
+
+**Planning-time measurements (not a stage result; Stage 0 must re-measure and record them as its own baseline):** `node --test out/test/standalone/*.standalone.js` → 1161 tests / 1161 pass / 0 fail / 0 skipped (~5.1 s); `npx tsc -p . --noEmit` exit 0 (0 findings); `npx eslint src --quiet` 0 findings; working tree clean on `context-management`.
+
+---
+
+## 0. How to use this plan
+
+### 0.1 One stage per conversation
+
+1. Read §0, §1 (non-negotiable rules), §2 (current architecture), §3 (gap analysis), §4 (shared contracts), the **Progress Log**, and **only** the section of the stage you are given, plus the sections it cites.
+2. Confirm every stage listed under that stage's **Depends on** is `done` in the Progress Log, with recorded numbers. If not, stop and report.
+3. Establish the current repository state before writing anything (see 0.4). Do not trust line numbers from earlier conversations or from this plan; locate code by symbol name (`grep -n`, `find_symbol`).
+4. Do exactly that stage. Do not start the next one, even if it looks trivial.
+5. Finish with the report in 0.5 and update the Progress Log row.
+
+### 0.2 Hard rules
+
+- **No commits, pushes, stashes, resets, `git add`, branch switches or discards.** Leave all changes in the working tree on `context-management`.
+- **Planning stages are read-only.** Stage 0 changes no source, schema, test or configuration file; it may only edit its own Progress Log row.
+- **Inspect before editing.** Read the files named in the stage; reuse existing functions; do not create competing subsystems. If a stage says to reuse a symbol, `grep -n` for it first.
+- **Never weaken, skip, delete or loosen an existing test** except the ones a stage names explicitly by title. When a stage says "update" a test, change only the assertions it names. A deterministic failure is reported, not hidden; no indefinite retry loops after a deterministic failure.
+- **Tests must exercise the production code path** (real `workspaceTools(...).run`, real `TodoRepository`, real `SqliteFile`, real `SourceRoots`, real `WorkspaceView`, real `ToolLoop`), not a reimplementation of it.
+- **No placeholders, TODO comments, dead code, speculative abstractions, generated reports or planning files.** No new dependencies except where a stage says so.
+- Comments only where the code is not self-explanatory; double quotes, no semicolons (the repo style — `npx eslint <files> --fix` for import-order findings).
+- If the plan contradicts what you observe in the code, **stop and report the contradiction** instead of improvising. Do not ask routine questions the plan already answers.
+- Scratch files go in `/tmp` and are deleted before you finish. Never write test databases into the repository tree.
+
+### 0.3 Verification gates
+
+Every stage must run these from the repository root and record actual exit statuses and counts:
+
+| Gate | Command | Expected at planning time |
+|---|---|---|
+| Types | `npx tsc -p . --noEmit` | exit 0 |
+| Lint | `npx eslint src --quiet` | 0 findings |
+| Build for tests | `npm run build-tests` | exit 0 (writes ignored `out/`) |
+| Bundle | `npm run build` | exit 0 (needed so the agent-profiles webview test finds `out/sidebar.js`) |
+| Standalone tests | `npm run test:sqlite` | 1161 tests, 1161 pass, 0 fail, 0 skipped at planning time; a stage reports its own additions as `base + N` |
+| Whitespace | `git --no-pager diff --check` | no output |
+| VS Code suite | `xvfb-run -a npm test` (`pretest` cleans, builds, bundles, lints first) | record real counts; or `NOT RUN: <exact error>` |
+
+Rules for the VS Code suite (`.vscode-test.js` currently lists `agent-reply`, `agents`, `line-edit`, `workspace-index`, `file-access`):
+
+- A stage that changes code which only runs inside VS Code (`chat/*`, `edit/*`, `workspace-index/*`, `src/index.ts`, webview) must run the suite and record real counts. Place new VS Code tests in a file `.vscode-test.js` already lists; if a stage must add a suite file, it says so explicitly.
+- A long-running integration test may be run detached (for example `xvfb-run -a npm test > /tmp/suite.log 2>&1; echo exit=$?`), but **a timeout or a missing final Mocha summary is not a pass**. Report `NOT RUN` with the exact error, and never claim a suite pass you did not observe.
+- Every stage reports per-command exit status and pass/fail/pending counts. Compilation alone is never a green stage.
+
+Focused runs: one standalone file with `node --test out/test/standalone/<name>.standalone.js`; a named suite test with `npx vscode-test --grep "<test title>"`. `npm run build-tests` before running compiled tests.
+
+### 0.4 How a fresh agent establishes the existing repository state
+
+Before writing code, in this order:
+
+1. `git status --short`, `git rev-parse --abbrev-ref HEAD`, `git branch --list` — record them; if the branch is not `context-management`, stop and report.
+2. Read the Progress Log rows for this stage's prerequisites. Cite their recorded numbers instead of re-deriving them.
+3. `twinny_evidence_lookup` on symbols/paths this stage names, before reading source. If an accepted fact is `current`, cite its `observation_id`; do not reread the file. Only when nothing is proven do you read — then read bounded ranges, not whole files.
+4. Read the exact files the stage names, using `read_file` ranges, and record their fingerprints for any later edit.
+5. Run the gates (0.3) once at the start to confirm the tree is green before your own changes; record the counts as this stage's control run.
+6. Check the schema state directly where the stage touches storage: `PRAGMA user_version` and the object inventory named by Stage 1 (the development database is the project database at `<home>/.twinny/project.sqlite`; see §5).
+
+Persistent state a fresh conversation must not lose: the Progress Log, the unified project database rows (observations, outcomes, blobs, dependencies, favourites, projection history), and the stage completion markers in this document. Nothing in this plan depends on conversational memory.
+
+### 0.5 Final report format (end of every stage)
+
+```
+Stage N report
+- Changed files: <list, one line each, with a few words on the change>
+- Commands run and actual results: <command → exit status → "N tests, N pass, N fail, N pending", or "NOT RUN: reason">
+- Acceptance criteria: <each criterion → met / not met, with the evidence (test title or command output)>
+- Negative/adversarial tests: <each named test → result>
+- Deviations from the plan: <none, or each deviation and why>
+- Remaining / blocked: <none, or exact blocker>
+- Progress Log: updated
+```
+
+Do not mark ordinary implementation TODOs complete by hand. A completion claim goes through the normal Feedback path; `in_review` means the claim was received, not accepted. Distinguish an actual approval requirement (an outside-workspace write, a protected file) from a TODO review status, and say which one blocks you.
+
+### 0.6 Handoff prompt template
+
+Paste as the first message of a fresh conversation:
+
+```
+You are implementing Stage N of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny (branch context-management). Do not commit.
+Read first: §0, §1, §2, §3, §4, the Progress Log, Stage N, and the sections Stage N cites. Confirm the stages Stage N depends on are done with recorded numbers.
+Do only Stage N. Satisfy its acceptance criteria, run its gates (recording actual counts), update the Progress Log, and finish with the §0.5 report.
+```
+
+---
+
+## 1. Non-negotiable design rules (restated as implementation constraints)
+
+These are binding on every stage. A test that shows a violation is a defect in the stage, not a nuisance.
+
+**Rule 0 — User requests never become stale.** Original user messages and their authoritative task requirements are durable, non-prunable records. Time passing or source files changing never makes them stale. A newer instruction may **supersede** an earlier requirement for future action without deleting or degrading the original. Context budgeting may use a faithful task-intent projection but may not drop or distort operative user requirements. Model-generated plans, TODOs and summaries never outrank user requests. User input is not a candidate for ordinary evidence pruning.
+
+**Rule 1 — Preserve execution history.** Every actual tool invocation and its relevant raw outcome, success or failure, is recorded durably **before** any lossy presentation or context fitting: tool name; typed original arguments; invocation/execution/session identity; start and finish times; status; paths/targets and authorization scope; source and observed fingerprints; return payload; stdout and stderr as separate byte streams where applicable; exit code, signal, timeout/cancellation; structured errors; result and delivery completeness. Attempted calls rejected before execution are recorded as attempts with `executed = false` and must never be represented as successful execution. Context truncation must not silently truncate authoritative evidence.
+
+**Rule 2 — Context is a projection, not the evidence database.** Pruning a prompt never deletes an observation, rewrites the transcript or changes a historical record. Evidence validity says whether an observation describes **current** state, not whether it historically happened. Historical observations remain historically true after their sources change. Source validity, evidence retention and model-context projection are three independent concerns and must not share a destructive retention mechanism.
+
+**Rule 3 — Never leak a replacement fingerprint through invalidation.** A stale notice may carry the **original/obsolete** source hash and observation UUID, never a new current hash or new file contents. A newly verified current fingerprint comes only from an explicit, authorized, verified lookup (§4.4) or a fresh authorized read.
+
+**Rule 4 — Sparse model-facing metadata.** Omit fields whose absence has a well-defined default: no `favourite:false` on every observation, no empty arrays, no redundant wrappers, no repeated paths/hashes, no `null` placeholders, no duplicated status fields. Unknown is not a default: unknown freshness, completeness, execution status or authorization must never be silently inferred as valid, complete, executed or permitted. A complete, unexceptional short result may stay plain text; an envelope is used only when integrity, status or retrieval semantics require it.
+
+**Rule 5 — Favourites are opt-in except user input.** All ordinary tool observations begin unfavourited. User input is inherently protected for context policy. The model may mark or unmark evidence by UUID with compact idempotent operations. Favourites change **retention priority only**: not validity, not authorization, not storage policy, not the hard capacity limit.
+
+**Rule 6 — Honest integrity and bounded retrieval.** Never advertise an unavailable observation, an omitted tail, an evicted blob or a failed command as retrievable. Never mark a partially delivered or partially retained result complete. Never call a launched background command successful. Zero matches from a search is a **success**, not a failure; "not run" is never a successful zero-result execution.
+
+**Rule 7 — Authorization is independent of evidence.** Hash matching and possession of an observation ID convey no read, write or command permission. Existing canonical-path resolution, outside-workspace approval (`access-grants.ts`, `access-preflight.ts`, `operation-authorization.ts`), operation-scoped write authorization and source verification remain intact. A lookup that is denied names no restricted candidate.
+
+---
+
+## 2. Current repository architecture (as audited at planning time)
+
+### 2.1 The unified project database
+
+- `<home>/.twinny/project.sqlite`, `PRAGMA user_version = 20` (`CURRENT_SCHEMA_VERSION = 20` in `src/extension/todos/sqlite.ts`). `.twinny/` is created and git-ignored by `prepareProjectTodoStorage`; the project home is resolved by `resolveProjectHome` (`src/extension/todos/project-home.ts`) — explicit `twinny.projectHome`, then the saved workspace file's directory, then a single root, then the path-sorted first local root.
+- One `SqliteFile` connection per consumer; writes are short synchronous transactions (`SqliteFile.write`, which rejects async closures); WAL, `busy_timeout = 5000`, `foreign_keys = ON`; the index connection sets `synchronous = NORMAL`. The workspace index (`src/extension/workspace-index/index.ts`) runs on `src/extension/workspace-index/sql.ts` in the same database (`index_meta`, `documents`, `symbols`, `documents_fts`).
+- Development policy already stated in code (`refusedVersion` in `todos/sqlite.ts`): a database at any other version is refused and left untouched; resetting the development database means deleting `project.sqlite` and its `-wal`/`-shm` sidecars by hand. No migrations exist, and none may be added for development-only needs (§5).
+- Evidence records: `todo_tool_observations` (immutable invocation record), `todo_tool_evidence` (retained content + `original_chars`/`preserved_chars`/`complete`/`metadata_json`), `observation_source` (per-file reference with role, range, hash, `observed_version`, `editor_version`), `source_root` (home/workspace/external identity, `SourceRoots` in `todos/source-roots.ts`), `todo_accepted_evidence` (facts with `superseded_by`), `todo_edit_operations`, `todo_events`, `todo_evidence_usage`.
+
+### 2.2 Tool invocation, recording and dispatch
+
+- Native tool contract: `ToolSpec` (`protocol.ts`: `name`, `description`, `parameters`, `guidance`, `readOnly`, `schema`), `ToolResult` (`workspace.ts`: `output`, `summary`, `integrity`, `rawOutput`, `rawIntegrity`, `failed`, `final`, `preface`, `execution`, `observation`, `error`), typed arguments with types preserved (`arguments.ts`), refused calls carrying `executed: false` in `ToolErrorDetail`.
+- Dispatch: `workspaceTools(...).run` resolves the target through `resolveSourceTarget` (hash-first resolution, `source-resolver.ts`), authorizes outside paths, serialises mutations (`serializeMutation`), adds folder instructions, and returns a `ToolResult`.
+- Recording: `Chat`'s `onToolResult` hook (`chat/index.ts`) → `chat/tool-evidence.ts` (`isRecordableToolResult`, `toolObservationInput`, `recordToolResult`, `reportRecordFailure`) → `repository.recordToolObservation` + `SourceRoots.recordObservationSources`. `run_command` results without an execution and declined commands are not recorded as observations.
+- Fingerprints: one function, `fingerprintContent` (`tools/fingerprint.ts`), tokens `xxh64:`/`xxh3_128:`/`sha256:`; `verifyContentFingerprint` also accepts a bare legacy sha256. `read_file` prints `content_hash: <token>; total_lines: N`; `edit_lines` requires `expected_hash`; `create_file`/`move_file`/`rename_symbol` report resulting hashes.
+
+### 2.3 Capture, retention and context budgeting today
+
+- `todos/evidence.ts`: `compactToolEvidence` reduces a successful result to counts (only failures keep a short redacted excerpt); `compactEvidenceText` bounds the stored JSON at `MAX_EVIDENCE_TEXT = 1000`; `preserveEvidence` keeps content up to `MAX_RETAINED_EVIDENCE_CHARS = 200_000`, **redacted** (`redactEvidence`) and cut at a line boundary, with `originalChars`/`preservedChars`/`complete`; `parseSources`/`parseHits` read the read_file header and search JSON. Storage eviction: `enforceEvidenceBudget` (per-list `DEFAULT_EVIDENCE_STORAGE_LIMITS.listChars = 2_000_000`) sets `retained = 0, content = NULL` on the oldest rows.
+- Presentation budgets are separate and smaller: `MAX_EXCERPT_CHARS = 2400`, `MAX_WINDOW_CHARS = 1200`, evidence-entry cap `600`.
+- `tools/budget.ts`: `planContext(window, maxResultChars, outputTokens)` → `margin = 10%`, output reserve capped at `min(desired, 25% of window, window − margin − 512)`, `limit = window − reserved − margin`, `target = 0.65 × limit` (the hysteresis point), `resultChars = clamp(window × charsPerToken × 0.2, 2000, ceiling)`, `notesChars`. `fitResult`, `fitFileResult`, `trimmedResult`, `TokenEstimator` (learns chars-per-token from counted requests), `ContextUsageStore`, `formatResultIntegrity`/`stripResultIntegrity`/`withResultIntegrity`, `ContextDiagnostics` including `utilizationPercent`, `exhausted`, `outputCapped`.
+- `tools/loop.ts`: `ToolLoop.fit(extraChars, step)` measures the request (tool definitions and closing prompt included), trims the oldest result slots in two passes (`step < newest − 1`, then `step < newest`) down to `plan.target`, cuts or omits fresh results, and reports through `onBudget`/`onContext`. Trimmed results are replaced by their first line plus a "Run the tool again" notice. Read-only repeats are answered from `_answered` (cleared on any workspace-mutating call): an earlier result whose content is still visible is not re-run; one that was trimmed *is* run again; one omitted for lack of room is refused with a notice.
+- Conversation construction: `chat/turn.ts` (`buildChatTurn`) shapes each message for the API; `onTranscript` keeps the messages the model actually saw, so a Continue replays them rather than a summary. Native pairing uses `tool_calls` + tool messages with call IDs; text mode uses `<tool_result name=…>`.
+
+### 2.4 Validity today
+
+`todos/source-validity.ts` owns one boundary (`SourceValidityBoundary`) used on storage and retrieval, per reference and aggregate: `valid`, `stale`, `invalid`; an I/O error is `unverifiable`, not a state; disk-versus-buffer is explicit (`checkedAgainst`, `persistedSource`, `editorVersion`); nothing is cached across consumer sessions. Consumers (`feedback.ts`, `evidence-context.ts`, `delivery.ts`, `tools/todos.ts`) read through it. Relocation candidates (`repository.findRelocationCandidates`) return `recorded_move` and `matching_hash` proposals, never a chosen file. The index does not handle `onDidRenameFiles`; renames reach it through watchers.
+
+### 2.5 Settings, UI and model-facing guidance
+
+- Inline chat settings are the agent-settings panel (`src/webview/agent-settings.tsx`) read/written through `EVENT_NAME.twinnyGetConfigValue` / `twinnySetConfigValue` → `src/extension/webview/base.ts` (`readSettingWithLegacy`, scoped `configuration.update`). It has `NumberSetting` and `Choices` controls; there is no percentage slider control in this panel yet (`type="range"` appears only in `src/webview/embeddings/index.tsx`).
+- Existing context settings: `twinny.chatContextWindow` (Auto or a number), `twinny.chatContextFallback`, `twinny.chatToolsMaxResultChars` (default 131072, max 2,000,000), `twinny.chatToolsMaxReadLines` (default 1000, ranges are refused rather than cut), `twinny.chatInferenceMaxOutputTokens` (default 6144), `chatInferenceMaxDurationSeconds` (900), `chatInferenceNoProgressSeconds` (300).
+- Capacity discovery (`inference/context-window.ts`): per-provider probes; `confirmed` values are separated from `advertised`; `resolveCapacity` takes the **smallest confirmed** size, warns when a manual override disagrees with the server or is below `SUPPORTED_CONTEXT_TOKENS = 65_536`, and marks an unconfirmed fallback. The composer reads it through `twinnyGetContextWindow`/`twinnyGetContextUsage` (`Chat.contextWindowOf`, `contextUsageOf`) — a prompt-token estimate, not physical memory.
+- Guidance catalogue lives in strings across `protocol.ts` (`GUIDANCE`, per-tool `guidance`), `budget.ts` (`fitResult`, `trimmedResult`), `workspace.ts` (`suggestedReads`, `overLimitMessage`, search notes), `line-edit.ts`/`edit/service.ts` (reread on hash change), `source-resolver.ts` (`recovery`), `todos/evidence.ts` (`describeGap`) and `tools/todos.ts` (the `refresh` hint).
+
+---
+
+## 3. Implementation inventory and gap analysis
+
+Legend: **Done** = implemented; **Partial** = exists but incomplete for this design; **Missing**; **Incompatible** = an existing interface must be extended, not replaced; **Depends** = needs another stage.
+
+| # | Design requirement | State today | Where the current code shows it | Stage |
+|---|---|---|---|---|
+| 1 | Immutable invocation record with typed arguments | Done | `todo_tool_observations`, `UNIQUE(project_id, request_id)`, replay returns the prior row in `recordToolObservation` | — |
+| 2 | Complete raw capture before fitting | Partial | `ToolResult.rawOutput`/`rawIntegrity` exist; `compactToolEvidence` reduces successes to counts; failed calls store no retained content (`evidenceOutput: evidence.failed ? undefined : rawOutput` in `chat/tool-evidence.ts`) | 1 |
+| 3 | Independent stdout/stderr, byte-preserving, ordered chunks | Missing | `tool-sinks.ts` merges both streams into one rolling tail (`MAX_CAPTURE_CHARS = 200_000`, head lost), ANSI-stripped; no per-stream storage | 1 |
+| 4 | Exit code, signal, timeout/cancellation, refusal with `executed:false` | Partial | exit code and `timedOut`/`stoppedByUser` exist; no signal, no terminal lifecycle enumeration, `run_command` records no execution identity (`execution_id` is set by the host, not the command) | 1, 11 |
+| 5 | Retention and completeness metadata (original/captured/stored, gap reason) | Partial | `original_chars`, `preserved_chars`, `complete`, `retained`; `ToolTruncationStage` has `evidence_retention` but no capture/storage distinction and no per-stream completeness; eviction is silent (`retained = 0`) | 1, 3 |
+| 6 | Storage quota as an explicit configurable policy | Missing | `DEFAULT_EVIDENCE_STORAGE_LIMITS.listChars = 2_000_000` is a per-list character budget, not a storage policy; no binary/long-line storage view | 1 |
+| 7 | Redaction as presentation, separate from captured bytes | Partial | `redactEvidence` is applied to stored content itself, so original bytes are lost | 1 |
+| 8 | Retrieval by observation UUID, bounded ranges, char/byte offsets, long-line fragments, stream selection, search/filter, pagination | Missing | `twinny_evidence_lookup` returns metadata and bounded excerpts; no `query_evidence`/`query_evidence_range`; the 1,374-line reproduction cannot be answered without rereading | 2, 3 |
+| 9 | Retrieval must not rerun the tool | Partial (risk) | `_answered` re-runs a read whose result was trimmed; a stored result that is not exposed can still be described as needing a rerun | 8, 10 |
+| 10 | Validity classes `current/stale/unknown/historical/superseded` | Partial | `SourceValidity` is `valid/stale/invalid/unverifiable`; `freshness` maps stale→`historical`; no explicit `unknown`, no user/task `superseded` class | 4 |
+| 11 | Derived-dependency invalidation graph | Partial/Missing | accepted facts link to an observation via FK; no edge table, no invalidation events for edits/saves/renames/Git beyond the index refresh and watchers | 4 |
+| 12 | Stale-to-current resolution returning a verified successor | Missing | `findRelocationCandidates` proposes paths only; no authorized current lookup, no `resolve_current_evidence` | 5 |
+| 13 | Favourites (storage + model operations) | Missing | no column, no tool, no projector input | 6 |
+| 14 | Protected user/task segments in the projection | Partial | `fit()` never trims user messages, but there is no protected-segment concept and `notes()` drops older blocks; task state reaches the prompt only through `requestContext()` | 6, 8 |
+| 15 | Deterministic two-tier projector with threshold, hysteresis, diagnostics | Partial | `planContext` + `fit()` trim oldest-first regardless of validity/favourite; `target = 0.65 × limit` is the only hysteresis; no configured utilization threshold, no stale-vs-valid tiering, no favourite tier | 8 |
+| 16 | Tool-call/result pairing survives compaction | Partial | call IDs and the per-reply transcript are kept (`_turn`, `replace()`); nothing proves pairing after a compacted body in the next turn | 8 |
+| 17 | Inline settings: auto-pruning toggle, percentage slider, capacity/utilization display | Missing | agent-settings panel has no pruning controls; usage is shown as an estimate elsewhere | 9 |
+| 18 | Context sizing / provider diagnostics corrections | Partial | `resolveCapacity` prefers the smallest confirmed size and warns; `planContext`'s reserve can make a large output maximum look like exhaustion (`plan.limit < 512` reason); no separation of prompt utilization from KV occupancy | 7 |
+| 19 | Response guidance that uses evidence instead of recommending reread/rerun when data exists | Partial | `trimmedResult`, `fitResult`, `cut()`, `describeGap`, `tools/todos.ts` `refresh`, `source-resolver.ts` `recovery`, `line-edit.ts` hash-change messages | 10 |
+| 20 | Sparse payload audit with measured savings | Missing | no measurement harness; `[result_integrity]` JSON lines are emitted for every partial delivery | 10 |
+| 21 | run_command shared evidence contract (no second schema) | Depends | command evidence currently lands only as one merged text blob | 11 |
+| 22 | Native-tool preference/soft refusal at the command boundary | Deliberately out of scope here | managed-command design §8; keep it in that work unless a context-stage interface must accommodate it | 11 (interface only) |
+| 23 | Test infrastructure and gates | Done | `node:test` standalone suite, Mocha suites listed in `.vscode-test.js`, all gate commands confirmed available | — |
+
+---
+
+## 4. Architectural decisions and shared contracts
+
+These contracts are frozen. A stage may not change a contract it does not own; if it must, the deviation is reported in its section here before implementation.
+
+### 4.1 Identity layers (never conflated)
+
+| Layer | Identifier | Meaning | Never used for |
+|---|---|---|---|
+| Project | `todo_projects.id` | one project per database | access scope |
+| Resource root | `source_root.root_id` | home / workspace / external root | permission |
+| Source path | `observation_source.(root_id, path)` | root-relative POSIX identity | current content |
+| Content version | content fingerprint (`xxh64:`/`xxh3_128:`/`sha256:`) | a claim about one version of content | file identity, uniqueness, write authorization |
+| Invocation | `todo_tool_observations.id` (UUID) + `request_id` uniqueness | what was attempted/observed | permission |
+| Execution | `execution_id`, plus `evidence_outcomes.execution_ref` for commands | what actually ran | output content |
+| Outcome | `evidence_outcomes.id` | the captured result before fitting | delivery status |
+| Blob | `evidence_blobs.id` + `content_digest` | stored bytes, content-addressed | historical record (repeated reads share a blob but keep separate observations) |
+| Observation preference | `evidence_favourites.observation_id` | retention priority | validity or permission |
+
+Deduplication is allowed at the blob level; it must never erase a separate invocation history. A command digest (`commandDigest` in `todos/evidence.ts`) is a verification identity for a command string, not a run identity.
+
+### 4.2 Completeness contract (extends `ToolResultIntegrity`, additive only)
+
+Existing consumers must keep working: `common/tool-output.ts` (`parseReadFile`, `parseCommandRun`), the webview's tool step view (`ToolStepView.outputOmitted`), `feedback.ts`, `evidence-context.ts`, and `[result_integrity]` line parsing in `budget.ts`. Additive fields only; no existing field changes meaning.
+
+```ts
+export type CaptureCompleteness = "complete" | "partial" | "not_captured" | "excluded"
+export type StorageCompleteness = "complete" | "partial" | "evicted" | "inaccessible" | "unknown"
+
+export interface ResultCapture {
+  originalBytes: number
+  capturedBytes: number          // what the host actually received
+  storedBytes: number            // what the database holds (post-redaction where policy applies)
+  redaction: "none" | "applied" | "excluded_by_policy"
+  encoding: "utf8" | "bytes" | "mixed"
+}
+
+export interface ResultGap {
+  stream: "stdout" | "stderr" | "payload" | "output"
+  reason: "capture_limit" | "storage_limit" | "eviction" | "redaction" | "failure" | "inaccessible" | "not_captured"
+  fromByte?: number              // where coverage stops
+  toByte?: number
+}
+
+export interface DeliveryCoverage {
+  stream: "stdout" | "stderr" | "payload" | "output"
+  ranges: { fromByte: number; toByte: number }[]   // retained coverage, in order
+  deliveredRanges?: { fromByte: number; toByte: number }[]
+}
+```
+
+Rule: a result may be `status: "complete"` for delivery while storage is incomplete, and vice versa. The words "retained", "incomplete", "evicted", "missing", "not authorized" keep their distinct meanings (design §4.2, §4.5).
+
+### 4.3 Evidence access contract (read-only service, Stage 2)
+
+```ts
+export interface EvidenceAccess {
+  /** Resolve one observation by UUID; optional invocation-id alias. Enforces project/host/root scope. */
+  get(observationId: string, options?: { invocationId?: string }): Promise<EvidenceObservation>
+  /** Bounded inclusive retrieval over retained content. Never re-runs the original tool. */
+  range(observationId: string, request: RangeRequest): Promise<RetrievedSpan>
+  /** Literal and optional regex search over retained output with continuation. Zero matches is success. */
+  search(observationId: string, request: SearchRequest): Promise<SearchPage>
+  /** Filter observations by source path, fingerprint, tool, time, status, project — bounded. */
+  find(filter: EvidenceFilter): Promise<EvidenceMatch[]>
+}
+
+export interface RangeRequest {
+  stream?: "stdout" | "stderr" | "payload" | "output"   // default "output" for non-command results
+  startLine?: number; endLine?: number                  // 1-based, inclusive
+  startChar?: number; endChar?: number                  // 1-based character offsets on one line
+  startByte?: number; endByte?: number                  // exact byte offsets for arbitrary output
+}
+
+export interface RetrievedSpan {
+  observationId: string
+  stream: "stdout" | "stderr" | "payload" | "output"
+  requested: RangeRequest
+  coverage: { fromLine?: number; toLine?: number; fromByte: number; toByte: number }
+  text?: string
+  state: "retained" | "partial_prefix" | "missing_tail" | "unknown_content" | "evicted" | "not_retrievable"
+  completeness: { captured: CaptureCompleteness; stored: StorageCompleteness }
+  originalHash?: string            // the fingerprint as it was observed, not a current one
+  provenance: { toolName: string; path?: string; observedAt: string; executionId?: string }
+  continuation?: { nextByte?: number; cursor?: string }
+}
+
+export interface SearchPage {
+  observationId: string
+  query: string
+  mode: "literal" | "regex"
+  stream: "stdout" | "stderr" | "payload" | "output"
+  matchCount: number               // 0 is a successful result
+  matches: { line?: number; byte?: number; preview: string }[]
+  contextLines?: number
+  cursor?: string                  // deterministic continuation, not a rerun
+  state: "retained" | "partial_prefix" | "missing_tail" | "unknown_content" | "evicted" | "not_retrievable"
+}
+```
+
+Determinism and bounds: pages are ordered by `(stream, byte)`; the same request on the same stored content returns the same page; every returned page is itself size-bounded and continuable; a query result never claims coverage it does not have. Retrieval invocations are recorded as lightweight execution events (an `evidence_access_event` row) without duplicating the blob, and they are **not** stored as model-visible evidence content.
+
+### 4.4 Stale-to-current contract (Stage 5)
+
+```ts
+export type CurrentResolution =
+  | { state: "current"; observationId: string; contentHash: string; path: string; contentRef?: string }
+  | { state: "unchanged"; observationId: string; contentHash: string; path: string }
+  | { state: "deleted"; previousObservationId: string }
+  | { state: "moved"; observationId: string; path: string; link: "recorded_move" | "rename_event" }
+  | { state: "ambiguous"; previousObservationId: string; candidates: string[] }   // bounded, authorized only
+  | { state: "unknown"; previousObservationId: string; reason: string }
+  | { state: "not_found" | "history_unavailable"; reason: string }
+  | { state: "permission_denied"; reason: string }
+  | { state: "not_applicable"; reason: string; suggestedOperation?: string }
+
+export interface ResolveCurrentRequest {
+  observationId?: string            // preferred
+  contentHash?: string              // legacy path, only with enough scope to disambiguate
+  path?: string; root?: string
+  startLine?: number; endLine?: number   // optional bounded current range in the same response
+}
+```
+
+Invariants (from design §6.1): historical identity is a lineage query, not permission; follow recorded path/rename links, never "find any file with this hash"; verify existence, permission scope, disk-versus-buffer selection and content at lookup time; index mappings are candidate hints, not proof; concurrent edits return `unknown`/race, never a current claim; if a verified authorized observation already exists, return its ID and hash without re-reading; otherwise perform one explicit authorized read and store it before answering; every successful fresh lookup records provenance (`supersedes_observation_id` / `derived_from_observation_id`); a lookup must not be usable to bypass `edit_lines` concurrency or authorization guards.
+
+### 4.5 Favourite contract (Stage 6)
+
+```ts
+export interface FavouriteOperation {
+  mark?: string[]      // observation UUIDs
+  unmark?: string[]
+  requestId: string    // idempotent replay returns the same outcome, no duplicate rows
+}
+export interface FavouriteOutcome {
+  changed: string[]    // IDs that actually moved state
+  already: string[]    // idempotent repeats
+  unknown: string[]    // IDs not found in this project under this scope
+  denied: string[]     // IDs outside the caller's authorization scope
+}
+```
+
+Storage updates metadata only; the immutable observation body is never modified. Model-facing read output omits `favourite` when it is the default (`false`).
+
+### 4.6 Projection contract (Stage 8)
+
+```ts
+export type SegmentKind = "user_instruction" | "system_policy" | "task_state" | "assistant_reply" | "evidence_projection"
+export interface ProjectedSegment {
+  id: string
+  kind: SegmentKind
+  observationId?: string
+  protected: boolean            // user input and mandatory system/task state are inherently protected
+  favourite: boolean            // ordinary evidence starts false; never emitted when false
+  ageOrder: number              // deterministic chronology key
+  chars: number
+  tokens: number
+  relevance: number             // tie-breaker only, never age alone
+}
+
+export interface ProjectorSettings {
+  enabled: boolean
+  thresholdPercent: number      // 40–95, step 5, default 80
+  strategy: "two-tier" | "stale-first"   // two-tier is the default
+  hysteresisPoints: number      // internal target = threshold − hysteresis (default 5)
+}
+
+export interface ProjectionResult {
+  segments: ProjectedSegment[]
+  removedStale: number
+  removedValid: number
+  compactedFavourites: number
+  tokensBefore: number; tokensAfter: number
+  utilizationBefore: number; utilizationAfter: number
+  threshold: number
+  reason: string
+  pairsPreserved: boolean       // tool call/result pairing intact
+  duplicateExecutionPrevented: boolean
+}
+```
+
+Determinism: the same segments, settings and token estimates produce the same projection. The projector never mutates stored records; it produces a message list. It reports which segments became references and why. A reference carries `observationId`, original obsolete hash (never the new hash), `reason` and only supported retrieval calls.
+
+### 4.7 Sparse envelope contract (Stage 3)
+
+Use plain text for a complete, unexceptional short result. Emit an envelope only when integrity, status or retrieval semantics require it. A model-facing example (illustrative, not mandated field names):
+
+```json
+{"observation_id":"<uuid>","tool":"read_file","original_hash":"xxh64:<old>","delivery":"partial","retrieve":{"tool":"query_evidence","start_line":687,"end_line":710}}
+```
+
+Rules: no `favourite:false`; no empty arrays; no null placeholders; no repeated path/hash; no duplicated status. Failed operations always carry execution truth (`executed`), failure status and an actionable next step, even under sparse encoding.
+
+### 4.8 Managed-command compatibility contract (Stage 11 defines, does not implement)
+
+The shapes below are the interface the future managed `run_command` consumes; they must exist as types and be exercised against the existing one-shot path without changing command behaviour.
+
+```ts
+export type ExecutionState = "accepted" | "queued" | "starting" | "running" | "exited" | "failed_to_start" | "cancelled" | "timed_out" | "lost" | "unknown"
+export interface CommandEvidence {
+  invocationId: string
+  executionId?: string
+  sessionId?: string
+  batchId?: string
+  children?: string[]
+  cwd?: string; hostKey?: string
+  state: ExecutionState
+  exitCode?: number; signal?: string; terminationReason?: "exit" | "signal" | "timeout" | "cancel" | "lost" | "spawn_error"
+  streams?: { stdout?: string; stderr?: string }     // blob IDs
+  chunkOrder?: { stream: "stdout" | "stderr"; seq: number }[]
+  capturedComplete?: boolean; storedComplete?: boolean
+}
+```
+
+Rules that must hold after Stage 11: `exit_code = 0` means process success only when a terminal exit state was truly reached; a nonzero exit with useful output is a completed process, not a tool failure; "no stderr" and "stderr not captured" are different states; starting is not completing; refused operations record `executed: false`; retrieving command output must not rerun it. Concurrency is designed for (independent IDs, jobs, stream cursors) but not implemented in this branch.
+
+### 4.9 What Stage 11 does **not** take on
+
+Sessions, batches, polling/cancellation, streaming, preflight parsers, shell-state semantics, `&`/`nohup`/`disown` policy and native-preference soft refusal remain in the managed-command stages. The native-tool preference guidance for agent instructions (prefer `read_file`/`grep`/evidence retrieval when authoritative results exist) **is** in this plan (Stage 10), as text guidance only — no command interception here.
+
+
+---
+
+## 5. Database and storage considerations
+
+### 5.1 Development database policy
+
+This is a private development branch. For schema changes during active development the established policy is **wipe/recreate the designated development database**, not migration — and that policy is already encoded in `refusedVersion` (`src/extension/todos/sqlite.ts`): a database at any other version is refused and left untouched, and the message tells the developer to delete `<home>/.twinny/project.sqlite` plus its `-wal`/`-shm` sidecars by hand.
+
+Hard limits, binding on every stage:
+
+- Never delete an arbitrary SQLite database.
+- Never delete user or production data.
+- Never silently reset a database outside the designated development environment. No stage may add automatic deletion code.
+- Keep the established unified project database location and ownership model (`resolveProjectHome`, `PROJECT_TODO_DIRECTORY = ".twinny"`, `PROJECT_TODO_DATABASE_NAME = "project.sqlite"`). LanceDB/embeddings remain separate.
+- Production migration requirements stay documented separately (§13): a production release would need a ladder, which this branch does not build.
+- New schema work is written as complete `CREATE TABLE` text in the v21 SCHEMA; tests that count objects must be regenerated from the new DDL, exactly as Stage 4 of the unified plan did for v20.
+
+The designated development database for this branch is the project database of a scratch test project under `/tmp` created by the test harness (`fs.mkdtempSync`), never anything in the repository tree. A stage that needs to exercise a schema bump may do so on its own temp database; it must not touch the developer's real `.twinny/project.sqlite`.
+
+### 5.2 v21 schema additions (Stage 1 owns this DDL)
+
+Additive tables only; `todo_tool_observations` and `todo_tool_evidence` keep their existing meaning and columns, with a small additive set:
+
+```sql
+-- Added to todo_tool_observations (all additive, existing consumers unaffected)
+executed          INTEGER NOT NULL DEFAULT 1 CHECK (executed IN (0,1)),
+call_id           TEXT,
+host_key          TEXT NOT NULL DEFAULT '',
+started_at        TEXT,
+finished_at       TEXT,
+outcome_id        TEXT REFERENCES evidence_outcomes(id),
+error_code        TEXT CHECK (error_code IS NULL OR error_code = 'refused_before_execution')
+
+CREATE TABLE evidence_outcomes (
+  id TEXT PRIMARY KEY,
+  observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  execution_ref TEXT,                                   -- the host execution id when there was one
+  status TEXT NOT NULL CHECK (status IN ('completed','exited','failed_to_start','cancelled','timed_out','lost','refused','unknown')),
+  exit_code INTEGER,
+  signal TEXT,
+  termination_reason TEXT CHECK (termination_reason IS NULL OR termination_reason IN ('exit','signal','timeout','cancel','lost','spawn_error')),
+  stdout_blob_id TEXT REFERENCES evidence_blobs(id),
+  stderr_blob_id TEXT REFERENCES evidence_blobs(id),
+  payload_blob_id TEXT REFERENCES evidence_blobs(id),
+  captured_complete INTEGER NOT NULL DEFAULT 0 CHECK (captured_complete IN (0,1)),
+  storage_complete INTEGER NOT NULL DEFAULT 0 CHECK (storage_complete IN (0,1)),
+  gap_reason TEXT CHECK (gap_reason IS NULL OR gap_reason IN ('capture_limit','storage_limit','eviction','redaction','failure','inaccessible','not_captured','storage_error')),
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE evidence_blobs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  content_digest TEXT NOT NULL,                         -- sha256 of stored bytes, content-addressed
+  storage_kind TEXT NOT NULL CHECK (storage_kind IN ('inline','file')),
+  relative_path TEXT,                                   -- storage_kind = 'file': under .twinny/blobs/
+  inline_text TEXT,                                     -- storage_kind = 'inline'
+  original_bytes INTEGER NOT NULL,
+  stored_bytes INTEGER NOT NULL,
+  encoding TEXT NOT NULL DEFAULT 'utf8' CHECK (encoding IN ('utf8','bytes','mixed')),
+  byte_preservation TEXT NOT NULL DEFAULT 'lossless' CHECK (byte_preservation IN ('lossless','normalized','excluded')),
+  redaction TEXT NOT NULL DEFAULT 'none' CHECK (redaction IN ('none','applied','excluded_by_policy')),
+  created_at TEXT NOT NULL,
+  evicted_at TEXT,
+  UNIQUE (project_id, content_digest)
+);
+
+CREATE TABLE evidence_chunks (
+  outcome_id TEXT NOT NULL REFERENCES evidence_outcomes(id) ON DELETE CASCADE,
+  stream TEXT NOT NULL CHECK (stream IN ('stdout','stderr','payload')),
+  seq INTEGER NOT NULL,
+  byte_start INTEGER NOT NULL,
+  byte_end INTEGER NOT NULL,
+  received_at TEXT NOT NULL,
+  PRIMARY KEY (outcome_id, stream, seq)
+);
+
+CREATE TABLE evidence_lines (
+  blob_id TEXT NOT NULL REFERENCES evidence_blobs(id) ON DELETE CASCADE,
+  line_no INTEGER NOT NULL,                             -- 1-based
+  char_start INTEGER NOT NULL,
+  char_end INTEGER NOT NULL,
+  byte_start INTEGER NOT NULL,
+  byte_end INTEGER NOT NULL,
+  PRIMARY KEY (blob_id, line_no)
+);
+
+CREATE TABLE evidence_dependencies (
+  derived_observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  source_observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('source_read','derived_claim','accepted_fact','supersedes')),
+  established_at TEXT NOT NULL,
+  PRIMARY KEY (derived_observation_id, source_observation_id, kind),
+  CHECK (derived_observation_id <> source_observation_id)
+);
+
+CREATE TABLE evidence_favourites (
+  observation_id TEXT PRIMARY KEY REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  marked_at TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  UNIQUE (project_id, request_id)
+);
+
+CREATE TABLE evidence_access_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  operation TEXT NOT NULL CHECK (operation IN ('get','range','search','find','resolve_current')),
+  arguments_json TEXT NOT NULL,
+  outcome TEXT NOT NULL,                                 -- the state string the service returned
+  execution_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE context_projections (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT,
+  request_seq INTEGER NOT NULL,
+  capacity_tokens INTEGER NOT NULL,
+  threshold_percent INTEGER NOT NULL,
+  utilization_before INTEGER NOT NULL,
+  utilization_after INTEGER NOT NULL,
+  removed_stale INTEGER NOT NULL DEFAULT 0,
+  removed_valid INTEGER NOT NULL DEFAULT 0,
+  compacted_favourites INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE context_projection_segments (
+  projection_id TEXT NOT NULL REFERENCES context_projections(id) ON DELETE CASCADE,
+  segment_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user_instruction','system_policy','task_state','assistant_reply','evidence_projection')),
+  observation_id TEXT,
+  decision TEXT NOT NULL CHECK (decision IN ('kept','reference','compact_reference','removed')),
+  tokens INTEGER NOT NULL,
+  PRIMARY KEY (projection_id, segment_id)
+);
+
+CREATE TABLE storage_policy (
+  project_id TEXT PRIMARY KEY REFERENCES todo_projects(id),
+  max_project_bytes INTEGER NOT NULL,
+  max_blob_bytes INTEGER NOT NULL,
+  eviction_order TEXT NOT NULL DEFAULT 'oldest_unfavourited_first',
+  redaction_mode TEXT NOT NULL DEFAULT 'presentation_only',
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1))
+);
+```
+
+`todo_tool_evidence` is **not** replaced. It remains the presentation copy (redacted text, sources, hits) that Feedback and lookup already read; `evidence_blobs` becomes the authoritative byte store. Where both exist, tests must prove they report the same coverage and disagree only in the documented way (blob = original bytes, evidence row = redacted presentation).
+
+### 5.3 Storage settings Stage 1 adds
+
+```json
+"twinny.evidenceStorageMaxProjectBytes": { "order": 24, "type": "number", "default": 64000000, "minimum": 1000000, "maximum": 500000000, "scope": "machine" },
+"twinny.evidenceStorageMaxBlobBytes":    { "order": 25, "type": "number", "default": 2000000,  "minimum": 100000,   "maximum": 20000000,   "scope": "machine" }
+```
+
+These are explicit storage policies, reported honestly when hit; they are not model-context caps and must never produce phantom observation IDs.
+
+---
+
+## 6. Stage index, dependency graph and how to read a stage
+
+```
+0 ─ 1 ─┬─ 2 ─ 3 ────────────────────┐
+       ├─ 4 ─ 5                     │
+       ├─ 6                        │
+       └─ 11                       │
+0 ───── 7 ─ 8 ─ 9 ──────────────────┴─ 10 ─ 12
+```
+
+| Stage | Depends on | Touches VS Code-only code? | Main modules |
+|---|---|---|---|
+| 0 | — | no | audit only |
+| 1 | 0 | `chat/tool-evidence.ts` wiring → **[VS Code suite]** | `todos/evidence-store.ts` (new), `todos/sqlite.ts` SCHEMA, `tools/budget.ts` completeness types |
+| 2 | 1 | no | `todos/evidence-access.ts` (new) |
+| 3 | 2 | tool registration in `tools/workspace.ts` | `tools/evidence.ts` (new), `tools/protocol.ts` guidance |
+| 4 | 1 | `chat/index.ts`, `workspace-index/index.ts` → **[VS Code suite]** | `todos/source-validity.ts`, `todos/dependency-index.ts` (new) |
+| 5 | 2, 4 | `chat/index.ts` (source reader) → **[VS Code suite]** | `todos/current-resolution.ts` (new), `tools/evidence.ts` |
+| 6 | 1, 4 | no | `todos/favourites.ts` (new), `tools/evidence.ts` |
+| 7 | 0 | `inference/context-window.ts`, `chat/index.ts` → **[VS Code suite]** | `tools/budget.ts`, `inference/context-window.ts` |
+| 8 | 2, 4, 6, 7 | no (pure) | `context/projector.ts` (new), `context/settings.ts` (new) |
+| 9 | 8 | **[VS Code suite]** + webview | `tools/loop.ts`, `chat/index.ts`, `webview/agent-settings.tsx`, `package.json` |
+| 10 | 3, 4, 8, 9 | no | `tools/response-guidance.ts` (new), `tools/budget.ts`, `tools/workspace.ts`, `todos/evidence.ts`, `tools/todos.ts` |
+| 11 | 1, 2, 3 | `chat/tool-sinks.ts` → **[VS Code suite]** | `tools/command-evidence.ts` (new) |
+| 12 | all | **[VS Code suite]** | verification only |
+
+Every stage below carries the same fifteen parts in the same order: goal and scope; prerequisites; existing components reused; files expected to change; schema changes; new interfaces/contracts; implementation instructions; safety and backwards compatibility; required unit and integration tests; negative and adversarial tests; verification commands; acceptance criteria; completion report; conditions that prevent declaring the stage complete.
+
+
+---
+
+## 7. Stages
+
+### Stage 0 — Current-code audit, storage contract and baseline reproductions
+
+**Depends on:** nothing. **Read-only stage: no source, schema, test or configuration change.** Only this plan's Progress Log row is written.
+
+**Goal:** re-verify the gap analysis in §3 against the current tree, measure the baselines this plan will be judged against, and freeze Stage 1's storage contract before any code changes. Line numbers from earlier conversations (including the unified plan) must not be reused as facts.
+
+**Steps**
+
+1. `git status --short`, `git rev-parse --abbrev-ref HEAD`, `git branch --list` — record them; confirm the branch is `context-management`.
+2. Run every gate in §0.3 and record actual counts (planning-time expectation: standalone 1161/1161, tsc exit 0, eslint 0 findings).
+3. Re-measure the design's reproduction case against the current branch, read-only, and record it as this stage's baseline:
+   - read `docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md` (1374 lines) whole;
+   - record the character count of the delivered result, the lines actually delivered at a 65,536-token capacity, what the evidence row retained, and whether the tail was recoverable. The design recorded 207,507 characters delivered as 42,077 (lines 1–25) with retention to line 1318; the numbers must be re-measured, not copied.
+   - confirm whether `twinny_evidence_lookup` returns metadata only and that no range tool exists (`grep -rn "query_evidence" src`).
+4. Inventory the actual project database APIs Stage 1 will extend: `recordToolObservation`, `retainedEvidenceFor`, `projectObservations`, `findRelocationCandidates`, `preserveEvidence`, `compactToolEvidence`, `enforceEvidenceBudget`, `SourceRoots.recordObservationSources`, `SourceValidityBoundary`; record the current caps (`MAX_EVIDENCE_TEXT`, `MAX_RETAINED_EVIDENCE_CHARS`, `DEFAULT_EVIDENCE_STORAGE_LIMITS`, `MAX_CAPTURE_CHARS`, `OUTPUT_TAIL`) with their file and the symbol, not a line number.
+5. Record the model-visible pipeline for one tool result end to end: dispatch → `ToolResult` → per-result fit → conversation slot → request estimate → trim/omit → recorded observation. Name each function actually used.
+6. Record permissions still in force (`access-grants.ts`, `access-preflight.ts`, `operation-authorization.ts`, `isProtectedPath`) and confirm no stage may bypass them.
+7. Confirm the gates' VS Code suite list (`.vscode-test.js`) and which configured files actually run.
+8. Fill Progress Log row 0 with the measured numbers and every deviation from §3 you found; state explicitly that §3's status column changed if it did.
+
+**Prerequisites:** the three design documents and §4/§5 of this plan; nothing else.
+
+**Existing components reused:** every symbol named in step 4 — this stage writes no code, so its value is the contract it freezes for Stage 1.
+
+**Files expected to change:** none. **Schema changes:** none; this stage records the live v20 inventory and confirms §5.2 against it.
+
+**Tests:** none, because nothing changes behaviour. The baselines it records are what every later stage compares against; a gate failure is recorded as an exception here, not fixed.
+
+**Verification commands:** the §0.3 gates exactly as run in step 2, plus `grep -rn "query_evidence" src` (must find nothing) and `grep -n "MAX_EVIDENCE_TEXT\|MAX_RETAINED_EVIDENCE_CHARS\|DEFAULT_EVIDENCE_STORAGE_LIMITS" src/extension/todos/evidence.ts`, and the standalone suite run that gives the counted baseline.
+
+
+**Safety and backwards compatibility:** read-only. Compatibility is proven by the gates themselves — every existing test passes exactly as before this stage, and no baseline is restated from memory.
+
+**Acceptance criteria**
+
+- No file other than this plan's Progress Log row differs from the stage's start (`git --no-pager diff --check` clean; `git status --short` shows at most this plan).
+- Every §3 row marked Done/Partial/Missing is supported by a named symbol in the current tree, and any correction is recorded in the Notes column.
+- The reproduction numbers are measured, not quoted from the design.
+
+**Conditions that prevent declaring complete:** any source/schema/test/configuration edit; a gate that fails without an exact recorded error; a baseline number copied instead of measured; the working branch being different from `context-management`.
+
+```
+You are executing Stage 0 of docs/Moriarty_Context_Management_Implementation_Plan.md in /home/stark/source/twinny (branch context-management). Do not commit.
+Read §0, §1, §2, §3, §4, §5, the Progress Log and Stage 0. Run the gates, measure the reproduction, inventory the storage APIs, record actual numbers in the Progress Log, change no source file, and finish with the §0.5 report.
+```
+
+---
+
+### Stage 1 — Complete durable evidence capture: invocation, outcome, blob
+
+**Depends on:** Stage 0. **[VS Code suite]** (the recording path runs in the extension host).
+
+**Goal:** every actual tool invocation and its raw outcome is stored completely before any display or context fitting, with independent stdout/stderr streams, ordered chunks, exit code/signal/termination reason, structured errors, timing, execution identity, retention and completeness. No silent cap: when a limit is hit, the record says so and says where coverage stops.
+
+**Prerequisites:** Stage 0's frozen contract (§4.2, §5.2). The development database is reset by hand (delete `project.sqlite`, `-wal`, `-shm`) on the designated dev database — see §5.1; no migration ladder is written.
+
+**Existing components reused (do not reimplement):** `SqliteFile` and the v20 SCHEMA (`todos/sqlite.ts`), `SourceRoots` (`todos/source-roots.ts`), `redactEvidence`/`preserveEvidence`/`compactToolEvidence`/`observationArguments` (`todos/evidence.ts`), `chat/tool-evidence.ts` (`isRecordableToolResult`, `toolObservationInput`, `recordToolResult`, `reportRecordFailure`), `repository.recordToolObservation` (replay idempotency per `(project_id, request_id)`), `TokenEstimator`, the existing read-only refusal path in `arguments.ts` (`argumentFailure` with `executed: false`).
+
+**Files expected to change**
+
+- new `src/extension/todos/evidence-store.ts` (capture + persistence; no `vscode` import)
+- `src/extension/todos/sqlite.ts` (SCHEMA to v21 with §5.2, `CURRENT_SCHEMA_VERSION = 21`)
+- `src/extension/todos/repository.ts` (`recordToolObservation` gains the outcome write; `retainedEvidenceFor` reports capture/storage states)
+- `src/extension/todos/types.ts` (additive types; `TodoToolObservationInput`, `RetainedObservationEvidence`)
+- `src/common/types.ts` (`ToolResultIntegrity` additive fields per §4.2)
+- `src/extension/chat/tool-evidence.ts` (`toolObservationInput` passes the raw capture, including for failed calls)
+- `src/extension/tools/workspace.ts` (`ToolResult.execution` gains stream references; nothing in tool behaviour changes)
+- `package.json` (the two settings in §5.3)
+- tests: new `src/test/standalone/evidence-storage.standalone.ts`; additions to `todos-sqlite.standalone.ts`, `chat-tools.standalone.ts`, `tool-loop.standalone.ts`, and one suite test in `src/test/suite/agent-reply.test.ts`
+
+**Schema changes:** §5.2, applied as the full v21 SCHEMA text. Regenerate the object-count tests from the new DDL (tables, named indexes, triggers) exactly as Stage 4 of the unified plan required; add indexes `evidence_outcomes_observation`, `evidence_blobs_project`, `evidence_chunks_order`, `evidence_lines_lookup`, `evidence_dependencies_source`, `evidence_favourites_project`, `evidence_access_events_project`, `context_projections_project`.
+
+**New interfaces (this stage's contract for later stages)**
+
+```ts
+export interface CapturedResult {          // before fitting, straight from the tool
+  invocationId: string
+  executionId?: string
+  toolName: string
+  args: Record<string, unknown>              // typed original arguments, preserved as sent
+  executed: boolean
+  status: ExecutionState                     // §4.8 enumeration
+  streams: { stdout?: Buffer; stderr?: Buffer }
+  chunks: { stream: "stdout" | "stderr"; seq: number; bytes: Buffer; receivedAt: string }[]
+  exitCode?: number
+  signal?: string
+  terminationReason?: TerminationReason
+  error?: ToolErrorDetail
+  startedAt: string
+  finishedAt?: string
+  capture: ResultCapture
+}
+
+export interface EvidenceStore {
+  record(captured: CapturedResult): Promise<StoredOutcome>   // atomic, crash-consistent
+  pending(invocationId: string): Promise<StoredOutcome | undefined>
+}
+```
+
+**Implementation instructions**
+
+1. `EvidenceStore.record` writes observation + outcome + blobs + chunks in **one synchronous transaction** (`SqliteFile.write`, which already rejects async closures). Pending records are written first (`status = 'starting'` or `'accepted'`), and the terminal result is appended atomically; a crash between them leaves a recoverable pending record, never a lost result.
+2. Store bytes losslessly (`byte_preservation = 'lossless'`) and decode only when displaying/querying. Where policy forbids retaining raw sensitive bytes, set `redaction = 'excluded_by_policy'` and record the exclusion in `gap_reason`. Keep `todo_tool_evidence.content` as the redacted presentation copy; the blob keeps original bytes.
+3. Content-addressed blobs (`UNIQUE(project_id, content_digest)`) may be shared by many observations; each timed observation stays separate and its invocation history is never merged.
+4. Enforce limits explicitly: `maxBlobBytes`, `maxProjectBytes`; when either is hit, set `storage_complete = 0` with `gap_reason` and stop writing, reporting the state. Never create a blob row that claims content it does not hold, and never invent an ID.
+5. Eviction becomes an explicit state (`evicted_at` + `gap_reason = 'eviction'`), ordered oldest-unfavourited-first (the ordering exists from Stage 6; until then, keep today's order and make the *state* honest).
+6. Failed calls, refusals and skipped approvals are recorded: `executed = 0`, `status = 'refused'`, no fabricated exit code. `isRecordableToolResult` must keep declining TODO-tool self-records and non-executed commands, but a **refused command** still records an attempt.
+7. Binary and invalid UTF-8 bytes round-trip losslessly or are explicitly excluded; the plan's tests prove which.
+8. Retention/provenance keeps the existing model: nullable `list_id`/`item_id` as provenance only (no ownership cascade), project-scoped rows surviving task/list/conversation deletion.
+
+**Safety and backwards compatibility**
+
+- No tool behaviour change: no new tool, no changed output text, no changed hash protocol.
+- Every existing consumer of `RetainedObservationEvidence` keeps working; new fields are additive and optional; existing tests asserting the stored shape pass unmodified.
+- Access control unchanged: `WorkspaceView.resolve`, the access preflight and operation-scoped write grants still gate every path; storage never grants anything (Rule 7).
+- Secrets: apply the existing `redactEvidence` policy to model-visible projections, log/diagnostic exports and range retrieval; raw retention must not silently expose secrets through a range query.
+
+**Required tests** (`node:test`, production paths; new file `evidence-storage.standalone.ts`)
+
+1. *a complete tool result is stored before display fitting and the delivered copy is smaller than the stored bytes*
+2. *a failed call records its typed arguments, status, timing and structured error, and nothing claims it executed*
+3. *a refused command records an attempt with `executed = false` and no exit code*
+4. *stdout and stderr are stored independently and each keeps its own byte order when chunks interleave*
+5. *invalid UTF-8 and binary bytes round-trip losslessly, or are recorded as excluded by policy*
+6. *the storage limit is reported honestly: a result larger than `maxBlobBytes` is recorded incomplete with the exact coverage gap, and no phantom blob ID exists*
+7. *project storage exhaustion is visible: the record says what was not stored and retrieval reports `evicted`, never `retained`*
+8. *crash between a streamed chunk and the final status leaves a recoverable pending record that a reopen reconciles to `lost` or `unknown`, never to success*
+9. *replay of the same request idempotently returns the prior observation with its outcome; no second row, no rerun*
+10. *observations, outcomes, blobs, chunks, lines and dependencies survive deletion of a task, a list and a conversation* (extend the existing Stage 11 survival tests)
+11. **[VS Code suite]** in `agent-reply.test.ts`: *the real hook stores the raw bytes of one tool result before the loop fits it*, comparing the recorded `originalChars`/`originalBytes` with what the model received.
+
+**Negative and adversarial tests**
+
+- huge single line (over `MAX_LINE_FRAGMENT_CHARS`) stored whole, its line index bounded;
+- two different files producing the same content digest → one blob, two observations, both retrievable by their own UUID;
+- redaction that would change bytes must not be presented as lossless;
+- cross-project observation access denied, and a cross-project UUID does not leak which project it belongs to;
+- storage write failure reported as `storage_error`, never as a successful record;
+- a partial delivery for a successful tool stays successful; an unsuccessful tool stays unsuccessful even when its output was captured completely.
+
+**Verification commands:** the §0.3 gates, plus `node --test out/test/standalone/evidence-storage.standalone.ts` and the VS Code suite (or exact `NOT RUN`).
+
+**Acceptance criteria**
+
+- Every number in a recorded completeness field is measured by the stage's own tests, not asserted.
+- The Stage 0 reproduction case: capture the whole 1,374-line plan once; the storage layer retains all of it (no 200K silent cap), and the record reports `original`/`captured`/`stored` independently. Retrieval itself is Stage 2, so this stage proves *storage completeness*, not delivery.
+- No existing test changed except those this stage names; Formatting-only differences are not an approval gate.
+
+**Completion report:** the §0.5 format plus the measured before/after object counts for the v21 inventory, and the exact reproduction numbers.
+
+**Cannot be declared complete if:** any existing assertion was weakened or skipped; a completeness state is claimed without a test; the schema version was changed without the refusal-path test passing; any code path deletes a database by itself; the VS Code suite pass was claimed without observing it.
+
+---
+
+### Stage 2 — Read-only evidence access service
+
+**Depends on:** Stage 1.
+
+**Goal:** the §4.3 service: resolve by observation UUID, bounded inclusive line ranges, character and byte offsets, fragments of extremely long lines, stream selection, search/filter with deterministic pagination and continuation, explicit `incomplete` / `evicted` / `missing` / `inaccessible` states. Retrieval never reruns the original tool.
+
+**Prerequisites:** Stage 1's outcomes, blobs, chunks, line index and honest completeness states.
+
+**Existing components reused:** `SourceRoots` (canonical path identity), `todos/evidence.ts` (`EvidenceSource`, `EvidenceHit`, `samePath`, `redactEvidence`), the repository's `retainedEvidenceFor`/`projectObservations` query style, `WorkspaceView` for authorization scope, the existing `MAX_EXCERPT_CHARS`/`MAX_WINDOW_CHARS` budget style. Do not create a second evidence cache.
+
+**Files expected to change**
+
+- new `src/extension/todos/evidence-access.ts` (`vscode`-free service implementing §4.3)
+- `src/extension/todos/repository.ts` (exposes the access service through the same boundary it already owns)
+- `src/extension/todos/types.ts` (§4.3 types)
+- new `src/test/standalone/evidence-access.standalone.ts`; additions to `todos-sqlite.standalone.ts`
+
+**Schema changes:** none beyond Stage 1. `evidence_access_events` records retrieval calls as lightweight execution events; it must not copy blob content.
+
+**New contract:** exactly §4.3, plus the conversions stated unambiguously: line numbers are 1-based inclusive over the *stored* content; character offsets count decoded UTF-8 code units from the start of that line; byte offsets count stored bytes; when `byte_preservation = 'normalized'`, a byte query reports the normalization in its own words and the returned span is bounded to what exists.
+
+**Implementation instructions**
+
+1. Resolve by UUID first (invocation id as an optional alias); scope by project, host key and authorized roots before any content is read.
+2. Serve from stored bytes/lines, never from `read_file` or a rerun; if the content is not there, return the state (`evicted`, `missing_tail`, `unknown_content`, `inaccessible`) with the exact coverage that *is* there.
+3. Every returned page is size-bounded and continuable through a deterministic cursor (`(stream, byte)`), and the same cursor returns the same next page.
+4. Search supports literal and optional regex with bounded computation, surrounding context lines, exact match counts where bounds allow, and `match_count: 0` as a **success**. A search that runs out of its bound reports the bound, not a false total.
+5. Filter by source path, fingerprint, tool, time/execution, status and project when authorized, bounded by an explicit limit; general lookup stays discoverable without dumping a huge list.
+6. Record each access as an event row with arguments and outcome, deduplicating references to underlying blobs (no evidence-of-evidence chains).
+7. Report provenance in every result: original hash/UUID, tool, path, observed time, execution id, completeness. A stale observation retrieved as historical evidence is labelled historical, never presented as current source.
+
+**Safety and backwards compatibility:** no existing lookup, Feedback, preflight or export path changes behaviour; `RetrievedSpan` and `SearchPage` are new shapes, not replacements for `EvidenceSource`/`EvidenceHit`. Redaction applies to every returned span before it reaches the model, and a read-only service result grants no access: a denied scope returns no content and no candidate names.
+
+**Required tests** (production service over a real `TodoRepository`)
+
+1. *the 1,374-line plan reproduction: beginning, line 687 and the final non-empty line come from durable evidence without repeating read_file* — verify original bytes and model-delivery coverage independently.
+2. *long-line fragments and exact byte offsets round-trip, and a query beyond stored coverage returns the state that is true*
+3. *stdout and stderr selection returns each stream on its own, and merged presentation is only offered where chunk order allows it*
+4. *search over retained output returns zero matches as a successful result with `match_count: 0`*
+5. *pagination is deterministic: the same cursor returns the same page, and a page that cannot fit reports its continuation*
+6. *an evicted blob, a missing tail and an inaccessible record each report their own state and never advertise retrieval they cannot perform*
+7. *cross-project and unauthorized access is refused without naming restricted candidates*
+8. *retrieval records an execution event without duplicating the stored blob*
+
+**Negative and adversarial tests:** binary stderr queried by byte offsets; invalid UTF-8 in a returned range; a request whose range crosses an eviction boundary; redaction that forbids exposing a secret line (the match count may be reported while the text is not); a query against an observation for a failed tool (no content was retained → honest state); a query result larger than its own bound; two observations sharing one content blob.
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/evidence-access.standalone.ts`.
+
+**Acceptance criteria:** every state in §4.3 is reachable by at least one test; the reproduction case answers beginning/middle/end without a reread; no code path reruns a tool for retrieval.
+
+**Cannot be declared complete if:** any state is asserted without a test; the service reads current source instead of stored evidence without labelling it; a zero-match search is reported as failure; an existing lookup test changed.
+
+---
+
+### Stage 3 — `query_evidence` native tool and the sparse result envelope
+
+**Depends on:** Stage 2. **[VS Code suite]** (tool registration runs in the host).
+
+**Goal:** expose the Stage 2 service to the model as one native read-only tool with explicit range mode, and make the model-facing copy of integrity/status/retrieval semantics real: actual observation IDs reach `loop.ts`, `budget.ts`, the GUI step view and conversation export, and repeated identical read-only calls reuse a real stored observation instead of re-running.
+
+**Prerequisites:** Stage 2's service and states; Stage 1's completeness contract.
+
+**Existing components reused:** `ToolSpec`/`ToolResult` (`tools/protocol.ts`, `tools/workspace.ts`), the `workspaceTools` tool list and its `extras` pattern, `argumentReader` + typed arguments (`tools/arguments.ts`), `formatResultIntegrity`/`stripResultIntegrity` (`tools/budget.ts`), the `_answered` repeat suppression in `ToolLoop`, `common/tool-output.ts` parsers (must keep parsing today's headers), the webview tool-step view, `common/conversation-export.ts`.
+
+**Files expected to change**
+
+- new `src/extension/tools/evidence.ts` (`evidenceTools(...)` implementing §4.7 envelope and the `query_evidence` tool)
+- `src/extension/tools/workspace.ts` (register the tool through a new `extras.evidence` option; no behaviour change for existing tools)
+- `src/extension/chat/index.ts` (wire the repository's access service into `workspaceTools`/`todoWorkspaceTools`)
+- `src/extension/tools/loop.ts` (`onToolResult` keeps the observation id alongside the slot; repeated read-only calls reuse the stored content when identity, arguments, source version and authorization context are still valid)
+- `src/webview/tool-steps.tsx` / `tool-output.tsx` and `src/common/conversation-export.ts` only where an actual ID is displayed or exported
+- tests: new `src/test/standalone/evidence-query-tool.standalone.ts`; additions to `chat-tools.standalone.ts`, `tool-loop.standalone.ts`, `tool-output.standalone.ts`, `conversation-export.standalone.ts`
+
+**Schema changes:** none; use Stage 1's `evidence_access_events`.
+
+**New tool contract** (illustrative call and response shapes)
+
+```json
+{"observation_id":"<uuid>","start_line":687,"end_line":710}
+```
+
+```json
+{"state":"retained","coverage":{"from_line":687,"to_line":710},"provenance":{"tool":"read_file","path":"docs/Moriarty_Unified_Index_Evidence_Implementation_Plan.md"},"retrieve":{"continuation":{"cursor":"byte:46120"}}}
+```
+
+Rules for the tool surface: read-only; `readOnly: true` so repeat suppression applies; parameters typed (integer ranges, optional stream/mode); no boolean/number stringifying; a response is sparse — omit default-valued fields, keep states that have no default; the tool is only advertised when registered (never invent a model tool that does not exist).
+
+**Implementation instructions**
+
+1. The tool calls Stage 2's service; it never re-reads source or reruns a command.
+2. When integrity, status or retrieval semantics require an envelope, emit it; a complete plain result stays plain text with a lightweight source ID only where needed.
+3. Keep `[result_integrity]` working for existing consumers while carrying `observation_id` through the loop, budgeting, GUI step view and export.
+4. Repeat suppression: reuse a real observation ID only while identity, arguments, source versions, authorization context and observation semantics are still valid; otherwise run the tool. A refused repeat is reported as *not run*, never as a result.
+5. Never send the retained blob and its summary together (design §4.4.4): one compact reference plus the delivered coverage.
+
+**Safety and backwards compatibility:** existing tool output formats stay parseable (`common/tool-output.ts`, the webview step view, conversation export); new fields are additive. No message may reference a tool that is not registered, and repeat suppression may not change the outcome of a side-effecting call or answer from content that was never stored.
+
+**Required tests**
+
+1. *`query_evidence` answers the beginning, line 687 and the last non-empty line of a stored large result without rerunning the tool*
+2. *a complete short result stays plain text; an envelope appears only when integrity or retrieval semantics require it*
+3. *the model-visible copy carries the real observation id through loop, budget, the step view and the export*
+4. *repeated identical read-only calls reuse the stored content while validity holds, and run again once the source version changes*
+5. *a partial delivery for a successful tool reports both delivered coverage and retained coverage without claiming the tail is recoverable when it is not*
+
+**Negative and adversarial tests:** asking for a range beyond retained coverage; asking for an evicted observation; a call with a wrong-typed argument (refused, `executed: false`); a lookup of another project's UUID; a command whose output was never captured; a search that returns zero matches (success); a tool call whose result is omitted from context (must not be described as retrievable when storage capped it).
+
+**Verification commands:** §0.3 gates + the focused file, plus `grep -n "query_evidence" src/extension/tools/evidence.ts src/extension/tools/workspace.ts` showing registration and dispatch.
+
+**Acceptance criteria:** every tool call a response recommends is a registered tool; every "recoverable" claim is backed by stored data and authorization; existing header parsers and step-view tests pass unmodified.
+
+**Cannot be declared complete if:** an unregistered tool is referenced in any message; any response claims completeness the storage does not have; an existing GUI/export test needed a weakened assertion.
+
+---
+
+### Stage 4 — Validity classes, dependency edges and invalidation events
+
+**Depends on:** Stage 1. **[VS Code suite]** (the boundary is wired from the host).
+
+**Goal:** extend the existing single validity boundary to the design's full classification, record **established** dependencies between source observations and derived claims, and invalidate through events (native edits, editor saves, external changes, Git operations, renames, deletes) without ever guessing a dependency.
+
+**Prerequisites:** Stage 1 (outcome/blob identity so a derived claim can name the observation it came from); the existing `SourceValidityBoundary`, `SourceRoots`, `observation_source`, `todo_accepted_evidence`.
+
+**Existing components reused (extend, do not replace):** `todos/source-validity.ts` (`SourceValidityBoundary.check/assess/read`, `aggregateValidity`, `CheckedSourceReference`, `decidedBy`), `feedback.ts` (`assessAcceptedFacts`, `factReason`, `FRESHNESS_OF`, `resolveAcceptedFacts`, `evidencePreflight`), `delivery.ts`, `evidence-context.ts`, `tools/todos.ts` (the lookup projection), `repository.recordObservationSources`/`recordedSourceReferences`, the synchronous index refresh path (`chat/tool-sinks.ts` `refreshed(...)`, `WorkspaceSearchProvider.refresh`), the existing watchers in `workspace-index/index.ts` (`dirtyUris`, `pendingDeletes`, `scheduleUris`, `flushPendingUris`).
+
+**Files expected to change**
+
+- `src/extension/todos/source-validity.ts` (the new classes plus the old ones preserved)
+- new `src/extension/todos/dependency-index.ts`
+- `src/extension/todos/repository.ts` (`recordToolObservation` records established edges; `assess` uses them)
+- `src/extension/todos/types.ts` (the new validity types)
+- `src/extension/workspace-index/index.ts` (rename/create/delete reporting: `onDidRenameFiles`, and the existing delete path feeding `IndexChange`)
+- `src/extension/chat/index.ts` (`evidenceBoundary()` stays the single wiring point)
+- `src/extension/tools/todos.ts` (stale notices: original hash + observation UUID only)
+- tests: new `src/test/standalone/evidence-validity.standalone.ts`; additions to `todo-feedback.standalone.ts`, `source-analysis.standalone.ts`, `todos-sqlite.standalone.ts`, and one suite test in `workspace-index.test.ts`
+
+**Schema changes:** `evidence_dependencies` from §5.2 plus a `validity_class TEXT` column on `todo_tool_observations` (`CHECK (validity_class IS NULL OR validity_class IN ('current','stale','unknown','historical','superseded'))`) — recorded as the *classification at storage time*, while retrieval re-checks through the boundary, so the stored value is an audit fact, never the authority.
+
+**New contract**
+
+```ts
+export type ValidityClass = "current" | "stale" | "unknown" | "historical" | "superseded"
+export interface DependencyEdge {
+  derivedObservationId: string
+  sourceObservationId: string
+  kind: "source_read" | "derived_claim" | "accepted_fact" | "supersedes"
+  establishedAt: string
+}
+/** A stale notice as the projector and tools may render it. Never carries a new hash. */
+export interface StaleNotice {
+  observationId: string
+  originalHash: string
+  reason: "source_modified" | "source_deleted" | "dependency_invalidated" | "rename" | "git_operation"
+}
+```
+
+Preserve the existing per-reference states (`valid`/`stale`/`invalid`/`unverifiable`) and their mapping to `ValidityClass` (`valid → current`, `stale → stale`, `invalid → stale with reason source_deleted`, an event-only record → `historical`, insufficient or inaccessible evidence → `unknown`, a user/task decision → `superseded`). Aggregate order stays `invalid > stale > valid`; `unknown` is reported separately, never folded into a stronger state.
+
+**Implementation instructions**
+
+1. The boundary remains the single decider; consumers still do not opt in by passing a reader.
+2. Record an edge only when the relationship was established by an actual operation (a claim reconciled from a read, a fact accepted from an observation, a supersession). Never infer dependencies from arbitrary command text.
+3. Invalidating a source invalidates only claims whose **current-state** validity depends on it. A historical failure remains useful evidence; it does not prove today's test status.
+4. Command/test output is immutable history: whether it verifies the current build depends on the recorded source set, revision, configuration and runtime dependencies — all `unknown` unless established.
+5. Events: native edits (the existing `refreshed` path), editor saves (`onDidSaveTextDocument`), external changes (watchers, reported as `unknown` until reconciled), renames/creates/deletes (`onDidRenameFiles` + the existing delete path), Git operations (recorded as a `git_operation` reason only when the operation touched the recorded source).
+6. A later matching hash after a revert does **not** resurrect an old observation as freshly authorized evidence; it stays `stale` until revalidated (`valid again` only through the boundary's own check, which is what today's rule already proves).
+7. Stale notices carry `observationId`, the **original obsolete** hash and `reason` — never the new hash (Rule 3). A notice is inserted only when the active plan depends on the invalidated fact; indiscriminate insertion is forbidden.
+8. User requests and their original text/intent are immutable and never classified stale; later user changes create explicit `supersession` links (§4.6 protected segments, Stage 6 records them).
+
+**Safety and backwards compatibility:** the existing `SourceValidity` states and every existing validity/freshness test keep their meaning; the new classes are additive. The stored `validity_class` is an audit fact, never the authority, and no consumer may decide validity by itself.
+
+**Required tests**
+
+1. *four reads of one version then a verified edit makes those four current-state reads stale while the historical records survive*
+2. *a derived claim is invalidated only when its recorded dependency is invalidated; an unrelated claim keeps its state*
+3. *no dependency exists that the code did not establish* (the edge table stays empty for a command run with unknown side effects)
+4. *a stale notice names the original hash and UUID and never contains the new hash* — proven by asserting the new hash does not appear anywhere in the notice text.
+5. *renamed sources resolve to their recorded link; identical-content files at different paths stay separate*
+6. *deleted sources report `invalid`/`stale with reason source_deleted`, and the record is still listed*
+7. *external change reports `unknown` until reconciled, then the reconciled state*
+8. *Git operation invalidation is recorded only when it touched the recorded source*
+9. *buffer-versus-disk distinction is preserved for every class* (existing Stage 12 tests pass unmodified)
+10. **[VS Code suite]** in `workspace-index.test.ts`: *a rename reaches the dependency index with its link, and the index reports the new path through `onDidRenameFiles`*.
+
+**Negative and adversarial tests:** a hash collision across two files (never resolves to one); a claim whose dependency was never recorded; a stale buffer observation whose buffer closes; a file restored to matching content (`valid again`, not resurrected as authorized); an event that fires for a file outside the authorized roots; a notice built for a fact the active plan does not depend on (must not be inserted).
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/evidence-validity.standalone.ts` + `grep -n "ValidityClass\|StaleNotice" src/extension/todos/source-validity.ts`.
+
+**Acceptance criteria:** the five classes are reachable and distinct; every existing validity test passes unmodified; no code path emits a replacement hash outside an explicit Stage 5 lookup.
+
+**Cannot be declared complete if:** any existing assertion was changed except those this stage names; `unknown` is collapsed into a default; a dependency was inferred rather than recorded.
+
+---
+
+### Stage 5 — Explicit stale-to-current resolution (`resolve_current_evidence`)
+
+**Depends on:** Stage 2 (content reference), Stage 4 (validity classes and lineage). **[VS Code suite]** for the buffer/disk and authorization paths.
+
+**Goal:** give the model one read-only operation that takes an old observation UUID, or a sufficiently scoped old fingerprint, and returns the **verified current** source observation and its hash — only on an explicit, authorized request. Automatic invalidation notices keep carrying the old hash only.
+
+**Prerequisites:** `SourceRoots`, `SourceValidityBoundary`, `findRelocationCandidates`, the access preflight (`access-preflight.ts`), `WorkspaceView.resolve`/`text`/`relative`/`isExternal`, `contentHash`/`fingerprintContent`/`verifyContentFingerprint`.
+
+**Files expected to change**
+
+- new `src/extension/todos/current-resolution.ts` (the resolver; `vscode`-free, reads through the repository's boundary)
+- `src/extension/tools/evidence.ts` (the registered tool, §4.4 shapes, `readOnly: true`)
+- `src/extension/todos/repository.ts` (records `supersedes_observation_id` / `derived_from_observation_id` edges)
+- tests: new `src/test/standalone/resolve-current-evidence.standalone.ts`; additions to `source-analysis.standalone.ts`, `todo-feedback.standalone.ts`, and one suite test in `file-access.test.ts` (the file the harness lists for authorization paths)
+
+**Schema changes:** none; use `evidence_dependencies` with kind `supersedes`/`derived_claim` and the existing `observation_source` rows.
+
+**Implementation instructions**
+
+1. Prefer UUID over hash. With a hash alone, require enough scope (path or root) to disambiguate; identical contents or a collision return `ambiguous` with bounded authorized candidates.
+2. Follow recorded source identity, path, workspace root and verified rename/move links; never "find any file with this hash".
+3. At lookup time verify existence, permission scope, disk-versus-unsaved-buffer selection, current content and fingerprint. Index mappings are candidate hints only.
+4. If a verified authorized observation already covers the current content, return its `observation_id`, `content_hash`, `path` and an optional bounded retrieval reference **without repeating a read**. Otherwise perform one explicit authorized read, store it as an observation with provenance linking to the old item, then answer. Report where the information came from.
+5. When the request asks for a bounded current range, return it in the same response (avoid round trips); large bodies stay in the store and are served by `query_evidence`.
+6. Deleted source → `deleted`/`no_current_version`; no invented replacement, no unrelated file. Rename/move → verified successor location with the link as evidence. Ambiguous histories/duplicate candidates → `ambiguous`. Missing or evicted old observation → `not_found`/`history_unavailable`. Denied access → `permission_denied` without naming restricted candidates. No meaningful current successor (transient command, time-sensitive diagnostic, multi-file search, test run) → `not_applicable` plus an appropriate **suggested new authorized operation**; never silently rerun a side-effecting command.
+7. Concurrent modification during the lookup returns `unknown`/race or retries the safe read validation once, and never a misleading current claim.
+8. A lookup must not grant anything: it cannot be used to bypass `edit_lines`' `expected_hash` concurrency check or write authorization (Rule 7). An unchanged file may reuse a currently verified observation ID where valid rather than inventing a new version.
+9. Responses are sparse but truthful: `current` carries the verified ID and hash; `deleted` carries neither; ambiguity and unknown validity are explicit; `favourite` is omitted unless true.
+
+**Safety and backwards compatibility:** a resolution grants nothing. It cannot satisfy `edit_lines`' `expected_hash` check, cannot widen access, and cannot name a path the caller may not see. Every successful fresh lookup is stored as an observation with provenance; no lookup rewrites a historical row or its timestamps.
+
+**Required tests** (each named as a test title)
+
+1. *four reads of one old version then an edit resolve every old UUID to the same independently verified current source version*
+2. *a deleted source returns no replacement*
+3. *a renamed source resolves through its recorded link, not by hash guessing*
+4. *two identical-content files with the same old hash are ambiguous without path identity*
+5. *an evicted or stale-index record returns `history_unavailable`/`unknown`, never a current claim*
+6. *cross-project and unauthorized lookups are refused without naming candidates*
+7. *unsaved editor changes resolve against the buffer for a buffer observation and against disk once the buffer closes*
+8. *concurrent modification during a lookup returns race/stale, not a current hash*
+9. *when no current observation exists, the resolver creates one legitimate authorized read and records the provenance link*
+10. *the old hash never appears as newly authorized current, and the invalidation projection never contains the new hash while an explicit lookup does*
+11. *[VS Code suite]* *a lookup cannot be used to obtain a current hash for an edit that would otherwise fail its `expected_hash` check*
+12. *a direct lookup returns the requested small current range in one response, avoiding a second tool call*
+
+**Negative and adversarial tests:** a lookup against an observation whose tool was `run_command` (no file reference → `not_applicable`); a hash that resolves to a protected or team-blocked path; a lookup for a file inside `.git`; a stale index row whose file changed twice during the call; a candidate list longer than the bound; an invocation-id alias pointing at another project.
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/resolve-current-evidence.standalone.ts`.
+
+**Acceptance criteria:** all eleven required tests pass; the single-round-trip rule is proven by a test that asserts no second read; no path in the code returns a current hash without a verified read or a verified existing observation.
+
+**Cannot be declared complete if:** the resolver can answer from the index alone; it can infer identity from a matching hash; it can bypass an authorization check; it reruns a side-effecting command; any test asserts a hash without verifying it against the source.
+
+---
+
+### Stage 6 — Model-controlled favourites and protected user intent
+
+**Depends on:** Stage 1, Stage 4.
+
+**Goal:** compact idempotent mark/unmark by observation UUID with persistent storage and authorization semantics; protected user input; no unchanged/default favourite metadata transmitted.
+
+**Prerequisites:** `evidence_favourites` (Stage 1 DDL), the projector's protected-segment concept (§4.6, implemented in Stage 8; here define the types and the storage state only).
+
+**Existing components reused:** `TodoRepository` write path and request-id idempotency pattern (`validateRequestId`, replay lookups), `assertWriter`, `SourceRoots`, `recordEvidenceUse` style in `tools/todos.ts`, `toolEvidence` recording path.
+
+**Files expected to change**
+
+- new `src/extension/todos/favourites.ts`
+- new `src/extension/todos/protected-intent.ts` (the user-request/task-intent protection record; it does not store a copy of the conversation as its only source)
+- `src/extension/tools/evidence.ts` (`mark_evidence`, one tool with `mark`/`unmark`, `readOnly: false`)
+- `src/extension/todos/types.ts` (§4.5 types, `context_segments` shape for Stage 8)
+- tests: new `src/test/standalone/evidence-favourites.standalone.ts`; additions to `todo-feedback.standalone.ts`, `chat-tools.standalone.ts`
+
+**Schema changes:** `evidence_favourites`, `context_segments`, `context_projections` from §5.2. `context_segments` records the *projection input*, not a giant opaque conversation text: kind, observation reference, protection flag, token cost, chronology.
+
+```sql
+CREATE TABLE context_segments (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('user_instruction','system_policy','task_state','assistant_reply','evidence_projection')),
+  observation_id TEXT REFERENCES todo_tool_observations(id),
+  protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0,1)),
+  favourite INTEGER NOT NULL DEFAULT 0 CHECK (favourite IN (0,1)),
+  age_order INTEGER NOT NULL,
+  approx_tokens INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX context_segments_conversation ON context_segments(conversation_id, kind, age_order);
+CREATE INDEX context_segments_observation ON context_segments(observation_id);
+```
+
+**Implementation instructions**
+
+1. User input is inherently protected: `kind = 'user_instruction'` always sets `protected = 1`, and no ordinary pruning rule may drop it. A later user change writes a `supersedes` edge (Stage 4's kind), never a stale classification on the original.
+2. All ordinary tool observations start unfavourited; `favourite` is stored, not inferred, and is omitted from model output when false.
+3. The model may mark/unmark one or many UUIDs; the operation authorizes only the correct project/conversation metadata and returns §4.5's outcome. It never modifies the immutable observation body.
+4. Favourites affect retention priority only: they do not make a stale source current, elevate permission, immunise bytes from storage policy or defeat the hard capacity limit (Rule 5).
+5. Idempotency: `already` for repeats; `unknown` for IDs not in this project under this scope; `denied` for out-of-scope IDs. A compact acknowledgement is returned — never a replay of whole records.
+
+**Safety and backwards compatibility:** favourites change priority only — never validity, permission, storage policy or the hard capacity limit. Protection of user input is inherent and cannot be toggled off by the model or by a settings value.
+
+**Required tests**
+
+1. *mark and unmark change only metadata and leave the observation body byte-for-byte unchanged*
+2. *multi-ID updates report changed, already, unknown and denied separately*
+3. *repeat calls are idempotent: no duplicate rows, same outcome*
+4. *nonexistent IDs and other-project IDs are refused without revealing which project they belong to*
+5. *no read or tool output transmits `favourite:false`, an empty array or a null placeholder* — asserted by exact output comparison.
+6. *unknown state stays distinguishable from an established default* (a fact whose freshness is unknown is not reported as current)
+7. *user input remains protected when the projector runs with a stale source and a tight budget* (uses Stage 8's pure projector with injected settings)
+8. *a superseded requirement keeps its original user request intact and unprunable*
+
+**Negative and adversarial tests:** marking an observation belonging to another conversation in the same project (allowed only where authorization permits, per §8); marking a failed/refused invocation; marking while storage policy excludes bytes; unmarking a protected user segment (must be refused — protection is inherent, not a flag the model sets).
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/evidence-favourites.standalone.ts`.
+
+**Acceptance criteria:** Rule 5 holds end to end; no default-valued field is transmitted; protection cannot be turned off by the model.
+
+**Cannot be declared complete if:** a favourite can influence validity, permission or the hard cap; the model can unprotect user input; any output carries `favourite:false`.
+
+---
+
+### Stage 7 — Context sizing, token accounting and provider diagnostics
+
+**Depends on:** Stage 0 (its measured baselines), Stage 2 (the projector must measure retained evidence honestly).
+
+**Goal:** correct the existing capacity and budget path so a long-running local-model workflow with a 128K/256K (or larger) window is planned correctly, warnings are not misleading, output reservation does not make the model believe its context is exhausted, tool-result delivery budgets scale sanely, and repeated-result suppression cannot cause duplicate execution.
+
+**Prerequisites:** `planContext`, `TokenEstimator`, `ContextCapacity`, `ContextDiagnostics`, `resolveCapacity`, `serverProbeOf`, `parseContextSetting`, `resolveFallback`, `SUPPORTED_CONTEXT_TOKENS`, `SMALL_CONTEXT_TOKENS`, `ContextUsageStore`.
+
+**Files expected to change**
+
+- `src/extension/tools/budget.ts` (additive capacity accounting; no rename of existing fields)
+- `src/extension/inference/context-window.ts` (separate *effective prompt capacity* from *advertised* and from physical memory; the manual override path and its warning)
+- `src/extension/chat/index.ts` (`contextWindowOf`, `observeContext`, `logContext`, the loop's `maxResultChars` clamp)
+- `src/extension/tools/loop.ts` only where it consumes the plan (`fit()`), plus the repeated-result rule (§4.3 in Stage 2, honoured here)
+- tests: new `src/test/standalone/context-budget.standalone.ts`; additions to `context-usage.standalone.ts`, `context-breakdown.standalone.ts`, `tool-loop.standalone.ts`
+
+**Schema changes:** none (Stage 1's `context_projections` table is written by Stage 8).
+
+**Concrete issues this stage must resolve, each with a test that fails without the fix**
+
+1. **Output reservation vs prompt budget.** With `chatInferenceMaxOutputTokens` set far above a small window, `planContext` caps the reserve at 25% and can leave `limit` tiny; the model then behaves as if its context is exhausted at a small token count (design §8). Fix: report `reserved`, `margin` and `limit` as separate facts and never describe a *reservation* as *used context*; when the reservation cannot fit, say which part is the reservation, and refuse to plan rather than reporting a negative budget (`plan.limit < 512` already exists — extend it so the reason names the setting and the effective value).
+2. **Confirmed versus assumed capacity.** `resolveCapacity` uses the smallest confirmed size and marks an unconfirmed fallback. Keep that; add explicit display of "confirmed" vs "assumed", keep warning only when below 65,536, and stop calling a fallback a confirmed capacity.
+3. **Advertised maxima are not capacities.** A model advertised at 1M with a server loaded at 32K must plan on 32K, and the display must show both — with wording that does not equate prompt utilization with physical KV residency or per-slot occupancy (llama.cpp `total_slots` stays informational).
+4. **Estimation uncertainty buffer.** `margin = 10%` stays; add a configurable safety margin only where a stage names it, and prove the projector's threshold uses `limit` (which already subtracts reserve + margin), not raw capacity.
+5. **Tool-result delivery budgets.** `resultChars` scales with the window; confirm the ceiling behaviour at 256K windows and that `MIN_RESULT_CHARS`/`MIN_FRESH_CHARS` do not cause a large result to be omitted when the window plainly allows it.
+6. **Repeated-result suppression correctness.** A read whose content is still visible is answered from the stored observation (no rerun); a compacted result must remain *answerable* without executing the tool again; a side-effecting tool must never be replayed by a projection decision. Idempotency requires a stable invocation identity (Stage 1).
+7. **Exhaustion diagnosis.** `exhausted` must mean "still over budget after trimming", not "the estimate exceeded the window before trimming".
+
+**Safety and backwards compatibility:** existing `ContextDiagnostics` fields keep their meaning; the accounting added here is additive so the composer bar and the logs read the same numbers. The "smallest confirmed size wins" rule is not relaxed, and a manual override may not be used to plan above what a server holds.
+
+**Required tests**
+
+1. *a 128K window with a 6144 output reservation plans a prompt budget that does not look exhausted at 30K*
+2. *an output maximum larger than the window cannot fit is reported as a reservation problem, not as context usage*
+3. *confirmed, assumed and advertised capacities are reported distinctly and the warning appears only below the agent minimum*
+4. *the projector threshold is computed against effective capacity (window − reserve − margin), not raw capacity*
+5. *a repeated read-only call with unchanged source version does not execute the tool*
+6. *a side-effecting call is never replayed by a projection or compaction decision*
+7. *tool definitions and the closing prompt are counted in the utilization the threshold compares against*
+
+**Negative and adversarial tests:** a server that reports an implausible window (`MAX_PLAUSIBLE_TOKENS`); an invalid `chatContextWindow` value (still treated as Auto and reported); a cached unconfirmed probe expiring before a confirmed one; a tool-result ceiling at its maximum with a huge output; a provider that counts tokens very differently from the estimator (`TokenEstimator.observe` clamp 2–6).
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/context-budget.standalone.ts`; report actual counts for each named test.
+
+**Acceptance criteria:** every listed issue has a failing-without-the-fix test; existing context-usage tests pass unmodified; no warning text calls an estimate a physical measurement.
+
+**Cannot be declared complete if:** a count is claimed without running it; a warning path was changed without a test; the threshold math reads raw capacity.
+
+---
+
+### Stage 8 — Deterministic two-tier context projector (pure core)
+
+**Depends on:** Stages 2, 4, 6, 7.
+
+**Goal:** implement §4.6 as a pure, deterministic, testable module that decides what the next request sends — never touching stored evidence — and produces meaningful diagnostics.
+
+**Prerequisites:** validity classes (Stage 4), favourites and protected segments (Stage 6), honest capacity/token accounting (Stage 7), bounded historical references (Stage 2/3).
+
+**Existing components reused:** `TokenEstimator`, `planContext` (reserve, margin, limit, target, resultChars, notesChars), `withToolPrompt`/`withClosingPrompt`/`withRequestContext` and `charsOf` in `tools/loop.ts`, `formatResultIntegrity`, the `ResultSlot` structure and `_turn` transcript, provider-specific ordering rules in `chat/turn.ts` (`buildChatTurn`).
+
+**Files expected to change**
+
+- new `src/extension/context/projector.ts` (pure; no `vscode` import)
+- new `src/extension/context/settings.ts` (a pure settings reader taking a `get` function, matching `readFileSettings`' style in `tools/workspace.ts`)
+- `src/extension/tools/loop.ts` gains an injectable projector hook (`project?(segments, settings): ProjectionResult`) used by `fit()`; `fit()` keeps its existing behaviour when no projector is supplied (byte-for-byte unchanged for current tests)
+- tests: new `src/test/standalone/context-projector.standalone.ts`; additions to `tool-loop.standalone.ts`
+
+**Schema changes:** writes to `context_projections` and `context_projection_segments` (Stage 1's DDL) through the repository; no schema work here.
+
+**Algorithm (the default two-tier procedure, before each provider request)**
+
+```text
+0. Build protected segments: operative user instructions, system/tool policy, current task state.
+   User requests are never classified stale and are never pruned as ordinary evidence.
+1. Estimate utilization against effective capacity (capacity − output reserve − safety margin),
+   including tool definitions and the closing prompt. Below threshold → keep stale and valid bodies
+   in chronological order; the renderer must know validity, so a stale body is never presented as current.
+2. At or above threshold: remove or compact the OLDEST NON-FAVOURITE STALE projections first. Recompute.
+3. Still above: remove or compact the OLDEST NON-FAVOURITE VALID projections.
+   Task relevance and recorded dependencies are tie-breakers; age alone never overrides critical operative state.
+4. Compact FAVOURITE evidence to retrievable references only when required to meet the hard capacity limit.
+5. Stop at the internal target (threshold − hysteresis, default 5 points). Never produce a negative budget or
+   starvation. If non-prunable context alone exceeds physical capacity, fail transparently: report it and do not
+   silently alter user instructions.
+```
+
+Removal means "replace the body with a bounded reference": `observation_id`, original obsolete hash, `reason`, and only supported retrieval calls (`query_evidence` with a concrete range). Stale notices may carry only the old hash (Rule 3).
+
+**Pairing and duplicate-execution rules**
+
+- Every tool call keeps its call ID; every result stays paired with its call. A compacted body is replaced inside the same message, never dropped.
+- A minimal continuation marker is preserved where a provider requires one; provider-specific message ordering (`buildChatTurn`) is respected.
+- No projection decision may cause a side-effecting tool to run again (Rule 2, and Stage 7's repeated-result tests).
+
+**Safety and backwards compatibility:** the projector is pure — it never writes evidence, rewrites the transcript or changes stored records. `fit()` must behave byte-for-byte as today when no projector is injected, so existing loop tests stay meaningful.
+
+**Required tests** (pure module, deterministic inputs)
+
+1. *the same segments and settings produce the same projection* (run twice, compare)
+2. *crossing the configured threshold prunes oldest non-favourite stale bodies before valid ones*
+3. *favourite evidence is compacted only when capacity requires it*
+4. *protected user instructions and mandatory system/tool state survive every tier*
+5. *the projector stops at the hysteresis target and does not prune on the next step*
+6. *diagnostics report oldest stale removed, valid removed, favourites compacted, token estimates, threshold reason and retrieval references*
+7. *tool call/result pairing stays intact after compaction, including a multi-call reply*
+8. *a projection never changes the evidence database* (assert on a real repository: row counts unchanged)
+9. *non-prunable context exceeding capacity fails transparently rather than dropping user text*
+10. *no negative budget or starvation is possible: a zero-margin case and a tiny window each report a reason*
+
+**Negative and adversarial tests:** a favourite that is stale (compacted to a reference, not made current); a dependency that exists only as history; a segment whose observation was evicted (reference must not advertise retrieval); a threshold at its minimum (40%) with a large tool-definition cost; a request where the estimate lands exactly on the threshold boundary (boundary inclusive, as designed); a projection where only protected content remains.
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/context-projector.standalone.ts`.
+
+**Acceptance criteria:** all ten required tests plus the adversarial cases pass; `loop.ts` behaviour is byte-for-byte unchanged when no projector is injected (proven by existing tests passing unmodified).
+
+**Cannot be declared complete if:** determinism is not proven by a repeat run; any test asserts pruning happened without checking the database stayed intact; pairing is asserted rather than tested.
+
+---
+
+### Stage 9 — Projector wiring, inline chat settings and utilization display
+
+**Depends on:** Stage 8. **[VS Code suite]** plus webview tests.
+
+**Goal:** make the projector the thing that shapes each request in the chat, add the inline settings (automatic pruning toggle + percentage slider), and show effective capacity, estimated usage and the projected threshold — with wording that does not confuse prompt utilization with physical GPU KV-cache occupancy.
+
+**Prerequisites:** §4.6, Stage 7's accounting, the existing agent-settings panel pattern (`useSetting`, `NumberSetting`, `Choices`), `EVENT_NAME.twinnyGetConfigValue` / `twinnySetConfigValue` / `twinnyConfigValueChanged` and `readSettingWithLegacy` in `webview/base.ts`.
+
+**Files expected to change**
+
+- `package.json`: three settings —
+  `twinny.chatContextAutoPruning` (boolean, default `true`, machine scope), `twinny.chatContextMaxUtilization` (number, default `80`, min `40`, max `95`, step `5`, machine scope), `twinny.chatContextPruneStrategy` (`"two-tier"` default, with `"stale-first"` as the only alternative), each with a `markdownDescription` that states what the percentage measures.
+- `src/extension/context/settings.ts` (reads them through an injected `get`, so it is testable without VS Code)
+- `src/extension/chat/index.ts` (pass settings + projector into `withTools(...)` in both `todoToolsClient` and `toolsClient`; keep `onContext` logging, extend `ContextDiagnostics` with the projection counters through additive fields; expose the display through the existing `twinnyGetContextUsage` handler)
+- `src/extension/tools/loop.ts` (`fit()` uses the injected projector when present; keeps the existing fallback path byte-for-byte when not)
+- `src/webview/agent-settings.tsx` (a checkbox row for automatic pruning and a percentage slider row; add `RangeSetting` alongside `NumberSetting` — no existing control changes), plus new locale keys in `src/webview/assets/locales/en.json` (`agent-settings-pruning`, `agent-settings-pruning-title`, `agent-settings-max-utilization`, `agent-settings-max-utilization-title`, `agent-settings-strategy`, `agent-settings-strategy-two-tier`, `agent-settings-strategy-stale-first`) and the display row (configured capacity, estimated usage, projected threshold)
+- tests: additions to `context-projector.standalone.ts` (settings mapping), `feedback-settings.standalone.ts` (settings read pattern), `agent-tool-selection.standalone.ts` or `chat-tools.standalone.ts` for wiring, and one suite test in `agent-reply.test.ts`; a webview test for the slider only if an existing harness covers component behaviour (`src/test/suite/…` files listed by `.vscode-test.js`).
+
+**Implementation instructions**
+
+1. Respect hard server limits even when automatic pruning is disabled (design §8).
+2. Continue using Auto provider discovery and the manual override; expose confirmed vs assumed capacity and warn when context is under 65,536.
+3. Default to two-tier; do not add a UI switch unless the plan's two strategies are both reachable through the setting (the `Choices` control already exists — use it rather than inventing a new control).
+4. The slider changes **when the next request is pruned**, measured against effective capacity including response reserve, tool definitions, system instructions and safety margin. Its description must say so.
+5. Display "automatic pruning activity" as counters from Stage 8's diagnostics (stale removed / valid removed / favourites compacted / threshold reason), not as a log of content.
+6. Keep the physical-memory distinction explicit in every user-facing string: prompt utilization is an estimate; do not call it VRAM or per-slot KV occupancy.
+
+**Safety and backwards compatibility:** existing settings and controls keep their behaviour; only new settings and rows are added. Hard provider limits stay authoritative when automatic pruning is off, and a settings change applies to the next request, never retroactively to recorded history.
+
+**Required tests**
+
+1. *the inline setting changes the threshold the projector uses and the change reaches the next request*
+2. *automatic pruning off still respects the hard capacity limit and reports why a request could not fit*
+3. *the display shows configured capacity, estimated usage and projected threshold, and never labels the estimate as physical memory* — asserted by string inspection in the settings/locale text.
+4. *the hysteresis target prevents pruning on the step after a threshold crossing*
+5. *projection diagnostics reach the log and the display counters with actual numbers*
+
+**Negative and adversarial tests:** a threshold set at the minimum with tool definitions alone exceeding it; a provider reporting a window smaller than the settings range; a settings change mid-reply (applies to the next request, not retroactively); a disabled-pruning request that cannot fit; a strategy switch to `stale-first` (must still protect user input).
+
+**Verification commands:** §0.3 gates including the VS Code suite (or exact `NOT RUN`), plus `grep -n "chatContextMaxUtilization\|chatContextAutoPruning" package.json src/extension/context/settings.ts src/webview/agent-settings.tsx`.
+
+**Acceptance criteria:** the settings exist with the stated default/range/step; the projector is actually used in both chat paths; no existing loop test changed; display wording distinguishes estimate from physical memory.
+
+**Cannot be declared complete if:** a control was added without wiring it to the projector; the hard limit can be bypassed when pruning is off; the suite pass was claimed without observing a Mocha summary.
+
+---
+
+### Stage 10 — Response-guidance catalogue and model-facing payload audit
+
+**Depends on:** Stages 3, 4, 8, 9.
+
+**Goal:** one auditable catalogue of every response/error string the tools can give the model, replacing needless rerun/reread advice with evidence retrieval **only when the retained result actually exists and access is allowed**, while keeping accurate success/failure reporting; and measure the token cost of model-facing payloads so sparse metadata is proven, not assumed.
+
+**Prerequisites:** Stage 2's states (so a message can know what is truly retrievable), Stage 4's notices, Stage 8's references, Stage 3's registered tools.
+
+**Files expected to change**
+
+- new `src/extension/tools/response-guidance.ts`: one function per condition, each returning the message with the *actual* next action; every referenced tool must be a registered one.
+- `src/extension/tools/budget.ts` (`fitResult`, `trimmedResult`), `src/extension/tools/loop.ts` (repeat/omitted notices), `src/extension/tools/workspace.ts` (`overLimitMessage`, `suggestedReads`, search notes), `src/extension/tools/line-edit.ts` and `src/extension/edit/service.ts` (hash-change reread advice), `src/extension/todos/evidence.ts` (`describeGap`), `src/extension/todos/plan-context.ts` (`acceptedFactEntry`) and `src/extension/tools/todos.ts` (the `refresh` hint).
+- tests: new `src/test/standalone/response-guidance.standalone.ts`; additions to `tool-safety.standalone.ts`, `chat-tools.standalone.ts`, `read-file-arguments.standalone.ts`, `source-analysis.standalone.ts`, `tool-loop.standalone.ts`.
+
+**Per-entry audit fields (the catalogue table each message must carry)**
+
+| Field | Meaning |
+|---|---|
+| trigger | the exact condition that produced the message |
+| execution status | executed / refused / not run / stopped / timed out |
+| what was truly retained | nothing / prefix / full / evicted |
+| observation id | present only when a real record exists |
+| recoverable coverage | exact ranges, or an explicit statement that none is recoverable |
+| freshness | current / stale / unknown / historical |
+| available native retrieval | the registered tool and usable arguments, or "none" |
+| honest next action | retrieve, reread (only when actually necessary), or a new authorized operation |
+
+Rules: keep a fresh-read requirement for a stale source before mutation; never use an old hash as edit authorization; a repeated command/test execution is not automatically replaceable by historical output when live reevaluation is needed; zero matches from native search are successful.
+
+**Payload audit (measured, with the measurement in the report)**
+
+- redundant default fields (`favourite:false`, empty arrays, null placeholders, duplicated status), repeated hashes/paths, summary-plus-blob duplication;
+- token cost before and after, per message class, using `TokenEstimator` and the existing request breakdown (`context-breakdown.ts`);
+- savings reported as measured numbers (characters and tokens on a fixed fixture), not as an estimate.
+
+**Safety and backwards compatibility:** wording changes only. No tool's behaviour, permission model or error semantics change, and a success/failure status may not be softened to make a message read better.
+
+**Required tests**
+
+1. *a message that recommends retrieval only appears when the retained data exists and access is allowed*
+2. *a capped storage result never recommends retrieval it cannot perform; it says `not_retrievable` (§4.3)*
+3. *success and failure reporting stays accurate under sparse encoding* (a failed call still reports failure)
+4. *no message names a tool that is not registered* — asserted against the tool list built by `workspaceTools`
+5. *zero-match search returns a successful result with `match_count: 0`*
+6. *the fixed fixture produces the measured token saving, and the number is recorded in the report*
+7. *a reread recommendation survives where it is genuinely required (stale source before an edit)*
+
+**Negative and adversarial tests:** a message built for an evicted observation; one built for another project's UUID; one built for a refused command (`executed:false`); a regex pattern that matches nothing but is valid; a message that would otherwise recommend rerunning a side-effecting tool.
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/response-guidance.standalone.ts`; run the 20-row investigation catalogue as a regression checklist and record which rows changed and where each message now lives.
+
+**Acceptance criteria:** every catalogued message has a trigger, an execution truth, a coverage statement and an honest next action; measured savings recorded; no existing refusal test weakened.
+
+**Cannot be declared complete if:** the audit's numbers are estimated rather than measured; any message can claim retrievability that the service does not have; the update changes behaviour of a tool rather than its wording.
+
+---
+
+### Stage 11 — `run_command` evidence adapter (shared contract only)
+
+**Depends on:** Stages 1, 2, 3. **[VS Code suite]** for the command path.
+
+**Goal:** make today's one-shot `run_command` produce the shared evidence shapes (§4.8) so the future managed-command implementation needs **no second database redesign**. Do not implement sessions, batches, polling, cancellation, streaming, preflight parsers or native-preference soft refusal here.
+
+**Prerequisites:** Stage 1's outcomes/blobs/chunks; Stage 2's stream selection and byte ranges; the existing `CommandSink`/`CommandOutcome` shapes (`tools/workspace.ts`) and the background runner in `chat/tool-sinks.ts`.
+
+**Files expected to change**
+
+- new `src/extension/tools/command-evidence.ts` (the adapter: typed args → invocation identity → `CapturedResult` → bounded model response)
+- `src/extension/chat/tool-sinks.ts` (capture stdout and stderr separately where the existing path allows it; keep the same command behaviour, timeout, approval and process-tree rules)
+- `src/extension/tools/workspace.ts` (`run_command`'s `execution` field gains stream references; the model-visible text stays as it is today except for the honest status fields this stage adds)
+- tests: new `src/test/standalone/command-evidence.standalone.ts`; additions to `command-snapshot.standalone.ts`, `chat-tools.standalone.ts`, `tool-loop.standalone.ts`, `operation-lifecycle.standalone.ts`
+
+**Schema changes:** none. Use Stage 1's tables; this stage is the first consumer of `stdout_blob_id`, `stderr_blob_id`, `evidence_chunks` and the `ExecutionState` enumeration.
+
+**What this stage must establish (interfaces, tested against the existing path)**
+
+1. Invocation and execution UUIDs, independent from "the only command currently running"; batch/child references optional and unused for now.
+2. Independent stdout and stderr streams with ordered chunk sequence and per-stream completeness; `no stderr` and `stderr not captured` are different states.
+3. Exit code, signal, timeout/cancellation and lost reasons recorded out of band, never inferred from output text; a POSIX signal death is not converted into a successful integer exit.
+4. Lifecycle enumeration exactly as §4.8, with `running` distinct from terminal states; a head-only capture (today's rolling tail) must be reported as `capture_limit`, not as complete.
+5. Bounded retrieval by execution id through Stage 2 — poll/read semantics preserved for the future: retrieving must not rerun.
+6. Refused operations recorded with `executed: false` and no fabricated exit code.
+7. Authorization and project/host scoping unchanged; a permitted session is not blanket approval (the interface carries the scope, the implementation stays in the managed-command stages).
+
+**Deliberately left to the managed-command stages:** session registry, cwd/env semantics, persistent-shell vs per-command mode, ordered batches, background launch/poll/wait/cancel, process-tree cleanup policy, restart reconciliation, notification hooks, native-preference soft refusal (configurable `off`/`suggest`/`soft-refuse`), parser-based shell classification (never naive regex as the authorization gate).
+
+**Safety and backwards compatibility:** command execution semantics stay as they are (same approval mode, timeout, cwd, process-tree rules, background-versus-terminal choice). Only evidence shapes are added; no session, batch, polling or soft-refusal behaviour is introduced here.
+
+**Required tests**
+
+1. *exit 0 with nonempty stderr and exit 7 with no stderr are both recorded truthfully*
+2. *stdout-only, stderr-only and no-output runs keep their separate stream states*
+3. *the same run records each stream in its own byte order when chunks interleave*
+4. *binary and invalid UTF-8 bytes in stderr round-trip or are recorded as excluded*
+5. *a head truncated by the capture limit is reported as `capture_limit`, and retrieval returns what exists, not a claim*
+6. *retrieving command output does not rerun the command* (assert the sink is called once)
+7. *a refused or skipped command records an attempt with `executed: false` and no exit code*
+8. *a timeout is never recorded as exit 0*
+9. *an execution id resolves to its own streams and exit status independently of any other run*
+
+**Negative and adversarial tests:** hostile output containing a spoofed completion marker or an instruction ("run this next") — host status and approval policy must not be corrupted; a run whose child holds the pipes open after the shell exits (`EXIT_GRACE_MS` path); a run whose exit code arrives after the last chunk; two runs sharing one content blob.
+
+**Verification commands:** §0.3 gates + `node --test out/test/standalone/command-evidence.standalone.ts`; `grep -n "ExecutionState\|CommandEvidence" src/extension/tools/command-evidence.ts`.
+
+**Acceptance criteria:** the shapes exist and are exercised on the real one-shot path; no command behaviour change (same approval, timeout, cwd, termination rules); every §4.8 rule has a test; the managed-command plan can consume them without touching the schema.
+
+**Cannot be declared complete if:** this stage implements sessions/batches/polling (out of scope); a stream state is inferred from text; the existing `run_command` approval or timeout semantics were changed.
+
+---
+
+### Stage 12 — Integration, adversarial matrix and design handoff
+
+**Depends on:** all other stages. **[VS Code suite].** **No new features.**
+
+**Steps**
+
+1. Run every §0.3 gate and the whole VS Code suite; compare against Stage 0's recorded baselines (standalone 1161 + each stage's additions; no test removed except those a stage named by title). Record actual exit statuses and totals.
+2. **Reproduction regression:** the 1,374-line implementation-plan case end to end — one read, complete durable storage, beginning/middle/end retrieval through `query_evidence` without rereading, long-line fragment, byte offsets, zero-match search, pagination, eviction state, failed-tool observation. Report the measured numbers against Stage 0's baseline.
+3. **Read-only audits** (report matches; fix nothing here):
+   - replacement-hash leak audit: `grep -rn "current_hash" src/extension` — a current hash may appear only in an explicit verified lookup (`todos/current-resolution.ts`) and the two existing conflict paths that already return it (`line-edit.ts` `lineEditFailure(..., current_hash)` and `source-resolver.ts`'s `hash_mismatch` refusal). Those are permitted because the caller named the file and the host verified its content at that moment; a stale notice or projection reference may never carry a current hash.
+   - sparse-metadata audit: no `favourite:false`, no empty arrays, no null placeholders in any model-facing message (assert with the fixture tests);
+   - rerun/reread audit: every recommendation names a registered tool and existing data;
+   - projection audit: `grep -n "project(" src/extension/context/projector.ts src/extension/tools/loop.ts src/extension/chat/index.ts` shows the single projector path and its wiring;
+   - storage audit: the eviction path is explicit (`evicted_at`, `gap_reason`) and no code deletes a database.
+4. **Rule-by-rule verification** — for each of Rules 0–7, name the test that proves it and record its result.
+5. Confirm the managed-command contract Stage 11 produced can be consumed without schema change: run §4.8's rules as tests, list which are interface-only today, and record which clauses are already satisfied in this plan's Progress Log row; the managed-command design document is not edited by any stage on this branch.
+6. Record everything not proven as `NOT RUN` with the exact error, plus every deviation, in the Progress Log and §13.
+
+**Acceptance criteria:** all gates green or each exception recorded with its exact error; no unexplained audit match; the reproduction case passes without a reread; every rule has a named test; the design's §13 open questions are answered with evidence or listed as unresolved.
+
+**Cannot be declared complete if:** any stage's own gate was claimed without observed counts; a timed-out integration run is counted as a pass; an assertion was weakened to make the matrix pass.
+
+---
+
+### Stage completion report requirements (all stages)
+
+Every stage reports in the §0.5 form and additionally records the numbers its own acceptance criteria depend on:
+
+| Stage | What its report must contain |
+|---|---|
+| 0 | Gate counts, measured reproduction numbers, the frozen contract |
+| 1 | v21 object inventory before/after; original/captured/stored bytes per named case |
+| 2 | Reproduction retrieval results (beginning / line 687 / last line), page sizes, cursor determinism |
+| 3 | Which messages now carry real observation IDs, and the measured payload change |
+| 4 | Per-class counts (current/stale/unknown/historical/superseded) from the named tests |
+| 5 | Resolution states reached, and whether a second read was avoided |
+| 6 | changed/already/unknown/denied counts; an exact-output sample proving no default field is sent |
+| 7 | Planned reserve/margin/limit at 128K and 256K, with the settings used |
+| 8 | Determinism proof (two identical runs), tier counts, pairing check |
+| 9 | Settings values actually read, threshold applied, display counters |
+| 10 | The catalogue rows changed and the measured token/character savings |
+| 11 | Stream states per exit case and the no-rerun assertion |
+| 12 | Full gate counts, rule-by-rule proof table, every `NOT RUN` with its error |
+
+A stage is not complete until its Progress Log row holds those numbers. A stage that cannot run a gate records `NOT RUN: <exact error>` in the same row.
+
+---
+
+
+## 8. Security and authorization requirements (all stages)
+
+- Authorization is independent of evidence (Rule 7). No hash match, observation UUID, blob reference or favourite grants read, write or command permission.
+- `WorkspaceView.resolve`/`resolveNew`, `isProtectedPath`, team `blockedPaths`, `.gitignore` hiding inside the workspace, the access preflight (`access-preflight.ts`), operation-scoped write tokens (`operation-authorization.ts`) and the existing grant model (`access-grants.ts`, host isolation in `access-host.ts`) remain in force unchanged.
+- Range retrieval and search apply the redaction/access policy; a denied lookup names no restricted candidate. A file outside authorized roots is not discoverable through evidence even if its content hash matches.
+- Command output is untrusted data: an output line that looks like an instruction never becomes a system instruction (`GUIDANCE` in `tools/protocol.ts` stays the rule; Stage 11 tests it).
+- At-rest protection or policy-driven exclusion for credentials must be stated in the completeness metadata when bytes are excluded.
+- Indexing scope, tool access and evidence eligibility stay three separate axes (unified plan §2.3): a permission is not index enrollment, and evidence storage never widens filesystem reach.
+
+---
+
+## 9. Evidence validity and supersession semantics (normative)
+
+| Class | Meaning | Can it be pruned from context? | Can it prove a criterion today? |
+|---|---|---|---|
+| `current` | verified observed source still matches | yes, oldest non-favourite last | yes, if relevant and sufficient |
+| `stale` | verified content/version changed or a recorded dependency was invalidated | first tier | no — historical only |
+| `unknown` | insufficient or currently inaccessible evidence to decide | only after stale, never before reported uncertainty | no |
+| `historical` | an event or old snapshot that happened; factual as history | compacted to a reference when needed | as history, not as current proof |
+| `superseded` | a user/task decision replaced it | protected user text is never pruned | the newer requirement governs future action |
+
+Independent axes (must not share a destructive mechanism): the **immutable event record** (what was observed or attempted), the **mutable derived validity index** (does this still describe the current source), and the **context projector** (what do we send this request). Storage completeness, capture completeness and delivery completeness are three different facts; `retained`, `complete`, `partial`, `evicted`, `inaccessible` and `not_retrievable` are never synonyms.
+
+---
+
+## 10. Context pruning and UI requirements (normative summary)
+
+- Threshold semantics: percentage of **effective model context capacity** at which the next request is pruned, accounting for response reserve, tool definitions, system instructions and a safety margin.
+- Default strategy two-tier; `stale-first` available; default threshold 80% (provisional, subject to usability testing); range 40–95, step 5.
+- Hysteresis: an internal target at threshold − ~5 points so pruning does not happen every step.
+- Protected content: operative user instructions, system/tool policy, actively pending TODO/task state. Ordinary evidence is not protected by default; user input is inherently protected.
+- Pairing: matching call IDs and minimal continuation markers must survive; no orphaned tool messages; no duplicate execution caused by projection.
+- Diagnostics: oldest stale removed, valid removed, favourites compacted, token estimates, threshold reason, retrieval references — stored as `context_projections` + `context_projection_segments` without duplicating blobs.
+- Display: configured capacity, estimated current usage, projected threshold, and automatic-pruning activity. Estimated prompt utilization must never be labelled as physical VRAM or per-slot KV occupancy.
+
+---
+
+## 11. Regression and adversarial testing matrix
+
+Every row names the stage that owns it and where it is tested. "Additional tests uncovered by the audit" are rows 24–31, which came from inspecting the current implementation rather than the design.
+
+| # | Scenario | Stage | Where tested |
+|---|---|---|---|
+| 1 | 1,374-line plan reproduction: complete storage, beginning/middle/end retrieval without rereading | 2, 12 | `evidence-access.standalone.ts`, `evidence-query-tool.standalone.ts` |
+| 2 | Multiple reads of one source then a modification | 4 | `evidence-validity.standalone.ts` |
+| 3 | Explicit stale-to-current lookup returning a verified replacement | 5 | `resolve-current-evidence.standalone.ts` |
+| 4 | Deleted source returns no replacement | 5 | same |
+| 5 | Renamed source resolves through its recorded link | 4, 5 | same + `workspace-index.test.ts` |
+| 6 | Identical-content files / hash ambiguity | 5 | same |
+| 7 | Favourites on current and stale observations | 6, 8 | `evidence-favourites.standalone.ts`, `context-projector.standalone.ts` |
+| 8 | User requests protected and never stale | 6, 8 | same |
+| 9 | Utilization crossing the configured threshold | 8, 9 | `context-projector.standalone.ts` |
+| 10 | Oldest stale pruned before valid | 8 | same |
+| 11 | Favourite compacted only when necessary | 8 | same |
+| 12 | Source mutation during retrieval | 2, 5 | `evidence-access.standalone.ts`, `resolve-current-evidence.standalone.ts` |
+| 13 | Editor buffer versus disk content | 4, 5 | existing boundary tests + suite |
+| 14 | Source validity across restarts | 1, 4 | `todos-sqlite.standalone.ts` (reopen) |
+| 15 | Cross-project evidence access denial | 2, 3, 6 | each stage's named test |
+| 16 | Complete recording of failed tools | 1 | `evidence-storage.standalone.ts` |
+| 17 | Large stdout and stderr results, per-stream order | 1, 11 | `evidence-storage.standalone.ts`, `command-evidence.standalone.ts` |
+| 18 | Search returning zero matches as success | 2, 10 | both named tests |
+| 19 | Missing, inaccessible and evicted evidence | 1, 2 | named tests |
+| 20 | Compaction without orphaning tool messages | 8 | `context-projector.standalone.ts`, `tool-loop.standalone.ts` |
+| 21 | No accidental reexecution of side-effecting tools | 7, 8 | named tests |
+| 22 | Storage-capacity and crash-recovery failure modes | 1 | `evidence-storage.standalone.ts` |
+| 23 | Accurate context-budget diagnostics; sparse metadata correctness | 7, 10 | `context-budget.standalone.ts`, `response-guidance.standalone.ts` |
+| 24 | Failed calls currently store no retained content (`tool-evidence.ts` passes `evidenceOutput: undefined` on failure) — must now store the error payload while keeping presentation bounded | 1 | new test, named above |
+| 25 | Head loss from today's rolling-tail capture (`MAX_CAPTURE_CHARS`) must be reported as `capture_limit`, never as complete | 11 | named test |
+| 26 | Silent eviction (`enforceEvidenceBudget` sets `retained = 0`) must become an explicit state that retrieval can report | 1, 2 | named tests |
+| 27 | Redaction applied to stored bytes today: original bytes and redacted presentation must be distinguishable | 1 | named test |
+| 28 | Binary/oversized source files (`documents` skip rows, `MAX_SOURCE_BYTES = 512 KiB` in the boundary) must not become `invalid` through an I/O error | 4 | existing tests + new case |
+| 29 | `onDidRenameFiles` is absent from the index today; rename invalidation must not depend on a hash match elsewhere | 4, 5 | named tests |
+| 30 | Repeat suppression today re-runs a trimmed read; with the projector it must answer from a reference without executing | 7, 8 | named tests |
+| 31 | `notes()` drops oldest blocks and `MAX_EVIDENCE_TEXT` truncates stored JSON: neither may be presented as complete history | 1, 8 | named tests |
+
+---
+
+## 12. Verification and completion policy
+
+- Use the gates in §0.3; confirm they still exist before prescribing them for a stage. `npm run test:sqlite`, `npm run build-tests`, `npm run build`, `npx tsc -p . --noEmit`, `npx eslint src --quiet`, `git --no-pager diff --check` are present at planning time; the VS Code gate is `xvfb-run -a npm test`.
+- Focused gates where relevant: SQLite/evidence, context-budget, authorization, tool-protocol and VS Code integration tests.
+- A long-running integration test may be executed detached, but a timeout or missing final Mocha summary is not a pass; report `NOT RUN` with the exact error.
+- Every stage reports actual exit statuses and pass/fail/pending counts for every command it ran.
+- Never weaken assertions, introduce hidden skips, or declare a stage green on compilation alone. A bug fixed here must have a test that fails without the fix.
+- Formatting-only changes are not an approval gate; do not reformat lines outside a stage's own changes.
+
+---
+
+## 13. Known risks and unresolved decisions
+
+**Architecture conflicts found during the audit — these need attention before implementation.**
+
+1. **Storage completeness versus presentation bounds.** Today `compactEvidenceText` truncates the stored record at `MAX_EVIDENCE_TEXT = 1000` and `compactToolEvidence` reduces successful output to counts, while `preserveEvidence` keeps up to `200_000` chars of *redacted* text. Stage 1 must separate "authoritative captured bytes" from "bounded presentation", or the design's completeness fields would measure a copy rather than the truth. Decision needed: keep `todo_tool_evidence` as presentation only (this plan's choice) and make blobs authoritative.
+2. **Stream capture shape.** The existing command sink merges both streams into one rolling tail buffer; separate per-stream storage cannot be added without changing the sink. Stage 11 therefore touches behaviour-adjacent code; if a stage cannot keep command semantics identical, report the conflict instead of quietly changing shell handling.
+3. **Redaction at rest.** `redactEvidence` currently mutates what is stored, so "original bytes" and "policy exclusion" must be recorded per blob; the design leaves at-rest protection as policy. Needs a maintainer decision before Stage 1's tests are written: lossless-plus-redacted-presentation, or excluded-by-policy with an explicit gap record.
+4. **Rename identity.** `SourceRoots` has no rename table and the index has no `onDidRenameFiles`; Stage 4 adds the event path. A verified rename link must not be inferred from a matching hash (Stage 13 of the unified plan deliberately left matching hashes as candidates only).
+5. **Threshold vs hard limit.** The projector's threshold is a policy; the provider's hard limit stays authoritative even with pruning off. A stage that changes `planContext` semantics could make a request exceed what a server holds — the existing "smallest confirmed size wins" rule must not be relaxed.
+6. **Favourite scope** (design §13.8): this plan implements per-project observation preference with conversation/task visibility filtered by authorization, which is the design's recommended default. If the maintainer wants per-conversation scoping, Stage 6 must change before Stage 8 relies on it.
+
+**Design §13 open questions and what the audit answers today**
+
+| Question | Answer at planning time |
+|---|---|
+| Does the project DB retain raw bytes, normalized text or only compact/redacted excerpts? | Redacted text up to `MAX_RETAINED_EVIDENCE_CHARS`; counts-only summaries for successes; no raw bytes. Authoritative path for commands and failed calls is absent → Stage 1. |
+| Guaranteed storage policy for large/binary/credentials? | None exists beyond per-list char budget → Stage 1 (§5.3). |
+| Which fingerprint corresponds to disk versus editor buffer? | `observation_source.observed_version` + `editor_version`; the boundary distinguishes them; the index describes disk only. |
+| How much derived-fact dependency metadata already exists? | FK links (`observation_id`) only, no edge table → Stage 4's minimal additive schema. |
+| Provider-estimated tokens versus counted tokens? | `TokenEstimator` learns from counted requests; `ContextUsageStore` records counted vs estimated separately. Reliable enough for a threshold if the margin is respected. |
+| Minimal context fields required by tool call/result pairing? | Call ID + role + tool name for native mode; name + body for text mode; Stage 8 must preserve exactly these. |
+| Did evidence lookup tools change since the investigation? | `twinny_evidence_lookup` returns facts, per-reference validity, relocation candidates and bounded observations — metadata only, no content ranges → Stage 2/3. |
+| Favourites scoped per project, conversation or task? | Recommendation adopted: per-project preference with authorization-filtered visibility. |
+
+---
+
+## 14. Implementing one stage in a fresh conversation
+
+1. Open the plan at §0, §1, §2, §3, §4, the Progress Log and the stage you are given. Do not read other stages except where this stage cites them.
+2. Establish repository state per §0.4 (branch, status, gates, evidence lookup before rereading).
+3. Create the stage's own TODOs through the native TODO tools with a parent under the plan task; do not hand-mark completion — submit claims and let Feedback decide. Distinguish an approval requirement (protected file, outside-workspace access) from a review status.
+4. Implement only this stage's files. If the plan names a file that does not match what you read, stop and report the contradiction.
+5. Run every verification command in the stage's own section, plus the §0.3 gates, recording real counts.
+6. Write the §0.5 report and update the Progress Log row; keep unrelated working-tree changes untouched; delete scratch files.
+7. Resume rules after interruption, restart or model handoff: read the Progress Log row for this stage, `git status --short`, the stage's own test file results, and the persisted state (`context_projections`, `evidence_*` rows). Do not redo work that accepted evidence already proves; do not rerun a side-effecting tool to recover output. After context compaction, recover from stored evidence, not from memory, and never re-execute a mutation whose record exists.
+8. No indefinite retry loops: a deterministic failure is reported once with its exact error, then the stage's remaining work continues or stops.
+
+---
+
+## 15. Overall definition of done
+
+A long Moriarty run is complete when it can repeatedly read and edit files, preserve all original authorized tool execution evidence, retrieve any retained part by UUID without repeating the operation, invalidate source-dependent facts without exposing a new hash, honour favourites and Rule 0, resolve an old observation to an independently verified current source (or a clear deleted/ambiguous/unavailable state), and automatically prune stale then older valid model-visible results at the configured inline threshold. The model must be able to tell apart "not seen", "seen historically", "still current", "not stored" and "not authorized". Tests prove tool-call/result pairing, permissions, sparse protocol accuracy, determinism of the projector, and the absence of fake success or duplicated execution.
+
+The managed `run_command` redesign remains a separate reviewed effort; it adopts this branch's observation, output-stream and retrieval contracts without redesigning the evidence database.
+
+*End of plan. Nothing here has been implemented; the first action is Stage 0, and this document itself must not be treated as an implementation.*
