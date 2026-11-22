@@ -193,7 +193,7 @@ Legend: **Done** = implemented; **Partial** = exists but incomplete for this des
 |---|---|---|---|---|
 | 1 | Immutable invocation record with typed arguments | Done | `todo_tool_observations`, `UNIQUE(project_id, request_id)`, replay returns the prior row in `recordToolObservation` | — |
 | 2 | Complete raw capture before fitting | Partial | `ToolResult.rawOutput`/`rawIntegrity` exist; `compactToolEvidence` reduces successes to counts; failed calls store no retained content (`evidenceOutput: evidence.failed ? undefined : rawOutput` in `chat/tool-evidence.ts`) | 1 |
-| 3 | Independent stdout/stderr, byte-preserving, ordered chunks | Missing | `tool-sinks.ts` merges both streams into one rolling tail (`MAX_CAPTURE_CHARS = 200_000`, head lost), ANSI-stripped; no per-stream storage | 1 |
+| 3 | Independent stdout/stderr, byte-preserving, ordered chunks | Missing | `tool-sinks.ts` merges both streams into one rolling tail (`MAX_CAPTURE_CHARS = 200_000`, head lost), ANSI-stripped; no per-stream storage | 1 (generic store), 11 (real command sink) |
 | 4 | Exit code, signal, timeout/cancellation, refusal with `executed:false` | Partial | exit code and `timedOut`/`stoppedByUser` exist; no signal, no terminal lifecycle enumeration, `run_command` records no execution identity (`execution_id` is set by the host, not the command) | 1, 11 |
 | 5 | Retention and completeness metadata (original/captured/stored, gap reason) | Partial | `original_chars`, `preserved_chars`, `complete`, `retained`; `ToolTruncationStage` has `evidence_retention` but no capture/storage distinction and no per-stream completeness; eviction is silent (`retained = 0`) | 1, 3 |
 | 6 | Storage quota as an explicit configurable policy | Missing | `DEFAULT_EVIDENCE_STORAGE_LIMITS.listChars = 2_000_000` is a per-list character budget, not a storage policy; no binary/long-line storage view | 1 |
@@ -1369,11 +1369,11 @@ Rules: keep a fresh-read requirement for a stale source before mutation; never u
 **Files expected to change**
 
 - new `src/extension/tools/command-evidence.ts` (the adapter: typed args → invocation identity → `CapturedResult` → bounded model response)
-- `src/extension/chat/tool-sinks.ts` (capture stdout and stderr separately where the existing path allows it; keep the same command behaviour, timeout, approval and process-tree rules)
+- `src/extension/chat/tool-sinks.ts` (**must** capture actual stdout and stderr separately in the existing production one-shot command path; if that requires changing the sink, change only capture plumbing and preserve command behavior, timeout, approval and process-tree rules)
 - `src/extension/tools/workspace.ts` (`run_command`'s `execution` field gains stream references; the model-visible text stays as it is today except for the honest status fields this stage adds)
 - tests: new `src/test/standalone/command-evidence.standalone.ts`; additions to `command-snapshot.standalone.ts`, `chat-tools.standalone.ts`, `tool-loop.standalone.ts`, `operation-lifecycle.standalone.ts`
 
-**Schema changes:** none. Use Stage 1's tables; this stage is the first consumer of `stdout_blob_id`, `stderr_blob_id`, `evidence_chunks` and the `ExecutionState` enumeration.
+**Schema changes:** none. Use Stage 1's tables; this stage is the first **production command-sink** consumer of `stdout_blob_id`, `stderr_blob_id`, `evidence_chunks` and `ExecutionState`. Stage 1/2 must already have tested these storage/retrieval shapes with synthetic streams.
 
 **What this stage must establish (interfaces, tested against the existing path)**
 
@@ -1405,7 +1405,7 @@ Rules: keep a fresh-read requirement for a stale source before mutation; never u
 
 **Verification commands:** §0.3 gates + `node --test out/test/standalone/command-evidence.standalone.ts`; `grep -n "ExecutionState\|CommandEvidence" src/extension/tools/command-evidence.ts`.
 
-**Acceptance criteria:** the shapes exist and are exercised on the real one-shot path; no command behaviour change (same approval, timeout, cwd, termination rules); every §4.8 rule has a test; the managed-command plan can consume them without touching the schema.
+**Acceptance criteria:** actual stdout and stderr emitted by the one-shot command process are independently captured and retrieved by the real production path, not inferred from a merged string; no command behaviour change (same approval, timeout, cwd, termination rules); every §4.8 rule has a test; the managed-command plan can consume them without touching the schema.
 
 **Cannot be declared complete if:** this stage implements sessions/batches/polling (out of scope); a stream state is inferred from text; the existing `run_command` approval or timeout semantics were changed.
 
@@ -1442,7 +1442,7 @@ Every stage reports in the §0.5 form and additionally records the numbers its o
 | Stage | What its report must contain |
 |---|---|
 | 0 | Gate counts, measured reproduction numbers, the frozen contract |
-| 1 | v21 object inventory before/after; original/captured/stored bytes per named case |
+| 1 | complete v21 object inventory before/after (including later-stage objects), validated project config.json quotas/eviction, synthetic stream byte round trips and original/captured/stored bytes |
 | 2 | Reproduction retrieval results (beginning / line 687 / last line), page sizes, cursor determinism |
 | 3 | Which messages now carry real observation IDs, and the measured payload change |
 | 4 | Per-class counts (current/stale/unknown/historical/superseded) from the named tests |
@@ -1452,7 +1452,7 @@ Every stage reports in the §0.5 form and additionally records the numbers its o
 | 8 | Determinism proof (two identical runs), tier counts, pairing check |
 | 9 | Settings values actually read, threshold applied, display counters |
 | 10 | The catalogue rows changed and the measured token/character savings |
-| 11 | Stream states per exit case and the no-rerun assertion |
+| 11 | Actual production command stdout/stderr stream isolation, exit states and the no-rerun assertion |
 | 12 | Full gate counts, rule-by-rule proof table, every `NOT RUN` with its error |
 
 A stage is not complete until its Progress Log row holds those numbers. A stage that cannot run a gate records `NOT RUN: <exact error>` in the same row.
