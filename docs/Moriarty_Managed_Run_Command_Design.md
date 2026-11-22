@@ -133,7 +133,7 @@ On initial integration, existing `run_command` with `command` alone remains comp
 
 - Explicit array, **not** model-authored shell `&&`/`;` chains.
 - Execute in order in one session; default `stop_on_error=true` (omit when default).
-- Each item gets its own execution UUID, started/finished timestamps, stdout/stderr and exit code; batch UUID references children.
+- Each item gets its own **immutable observation UUID plus execution UUID**, started/finished timestamps, independently attributable stdout/stderr or declared merged terminal stream, and exit code; batch UUID references children. Reusing a session never combines commands into a single evidence record.
 - Return overall status derived from actual child statuses, with the stopping point and references.
 - Opting out of stop-on-error must be explicit and recorded.
 - No batch is automatically parallel; batches must not suppress earlier failures.
@@ -200,6 +200,18 @@ Recommended contract: support both as explicit capabilities, but prefer persiste
 - Reuse must not persist a one-time authorization grant into permission for all future commands.
 - Shell output can contain secrets and untrusted content. Apply the same secret/access policy as other evidence.
 - Shell process exit, crash, timeout or restart makes session health explicit; new session IDs on recreation unless a proven recovery mechanism preserves identity.
+
+## 5.0 One evidence object per command in a persistent terminal
+
+**Maintainer decision:** shell/terminal lifetime and command evidence lifetime are different. A persistent terminal has a durable `session_id`, but **every individual command request/attempt has its own immutable invocation/observation UUID**, and every actual execution has its own `execution_id`. Reusing the terminal must never merge command outputs into a single session-wide observation. A session transcript may exist as a separate optional historical view, but is **not** a replacement for independent per-command evidence.
+
+The command object contains the exact typed request/command text, session ID, unique command/execution IDs, effective cwd/env scope, authorization/refusal decision, start/end time, source transport/capture mode, stdin-write events, stdout and stderr separately when pipe-capable (or truthfully labelled `terminal` for merged PTY capture), ordered chunk references, exit code/signal/status, storage completeness and retrievable evidence ranges. A refusal still gets an invocation observation with `executed:false`, but not a fabricated running process/exit code. A batch has a parent batch ID and **one object per child command**, never a single concatenated result.
+
+**Attribution is mandatory and must be trustworthy.** For a persistent interactive shell, the execution manager must establish command start and termination boundaries using a **host-controlled, unspoofable control channel or equivalent supervised child-execution mechanism**. Plain shell prompts, echoed command text, magic stdout markers or terminal scrollback are **not** reliable attribution. Capture from the start of each command, preserve bytes and exit status, and associate every chunk with its originating execution ID. Session startup output, idle shell output, prompt redraws and unsolicited output that cannot be proven to belong to a command go to a **separate session event/transcript record**, not into the nearest command's evidence.
+
+**Long-running and asynchronous children:** identify descendants/process groups and their output ownership. An execution is not terminally complete merely because the parent shell displays another prompt if descendants still have output streams open. If a child outlives the initiating command or attribution is ambiguous, keep its separately attributable execution/job record or explicitly flag orphan/unknown output and incomplete coverage. Never silently attribute it to the next command. One active foreground command per persistent shell initially; any future concurrency uses independent execution IDs and supervised processes, not interleaved unlabelled PTY output.
+
+**Acceptance demonstration:** in one reused session, execute three commands with distinctive stdout/stderr and distinct exit statuses; retrieve each UUID independently; show no bytes or status cross between commands, and no re-execution. Include a failed command, a command that emits no output, shell-state persistence across commands, delayed child output, noisy prompts, spoofed delimiters, cancellation, and a session restart. The session survives completed commands while their immutable evidence survives session termination.
 
 ## 5.1 stdin, auxiliary file descriptors and control events
 
@@ -305,7 +317,7 @@ Synchronous persistence should make terminal exit status and final output chunk 
 
 Do not couple an execution record to “the only command currently running.” Use independent IDs, jobs and stream cursors from day one:
 
-- **Per-session serialization** for persistent interactive shells: one foreground command at a time so cwd, exported state and `$?` remain well-defined.
+- **Per-session serialization** for persistent interactive shells: one foreground command at a time so cwd, exported state and `$?` remain well-defined. Every serialized command has a separate observation and execution identity, independent of the session's long-lived identity.
 - **Across-session concurrency** later: separate sessions may run commands concurrently, subject to global/project/user quotas and authorization.
 - **Managed per-command concurrency** later: isolated child processes may share an immutable session configuration snapshot but never race a mutable interactive shell's cwd/env.
 - **Explicit dependencies** for job graphs: ordered chains, barriers, fan-out/fan-in, cancellation propagation and result aggregation. Future task planner can declare prerequisites rather than shell `&`/`wait` hacks.
@@ -324,7 +336,7 @@ Concurrency must be opt-in and separately tested. The initial implementation can
 - Context Stage 0: audit both current terminal/background output paths and choose honest capture semantics; confirm the schema can represent separated output, PTY-merged output, optional stdin write events and process control.
 - Context Stage 1: store exact bytes and event metadata generically, tested with synthetic independent streams. No claim that the current production command sink already separates streams.
 - Context Stages 2–3: expose read-only **`query_evidence`** with range, search, filter and continuation modes. Searching derived text never changes the authoritative bytes.
-- Context Stage 11: wire the existing one-shot runner into that contract, proving a single launch and appropriate real stdout/stderr or merged-terminal capture. Keep launch/approval/timeout semantics stable.
+- Context Stage 11: wire the existing one-shot runner into that contract, proving a single launch and appropriate real stdout/stderr or merged-terminal capture. **Before context Stage 10 begins**, perform the Stage 11 evidence-adapter work and, if its existing transport cannot satisfy mandatory separation/attribution, implement the smallest required managed-command execution transport first. This is an explicit permitted cross-track dependency, not a waiver of evidence guarantees.
 - Managed-command implementation later: replace command transport deliberately as required for persistent shells, explicit stdin, reusable cwd/env, managed jobs and future concurrency. The evidence DB remains reusable.
 
 No duplicated command run, no silent post-hoc splitting of merged output, and no second evidence database are acceptable shortcuts.
@@ -369,6 +381,14 @@ Suggested checks: TypeScript, ESLint, build-tests, build, SQLite suite, diff che
 21. Controlled stdin write records time, length and completion/failure; raw sensitive input follows retention policy; fd 3+ remains unobserved unless explicitly provisioned.
 22. A terminal viewer and evidence collector share **one** execution, with a single process ID/execution UUID. Neither capture path re-executes a command to recover missing output.
 23. A PTY transcript with mixed-looking text is still truthfully `terminal`, while a pipe-managed run keeps independent raw stdout/stderr.
+
+## 13.1 Persistent-session evidence acceptance
+
+1. Every user/model-issued command in a persistent terminal is represented by **one separate invocation/observation** and its own execution ID if actually run. A completed command's evidence remains queryable by ID even when the shell keeps running, changes cwd, or is closed.
+2. A shell session is a container for commands, not a single aggregated evidence object. Session-level idle/terminal events may be stored separately with truthful source/coverage; they may not contaminate command records.
+3. Command boundaries and exit codes are established through host-owned control, not spoofable stdout/stderr delimiters or textual prompts. On uncertainty, return `unknown`/incomplete rather than guessing.
+4. Three consecutive commands in one persistent shell, including distinct stderr, nonzero exit and no-output cases, yield three non-overlapping observation UUIDs; asynchronous children, prompts and cancellation do not misattribute bytes.
+5. The context-management implementation sequence is **Stage 11 before Stage 10** when Stage 10's recovery/guidance audit depends on real command capture. Bring forward the minimum managed-command transport implementation as soon as Stage 11's existing sink cannot meet this contract; do not defer it just to preserve a numeric stage order.
 
 ## 14. Acceptance and handoff
 
