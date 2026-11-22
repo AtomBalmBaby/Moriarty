@@ -388,7 +388,7 @@ Suggested checks: TypeScript, ESLint, build-tests, build, SQLite suite, diff che
 2. A shell session is a container for commands, not a single aggregated evidence object. Session-level idle/terminal events may be stored separately with truthful source/coverage; they may not contaminate command records.
 3. Command boundaries and exit codes are established through host-owned control, not spoofable stdout/stderr delimiters or textual prompts. On uncertainty, return `unknown`/incomplete rather than guessing.
 4. Three consecutive commands in one persistent shell, including distinct stderr, nonzero exit and no-output cases, yield three non-overlapping observation UUIDs; asynchronous children, prompts and cancellation do not misattribute bytes.
-5. The context-management implementation sequence is **Stage 10 (command evidence) before Stage 11 (recovery/guidance audit)**. Bring forward the minimum managed-command transport implementation if the existing sink cannot meet Stage 10's evidence contract. Bring forward the minimum managed-command transport implementation as soon as Stage 10's existing sink cannot meet this contract; do not defer it just to preserve a numeric stage order.
+5. The context-management implementation sequence is **Stage 10 (command evidence) before Stage 11 (recovery/guidance audit)**. Bring forward the minimum managed-command transport implementation if the existing sink cannot meet Stage 10's evidence contract.
 
 ## 14. Acceptance and handoff
 
