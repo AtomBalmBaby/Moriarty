@@ -1340,7 +1340,7 @@ Removal means "replace the body with a bounded reference": `observation_id`, ori
 
 ### Stage 10 — `run_command` evidence adapter (shared contract only)
 
-**Transport decision, frozen by Stage 0:** one process launch per command; capture and terminal presentation are consumers of that same execution. A pipe-capable managed child can provide true independent stdout/stderr. A PTY/VS Code terminal exposing only merged output produces **one `terminal` stream**, never invented separated streams. If existing terminal execution APIs cannot supply required independent bytes, either (a) explicitly mark the capability gap and defer changing that transport to managed-command stages, or (b) use one host-owned pipe process with terminal presentation fed by that process. **Never run the command twice** to retrieve missing stderr or simulate a terminal. Stage 10 cannot claim independent streams for a mode that only exposes PTY output.
+**Transport decision, frozen by Stage 0:** one process launch per command; capture and terminal presentation consume that same execution. A pipe-capable host-owned child provides independent stdout/stderr. A deliberate PTY mode provides one honestly labelled `terminal` stream, never invented separated streams. If existing VS Code terminal APIs cannot supply independent ordinary-command output, the minimal managed-command transport becomes a **Stage 10 prerequisite**. Documenting the gap alone is not completion. **Never run the command twice** to retrieve missing stderr or simulate a terminal.
 
 **Depends on:** Stages 1, 2, 3. **[VS Code suite]** for the command path.
 
@@ -1558,13 +1558,13 @@ Every row names the stage that owns it and where it is tested. "Additional tests
 | 14 | Source validity across restarts | 1, 4 | `todos-sqlite.standalone.ts` (reopen) |
 | 15 | Cross-project evidence access denial | 2, 3, 6 | each stage's named test |
 | 16 | Complete recording of failed tools | 1 | `evidence-storage.standalone.ts` |
-| 17 | Large stdout and stderr results, per-stream order | 1, 11 | `evidence-storage.standalone.ts`, `command-evidence.standalone.ts` |
-| 18 | Search returning zero matches as success | 2, 10 | both named tests |
+| 17 | Large stdout and stderr results, per-stream order | 1, 10 | `evidence-storage.standalone.ts`, `command-evidence.standalone.ts` |
+| 18 | Search returning zero matches as success | 2, 11 | both named tests |
 | 19 | Missing, inaccessible and evicted evidence | 1, 2 | named tests |
 | 20 | Compaction without orphaning tool messages | 8 | `context-projector.standalone.ts`, `tool-loop.standalone.ts` |
 | 21 | No accidental reexecution of side-effecting tools | 7, 8 | named tests |
 | 22 | Storage-capacity and crash-recovery failure modes; configurable project `config.json` overrides/reload | 1 | `evidence-storage.standalone.ts` |
-| 23 | Accurate context-budget diagnostics; sparse metadata correctness | 7, 10 | `context-budget.standalone.ts`, `response-guidance.standalone.ts` |
+| 23 | Accurate context-budget diagnostics; sparse metadata correctness | 7, 11 | `context-budget.standalone.ts`, `response-guidance.standalone.ts` |
 | 24 | Failed calls currently store no retained content (`tool-evidence.ts` passes `evidenceOutput: undefined` on failure) — must now store the error payload while keeping presentation bounded | 1 | new test, named above |
 | 25 | Head loss from today's rolling-tail capture (`MAX_CAPTURE_CHARS`) must be reported as `capture_limit`, never as complete | 10 | named test |
 | 26 | Silent eviction (`enforceEvidenceBudget` sets `retained = 0`) must become an explicit state that retrieval can report | 1, 2 | named tests |
