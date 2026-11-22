@@ -131,6 +131,44 @@ Derived accepted facts and claims carry dependency links to their source observa
 
 User requests and their original text/intent are immutable and **never stale**. Later user changes have explicit supersession relationships; operative constraints are preserved. System/tool authorization policy and actively pending TODO/task state are protected, not treated as ordinary evidence to prune.
 
+
+### 6.1 Resolve stale observation to current authorized source
+
+**Required model-visible capability:** a read-only operation such as \`resolve_current_evidence\` accepts an **old \`observation_id\`**, or a legacy **original source fingerprint** with enough source/project scope to disambiguate. It returns the verified current source observation (and its new fingerprint/ID) **only on an explicit, authorized model request**. This is distinct from an automatic invalidation notice, which must *never* disclose a replacement hash.
+
+Design invariants:
+
+1. Historical observation identity is immutable. The old UUID/hash provides a **lineage and origin query**, not write authorization, a guarantee that the file still exists, or a globally unique file key. Prefer UUID over hash; with hash alone, identical contents or collisions require path/root or explicit disambiguation.
+2. Follow recorded source identity/path, workspace root and verified rename/move relationships to locate the successor; do **not** simply find any current file with a matching old hash and pretend it is the same source.
+3. Verify file existence, active permission scope, disk-versus-unsaved-buffer source selection, current contents and fingerprint at lookup time. Source index mappings are candidate hints, not proof of currency. Handle concurrent edits by returning a race/stale status or retrying safe read validation, not a misleading current claim.
+4. **If current content is already available as a verified, authorized observation**, return its current \`observation_id\`, fingerprint, path and optional bounded content/retrieval reference without repeating a read. If no such observation exists but the source remains accessible, perform an authorized, explicit fresh source read/observation and store it **before** returning a fresh fingerprint. In either case report where the information came from.
+5. For a source deleted since the old observation, return \`deleted\` or \`no_current_version\`; do not invent a replacement or reuse an unrelated file. For rename/move, return the verified successor location, with evidence of the link. For ambiguous histories or duplicate candidates, return \`ambiguous\` and bounded authorized candidates. For a missing/evicted old observation, return \`not_found\` or \`history_unavailable\`; for denied access, return \`permission_denied\` without disclosing restricted candidate names.
+6. Some tool outputs have **no single current successor** (transient commands, time-sensitive diagnostics, multi-file searches, test runs). Return \`not_applicable\` or a dependency-specific stale classification and suggest an appropriate **new authorized operation**; do not silently rerun side-effecting commands or fabricate a replacement evidence ID.
+7. Retrieval can request a bounded **current content range** or just a current reference. Every successful fresh lookup is persisted as an observation/invocation with provenance linking \`supersedes_observation_id\` or \`derived_from_observation_id\` to the old item. Keep histories and timestamps intact. An unchanged file may reuse a currently verified observation ID where valid, rather than inventing a new version.
+8. Do not allow lookup of a current hash merely to bypass \`edit_lines\` concurrency/authorization guards. Mutations still require appropriate permissions and an expected current fingerprint verified at write time.
+9. Responses are sparse but truthful: successful \`current\` includes verified \`observation_id\` and \`content_hash\`; \`deleted\` contains neither; ambiguity and unknown validity are explicit. The old hash is never automatically upgraded in the context projector.
+10. Avoid round trips: a direct successful lookup can include the small requested current range along with the new ID/hash, while large source bodies stay in the evidence store and are served by \`query_evidence_range\`.
+
+Example read-only query (illustrative syntax):
+
+~~~json
+{"observation_id":"<old-observation-uuid>","start_line":90,"end_line":110}
+~~~
+
+Verified response after a user/model-requested lookup:
+
+~~~json
+{"state":"current","observation_id":"<new-observation-uuid>","content_hash":"xxh64:<verified-new-hash>","path":"src/extension/tools/protocol.ts","content_ref":"<retrievable-ref>"}
+~~~
+
+If source was deleted:
+
+~~~json
+{"state":"deleted","previous_observation_id":"<old-observation-uuid>"}
+~~~
+
+**Testing:** four reads of the same old version then edit -> each old UUID resolves to the same independently verified current source version; delete -> no replacement; rename -> correct linked target; two identical old hashes -> ambiguous without identity; stale/evicted evidence; cross-project/permission denial; unsaved editor changes; concurrent modification during lookup; no-current-observation fallback creates a legitimate new read; old hash never appears as newly authorized current; invalidation projection **never** contains the new hash but explicit lookup **does**.
+
 ## 7. Favourite evidence
 
 Add small native operations to mark/unmark one or many observation UUIDs as favourite, with authorization to modify only the correct project/conversation metadata. No repeated `favourite:false` in read/tool outputs. Update database metadata without modifying the immutable observation body.
@@ -214,7 +252,7 @@ Maintain a progress table in this document when work starts. A stage ends only o
 | 1 | Durable full invocation/outcome/blob recording | Success/failure/refusal, stdout/stderr/exit code, original args, source versions and incomplete/evicted states survive restarts; no silent 200K cap |
 | 2 | `query_evidence_range` + retained-output search | Beginning/middle/end retrieve without rerun, offsets/long lines, zero match, scope, pagination, bounded output and no fabricated recovery |
 | 3 | Sparse reference/result envelopes and guidance catalogue | Actual observation IDs across loop/budget/GUI/export; correct source/completeness; repeated calls reuse stored content safely |
-| 4 | Source and derived-evidence validity engine | Four reads then edit marks old snapshots stale, with only **old hashes** in notices; user requests never stale; unknown preserved |
+| 4 | Source and derived-evidence validity engine + explicit stale-to-current lookup | Four reads then edit marks old snapshots stale, with only **old hashes** in notices; user requests never stale; authorized model-requested lookup returns verified successor ID/hash or clear deleted/ambiguous/unavailable state |
 | 5 | Model favourite operations + protected intent | Opt-in UUID updates, favourites prefer retention but cannot bypass validity, access or hard token cap; user input always protected |
 | 6 | Inline slider + two-tier projector | Threshold behavior, stale-first then valid then favourite compact refs, safety reserve/hysteresis, reproducible diagnostics |
 | 7 | Integration/regression and design handoff | Full verification, context budget coverage, storage audit, and separate managed-`run_command` design contract accepted |
@@ -238,6 +276,6 @@ These are implementation research questions, **not blockers to approving this de
 
 ## 14. Exit criteria for this branch
 
-A long Moriarty run can repeatedly read and edit files, preserve all original authorized tool execution evidence, retrieve any retained part by UUID without repeating the operation, invalidate old source-dependent facts without exposing the new hash, honour favourites and **Rule 0**, and automatically prune stale then older valid model-visible results at the configured inline threshold. The model can distinguish “not seen”, “seen historically”, “still current”, “not stored”, and “not authorized”. Tests prove tool-call/result pairing, permissions, sparse protocol accuracy and no fake success or duplicated execution.
+A long Moriarty run can repeatedly read and edit files, preserve all original authorized tool execution evidence, retrieve any retained part by UUID without repeating the operation, invalidate old source-dependent facts without exposing the new hash, honour favourites and **Rule 0**, can explicitly resolve old observations to independently verified current sources (or deletion/ambiguity), and automatically prune stale then older valid model-visible results at the configured inline threshold. The model can distinguish “not seen”, “seen historically”, “still current”, “not stored”, and “not authorized”. Tests prove tool-call/result pairing, permissions, sparse protocol accuracy and no fake success or duplicated execution.
 
 The managed `run_command` redesign remains a separate reviewed design/implementation effort, but can adopt this branch's observation, output-stream and retrieval contracts without redesigning the evidence database.
