@@ -44,7 +44,18 @@ A long build/test currently may outlive the request's normal timeout. Repeating 
 
 ### 1.4 Shell text processing used where native evidence already exists
 
-An agent often runs `sed`, `cat`, `grep`, `rg`, `awk`, or similar programs to reread/filter source or output. When native `read_file`, `grep`, source indexing or `query_evidence_range` can answer equivalently, that costs time, tokens and loses provenance. Native preference must be configurable and enforced carefully at the **command boundary**, not by pretending every shell command has an equivalent native operation.
+An agent often runs `sed`, `cat`, `grep`, `rg`, `awk`, or similar programs to reread/filter source or output. When native `read_file`, `grep`, source indexing or `query_evidence` can answer equivalently, that costs time, tokens and loses provenance. Native preference must be configurable and enforced carefully at the **command boundary**, not by pretending every shell command has an equivalent native operation.
+
+## 1.5 One execution: transport and capture decision
+
+**Non-negotiable:** a command executes **once** under one host-owned execution ID. Capture, terminal presentation, status and durable evidence come from that same process. Never launch a duplicate process to recover independent streams, and never re-execute a command merely to retrieve output.
+
+Current code paths must be audited independently: the VS Code terminal `execution.read()` view and the background runner's rolling merged output do **not** automatically provide separate byte-perfect streams.
+
+- For independent stdout/stderr, the host owns a child process and connects separate pipes at **process creation**. The capture service records both streams; terminal presentation may subscribe to the same stream events. Do not launch a second process for display.
+- Where a VS Code terminal/PTY provides only a merged transcript, record a single **`terminal`** (or `pty`) stream with honest origin/completeness. It is impossible to reconstruct authoritative stdout/stderr attribution from merged bytes.
+- Persistent-shell sessions must establish capture and per-command attribution **when the shell is created**, with a private reliable control protocol. They may be pipe-based (separate output) or PTY-backed (single merged terminal transcript); the advertised capability must match reality.
+- Context-management Stage 1 owns generic storage and synthetic stream tests. Its Stage 11 owns the existing real one-shot command capture adapter and must prove that one process was launched; the separate managed-command stages own the eventual process supervisor and session/terminal rework. Do not silently change approval, timeout or process lifecycle semantics during Stage 11.
 
 ## 2. Scope and non-goals
 
@@ -75,7 +86,7 @@ managed execution coordinator ----> session registry (scope, cwd, env, shell, he
                \         |          /
                 evidence event / blob store
                       |
-       bounded model response + query_evidence_range
+       bounded model response + query_evidence
 ~~~
 
 Separate responsibilities:
@@ -190,13 +201,31 @@ Recommended contract: support both as explicit capabilities, but prefer persiste
 - Shell output can contain secrets and untrusted content. Apply the same secret/access policy as other evidence.
 - Shell process exit, crash, timeout or restart makes session health explicit; new session IDs on recreation unless a proven recovery mechanism preserves identity.
 
+## 5.1 stdin, auxiliary file descriptors and control events
+
+A normal Unix process has three standard streams, but only two are output:
+
+| Descriptor | Direction | Evidence contract |
+|---|---|---|
+| `stdin` / fd 0 | Into the child | Host-provided input **write events**, not an output stream; record execution identity, byte count, time and write status. Retain sensitive input bytes only when permitted by explicit policy. |
+| `stdout` / fd 1 | Child to host | Capture raw bytes separately, from process start, with chunk ordering and exact coverage. |
+| `stderr` / fd 2 | Child to host | Capture raw bytes separately, from process start, with chunk ordering and exact coverage. |
+
+File descriptors **3 and higher** are application-defined, not universal additional streams. A future explicit `extraPipes` capability may attach named and authorized auxiliary descriptors; do not opportunistically intercept or infer them.
+
+Also capture **non-stream control metadata**: spawn attempt/result, execution/session IDs, actual cwd/host, timestamps, process/PID and process group when permitted, exit code, termination signal, timeout/cancellation, limits, process reaping and any capture/storage gaps.
+
+**stdin policy:** default isolated commands to closed/noninteractive stdin unless requested; interactive sessions may accept controlled writes. Log accepted/failed input writes, but never assume accepted bytes were consumed. Prevent secrets and password prompts from entering unprotected raw evidence. An approval question is not silently answered through stdin.
+
+**PTY:** a pseudoterminal typically presents one terminal transcript (including prompt, echo, control sequences and possibly program output); it does not preserve authoritative stdout/stderr identity. Model/store representation must have a distinct `terminal`/PTY stream and a truthful capture-capability field. No content classifier may invent source descriptors.
+
 ## 6. stdout, stderr, ordering, exit codes
 
 ### Capture independent OS streams
 
-- Launch with separate stdout/stderr pipes or PTY-safe equivalents where supported. Do not require `2>&1`, `1>&2`, `tee`, `echo $?`, or `; echo EXIT:$?` to see results.
-- Store **raw bytes** from each stream, not merely a merged formatted string. Preserve binary and UTF-8-invalid bytes; decode only when displaying/querying.
-- Timestamp and sequence each chunk as received; preserve per-stream byte order exactly. Cross-stream interleaving is only an observed delivery order, not a guarantee of precise emission order by the child.
+- Launch **one child exactly once** with separate stdout/stderr pipes from spawn, or explicitly select a merged PTY/terminal transcript. Capture and terminal presentation share the same execution ID. Do not require `2>&1`, `1>&2`, `tee`, `echo $?`, or `; echo EXIT:$?` to see results.
+- Store **raw bytes** from each output stream, not merely merged formatted text. Preserve binary and invalid UTF-8; decode only for presentation/search. Every output chunk records origin `stdout`, `stderr` or `terminal`, where `terminal` is intentionally merged. Distinguish an empty captured stderr from stderr that was never independently captured.
+- Timestamp and sequence each chunk as received; preserve per-stream byte order exactly. Cross-stream interleaving is only observed delivery order, not a guarantee of emission order. Every chunk belongs to one execution ID, one stream and a precise half-open byte range `[start,end)`; do not merge output across concurrent jobs.
 - A merged *presentation* can be reconstructed with caveats, but independent stdout and stderr remain authoritative.
 - Process exit information comes from the host wait/exit event, not from parsing output. Record integer exit code when available, signal when applicable, and whether timed out or was cancelled. POSIX signal deaths are not silently converted into successful integer exits.
 - A shell's final `$?` must be captured via a trustworthy session protocol without letting arbitrary user command output spoof the result. Prefer launching through an OS process supervisor for isolated commands; if a persistent interactive shell is used, frame command boundaries using a private, authenticated control channel rather than easily spoofed stdout markers.
@@ -231,7 +260,7 @@ The objective is **less boilerplate and more reliable provenance**, not banning 
 | `sleep 10; cat /tmp/log` as polling | `poll_command` / `read_command_output` on execution UUID | Suggest native poll, do not rerun |
 | `sed -n` or `cat` solely to read files | `read_file` with path/line range | Optional soft-refusal with tool + arguments |
 | `grep`/`rg`/`awk` solely to search/filter known files/results | Native `grep`/evidence query | Optional soft-refusal only for clear semantic equivalence |
-| repeated `npm test` merely to obtain omitted output | `query_evidence_range` or command-output retrieval | Reuse real completed observation; rerun only if fresh execution required |
+| repeated `npm test` merely to obtain omitted output | `query_evidence` or command-output retrieval | Reuse real completed observation; rerun only if fresh execution required |
 | pipelines solely to truncate output (`| head`) | Bounded result delivery and range search | Guidance; honor legitimate transformations |
 
 **Detection and refusal rules:**
@@ -261,7 +290,7 @@ Use the canonical unified project database established by the companion context-
 For every attempted `run_command` operation preserve:
 - Invocation UUID, provider call ID, tool name, original typed args/exact command, project/host/owner/authorization scope, requested session ID, timestamp and `executed` flag.
 - Execution UUID(s), batch UUID if any, actual cwd, command/shell mode, start/end timestamps, lifecycle transitions, process/pid/group identity where safe, exit code/signal/timeout/cancellation/lost reason.
-- Separate stdout/stderr blobs with ordered byte offsets/chunk sequence and completeness/retention markers; optional reconstructed display only.
+- Separate stdout/stderr blobs **or one explicitly labelled terminal/PTY blob** with ordered half-open byte offsets/chunk sequence and completeness/retention markers; optional reconstructed display only. Input writes and process-control events use distinct metadata/events, never fabricated output bytes.
 - Structured tool result/errors, stdout/stderr reference IDs, lengths and content digests, model-delivery completeness versus storage completeness, provenance/dependencies **only when known**.
 - Refusal/approval-needed events without a process launch; distinguish `never_executed` from failed process.
 - Read and filter by exact execution ID via evidence tools, with authorization and bounded line/byte ranges, pagination and search. Retrieving command results must not rerun the command.
@@ -288,6 +317,18 @@ Do not couple an execution record to “the only command currently running.” U
 
 Concurrency must be opt-in and separately tested. The initial implementation can remain serialized while adopting these identities and scheduler abstractions.
 
+## 11.1 Implementation ordering and evidence handoff
+
+**Decision: finalize the capture/transport requirements before context-management Stage 1**, without implementing the entire managed-command system first.
+
+- Context Stage 0: audit both current terminal/background output paths and choose honest capture semantics; confirm the schema can represent separated output, PTY-merged output, optional stdin write events and process control.
+- Context Stage 1: store exact bytes and event metadata generically, tested with synthetic independent streams. No claim that the current production command sink already separates streams.
+- Context Stages 2–3: expose read-only **`query_evidence`** with range, search, filter and continuation modes. Searching derived text never changes the authoritative bytes.
+- Context Stage 11: wire the existing one-shot runner into that contract, proving a single launch and appropriate real stdout/stderr or merged-terminal capture. Keep launch/approval/timeout semantics stable.
+- Managed-command implementation later: replace command transport deliberately as required for persistent shells, explicit stdin, reusable cwd/env, managed jobs and future concurrency. The evidence DB remains reusable.
+
+No duplicated command run, no silent post-hoc splitting of merged output, and no second evidence database are acceptable shortcuts.
+
 ## 12. Proposed implementation stages
 
 | Stage | Deliverable | Acceptance gate |
@@ -306,8 +347,8 @@ Suggested checks: TypeScript, ESLint, build-tests, build, SQLite suite, diff che
 ## 13. Required adversarial tests
 
 1. `exit 0` with nonempty stderr; `exit 7` with no stderr; stdout only; stderr only; no output at all.
-2. Two streams emit overlapping chunks; ordering within each is exact; presentation acknowledges approximate cross-stream order.
-3. Command emits invalid UTF-8 or binary bytes; evidence round-trip is lossless or explicitly excludes prohibited bytes.
+2. Two streams emit overlapping chunks; ordering within each is exact; presentation acknowledges approximate cross-stream order; capture is attached before the first byte and the command launches once.
+3. Command emits invalid UTF-8 or binary bytes; evidence round-trip is lossless or explicitly excludes prohibited bytes. PTY-only capture is stored as merged `terminal`, not falsely split.
 4. Large output exceeds model budget and stream retrieval returns middle/end without a rerun.
 5. Full output retained after context compaction, even when original tool result was omitted.
 6. Nonzero exit on the second command in batch halts subsequent commands; child exit codes preserved.
@@ -325,6 +366,9 @@ Suggested checks: TypeScript, ESLint, build-tests, build, SQLite suite, diff che
 18. Future two-session parallel executions have independent stream/exit attribution and obey quota; persistent one-shell commands remain serialized.
 19. Output contains spoofed completion markers or hostile instructions; host status and approval policy are not corrupted.
 20. Storage full/secret-redacted output is explicitly incomplete; never claim content can be recovered if unavailable.
+21. Controlled stdin write records time, length and completion/failure; raw sensitive input follows retention policy; fd 3+ remains unobserved unless explicitly provisioned.
+22. A terminal viewer and evidence collector share **one** execution, with a single process ID/execution UUID. Neither capture path re-executes a command to recover missing output.
+23. A PTY transcript with mixed-looking text is still truthfully `terminal`, while a pipe-managed run keeps independent raw stdout/stderr.
 
 ## 14. Acceptance and handoff
 
