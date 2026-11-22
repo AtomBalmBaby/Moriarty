@@ -55,7 +55,7 @@ Current code paths must be audited independently: the VS Code terminal `executio
 - For independent stdout/stderr, the host owns a child process and connects separate pipes at **process creation**. The capture service records both streams; terminal presentation may subscribe to the same stream events. Do not launch a second process for display.
 - Where a VS Code terminal/PTY provides only a merged transcript, record a single **`terminal`** (or `pty`) stream with honest origin/completeness. It is impossible to reconstruct authoritative stdout/stderr attribution from merged bytes.
 - Persistent-shell sessions must establish capture and per-command attribution **when the shell is created**, with a private reliable control protocol. They may be pipe-based (separate output) or PTY-backed (single merged terminal transcript); the advertised capability must match reality.
-- Context-management Stage 1 owns generic storage and synthetic stream tests. Its Stage 11 owns the existing real one-shot command capture adapter and must prove that one process was launched; the separate managed-command stages own the eventual process supervisor and session/terminal rework. Do not silently change approval, timeout or process lifecycle semantics during Stage 11.
+- Context-management Stage 1 owns generic storage and synthetic stream tests. Its Stage 10 owns the existing real one-shot command capture adapter and must prove that one process was launched; the separate managed-command stages own the eventual process supervisor and session/terminal rework. Do not silently change approval, timeout or process lifecycle semantics during Stage 10.
 
 ## 2. Scope and non-goals
 
@@ -336,7 +336,7 @@ Concurrency must be opt-in and separately tested. The initial implementation can
 - Context Stage 0: audit both current terminal/background output paths and choose honest capture semantics; confirm the schema can represent separated output, PTY-merged output, optional stdin write events and process control.
 - Context Stage 1: store exact bytes and event metadata generically, tested with synthetic independent streams. No claim that the current production command sink already separates streams.
 - Context Stages 2–3: expose read-only **`query_evidence`** with range, search, filter and continuation modes. Searching derived text never changes the authoritative bytes.
-- Context Stage 11: wire the existing one-shot runner into that contract, proving a single launch and appropriate real stdout/stderr or merged-terminal capture. **Before context Stage 10 begins**, perform the Stage 11 evidence-adapter work and, if its existing transport cannot satisfy mandatory separation/attribution, implement the smallest required managed-command execution transport first. This is an explicit permitted cross-track dependency, not a waiver of evidence guarantees.
+- Context Stage 10: wire the existing one-shot runner into that contract, proving a single launch and appropriate real stdout/stderr or merged-terminal capture. **Before context Stage 11 begins**, perform the Stage 10 evidence-adapter work and, if its existing transport cannot satisfy mandatory separation/attribution, implement the smallest required managed-command execution transport first. This is an explicit permitted cross-track dependency, not a waiver of evidence guarantees.
 - Managed-command implementation later: replace command transport deliberately as required for persistent shells, explicit stdin, reusable cwd/env, managed jobs and future concurrency. The evidence DB remains reusable.
 
 No duplicated command run, no silent post-hoc splitting of merged output, and no second evidence database are acceptable shortcuts.
@@ -388,7 +388,7 @@ Suggested checks: TypeScript, ESLint, build-tests, build, SQLite suite, diff che
 2. A shell session is a container for commands, not a single aggregated evidence object. Session-level idle/terminal events may be stored separately with truthful source/coverage; they may not contaminate command records.
 3. Command boundaries and exit codes are established through host-owned control, not spoofable stdout/stderr delimiters or textual prompts. On uncertainty, return `unknown`/incomplete rather than guessing.
 4. Three consecutive commands in one persistent shell, including distinct stderr, nonzero exit and no-output cases, yield three non-overlapping observation UUIDs; asynchronous children, prompts and cancellation do not misattribute bytes.
-5. The context-management implementation sequence is **Stage 11 before Stage 10** when Stage 10's recovery/guidance audit depends on real command capture. Bring forward the minimum managed-command transport implementation as soon as Stage 11's existing sink cannot meet this contract; do not defer it just to preserve a numeric stage order.
+5. The context-management implementation sequence is **Stage 10 (command evidence) before Stage 11 (recovery/guidance audit)**. Bring forward the minimum managed-command transport implementation if the existing sink cannot meet Stage 10's evidence contract. Bring forward the minimum managed-command transport implementation as soon as Stage 10's existing sink cannot meet this contract; do not defer it just to preserve a numeric stage order.
 
 ## 14. Acceptance and handoff
 
