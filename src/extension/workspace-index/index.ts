@@ -5,6 +5,8 @@ import path from "node:path"
 import * as vscode from "vscode"
 
 import { logger } from "../../common/logger"
+import { currentProjectTodoStorage } from "../todos/project-storage"
+import { toPosixPath } from "../todos/source-roots"
 import { type Database, SqliteFile, type SqliteLocation } from "../todos/sqlite"
 import { ContentHashAlgorithm, fingerprintContent } from "../tools/fingerprint"
 import type { IndexChange, IndexRefreshOutcome } from "../tools/workspace"
@@ -196,6 +198,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   private operationSyncSources = new Set<string>()
   private paused = false
   private disposed = false
+  private projectHome?: string
   private readonly dirtyUris = new Set<string>()
   private readonly ignoredRules = new Map<string, GitIgnoreRule[]>()
   private readonly pendingUris = new Map<string, vscode.Uri>()
@@ -864,6 +867,8 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   }
 
   private async open(): Promise<void> {
+    // The home is the project identity, resolved once per process like the database path.
+    this.projectHome = currentProjectTodoStorage().home
     const database = await this.file.read((connection) => connection)
     if (this.disposed) return
     // The shared project connection runs synchronous=FULL; this one is a rebuildable cache.
@@ -1001,8 +1006,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
           this.update({ activeWorkers: this.state.activeWorkers + 1 })
           try {
             if (isIgnored || skipReason) {
-              const relative = path.posix.relative(folder.uri.path, uri.path)
-              const displayPath = folders.length > 1 ? `${folder.name}/${relative}` : relative
+              const displayPath = this.canonicalDisplayPath(uri)
               const stat = await vscode.workspace.fs.stat(uri).then((stat) => stat, () => undefined)
               this.throwIfCancelled(signal)
               await this.storeSkipped(uri, folder.uri.toString(), displayPath, stat?.size ?? 0, skipReason ?? "ignored by .gitignore", signal, scanId)
@@ -1067,9 +1071,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     const folder = this.folderFor(uri)
     if (!folder || this.isCancelled(signal)) return "cancelled"
     const identity = uri.toString()
-    const relative = path.posix.relative(folder.uri.path, uri.path)
-    const folders = vscode.workspace.workspaceFolders ?? []
-    const displayPath = folders.length > 1 ? `${folder.name}/${relative}` : relative
+    const displayPath = this.canonicalDisplayPath(uri)
     try {
       const stat = await vscode.workspace.fs.stat(uri)
       this.throwIfCancelled(signal)
@@ -1256,6 +1258,18 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   /** A window whose first workspace folder is not a local folder has no project database, so the index stays quiet. */
   private projectAvailable(): boolean {
     return vscode.workspace.workspaceFolders?.[0]?.uri.scheme === "file"
+  }
+
+  /**
+   * The path a hit is shown with: home-relative inside the project home, absolute POSIX in
+   * every other root, so a hit from any root is a path read_file and the edit tools can take
+   * without guessing. A window with no local folder has no home, so its paths stay absolute.
+   */
+  private canonicalDisplayPath(uri: vscode.Uri): string {
+    const target = toPosixPath(uri.path)
+    if (!this.projectHome) return target
+    const relative = path.posix.relative(this.projectHome, target)
+    return relative && !relative.startsWith("..") ? relative : target
   }
 
   private async refreshCounts(): Promise<void> {

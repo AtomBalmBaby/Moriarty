@@ -1248,9 +1248,9 @@
         "twinny.chatToolsMaxResultChars": {
           "order": 20,
           "type": "number",
-          "default": 100000,
+          "default": 131072,
           "minimum": 10000,
-          "maximum": 200000,
+          "maximum": 2000000,
           "markdownDescription": "The largest tool-result payload kept in a model's context before the agent trims older results. This scales with the model's context window while never exceeding the cap.",
           "scope": "machine"
         },

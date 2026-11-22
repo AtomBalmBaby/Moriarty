@@ -11,7 +11,10 @@ import { editorEdits } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits } from "../../extension/edit/line-edit"
 import { GenerationTracker } from "../../extension/generations"
 import { TwinnyStatusBar } from "../../extension/status-bar"
+import { projectTodoStorageOf } from "../../extension/todos/project-home"
+import { currentProjectTodoStorage } from "../../extension/todos/project-storage"
 import { DEFAULT_EVIDENCE_STORAGE_LIMITS, PROJECT_FINGERPRINT, TodoRepository } from "../../extension/todos/repository"
+import { toPosixPath } from "../../extension/todos/source-roots"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { WorkspaceView } from "../../extension/tools/view"
 import { workspaceTools } from "../../extension/tools/workspace"
@@ -126,7 +129,9 @@ suite("Persistent workspace intelligence index", () => {
     assert.ok(nativeTool.results.some((hit) => hit.path.endsWith("src/extension/tools/workspace.ts")), "real repository search must locate the native read_file implementation")
     assert.ok(literal.results.some((hit) => hit.path.endsWith("src/extension/tools/workspace.ts") && hit.category === "content" && hit.line && hit.column), JSON.stringify(literal))
     assert.ok((await index.search({ query: "workspace.ts", mode: "path" }, root)).total > 0)
-    assert.ok((await index.search({ query: "index-main/src/extension/**/*.ts", mode: "path" }, root)).total > 0)
+    // Stage 15: the hit path is home-relative inside the project home and absolute in every other root. This fixture's home is the path-sorted first local root, so `root` is another root and its glob is written as an absolute path.
+    assert.ok((await index.search({ query: "src/extension/**/*.ts", mode: "path" }, repositoryUri.toString())).total > 0, "a hit inside the project home is home-relative")
+    assert.ok((await index.search({ query: `${toPosixPath(root)}/src/extension/**/*.ts`, mode: "path" }, root)).total > 0, "a hit in another root is found by its absolute path")
     assert.ok((await index.search({ query: "workspaceSearchAcceptanceMarker\\s*=\\s*'before'", mode: "regex" }, root)).total > 0)
     const firstPage = await index.search({ query: "export", mode: "literal", limit: 1 }, root)
     const secondPage = await index.search({ query: "export", mode: "literal", limit: 1, offset: 1 }, root)
@@ -134,6 +139,8 @@ suite("Persistent workspace intelligence index", () => {
     assert.notEqual(firstPage.results[0]?.path, secondPage.results[0]?.path)
     const otherRoot = await index.search({ query: "multiRootMarker", mode: "literal" }, secondRoot)
     assert.ok(otherRoot.results.some((hit) => hit.path.endsWith("src/other.ts")))
+    assert.equal(otherRoot.results.find((hit) => hit.path.endsWith("src/other.ts"))?.path, path.posix.join(toPosixPath(secondRoot), "src/other.ts"), "the second root's hit is the absolute POSIX path read_file can take")
+    assert.ok((await index.search({ query: `${toPosixPath(secondRoot)}/src/**/*.ts`, mode: "path" }, secondRoot)).total > 0, "an absolute-path glob finds it")
     assert.ok((await index.search({ query: "foo.bar", mode: "literal" }, secondRoot)).total > 0)
     assert.equal((await index.search({ query: "fooXbar", mode: "literal" }, secondRoot)).total, 0)
     assert.equal((await index.search({ query: "multiRootMarker", mode: "literal" }, root)).total, 0)
@@ -726,6 +733,57 @@ suite("Persistent workspace intelligence index", () => {
       assert.deepEqual(candidates, [{ path: to, source: "matching_hash" }], "the row the refresh wrote at the new path is offered, and the recorded path is not its own candidate")
     } finally {
       repository.close()
+    }
+  })
+
+  test("a search hit from a second workspace folder can be read with read_file", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(storage, "project.sqlite")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    await index.rebuild()
+    const view = new WorkspaceView(root, [], undefined, [], [secondRoot])
+    const tools = workspaceTools(view, [], { workspaceSearch: index, git: false, instructions: false })
+    const found = await index.search({ query: "other.ts", mode: "path" }, secondRoot)
+    assert.ok(found.total > 0, JSON.stringify(found))
+    const hit = found.results[0]
+    assert.ok(hit, "the file in the second root is in the index")
+    assert.equal(hit?.path, path.posix.join(toPosixPath(secondRoot), "src/other.ts"), "the hit from another root is its absolute POSIX path")
+    assert.equal(view.resolve(hit?.path ?? "", "file"), path.join(secondRoot, "src", "other.ts"), "and the native tools take that same path")
+    const read = await tools.run({ name: "read_file", args: { path: hit?.path ?? "" } })
+    assert.ok(!read.failed, read.output)
+    assert.ok(read.output.includes(hit?.path ?? ""), "read_file answers with the path the hit gave: " + read.output)
+    assert.match(read.output, /export const multiRootMarker = 'foo\.bar'/, read.output)
+    assert.equal(read.output.match(/content_hash: ([^;]+);/)?.[1], await fingerprintContent(fs.readFileSync(path.join(secondRoot, "src", "other.ts"), "utf8")), "the hash is that same file's: " + read.output)
+  })
+
+  test("reversing the workspace folder order leaves the project home, its database and the canonical hit path unchanged", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(storage, "project.sqlite")
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    await index.rebuild()
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ uri: folder.uri, name: folder.name }))
+    const locations = folders.map((folder) => ({ scheme: folder.uri.scheme, fsPath: folder.uri.fsPath }))
+    const home = currentProjectTodoStorage().home
+    assert.equal(projectTodoStorageOf({ folders: locations }).home, home, "this suite's home is the path-sorted first local root, the repository root")
+    assert.equal(toPosixPath(path.resolve(__dirname, "../../..")), home, "and it is one of the roots this suite opens")
+    assert.notEqual(home, toPosixPath(secondRoot), "so the second root is another root")
+    const insideHome = await index.search({ query: "src/extension/**/*.ts", mode: "path" }, path.resolve(__dirname, "../../.."))
+    assert.ok(insideHome.total > 0, JSON.stringify(insideHome))
+    assert.ok(insideHome.results.every((hit) => !hit.path.startsWith("/")), "a hit inside the home is home-relative: " + JSON.stringify(insideHome.results.slice(0, 3)))
+    const before = (await index.search({ query: "other.ts", mode: "path" }, secondRoot)).results[0]
+    assert.ok(before && before.path.startsWith("/"), JSON.stringify(before))
+    const config = vscode.workspace.getConfiguration("twinny")
+    const previousAuto = config.get<boolean>("indexing.auto", true)
+    try {
+      await config.update("indexing.auto", false, vscode.ConfigurationTarget.Global)
+      assert.equal(await updateWorkspaceFolders(0, folders.length, ...[...folders].reverse()), true, "the same folders in the opposite order")
+      const file = path.join(secondRoot, "src", "other.ts")
+      assert.deepEqual(await index.refresh([{ path: file, kind: "write" }]), { status: "synced" }, "its row is rewritten under the reversed order")
+      assert.equal(currentProjectTodoStorage().home, home, "the same folder set answers with the same project home")
+      assert.equal(projectTodoStorageOf({ folders: [...locations].reverse() }).databasePath, projectTodoStorageOf({ folders: locations }).databasePath, "and the same project database")
+      assert.equal((await index.search({ query: "other.ts", mode: "path" }, secondRoot)).results[0]?.path, before?.path, "and the hit shows the same canonical path")
+    } finally {
+      await config.update("indexing.auto", previousAuto, vscode.ConfigurationTarget.Global)
     }
   })
 
