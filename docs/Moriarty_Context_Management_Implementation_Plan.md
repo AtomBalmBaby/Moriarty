@@ -193,7 +193,7 @@ Legend: **Done** = implemented; **Partial** = exists but incomplete for this des
 |---|---|---|---|---|
 | 1 | Immutable invocation record with typed arguments | Done | `todo_tool_observations`, `UNIQUE(project_id, request_id)`, replay returns the prior row in `recordToolObservation` | — |
 | 2 | Complete raw capture before fitting | Partial | `ToolResult.rawOutput`/`rawIntegrity` exist; `compactToolEvidence` reduces successes to counts; failed calls store no retained content (`evidenceOutput: evidence.failed ? undefined : rawOutput` in `chat/tool-evidence.ts`) | 1 |
-| 3 | Independent stdout/stderr, byte-preserving, ordered chunks | Missing | `tool-sinks.ts` merges both streams into one rolling tail (`MAX_CAPTURE_CHARS = 200_000`, head lost), ANSI-stripped; no per-stream storage | 1 (generic store), 11 (real command sink) |
+| 3 | Independent stdout/stderr, byte-preserving, ordered chunks | Missing | `tool-sinks.ts` merges both streams into one rolling tail (`MAX_CAPTURE_CHARS = 200_000`, head lost), ANSI-stripped; no per-stream storage | 0 (transport decision), 1 (generic store), 11 (real command sink) |
 | 4 | Exit code, signal, timeout/cancellation, refusal with `executed:false` | Partial | exit code and `timedOut`/`stoppedByUser` exist; no signal, no terminal lifecycle enumeration, `run_command` records no execution identity (`execution_id` is set by the host, not the command) | 1, 11 |
 | 5 | Retention and completeness metadata (original/captured/stored, gap reason) | Partial | `original_chars`, `preserved_chars`, `complete`, `retained`; `ToolTruncationStage` has `evidence_retention` but no capture/storage distinction and no per-stream completeness; eviction is silent (`retained = 0`) | 1, 3 |
 | 6 | Storage quota as an explicit configurable policy | Missing | `DEFAULT_EVIDENCE_STORAGE_LIMITS.listChars = 2_000_000` is a per-list character budget, not a storage policy; no binary/long-line storage view | 1 |
@@ -287,7 +287,7 @@ export interface RangeRequest {
   stream?: "stdout" | "stderr" | "terminal" | "payload" | "output"   // default "output" for non-command results
   startLine?: number; endLine?: number                  // 1-based, inclusive
   startChar?: number; endChar?: number                  // 1-based character offsets on one line
-  startByte?: number; endByte?: number                  // exact byte offsets for arbitrary output
+  startByte?: number; endByte?: number                  // zero-based, half-open [startByte,endByte) in original bytes
 }
 
 export interface RetrievedSpan {
@@ -317,6 +317,14 @@ export interface SearchPage {
 ```
 
 Determinism and bounds: pages are ordered by `(stream, byte)`; the same request on the same stored content returns the same page; every returned page is itself size-bounded and continuable; a query result never claims coverage it does not have. Retrieval invocations are recorded as lightweight execution events (an `evidence_access_event` row) without duplicating the blob, and they are **not** stored as model-visible evidence content.
+
+### 4.3.1 Raw BLOB search versus indexed text search
+
+**Source of truth:** original bytes in `evidence_blobs.inline_bytes BLOB` or a verified, crash-consistent external byte object. SQLite supports bounded literal byte-pattern search with `instr(BLOB, BLOB)`, but that is a **scan**, not a general indexed full-text search. FTS5 is a text indexing facility, so it **cannot index arbitrary binary stdout/stderr as if the raw BLOB were text**.
+
+The required `query_evidence` service offers (1) exact bounded raw-byte substring search with original offsets; (2) bounded decoded/redacted literal and regex searches with a line/character-to-byte mapping; (3) deterministic, resumable, authorized pagination. Report partial coverage and never claim zero matches across unsearched/unretained content. Index redacted permitted text in a **derived** projection, not as an alternative source of truth. An optional FTS5 acceleration/index may be added after checking driver support and actual performance; it is **not mandatory for Stage 2**. If FTS5 is introduced, its indexing, eviction, redaction, offsets and rebuild consistency require tests. A raw secret that is withheld from retrieval must never leak via a search preview or index.
+
+Model-visible `start_line/end_line` remain 1-based inclusive. Internal byte offsets for chunks, lines and range retrieval are **zero-based half-open `[start,end)`**. Keep original bytes intact for invalid UTF-8 and NULs; decoded character positions are explicitly mapped to raw bytes rather than assumed equal.
 
 ### 4.4 Stale-to-current contract (Stage 5)
 
@@ -633,7 +641,7 @@ CREATE TABLE storage_policy (
 );
 ```
 
-`todo_tool_evidence` is **not** replaced. It remains the presentation copy (redacted text, sources, hits) that Feedback and lookup already read; `evidence_blobs` becomes the authoritative byte store. Where both exist, tests must prove they report the same coverage and disagree only in the documented way (blob = original bytes, evidence row = redacted presentation).
+`todo_tool_evidence` is **not** replaced. It remains the presentation copy (redacted text, sources, hits) that Feedback and lookup already read; `evidence_blobs` becomes the authoritative byte store. Store inline payloads as actual SQLite BLOB bytes, not TEXT; crash-safe external file references need a staged-write, atomic rename and reconciliation protocol because a SQLite transaction alone does not atomically commit filesystem objects. Where both exist, tests must prove they report the same coverage and disagree only in the documented way (blob = original bytes, evidence row = redacted presentation).
 
 ### 5.3 Project `config.json` storage policy (Stage 1)
 
@@ -799,7 +807,7 @@ export interface EvidenceStore {
 
 1. `EvidenceStore.record` writes observation + outcome + blobs + chunks in **one synchronous transaction** (`SqliteFile.write`, which already rejects async closures). Pending records are written first (`status = 'starting'` or `'accepted'`), and the terminal result is appended atomically; a crash between them leaves a recoverable pending record, never a lost result.
 2. Store bytes losslessly (`byte_preservation = 'lossless'`) and decode only when displaying/querying. Where policy forbids retaining raw sensitive bytes, set `redaction = 'excluded_by_policy'` and record the exclusion in `gap_reason`. Keep `todo_tool_evidence.content` as the redacted presentation copy; the blob keeps original bytes.
-3. Content-addressed blobs (`UNIQUE(project_id, content_digest)`) may be shared by many observations; each timed observation stays separate and its invocation history is never merged.
+3. Content-addressed blobs (`UNIQUE(project_id, content_digest)`) may be shared by many observations; each timed observation stays separate and its invocation history is never merged. Inline payloads are BLOBs. External blob writes must stage bytes, verify hashes and reconcile orphan files/DB pointers after crash; never assert that the DB transaction by itself makes filesystem writes atomic.
 4. Read quotas, retention and eviction settings from the project `config.json` (§5.3), with validated defaults/reload and one authoritative source. Enforce `maxBlobBytes` and `maxProjectBytes`; report `storage_complete = 0`, `gap_reason` and exact coverage when exceeded. Never invent an ID or falsely claim content is retained. The DB policy row mirrors the effective JSON settings.
 5. Eviction becomes an explicit state (`evicted_at` + `gap_reason = 'eviction'`), ordered oldest-unfavourited-first (the ordering exists from Stage 6; until then, keep today's order and make the *state* honest).
 6. Failed calls, refusals and skipped approvals are recorded: `executed = 0`, `status = 'refused'`, no fabricated exit code. `isRecordableToolResult` must keep declining TODO-tool self-records and non-executed commands, but a **refused command** still records an attempt.
@@ -818,7 +826,7 @@ export interface EvidenceStore {
 1. *a complete tool result is stored before display fitting and the delivered copy is smaller than the stored bytes*
 2. *a failed call records its typed arguments, status, timing and structured error, and nothing claims it executed*
 3. *a refused command records an attempt with `executed = false` and no exit code*
-4. *synthetic independent stdout and stderr streams round-trip separately in storage, maintaining their per-stream byte order* (end-to-end real command capture belongs to Stage 11)
+4. *synthetic independent stdout and stderr streams round-trip separately in BLOB storage; a synthetic merged `terminal` stream remains a single truthfully named stream* (real end-to-end command capture belongs to Stage 11)
 5. *invalid UTF-8 and binary bytes round-trip losslessly, or are recorded as excluded by policy*
 6. *the storage limit is reported honestly: a result larger than `maxBlobBytes` is recorded incomplete with the exact coverage gap, and no phantom blob ID exists*
 7. *project storage exhaustion is visible: report `storage_limit`/partial on a capped write and `evicted` only on an actual eviction, never a false `retained`*
@@ -1379,6 +1387,8 @@ Rules: keep a fresh-read requirement for a stale source before mutation; never u
 
 ### Stage 11 — `run_command` evidence adapter (shared contract only)
 
+**Transport decision, frozen by Stage 0:** one process launch per command; capture and terminal presentation are consumers of that same execution. A pipe-capable managed child can provide true independent stdout/stderr. A PTY/VS Code terminal exposing only merged output produces **one `terminal` stream**, never invented separated streams. If existing terminal execution APIs cannot supply required independent bytes, either (a) explicitly mark the capability gap and defer changing that transport to managed-command stages, or (b) use one host-owned pipe process with terminal presentation fed by that process. **Never run the command twice** to retrieve missing stderr or simulate a terminal. Stage 11 cannot claim independent streams for a mode that only exposes PTY output.
+
 **Depends on:** Stages 1, 2, 3. **[VS Code suite]** for the command path.
 
 **Goal:** connect today's real one-shot `run_command` to the generic stream/outcome storage prepared in Stage 1 and evidence retrieval from Stage 2, so the future managed-command implementation needs **no second database redesign**. Stage 1 only proved synthetic stream storage; this stage proves real stdout/stderr capture from the existing production sink. Do not implement sessions, batches, polling, cancellation, streaming, preflight parsers or native-preference soft refusal here.
@@ -1424,7 +1434,7 @@ Rules: keep a fresh-read requirement for a stale source before mutation; never u
 
 **Verification commands:** §0.3 gates + `node --test out/test/standalone/command-evidence.standalone.ts`; `grep -n "ExecutionState\|CommandEvidence" src/extension/tools/command-evidence.ts`.
 
-**Acceptance criteria:** actual stdout and stderr emitted by the one-shot command process are independently captured and retrieved by the real production path, not inferred from a merged string; no command behaviour change (same approval, timeout, cwd, termination rules); every §4.8 rule has a test; the managed-command plan can consume them without touching the schema.
+**Acceptance criteria:** one launch per command is proven; real pipe-capable executions capture separate stdout/stderr from first byte; PTY-only executions are honestly labelled a single terminal stream and any unimplemented independent-capture mode is an explicitly recorded blocker, not a false pass. Exit/control events are distinct from output. The existing approval, timeout, cwd and termination rules remain unchanged; the managed-command plan can consume the schema without redesign.
 
 **Cannot be declared complete if:** this stage implements sessions/batches/polling (out of scope); a stream state is inferred from text; the existing `run_command` approval or timeout semantics were changed.
 
