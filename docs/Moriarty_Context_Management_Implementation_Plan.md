@@ -47,9 +47,9 @@ Status values: `todo` · `in-progress` · `in_review` · `done` · `blocked`. A 
 ### 0.1 One stage per conversation
 
 1. Read §0, §1 (non-negotiable rules), §2 (current architecture), §3 (gap analysis), §4 (shared contracts), the **Progress Log**, and **only** the section of the stage you are given, plus the sections it cites.
-2. Confirm every stage listed under that stage's **Depends on** is `done` in the Progress Log, with recorded numbers. If not, stop and report.
+2. Confirm every stage listed under that stage's **Depends on** is `done` in the Progress Log, with recorded numbers. **Stage numbers are labels, not strict numeric order: Stage 11 must precede Stage 10.**
 3. Establish the current repository state before writing anything (see 0.4). Do not trust line numbers from earlier conversations or from this plan; locate code by symbol name (`grep -n`, `find_symbol`).
-4. Do exactly that stage. Do not start the next one, even if it looks trivial.
+4. Do exactly that stage. Do not start another stage in the same conversation, even if it looks trivial. Stage 11 comes before Stage 10 in execution order.
 5. Finish with the report in 0.5 and update the Progress Log row.
 
 ### 0.2 Hard rules
@@ -438,6 +438,8 @@ export interface CommandEvidence {
 }
 ```
 
+**Per-command evidence rule:** every attempted command in a persistent shell has its own immutable invocation/observation UUID and, if executed, its own execution UUID, even when commands share `sessionId`. An optional session transcript is separate and is never an aggregation substituting for command evidence. Attribute output and exit status using host-controlled per-command boundaries, never spoofable prompts or stdout delimiters; startup/idle/unattributable output belongs to separate session events. Batches group child observations without collapsing them.
+
 Rules that must hold after Stage 11: `exit_code = 0` means process success only when a terminal exit state was truly reached; a nonzero exit with useful output is a completed process, not a tool failure; "no stderr" and "stderr not captured" are different states; starting is not completing; refused operations record `executed: false`; retrieving command output must not rerun it. Concurrency is designed for (independent IDs, jobs, stream cursors) but not implemented in this branch.
 
 ### 4.9 What Stage 11 does **not** take on
@@ -481,9 +483,12 @@ validity_class    TEXT CHECK (validity_class IS NULL OR validity_class IN ('curr
 
 CREATE TABLE evidence_outcomes (
   id TEXT PRIMARY KEY,
-  observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  observation_id TEXT NOT NULL UNIQUE REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL REFERENCES todo_projects(id),
-  execution_ref TEXT,                                   -- the host execution id when there was one
+  execution_ref TEXT,                                   -- per-command process identity, not shell session
+  session_id TEXT,                                      -- shared by commands in one persistent shell
+  batch_id TEXT,                                        -- optional grouping; never consolidated evidence
+  command_sequence INTEGER,                            -- optional session-local order
   status TEXT NOT NULL CHECK (status IN ('accepted','queued','starting','running','completed','exited','failed_to_start','cancelled','timed_out','lost','refused','unknown')),
   exit_code INTEGER,
   signal TEXT,
@@ -670,13 +675,16 @@ CREATE TABLE storage_policy (
 
 ## 6. Stage index, dependency graph and how to read a stage
 
+```text
+Stage 0 → Stage 1 → Stage 2 → Stage 3 → Stage 11 ───┐
+                 └→ Stage 4 → Stage 5                 │
+                 └→ Stage 6 → Stage 8 → Stage 9 ──────┤
+Stage 0 → Stage 7 ───────────→ Stage 8                 ├→ Stage 10 → Stage 12
+Stage 2, 4, 6, 7 ────────────→ Stage 8                 │
+Stage 1, 2, 3 ───────────────→ Stage 11 ───────────────┘
+Stage 10 additionally requires Stages 3, 4, 8, 9 and 11.
 ```
-0 ─ 1 ─┬─ 2 ─ 3 ────────────────────┐
-       ├─ 4 ─ 5                     │
-       ├─ 6                        │
-       └─ 11                       │
-0 ───── 7 ─ 8 ─ 9 ──────────────────┴─ 10 ─ 12
-```
+
 
 | Stage | Depends on | Touches VS Code-only code? | Main modules |
 |---|---|---|---|
@@ -690,7 +698,7 @@ CREATE TABLE storage_policy (
 | 7 | 0 | `inference/context-window.ts`, `chat/index.ts` → **[VS Code suite]** | `tools/budget.ts`, `inference/context-window.ts` |
 | 8 | 2, 4, 6, 7 | no (pure) | `context/projector.ts` (new), `context/settings.ts` (new) |
 | 9 | 8 | **[VS Code suite]** + webview | `tools/loop.ts`, `chat/index.ts`, `webview/agent-settings.tsx`, `package.json` |
-| 10 | 3, 4, 8, 9 | no | `tools/response-guidance.ts` (new), `tools/budget.ts`, `tools/workspace.ts`, `todos/evidence.ts`, `tools/todos.ts` |
+| 10 | 3, 4, 8, 9, **11** | no | `tools/response-guidance.ts` (new), `tools/budget.ts`, `tools/workspace.ts`, `todos/evidence.ts`, `tools/todos.ts` |
 | 11 | 1, 2, 3 | `chat/tool-sinks.ts` → **[VS Code suite]** | `tools/command-evidence.ts` (new); prove actual separate stream capture in the production command path |
 | 12 | all | **[VS Code suite]** | verification only |
 
@@ -780,6 +788,8 @@ Read §0, §1, §2, §3, §4, §5, the Progress Log and Stage 0. Run the gates, 
 export interface CapturedResult {          // before fitting, straight from the tool
   invocationId: string
   executionId?: string
+  sessionId?: string        // shared across calls; NOT a command observation ID
+  batchId?: string
   toolName: string
   args: Record<string, unknown>              // typed original arguments, preserved as sent
   executed: boolean
@@ -1330,7 +1340,7 @@ Removal means "replace the body with a bounded reference": `observation_id`, ori
 
 ### Stage 10 — Response-guidance catalogue and model-facing payload audit
 
-**Depends on:** Stages 3, 4, 8, 9.
+**Depends on:** Stages 3, 4, 8, 9, **11**. Execute Stage 11 before Stage 10; no evidence-retrieval guidance may claim command-output support until the actual capture path passes.
 
 **Goal:** one auditable catalogue of every response/error string the tools can give the model, replacing needless rerun/reread advice with evidence retrieval **only when the retained result actually exists and access is allowed**, while keeping accurate success/failure reporting; and measure the token cost of model-facing payloads so sparse metadata is proven, not assumed.
 
@@ -1434,9 +1444,9 @@ Rules: keep a fresh-read requirement for a stale source before mutation; never u
 
 **Verification commands:** §0.3 gates + `node --test out/test/standalone/command-evidence.standalone.ts`; `grep -n "ExecutionState\|CommandEvidence" src/extension/tools/command-evidence.ts`.
 
-**Acceptance criteria:** one launch per command is proven; the **default ordinary execution path** captures distinct stdout/stderr from process creation, not after merging or truncation. A deliberately selected PTY mode may produce only a labelled `terminal` transcript, with no claim of separated streams. **If current VS Code terminal APIs cannot meet the ordinary pipe-capture requirement, Stage 11 is BLOCKED until the single-launch host-owned pipe transport from the managed-command rework is available; documenting a capability gap does not satisfy this acceptance gate.** Exit/control events are distinct from output, and approval/timeout/cwd/termination safeguards remain intact. The managed-command implementation can consume the schema without redesign.
+**Acceptance criteria:** one launch per command is proven; the **default ordinary execution path** captures distinct stdout/stderr from process creation, not after merging or truncation. In synthetic shared-session tests, three separate commands using one `sessionId` produce three independent observation/execution IDs and independently retrievable outcomes; real persistent-session attribution must satisfy the same contract when that mode is implemented. A deliberately selected PTY mode may produce only a labelled `terminal` transcript, with no claim of separated streams. **If current VS Code terminal APIs cannot meet the ordinary pipe-capture requirement, Stage 11 is BLOCKED until the single-launch host-owned pipe transport from the managed-command rework is available; documenting a capability gap does not satisfy this acceptance gate.** Exit/control events are distinct from output, and approval/timeout/cwd/termination safeguards remain intact. The managed-command implementation can consume the schema without redesign.
 
-**Cannot be declared complete if:** separate stdout/stderr for ordinary commands are absent or were inferred by splitting merged text; one command executed twice; this stage implements sessions/batches/polling (out of scope); the existing `run_command` approval or timeout semantics were changed. An ordinary-mode capture limitation is a prerequisite for the separate managed-command transport implementation, not a waiver.
+**Cannot be declared complete if:** separate stdout/stderr for ordinary commands are absent or were inferred by splitting merged text; one command executed twice; several commands in a persistent terminal are stored as one observation; attribution is guessed from prompt/marker text; or approval/timeout semantics change. Full sessions/batches/polling remain in managed-command work, but the **minimum host-managed capture/attribution transport may be brought forward** if needed to pass this gate. An ordinary-mode capture limitation is a prerequisite for the separate managed-command transport implementation, not a waiver.
 
 ---
 
@@ -1584,7 +1594,7 @@ Every row names the stage that owns it and where it is tested. "Additional tests
 **Architecture conflicts found during the audit — these need attention before implementation.**
 
 1. **Storage completeness versus presentation bounds.** Today `compactEvidenceText` truncates the stored record at `MAX_EVIDENCE_TEXT = 1000` and `compactToolEvidence` reduces successful output to counts, while `preserveEvidence` keeps up to `200_000` chars of *redacted* text. Stage 1 must separate "authoritative captured bytes" from "bounded presentation", or the design's completeness fields would measure a copy rather than the truth. Decision needed: keep `todo_tool_evidence` as presentation only (this plan's choice) and make blobs authoritative.
-2. **Stream capture shape and ownership.** The existing command sink merges both streams. Stage 1 establishes complete storage using synthetic independent-stream inputs; Stage 2 retrieves them; Stage 11 modifies the existing one-shot sink narrowly and verifies independent real stdout/stderr capture. Stage 1 cannot claim production-command separation. Stage 11 must preserve approval, timeout and process lifecycle semantics, and stop/report any behavior change beyond necessary capture instrumentation.
+2. **Stream capture shape and ownership.** The existing command sink merges both streams. Stage 1 establishes complete storage using synthetic independent-stream inputs; Stage 2 retrieves them; Stage 11 modifies the existing one-shot sink narrowly and verifies independent real stdout/stderr capture. Stage 1 cannot claim production-command separation. Stage 11 must preserve approval, timeout and process lifecycle safeguards. If the current runner cannot meet these requirements, the **minimum managed-command capture transport becomes an immediate prerequisite**, not a deferred issue beyond Stage 10.
 3. **Redaction at rest.** `redactEvidence` currently mutates what is stored, so "original bytes" and "policy exclusion" must be recorded per blob; the design leaves at-rest protection as policy. Needs a maintainer decision before Stage 1's tests are written: lossless-plus-redacted-presentation, or excluded-by-policy with an explicit gap record.
 4. **Rename identity.** `SourceRoots` has no rename table and the index has no `onDidRenameFiles`; Stage 4 adds the event path. A verified rename link must not be inferred from a matching hash (Stage 13 of the unified plan deliberately left matching hashes as candidates only).
 5. **Threshold vs hard limit.** The projector's threshold is a policy; the provider's hard limit stays authoritative even with pruning off. A stage that changes `planContext` semantics could make a request exceed what a server holds — the existing "smallest confirmed size wins" rule must not be relaxed.
