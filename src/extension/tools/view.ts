@@ -22,6 +22,8 @@ import { authorizedRootOf, normalizeAuthorizedRoots } from "./authorized-paths"
 
 export const MAX_LINE_CHARS = 200
 const MAX_FILE_BYTES = 512 * 1024
+/** How many files one walk under an authorized folder takes before it stops and says so. */
+export const MAX_SEARCH_FILES = 5000
 
 export const clip = (line: string) =>
   line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}…` : line
@@ -425,6 +427,44 @@ export class WorkspaceView {
   /** Every folder that is not ignored. */
   allDirs(): Promise<string[]> {
     return this.tree().then(({ dirs }) => dirs)
+  }
+
+  /**
+   * The files under `target`, an absolute path `resolve()` has already checked: a file is its own one entry,
+   * a folder is walked depth-first the way `walk()` walks it — what `ignoredAt` hides is skipped, and a
+   * symbolic link is neither a file nor a folder here, so nothing below the target is reached through one —
+   * stopping after `limit` files. Every regular file counts, because `text()` is what decides whether one is
+   * worth reading; the paths come back sorted.
+   */
+  async filesUnder(target: string, limit = MAX_SEARCH_FILES): Promise<string[]> {
+    const absolute = path.resolve(target)
+    let stat: fs.Stats
+    try {
+      stat = await fs.promises.lstat(absolute)
+    } catch {
+      return []
+    }
+    if (stat.isFile()) return [absolute]
+    if (!stat.isDirectory()) return []
+    const files: string[] = []
+    const visit = async (dir: string) => {
+      if (files.length >= limit) return
+      let dirents: fs.Dirent[]
+      try {
+        dirents = await fs.promises.readdir(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const dirent of dirents) {
+        if (files.length >= limit) return
+        const entry = path.join(dir, dirent.name)
+        if (this.ignoredAt(entry, dirent.isDirectory())) continue
+        if (dirent.isFile()) files.push(entry)
+        else if (dirent.isDirectory()) await visit(entry)
+      }
+    }
+    await visit(absolute)
+    return files.sort()
   }
 
   private tree() {

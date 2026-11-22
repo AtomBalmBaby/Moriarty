@@ -36,7 +36,7 @@ import {
 import type { OperationAuthorization } from "./operation-authorization"
 import { ToolCall, ToolSpec } from "./protocol"
 import { type TodoToolOptions,todoTools } from "./todos"
-import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
+import { clip, linesOf, MAX_SEARCH_FILES, plural, ToolInputError, WorkspaceView } from "./view"
 
 export interface ToolResult {
   /** What the model is sent. */
@@ -328,7 +328,10 @@ const grep = (view: WorkspaceView): Tool => ({
   async run({ pattern, path: dir }, context) {
     if (!pattern) throw new ToolInputError("grep needs a pattern.")
     rejectInternalIdentifier("grep", pattern.trim())
-    const scope = dir ? view.relative(view.resolve(dir, "any")) : "."
+    const target = dir ? view.resolve(dir, "any") : undefined
+    /** An authorized folder outside the root is searched by walking it here; `files()` stays the workspace's own. */
+    const outside = target !== undefined && view.isExternal(target)
+    const scope = target ? view.relative(target) : "."
     const started = Date.now()
     const search = async (regex: RegExp) => {
       /** Files whose matches are shown: their lines, and which of them matched (0-based). */
@@ -338,7 +341,9 @@ const grep = (view: WorkspaceView): Tool => ({
       let shown = 0
       let total = 0
       let unsearched = 0
-      const all = await view.files()
+      const all = outside && target ? await view.filesUnder(target) : await view.files()
+      /** A walk that stopped at its limit is not an empty search; the model needs to know which one it got. */
+      const capped = outside && target !== undefined && all.length >= MAX_SEARCH_FILES
       for (const [index, file] of all.entries()) {
         const rel = view.relative(file)
         if (scope !== "." && rel !== scope && !rel.startsWith(`${scope}/`)) continue
@@ -386,7 +391,7 @@ const grep = (view: WorkspaceView): Tool => ({
         }
         return [file, ...rows, ...(count > hits.length ? [`… ${count - hits.length} more in this file`] : [])].join("\n")
       })
-      return { blocks, others, total, files: blocks.length + others.length, unsearched }
+      return { blocks, others, total, files: blocks.length + others.length, unsearched, capped }
     }
 
     // A pattern is tried as written, then as the models tend to mean it,
@@ -420,7 +425,7 @@ const grep = (view: WorkspaceView): Tool => ({
       if (again.total) [found, note] = [again, attempt.note]
     }
 
-    const { blocks, others, total, files, unsearched } = found
+    const { blocks, others, total, files, unsearched, capped } = found
     // Where else it matched, busiest first: enough for a narrower search.
     const elsewhere = [...others].sort((a, b) => b.count - a.count)
     const named = elsewhere.slice(0, MAX_GREP_OTHER_FILES).map(({ file, count }) => `${file} (${count})`)
@@ -432,7 +437,8 @@ const grep = (view: WorkspaceView): Tool => ({
               "; narrow the pattern or the path"
           ]
         : []),
-      ...(unsearched > 0 ? [`… stopped early: ${plural(unsearched, "file")} not searched; narrow the path`] : [])
+      ...(unsearched > 0 ? [`… stopped early: ${plural(unsearched, "file")} not searched; narrow the path`] : []),
+      ...(capped ? [`… stopped early: only the first ${MAX_SEARCH_FILES} files were searched; narrow the path`] : [])
     ]
     return {
       output: blocks.length ? [...(note ? [note] : []), ...blocks, ...notes].join("\n") : ["No matches.", ...notes].join("\n"),

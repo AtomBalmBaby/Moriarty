@@ -216,6 +216,110 @@ test("grep shows a few matches per file so one noisy file does not hide the rest
   ])
 })
 
+/** A workspace with a granted folder outside it: the same files, in both. */
+const outsideGrep = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-grepoutside-"))
+  const allowed = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-allowed-"))
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-elsewhere-"))
+  write(root, "src/main.ts", "needle in the workspace\n")
+  write(allowed, "notes/deeper/other.md", "needle in a file below it\nsecond line\n")
+  write(allowed, "notes/plan.md", "heading\nneedle in the plan\n")
+  // A walk of a granted folder takes every regular file; only `text()` decides which one is worth reading.
+  write(allowed, "notes/dep.lock", "needle in a file the search allow-list would skip\n")
+  write(elsewhere, "deep/private.md", "needle nobody granted\n")
+  fs.symlinkSync(elsewhere, path.join(allowed, "link"))
+  return { root, allowed, elsewhere, shown: path.resolve(allowed).split(path.sep).join("/") }
+}
+
+test("grep finds lines under an authorized external directory and prints absolute paths", async () => {
+  const { root, allowed, shown } = outsideGrep()
+  const tools = workspaceTools(new WorkspaceView(root, [], undefined, [], [allowed]))
+  const grep = await tools.run({ name: "grep", args: { pattern: "needle", path: path.join(allowed, "notes") } })
+  assert.strictEqual(
+    grep.output,
+    [
+      `${shown}/notes/deeper/other.md`,
+      "1: needle in a file below it",
+      "2- second line",
+      `${shown}/notes/dep.lock`,
+      "1: needle in a file the search allow-list would skip",
+      `${shown}/notes/plan.md`,
+      "1- heading",
+      "2: needle in the plan"
+    ].join("\n"),
+    "the files below the granted folder are named by where they are, and every regular file is searched"
+  )
+  assert.strictEqual(grep.summary, `searched for \`needle\` in \`${shown}/notes\` · 3 matches in 3 files`)
+  assert.doesNotMatch(grep.output, /main\.ts/, "naming an outside folder searches that folder alone")
+  assert.strictEqual(
+    (await tools.run({ name: "grep", args: { pattern: "needle" } })).output,
+    "src/main.ts\n1: needle in the workspace",
+    "a search with no path still searches the workspace as it did"
+  )
+})
+
+test("grep of a single external file works", async () => {
+  const { root, allowed, shown } = outsideGrep()
+  const tools = workspaceTools(new WorkspaceView(root, [], undefined, [], [allowed]))
+  const one = await tools.run({ name: "grep", args: { pattern: "needle", path: path.join(allowed, "notes/plan.md") } })
+  assert.strictEqual(one.output, `${shown}/notes/plan.md\n1- heading\n2: needle in the plan`)
+  assert.strictEqual(one.summary, `searched for \`needle\` in \`${shown}/notes/plan.md\` · 1 match in 1 file`)
+})
+
+test("grep skips .git and node_modules inside an external directory", async () => {
+  const { root, allowed, shown } = outsideGrep()
+  write(allowed, ".git/config", "needle in the git folder\n")
+  write(allowed, "node_modules/dep.js", "needle in a dependency\n")
+  const tools = workspaceTools(new WorkspaceView(root, [], undefined, [], [allowed]))
+  const whole = await tools.run({ name: "grep", args: { pattern: "needle", path: allowed } })
+  assert.strictEqual(
+    whole.output,
+    [
+      `${shown}/notes/deeper/other.md`,
+      "1: needle in a file below it",
+      "2- second line",
+      `${shown}/notes/dep.lock`,
+      "1: needle in a file the search allow-list would skip",
+      `${shown}/notes/plan.md`,
+      "1- heading",
+      "2: needle in the plan"
+    ].join("\n"),
+    "the rules that hold everywhere hold there too, and nothing from them is searched or shown"
+  )
+})
+
+test("grep of an unauthorized directory is refused", async () => {
+  const { root, allowed, elsewhere } = outsideGrep()
+  const tools = workspaceTools(new WorkspaceView(root, [], undefined, [], [allowed]))
+  const refused = await tools.run({ name: "grep", args: { pattern: "needle", path: path.join(elsewhere, "deep") } })
+  assert.ok(refused.failed, "the call is refused as it always was")
+  assert.match(refused.output, /outside the workspace/)
+  assert.doesNotMatch(refused.output, /needle/, "nothing from the folder is shown")
+})
+
+test("filesUnder(dir, 3) stops at the limit and never follows a symlink", async () => {
+  const { root, allowed, shown } = outsideGrep()
+  write(allowed, "top.txt", "one\n")
+  const view = new WorkspaceView(root, [], undefined, [], [allowed])
+  const capped = await view.filesUnder(allowed, 3)
+  assert.strictEqual(capped.length, 3, "the walk stops at the limit")
+  assert.deepStrictEqual(capped, [...capped].sort(), "the paths come back sorted")
+  assert.ok(capped.every((file) => file.startsWith(`${path.resolve(allowed)}${path.sep}`)), "every path is inside the granted folder")
+  assert.deepStrictEqual(
+    await view.filesUnder(allowed),
+    [
+      `${shown}/notes/deeper/other.md`,
+      `${shown}/notes/dep.lock`,
+      `${shown}/notes/plan.md`,
+      `${shown}/top.txt`
+    ],
+    "the link is neither a file nor a folder here, so nothing below it is reached through it"
+  )
+  assert.deepStrictEqual(await view.filesUnder(path.join(allowed, "notes/plan.md")), [path.resolve(allowed, "notes/plan.md")], "a file is its own one entry")
+  assert.deepStrictEqual(await view.files(), [path.join(root, "src/main.ts")], "files() is still the workspace's own walk")
+})
+
+
 const repoWithHistory = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-githist-"))
   const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" })
