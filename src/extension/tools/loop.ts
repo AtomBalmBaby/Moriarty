@@ -36,6 +36,7 @@ import { hostedTakesTools } from "../inference/adapters/fluency"
 import { isRetryableProviderFailure } from "../inference/errors"
 import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
+import { displayArguments } from "./arguments"
 import { ContextCapacity, ContextDiagnostics, ContextPlan, fitFileResult, fitResult, planContext, stripResultIntegrity, TokenEstimator, trimmedResult, withResultIntegrity } from "./budget"
 import { buildBreakdown, FullRequestPayload, RequestBreakdown, RowChars } from "./context-breakdown"
 import { logToolFailure } from "./failure-log"
@@ -433,11 +434,10 @@ const parseArguments = (call: ChatToolCall): ToolCall | { error: string; detail?
   if (!value || typeof value !== "object" || Array.isArray(value)) return { error: "the arguments were not an object" }
   return {
     name: call.name,
-    args: Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .filter(([, v]) => v !== undefined && v !== null)
-        .map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)])
-    )
+    // Every value keeps the type the model sent it with: a boolean stays a
+    // boolean, a number a number, an array an array. A null is kept as null so
+    // that an explicit null still reads differently from an absent field.
+    args: Object.fromEntries(Object.entries(value as Record<string, unknown>))
   }
 }
 
@@ -1079,7 +1079,7 @@ class ToolLoop {
           rawArguments,
           parsedArguments: pending.call?.args ?? null
         })
-        this._options.onToolStart?.({ id, name, args: pending.call?.args ?? {} })
+        this._options.onToolStart?.({ id, name, args: displayArguments(pending.call?.args ?? {}) })
         const key = pending.call ? this.answerKey(pending.call) : undefined
         // Anything that may change the workspace makes every earlier read stale.
         if (pending.call && !key) this._answered.clear()
@@ -1211,13 +1211,13 @@ class ToolLoop {
         results.push(sent)
         // The next turn's notes keep what the tool returned; the folder's
         // instructions come again when that turn's tools reach the folder.
-        this._record.push({ name, args: pending.call?.args ?? {}, output: result.output })
+        this._record.push({ name, args: displayArguments(pending.call?.args ?? {}), output: result.output })
         this._options.onStep?.({
           id,
           index: step,
           mode: this._mode,
           name: pending.call?.name ?? pending.raw?.name,
-          args: pending.call?.args,
+          args: pending.call?.args ? displayArguments(pending.call.args) : undefined,
           parseError: pending.error,
           summary: result.summary,
           output: result.output,
@@ -1265,8 +1265,8 @@ class ToolLoop {
   private answerKey(call: ToolCall): string | undefined {
     if (!this._workspace.tools.find((tool) => tool.name === call.name)?.readOnly) return undefined
     const args = Object.entries(call.args)
-      .map(([name, value]) => [name, value.trim()])
-      .filter(([, value]) => value)
+      .map(([name, value]) => [name, typeof value === "string" ? value.trim() : JSON.stringify(value)])
+      .filter(([, value]) => value && value !== "null")
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     return JSON.stringify([call.name, args])
   }

@@ -5,6 +5,7 @@
  */
 import { HttpMcpClient } from "./mcp/http"
 import { StdioMcpClient } from "./mcp/stdio"
+import type { ToolArguments } from "./arguments"
 import type { ToolParameter, ToolSpec } from "./protocol"
 
 export const MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -121,11 +122,17 @@ const clipDescription = (text: string | undefined) => {
 
 const typeOf = (schema: JsonSchema | undefined) => (Array.isArray(schema?.type) ? schema?.type[0] : schema?.type)
 
-export const coerceArguments = (schema: JsonSchema | undefined, args: Record<string, string>): Record<string, unknown> => {
+/**
+ * A value that already has the type the server's schema declares is passed
+ * through as it is; only text is read into the type the schema asks for.
+ */
+export const coerceArguments = (schema: JsonSchema | undefined, args: ToolArguments): Record<string, unknown> => {
   const properties = schema?.properties ?? {}
   return Object.fromEntries(
     Object.entries(args).map(([name, value]) => {
       const type = typeOf(properties[name])
+      // A value that already has the shape the schema asks for is left alone.
+      if (typeof value !== "string") return [name, value]
       if (type === "number" || type === "integer") {
         const number = Number(value)
         return [name, Number.isFinite(number) && value.trim() !== "" ? number : value]
@@ -158,7 +165,16 @@ export const mcpToolSpecs = (server: string, tools: McpTool[], taken: Set<string
     const parameters: ToolParameter[] = Object.entries(schema.properties ?? {}).map(([parameter, property]) => ({
       name: parameter,
       description: clipDescription(property?.description) || parameter,
-      ...(required.has(parameter) ? {} : { optional: true })
+      ...(required.has(parameter) ? {} : { optional: true }),
+      type: typeOf(property) === "integer" || typeOf(property) === "number"
+        ? "integer"
+        : typeOf(property) === "boolean"
+          ? "boolean"
+          : typeOf(property) === "array"
+            ? "array"
+            : typeOf(property) === "object"
+              ? "object"
+              : "string"
     }))
     return [
       {

@@ -84,6 +84,7 @@ import { formatCountedTokens, formatFullRequestTrace, formatRequestBreakdown, ty
 import { DEFAULT_MAX_STEPS, describeResultBudget, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import { type ToolCall, toolDefinition } from "../tools/protocol"
+import type { FingerprintCandidates } from "../tools/source-resolver"
 import { type TodoToolOptions, todoTools, todoWorkspaceTools } from "../tools/todos"
 import { WorkspaceView } from "../tools/view"
 import type { ToolResult } from "../tools/workspace"
@@ -304,6 +305,16 @@ const writePromptCompilerTrace = async (
   return tracePath
 }
 
+const fingerprintIndexOf = (provider: WorkspaceSearchProvider | undefined): FingerprintCandidates | undefined => {
+  if (!provider?.candidatesFor || !provider.coverage) return undefined
+  const candidatesFor = provider.candidatesFor.bind(provider)
+  const coverage = provider.coverage.bind(provider)
+  return {
+    candidatesFor,
+    coverage
+  }
+}
+
 /**
  * The chat feature's front door.
  *
@@ -479,6 +490,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       const extras: ToolExtras = {
         ...readFileSettings((key, fallback) => this.config.get(key, fallback)),
         workspaceSearch: this._workspaceSearch,
+        fingerprintIndex: fingerprintIndexOf(this._workspaceSearch),
+        openFiles: () => workspace.textDocuments
+          .filter((document) => document.uri.scheme === "file")
+          .map((document) => document.uri.fsPath),
         edits: {
           mode: "apply" as const,
           read: async (): Promise<string | undefined> => undefined,
@@ -2677,6 +2692,10 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     } : undefined
     let available = workspaceTools(view, [], {
       workspaceSearch: this._workspaceSearch,
+      fingerprintIndex: fingerprintIndexOf(this._workspaceSearch),
+      openFiles: () => workspace.textDocuments
+        .filter((document) => document.uri.scheme === "file")
+        .map((document) => document.uri.fsPath),
       access: createAccessPreflight({ store: this._accessStore, view, approve: chatAccessApprover }),
       edits: editorEdits(view, editMode, approveChange, changes, safety, this.config.get<EditorVisibility>("chatToolsEditorVisibility", "background")),
       editor: editorKnowledge(view, editMode, approveChange, changes, safety),

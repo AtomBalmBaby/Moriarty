@@ -269,6 +269,64 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
     return { ...this.state }
   }
 
+  /** Fingerprint candidates for hash-first source resolution. */
+  async candidatesFor(fingerprint: string): Promise<string[]> {
+    if (this.disposed) return []
+    await this.initialize()
+    if (!this.database || !this.projectAvailable()) return []
+    const separator = fingerprint.indexOf(":")
+    const digest = separator < 0 ? fingerprint : fingerprint.slice(separator + 1)
+    const legacy = /^[0-9a-f]{64}$/i.test(digest) ? digest : undefined
+    const found = legacy
+      ? await rows<{ uri: string }>(
+          this.database,
+          "SELECT uri FROM documents WHERE (fingerprint=? OR fingerprint=?) AND skip_reason IS NULL AND error IS NULL",
+          [fingerprint, legacy]
+        )
+      : await rows<{ uri: string }>(
+          this.database,
+          "SELECT uri FROM documents WHERE fingerprint=? AND skip_reason IS NULL AND error IS NULL",
+          [fingerprint]
+        )
+    return found.flatMap((row) => {
+      try {
+        return [vscode.Uri.parse(row.uri).fsPath]
+      } catch {
+        return []
+      }
+    })
+  }
+
+  /** Whether the index covers and is current for every eligible file. */
+  async coverage(shown: string[]): Promise<{ complete: boolean; fresh: boolean; unexamined?: number; reason?: string }> {
+    void shown
+    if (this.disposed) return { complete: false, fresh: false, reason: "The workspace index has been disposed." }
+    await this.initialize()
+    if (!this.database || !this.projectAvailable()) return { complete: false, fresh: false, reason: "The unified project index is unavailable." }
+    const snapshot = this.snapshot
+    const complete = snapshot.discoveryComplete &&
+      (snapshot.status === "ready" || snapshot.status === "paused") &&
+      snapshot.filesSkipped === 0 &&
+      snapshot.filesFailed === 0 &&
+      snapshot.filesPending === 0
+    const fresh = complete &&
+      this.dirtyUris.size === 0 &&
+      this.pendingUris.size === 0 &&
+      this.pendingDeletes.size === 0 &&
+      !this.scanning &&
+      !this.synchronizing &&
+      !this.updateWorker
+    const unexamined = snapshot.filesPending + snapshot.filesSkipped + snapshot.filesFailed
+    return {
+      complete,
+      fresh,
+      ...(unexamined ? { unexamined } : {}),
+      ...(!fresh ? { reason: snapshot.status === "scanning" || snapshot.status === "indexing"
+        ? "The unified project index is currently synchronizing."
+        : "The unified project index has dirty or unexamined files." } : {})
+    }
+  }
+
   async start(): Promise<void> {
     if (!vscode.workspace.getConfiguration("twinny").get<boolean>("indexing.enabled", true)) {
       this.update({ status: "disabled" })

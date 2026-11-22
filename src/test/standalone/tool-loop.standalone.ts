@@ -1645,7 +1645,7 @@ test("a native edit_lines call the tool refuses is logged as a warning, with wha
   assert.doesNotMatch(log, /SECRET_SOURCE_LINE/)
 })
 
-test("a call whose arguments were dropped or changed on the way is logged with each mismatch named", async () => {
+test("a native null argument is preserved and refused by type, never dropped or stringified", async () => {
   const root = workspace({ "a.ts": "x\n" })
   const { client } = scripted([
     { calls: [{ id: "1", name: "read_file", arguments: JSON.stringify({ path: "missing.ts", start_line: null }) }] },
@@ -1653,8 +1653,10 @@ test("a call whose arguments were dropped or changed on the way is logged with e
   ])
   const log = await captureStderr(() => collect(withTools(client, workspaceTools(root), { mode: "native", provider: "llamacpp" }).chat(ask("Read."))))
   assert.match(log, /\[twinny\] warn tool failed · read_file \(native, llamacpp\) · call 1, step 0\.0/)
-  assert.match(log, /received: \{"path":"<10 chars>"\}/)
-  assert.match(log, /mismatch: start_line: sent as null, not received/)
+  assert.match(log, /sent: \{"path":"<10 chars>","start_line":null\}/)
+  assert.match(log, /received: \{"path":"<10 chars>","start_line":null\}/)
+  assert.doesNotMatch(log, /mismatch:/)
+  assert.match(log, /"code":"invalid_argument_type"/)
 })
 
 test("a call the model wrote that could not be read is logged with its raw text described and the parser's reason", async () => {

@@ -3,7 +3,7 @@ import { linesOf } from "./view"
 
 export const contentHash = fingerprintContent
 
-export type LineEditFailureCode = "hash_mismatch" | "invalid_range" | "overlapping_edits" | "document_unavailable" | "permission_denied" | "application_failed" | "save_failed"
+export type LineEditFailureCode = "hash_mismatch" | "invalid_range" | "overlapping_edits" | "document_unavailable" | "permission_denied" | "application_failed" | "save_failed" | "missing_target" | "invalid_hash" | "hash_not_found" | "ambiguous_hash" | "hash_unproven" | "malformed_arguments" | "missing_argument" | "invalid_argument_type"
 
 /** `disk` when the saved file's bytes were read back and match; `buffer` when the text was not read from disk (left unsaved, or the bytes cannot be compared). */
 export type ContentSource = "disk" | "buffer"
@@ -12,6 +12,12 @@ export interface LineEditFailure {
   code: LineEditFailureCode
   message: string
   current_hash?: string
+  /** The argument the call was missing or sent with the wrong type. */
+  required_argument?: string
+  /** Paths the caller may be told about, when more than one file answers. */
+  candidates?: string[]
+  /** The smallest step that would make the same call work. */
+  recovery?: string
 }
 
 export class LineEditError extends Error {
@@ -42,8 +48,8 @@ export const changedSpan = (patches: LinePatch[]): { start: number; end: number;
   added: patches.reduce((added, patch) => added + patch.text.split("\n").length - 1, 0)
 })
 
-export const lineEditFailure = (code: LineEditFailureCode, message: string, current_hash?: string): LineEditFailure =>
-  ({ code, message, ...(current_hash ? { current_hash } : {}) })
+export const lineEditFailure = (code: LineEditFailureCode, message: string, current_hash?: string, extra: { required_argument?: string; candidates?: string[]; recovery?: string } = {}): LineEditFailure =>
+  ({ code, message, ...(current_hash ? { current_hash } : {}), ...extra })
 
 function invalid(message: string): never { throw new LineEditError(lineEditFailure("invalid_range", message)) }
 

@@ -15,11 +15,12 @@ import { TodoRepository } from "../todos/repository"
 import { TodoWriteRequest } from "../todos/types"
 
 import { AccessPreflight,accessTargetsOf } from "./access-preflight"
+import { argumentFailure, argumentObject, argumentReader, checkDeclaredArguments, jsonType, positiveNumberArgument, structuredErrorResult, textArgument, ToolArgumentError,type ToolArguments, type ToolErrorDetail } from "./arguments"
 import { formatResultIntegrity } from "./budget"
 import { planReplacement, Replacement } from "./edit"
 import { indexChangeNote } from "./helpers"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
-import { contentHash, ContentSource, LINE_EDIT_OPERATIONS, LineEditError, LineEditFailure, lineEditFailure, LineEditRequest } from "./line-edit"
+import { contentHash, ContentSource, LINE_EDIT_OPERATIONS, LineEditError, LineEditFailure, lineEditFailure, LineEditFailureCode, LineEditRequest } from "./line-edit"
 import { coerceArguments, JsonSchema, McpToolSpec } from "./mcp"
 import {
   deleteFile,
@@ -35,8 +36,9 @@ import {
   moveFile,
   renameSymbol
 } from "./more"
-import type { OperationAuthorization } from "./operation-authorization"
+import type { OperationAuthorization, WriteOperation } from "./operation-authorization"
 import { ToolCall, ToolSpec } from "./protocol"
+import { type FingerprintCandidates, normalizeFingerprint, type ResolvedSource, type ResolvedTarget, resolveSourceTarget, type SourceResolverOptions } from "./source-resolver"
 import { type TodoToolOptions,todoTools } from "./todos"
 import { clip, linesOf, MAX_SEARCH_FILES, plural, ToolInputError, WorkspaceView } from "./view"
 
@@ -66,9 +68,11 @@ export interface ToolResult {
   execution?: { command: string; exitCode?: number; output: string }
   /** Structured fields the host records with this observation. Verification reads them; the model does not see them. */
   observation?: { arguments: Record<string, string> }
+  /** Why the call was refused, when the tool can name the condition precisely. */
+  error?: ToolErrorDetail
 }
 
-/** What a running tool is told: when the user has stopped the reply, and the write its approval allows, if the call needs one outside the workspace. */
+/** What a running tool is told: when the user has stopped the reply, the write its approval allows, and the file the shared resolver settled on. */
 export interface ToolContext {
   signal?: AbortSignal
   write?: OperationAuthorization
@@ -77,10 +81,15 @@ export interface ToolContext {
     requestId?: string
     step?: number
   }
+  /**
+   * The file this call is about: the one the call named, or the one its content
+   * fingerprint uniquely resolved to.
+   */
+  source?: ResolvedSource
 }
 
 export interface Tool extends ToolSpec {
-  run(args: Record<string, string>, context?: ToolContext): Promise<ToolResult>
+  run(args: ToolArguments, context?: ToolContext): Promise<ToolResult>
 }
 
 const MIN_READ_LINES = 100
@@ -182,7 +191,9 @@ const listDir = (view: WorkspaceView): Tool => ({
   readOnly: true,
   description: "The files and folders in a directory.",
   parameters: [{ name: "path", description: "The directory; the workspace root by default.", optional: true }],
-  async run({ path: dir }) {
+  async run(raw) {
+    const a = argumentReader("list_dir", raw)
+    const dir = a.text("path")
     const absolute = view.resolve(dir, "dir")
     const entries = view.entries(absolute)
     const shown = entries.slice(0, MAX_LIST_ENTRIES)
@@ -202,22 +213,9 @@ const clampReadLines = (limit: number | undefined) => {
   return Math.min(MAX_READ_LINES, Math.max(MIN_READ_LINES, value))
 }
 
-/** A line number argument: blank is absent; a whole number from 1 (a trailing ".0" is tolerated) is accepted; anything else is rejected rather than guessed. */
-const lineArgument = (rel: string, name: string, raw: string | undefined) => {
-  const text = raw === undefined ? "" : String(raw).trim()
-  if (text === "") return undefined
-  const value = /^\d+(\.0+)?$/.test(text) ? Number(text) : 0
-  if (value < 1) throw new ToolInputError(`${rel}: ${name} must be a line number from 1, got "${text}".`)
-  return value
-}
-
-/** A true/false argument in any letter case; blank counts as false. */
-const flagArgument = (rel: string, name: string, raw: string | undefined) => {
-  const text = raw === undefined ? "" : String(raw).trim().toLowerCase()
-  if (text === "" || text === "false") return false
-  if (text === "true") return true
-  throw new ToolInputError(`${rel}: ${name} must be true or false, got "${raw}".`)
-}
+/** A line number, read at the shared boundary with this tool's wording. */
+const lineArgument = (rel: string, name: string, args: ToolArguments) =>
+  positiveNumberArgument(rel, name, args, "a line number from 1")
 
 /** The read settings, read through the host's configuration reader, so the mapping from settings to the tool is testable without VS Code. */
 export const readFileSettings = (get: <T>(key: string, fallback: T) => T) => ({
@@ -257,27 +255,41 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
   return {
     name: "read_file",
     readOnly: true,
-    description: `A file's lines, numbered. Pass only path, or full_file set to true, to read the whole file; a whole file longer than ${limit} lines is refused with suggested ranges, unless the user has allowed longer full-file reads. Read a range with start_line and end_line (start_line alone reads to the end of the file); a single line is start_line and end_line set to the same number. A range longer than ${limit} lines is refused, not cut short. Source lines are complete. Includes the content fingerprint of the entire authoritative editor document (including unsaved changes), for edit_lines.`,
+    hashAddressable: true,
+    description: `A file's lines, numbered. Pass only path, or full_file set to true, to read the whole file; a whole file longer than ${limit} lines is refused with suggested ranges, unless the user has allowed longer full-file reads. Read a range with start_line and end_line (start_line alone reads to the end of the file); a single line is start_line and end_line set to the same number. A range longer than ${limit} lines is refused, not cut short. Source lines are complete. Includes the content fingerprint of the entire authoritative editor document (including unsaved changes), for edit_lines. With no path, expected_hash resolves the file when it names exactly one current file the caller may use.`,
     // full_line is still accepted for earlier calls but is not advertised: start_line and end_line set to the same number already read one line.
     parameters: [
-      { name: "path", description: "The file." },
+      { name: "path", description: "The file; optional when expected_hash names exactly one current file the caller may use.", optional: true, type: "string" },
       { name: "full_file", description: "true to read the whole file.", optional: true, type: "boolean" },
       { name: "start_line", description: "First line to read, from 1. Omit to start at the top of the file.", optional: true, type: "integer" },
       { name: "end_line", description: "Last line to read, inclusive. Omit to read to the end of the file. Must not be before start_line.", optional: true, type: "integer" },
       { name: "start_char", description: "For one oversized source line, 1-based character offset at which to return a bounded fragment.", optional: true, type: "integer" },
-      { name: "end_char", description: "For one oversized source line, inclusive character offset. Omitting it reads up to 10,000 characters.", optional: true, type: "integer" }
+      { name: "end_char", description: "For one oversized source line, inclusive character offset. Omitting it reads up to 10,000 characters.", optional: true, type: "integer" },
+      { name: "expected_hash", description: "The content fingerprint read_file gave for this file. With no path, it resolves the file when it names exactly one current file the caller may use.", optional: true, type: "string" }
     ],
-    async run({ path: file, start_line, end_line, full_line, full_file, start_char, end_char }) {
-      if (!file) throw new ToolInputError("read_file needs a path.")
+    async run(raw, context) {
+      const a = argumentReader("read_file", raw)
+      const file = a.text("path") ?? context?.source?.path
+      if (!file) throw new ToolInputError("read_file needs a path, or an expected_hash that names exactly one file.")
       const absolute = view.resolve(file, "file")
       const rel = view.relative(absolute)
+      /** A character offset: the number as it came, or its text spelling. Anything else is refused, not made into text. */
+      const offsetText = (name: string): string | undefined => {
+        const value = raw[name]
+        if (!a.sent(name)) return undefined
+        if (value === null)
+          throw new ToolArgumentError(argumentFailure("invalid_argument_type", `${rel}: ${name} must be a character offset, not null.`, { required_argument: name }))
+        if (typeof value !== "string" && typeof value !== "number")
+          throw new ToolArgumentError(argumentFailure("invalid_argument_type", `${rel}: ${name} must be a character offset, not ${jsonType(value)}.`, { required_argument: name }))
+        return String(value).trim()
+      }
       const text = (await sink?.read?.(absolute)) ?? await view.text(absolute)
       if (text === undefined) throw new ToolInputError(`${rel} is binary or too large to read.`)
-      const fullFile = flagArgument(rel, "full_file", full_file)
+      const fullFile = a.flag("full_file", rel)
       // full_file takes precedence: range and full_line arguments sent with it are ignored, not validated.
-      const single = fullFile ? false : flagArgument(rel, "full_line", full_line)
-      const start = fullFile ? undefined : lineArgument(rel, "start_line", start_line)
-      const end = fullFile ? undefined : lineArgument(rel, "end_line", end_line)
+      const single = fullFile ? false : a.flag("full_line", rel)
+      const start = fullFile ? undefined : lineArgument(rel, "start_line", raw)
+      const end = fullFile ? undefined : lineArgument(rel, "end_line", raw)
       const lines = linesOf(text)
       const fingerprint = await contentHash(text)
       const metadata = `content_hash: ${fingerprint}; total_lines: ${lines.length}`
@@ -304,10 +316,10 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
           throw new ToolInputError(`${rel}: full_line returns exactly one line, but end_line ${end} differs from start_line ${start}. For a range, drop full_line and pass start_line and end_line. For one line, drop end_line.`)
         }
         const line = lines[start - 1]
-        const charStartRaw = start_char === undefined ? "" : String(start_char).trim()
-        const charEndRaw = end_char === undefined ? "" : String(end_char).trim()
-        const charStart = charStartRaw === "" ? undefined : Number(charStartRaw)
-        const charEnd = charEndRaw === "" ? undefined : Number(charEndRaw)
+        const charStartRaw = offsetText("start_char")
+        const charEndRaw = offsetText("end_char")
+        const charStart = charStartRaw === undefined || charStartRaw === "" ? undefined : Number(charStartRaw)
+        const charEnd = charEndRaw === undefined || charEndRaw === "" ? undefined : Number(charEndRaw)
         if ((charStart !== undefined && (!Number.isSafeInteger(charStart) || charStart < 1)) ||
             (charEnd !== undefined && (!Number.isSafeInteger(charEnd) || charEnd < 1))) {
           throw new ToolInputError(`${rel}: start_char and end_char must be positive character offsets within line ${start}.`)
@@ -390,15 +402,15 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
       if (last - from + 1 > limit && !(wholeFile && allowFullFile)) {
         throw new ToolInputError(overLimitMessage(rel, from, last, lines.length, limit, wholeFile))
       }
-      if (start_char !== undefined || end_char !== undefined) {
+      if (offsetText("start_char") !== undefined || offsetText("end_char") !== undefined) {
         if (from !== last) {
           throw new ToolInputError(`${rel}: start_char and end_char are only valid for exactly one source line; set start_line and end_line to the same line.`)
         }
-        const charStartRaw = start_char === undefined ? "" : String(start_char).trim()
-        const charEndRaw = end_char === undefined ? "" : String(end_char).trim()
+        const charStartRaw = offsetText("start_char")
+        const charEndRaw = offsetText("end_char")
         if (charStartRaw === "") throw new ToolInputError(`${rel}: start_char is required for a line fragment.`)
         const charStart = Number(charStartRaw)
-        const charEnd = charEndRaw === "" ? undefined : Number(charEndRaw)
+        const charEnd = charEndRaw === undefined || charEndRaw === "" ? undefined : Number(charEndRaw)
         if (!Number.isSafeInteger(charStart) || charStart < 1 ||
             (charEnd !== undefined && (!Number.isSafeInteger(charEnd) || charEnd < 1))) {
           throw new ToolInputError(`${rel}: start_char and end_char must be positive character offsets within line ${from}.`)
@@ -477,7 +489,10 @@ const grep = (view: WorkspaceView): Tool => ({
     { name: "pattern", description: "A JavaScript regular expression." },
     { name: "path", description: "A directory to search under, or one file; the whole workspace by default.", optional: true }
   ],
-  async run({ pattern, path: dir }, context) {
+  async run(raw, context) {
+    const a = argumentReader("grep", raw)
+    const pattern = a.text("pattern")
+    const dir = a.text("path")
     if (!pattern) throw new ToolInputError("grep needs a pattern.")
     rejectInternalIdentifier("grep", pattern.trim())
     const target = dir ? view.resolve(dir, "any") : undefined
@@ -606,7 +621,9 @@ const findSymbol = (view: WorkspaceView): Tool => ({
   readOnly: true,
   description: "Where a function, class, method, type or variable is defined.",
   parameters: [{ name: "name", description: "The symbol's name, exactly as written in code." }],
-  async run({ name }, context) {
+  async run(raw, context) {
+    const a = argumentReader("find_symbol", raw)
+    const name = a.text("name")
     const wanted = name?.trim()
     if (!wanted) throw new ToolInputError("find_symbol needs a name.")
     const regex = definitionPattern(wanted)
@@ -659,7 +676,10 @@ const createFile = (view: WorkspaceView, sink: EditSink): Tool => ({
     { name: "path", description: "Where the new file goes, relative to the workspace root, or an absolute path inside an allowed folder." },
     { name: "content", description: "The whole file." }
   ],
-  async run({ path: file, content }, context) {
+  async run(raw, context) {
+    const a = argumentReader("create_file", raw)
+    const file = a.text("path")
+    const content = a.text("content")
     if (content === undefined) throw new ToolInputError("create_file needs content.")
     if (content.length > MAX_NEW_FILE_CHARS) throw new ToolInputError("That file is too large to create in one go.")
     const absolute = view.resolveNew(file)
@@ -693,7 +713,7 @@ const lineEditErrorResult = (error: LineEditFailure): ToolResult => ({
   failed: true
 })
 
-const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]>): Tool => ({
+const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]>, resolve: (args: ToolArguments, context?: ToolContext) => Promise<ResolvedTarget>): Tool => ({
   name: "edit_lines",
   description:
     "The standard way to change an existing source file. Edit complete source lines atomically, guarded by expected_hash from read_file (the fingerprint of the entire editor buffer). " +
@@ -708,16 +728,19 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
   guidance:
     "To change existing source: read_file for its numbered lines and content_hash, then call edit_lines with that expected_hash and the line operations. " +
     "Use the content_hash it returns for the next edit to the same file. Reread only after a hash_mismatch, or when the lines you need were not in the last read. " +
-    "Use `replace_text` for small modifications within an existing line, especially long lines. Supply the whole-file `expected_hash`, the original 1-based line number, and the exact substring to replace. Do not reproduce the complete line.",
+    "Use `replace_text` for small modifications within an existing line, especially long lines. Supply the whole-file `expected_hash`, the original 1-based line number, and the exact substring to replace. Do not reproduce the complete line. " +
+    "A file can also be named by the fingerprint read_file gave for it: with no path, expected_hash resolves the one current file it matches. When more than one file matches, nothing is chosen and the call is refused with ambiguous_hash.",
+    // A fingerprint read_file gave can name the file on its own, when it matches exactly one.
+    hashAddressable: true,
   parameters: [
-    { name: "path", description: "Workspace-relative file path." },
-    { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted." },
-    { name: "edits", description: "Array of line operations in any order, all against the original snapshot. Each has operation: replace {operation,start_line,end_line,content} or delete {operation,start_line,end_line}, insert_before/insert_after {operation,line,content}, or replace_text {operation,line,old_text,new_text} for one exact substring inside one line." },
-    { name: "save", description: "Optional, default true. false leaves the edit unsaved for review; only allowed when the editor mode is visible and the task instructions say so." }
+    { name: "path", description: "Workspace-relative file path; optional when expected_hash names exactly one current file the tools may use.", optional: true, type: "string" },
+    { name: "expected_hash", description: "Prefixed content_hash from read_file; legacy unprefixed 64-character SHA-256 is accepted.", type: "string" },
+    { name: "edits", description: "Array of line operations in any order, all against the original snapshot. Each has operation: replace {operation,start_line,end_line,content} or delete {operation,start_line,end_line}, insert_before/insert_after {operation,line,content}, or replace_text {operation,line,old_text,new_text} for one exact substring inside one line.", type: "array" },
+    { name: "save", description: "Optional, default true. false leaves the edit unsaved for review; only allowed when the editor mode is visible and the task instructions say so.", optional: true, type: "boolean" }
   ],
   schema: {
     type: "object",
-    required: ["path", "expected_hash", "edits"],
+    required: ["expected_hash", "edits"],
     additionalProperties: false,
     properties: {
       path: { type: "string" },
@@ -762,26 +785,18 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       }
     }
   },
-  async run(args, context) {
-      const { path: file, expected_hash, edits, save } = args
-    if (!file || !/^(?:xxh64:[a-f0-9]{16}|xxh3_128:[a-f0-9]{32}|sha256:[a-f0-9]{64}|[a-f0-9]{64})$/.test(expected_hash ?? "")) {
-      return lineEditErrorResult(lineEditFailure("invalid_range", "path and a valid content fingerprint from read_file are required."))
-    }
-    if (save !== undefined && typeof save !== "boolean") {
-      return lineEditErrorResult(lineEditFailure("invalid_range", "save must be true or false."))
-    }
-    let absolute: string
-    try {
-      absolute = view.resolve(file, "file")
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return lineEditErrorResult(lineEditFailure(/outside|ignored|rules/.test(message) ? "permission_denied" : "document_unavailable", message))
-    }
-    let operations: unknown
-    try { operations = JSON.parse(edits) } catch {
-      return lineEditErrorResult(lineEditFailure("invalid_range", "edits must be a JSON array of line operations."))
-    }
-    const outcome = await apply(absolute, { expected_hash, edits: operations }, save !== false, context?.write)
+  async run(raw, context) {
+    const a = argumentReader("edit_lines", raw)
+    const hash = normalizeFingerprint(a.raw("expected_hash"))
+    if (!hash) return lineEditErrorResult(lineEditFailure("invalid_hash", "edit_lines needs expected_hash: the content fingerprint read_file gave for this file.", undefined, { required_argument: "expected_hash", recovery: "Read the file to get its fingerprint, then edit that." }))
+    const source = context?.source ?? (await resolve(raw, context))
+    if (!source.ok) return lineEditErrorResult(lineEditFailure(source.detail.code, source.detail.message, source.detail.current_hash, { required_argument: source.detail.required_argument, candidates: source.detail.candidates, recovery: source.detail.recovery }))
+    const absolute = source.absolute
+    // A real boolean stays a boolean: false means do not save, and an absent field keeps the default.
+    const save = a.sent("save") ? a.flag("save") : true
+    const operations = a.structure("edits")
+    if (!Array.isArray(operations)) return lineEditErrorResult(lineEditFailure("invalid_range", "edits must be a JSON array of line operations.", undefined, { required_argument: "edits" }))
+    const outcome = await apply(source.absolute, { expected_hash: hash, edits: operations }, save, context?.write ?? source.write)
     if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
     if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))
     return {
@@ -801,7 +816,11 @@ const editFile = (view: WorkspaceView, sink: EditSink): Tool => ({
     { name: "find", description: "Text already in the file, copied exactly." },
     { name: "replace", description: "What it becomes." }
   ],
-  async run({ path: file, find, replace }, context) {
+  async run(raw, context) {
+    const a = argumentReader("edit_file", raw)
+    const file = a.text("path")
+    const find = a.text("find")
+    const replace = a.text("replace")
     if (!file) throw new ToolInputError("edit_file needs a path.")
     if (find === undefined || replace === undefined) {
       throw new ToolInputError("edit_file needs find and replace.")
@@ -886,7 +905,9 @@ const runCommand = (sink: CommandSink): Tool => ({
   guidance:
     "Use run_command to check your work (tests, type checks, builds). Never run commands that delete files, rewrite history or install software unless the user asked for exactly that. Nothing can answer a prompt, and you get the output after two minutes at most: no interactive commands, servers or watch modes.",
   parameters: [{ name: "command", description: "One command line for the user's shell." }],
-  async run({ command }, context) {
+  async run(raw, context) {
+    const a = argumentReader("run_command", raw)
+    const command = a.text("command")
     const line = command?.trim()
     if (!line) throw new ToolInputError("run_command needs a command.")
     if (line.length > MAX_COMMAND_CHARS) throw new ToolInputError("That command is too long; write a shorter one.")
@@ -932,7 +953,9 @@ const searchCode = (view: WorkspaceView, index: CodeSearch): Tool => ({
   guidance:
     "Start with search_code when you do not know where something lives; it finds code by meaning.",
   parameters: [{ name: "query", description: "What the code does, in a few words." }],
-  async run({ query }) {
+  async run(raw) {
+    const a = argumentReader("search_code", raw)
+    const query = a.text("query")
     const wanted = query?.trim()
     if (!wanted) throw new ToolInputError("search_code needs a query.")
     // The index is built from the same files, but it is older than the
@@ -983,7 +1006,13 @@ const searchWorkspace = (view: WorkspaceView, index: WorkspaceSearchProvider): T
       offset: { type: "integer", minimum: 0, default: 0 }
     }
   },
-  async run({ query, mode, path, limit, offset }, context) {
+  async run(raw, context) {
+    const a = argumentReader("search_workspace", raw)
+    const query = a.text("query")
+    const mode = a.text("mode")
+    const pathArg = a.text("path")
+    const limit = a.number("limit")
+    const offset = a.number("offset")
     const wanted = query?.trim()
     if (!wanted) throw new ToolInputError("search_workspace needs a nonempty query.")
     rejectInternalIdentifier("search_workspace", wanted)
@@ -996,7 +1025,7 @@ const searchWorkspace = (view: WorkspaceView, index: WorkspaceSearchProvider): T
     if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100 || !Number.isSafeInteger(pageOffset) || pageOffset < 0) {
       throw new ToolInputError("limit must be 1-100 and offset must be a nonnegative integer.")
     }
-    const result = await index.search({ query: wanted, mode: selectedMode, path: path || undefined, limit: pageSize, offset: pageOffset }, view.root, context?.signal)
+    const result = await index.search({ query: wanted, mode: selectedMode, path: pathArg || undefined, limit: pageSize, offset: pageOffset }, view.root, context?.signal)
     return {
       output: JSON.stringify({ query: wanted, mode: selectedMode, total: result.total, offset: pageOffset, limit: pageSize, results: result.results.map((hit) => ({
         path: hit.path,
@@ -1043,6 +1072,13 @@ export interface ToolExtras {
    * such paths are refused, as they always were.
    */
   access?: AccessPreflight
+  /**
+   * Where the project keeps fingerprints, for a call that names a file by its
+   * content instead of its path. Candidates only: the current content decides.
+   */
+  fingerprintIndex?: FingerprintCandidates
+  /** Files open in the editor, whose buffer may not be what the index recorded. */
+  openFiles?: () => string[]
 }
 
 /**
@@ -1077,6 +1113,28 @@ export const workspaceTools = (
   const { edits, commands, codeSearch, workspaceSearch, editor, readFileMaxLines, readFileAllowFullFile } = extras
   const view =
     typeof root === "string" ? new WorkspaceView(root, ignoredGlobs, edits?.read?.bind(edits)) : root
+  /** The shared resolver: a call may name its file by the fingerprint it was given. */
+  const resolverOptions: SourceResolverOptions = {
+    view,
+    index: extras.fingerprintIndex,
+    openFiles: extras.openFiles,
+    cache: new Map<string, string[]>(),
+    authorize: (targets, tool, signal) =>
+      extras.access ? extras.access.authorize(targets, tool, signal) : Promise.resolve({ ok: true })
+  }
+
+  /** What a mutating tool does to the file it names, for the write that allows it. */
+  const mutationOperationOf = (name: string): WriteOperation | undefined => {
+    if (name === "create_file") return "create"
+    if (name === "delete_file") return "remove"
+    if (name === "move_file") return "move"
+    return name === "edit_lines" ? "edit" : undefined
+  }
+
+  /** A tool that can be pointed at a file by content, resolved the same way for every caller. */
+  const resolveFor = (tool: string, kind: "read" | "write", operation?: WriteOperation) =>
+    (args: ToolArguments, context?: ToolContext): Promise<ResolvedTarget> =>
+      resolveSourceTarget(resolverOptions, { tool, args, kind, operation, signal: context?.signal })
   const tools = [
     ...(codeSearch ? [searchCode(view, codeSearch)] : []),
     ...(editor ? [editorContext(view, editor)] : []),
@@ -1091,7 +1149,7 @@ export const workspaceTools = (
   ]
   if (edits && extras.legacyEditFile) tools.push(editFile(view, edits))
   if (edits) tools.push(createFile(view, edits))
-  if (edits?.editLines) tools.push(editLines(view, edits.editLines.bind(edits)))
+  if (edits?.editLines) tools.push(editLines(view, edits.editLines.bind(edits), resolveFor("edit_lines", "write", "edit")))
   if (edits && editor) tools.push(renameSymbol(view, editor, extras.access))
   if (edits?.remove && edits.move) {
     const ops = { remove: edits.remove.bind(edits), move: edits.move.bind(edits) }
@@ -1107,7 +1165,7 @@ export const workspaceTools = (
   /** A finished call with the instructions of the folders it reached, the first time the reply reaches them. */
   const withFolderInstructions = (call: ToolCall, result: ToolResult): ToolResult => {
     if (!folders || result.failed) return result
-    const found = PLACE_ARGUMENTS.flatMap((name) => (call.args[name] ? folders.for(call.args[name]) : []))
+    const found = PLACE_ARGUMENTS.flatMap((name) => { const place = textArgument("workspace", name, call.args); return place ? folders.for(place) : [] })
     return found.length ? { ...result, preface: found.map(folderInstructionsNote).join("\n\n") } : result
   }
   return {
@@ -1138,10 +1196,22 @@ export const workspaceTools = (
       authorizationDecision: "checking"
     })
     try {
-      if (extras.access) {
-        const outcome = await extras.access.authorize(accessTargetsOf(call.name, call.args), call.name, context?.signal)
+      const args = argumentObject(call.args, call.name)
+      checkDeclaredArguments(call.name, tool.parameters, args)
+      /** The file this call is about: the one it named, or the one its content fingerprint names. */
+      let source: ResolvedSource | undefined
+      if (tool.hashAddressable && !textArgument(call.name, "path", args)) {
+        const resolved = await resolveSourceTarget(resolverOptions, { tool: call.name, args, kind: tool.readOnly ? "read" : "write", operation: mutationOperationOf(call.name), signal: context?.signal })
+        if (!resolved.ok) return structuredErrorResult(resolved.detail, call.name)
+        source = resolved
+      }
+      if (extras.access && !source?.write) {
+        const outcome = await extras.access.authorize(accessTargetsOf(call.name, args), call.name, context?.signal)
         if (!outcome.ok) {
-          const refused = { output: outcome.message, summary: `${call.name} refused · access not granted`, failed: true }
+          const refused = structuredErrorResult(
+            argumentFailure("permission_denied", outcome.message, { required_argument: "path" }),
+            call.name
+          )
           diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
             toolName: call.name,
             implementationType: "native",
@@ -1153,11 +1223,13 @@ export const workspaceTools = (
           return refused
         }
         write = outcome.write
+      } else if (source?.write) {
+        write = source.write
       }
       const run = () => {
         if (!tool.readOnly && context?.signal?.aborted) throw new ToolInputError("The execution stopped before this tool could run.")
         // The write approval comes only from this call's authorization, never from the caller's context.
-        return tool.run(call.args, { ...context, write })
+        return tool.run(args, { ...context, write, source })
       }
       const result = withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
       diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
@@ -1175,6 +1247,43 @@ export const workspaceTools = (
       // around; it never ends the reply. A refusal of the model's input is
       // given whole (it may show the lines to use instead); anything else,
       // and the step's summary, keeps to the first line.
+      if (error instanceof ToolArgumentError) {
+        if (call.name === "edit_lines") {
+          const result = lineEditErrorResult(lineEditFailure(error.detail.code as LineEditFailureCode, error.detail.message, error.detail.current_hash, {
+            required_argument: error.detail.required_argument,
+            candidates: error.detail.candidates,
+            recovery: error.detail.recovery
+          }))
+          diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
+            toolName: call.name,
+            implementationType: "native",
+            parsedArguments: call.args,
+            authorizationDecision: "approved",
+            durationMs: Date.now() - startedAt,
+            result,
+            error: { name: error.name, message: error.message }
+          })
+          return result
+        }
+          if (!context?.diagnostic) {
+            return {
+              output: error.detail.message,
+              summary: `${call.name} failed · ${error.detail.message.split("\n")[0]}`,
+              failed: true
+            }
+          }
+        const result = structuredErrorResult(error.detail, call.name)
+        diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
+          toolName: call.name,
+          implementationType: "native",
+          parsedArguments: call.args,
+          authorizationDecision: "approved",
+          durationMs: Date.now() - startedAt,
+          result,
+          error: { name: error.name, message: error.message }
+        })
+        return result
+      }
       if (error instanceof LineEditError) {
         const result = lineEditErrorResult(error.detail)
         diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
@@ -1231,4 +1340,7 @@ export interface WorkspaceSearchProvider {
   search(request: { query: string; mode?: WorkspaceSearchMode; path?: string; limit?: number; offset?: number }, scope?: string, signal?: AbortSignal): Promise<{ results: WorkspaceSearchHit[]; total: number }>
   /** Catch the index up with the files a dedicated native mutation just saved. */
   refresh?(changes: readonly IndexChange[]): Promise<IndexRefreshOutcome>
+  /** Optional fingerprint leads and coverage from the unified project index. */
+  candidatesFor?(fingerprint: string): Promise<string[]>
+  coverage?(shown: string[]): Promise<{ complete: boolean; fresh: boolean; unexamined?: number; reason?: string }>
 }

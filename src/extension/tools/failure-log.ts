@@ -1,6 +1,7 @@
 import { logger } from "../../common/logger"
 
-/** Keys whose values name what a call does; shown in full, since they are not source text. */
+import { jsonType, type ToolArguments } from "./arguments"
+
 const CONTROL_KEYS = new Set(["operation", "type", "op", "action", "mode"])
 const MAX_SHOWN_ITEMS = 10
 const MAX_DEPTH = 8
@@ -48,12 +49,33 @@ export const shapeOf = (key: string, value: unknown, depth = 0): unknown => {
  * key by key. Dropped nulls, values changed in type, and keys lost either way
  * are what a model that "sent" a call can still be wrong about.
  */
-export const describeMismatch = (sent: Record<string, unknown>, received: Record<string, string>): string[] => {
+/**
+ * Whether two arguments are the same value: the same type and the same
+ * contents, so a boolean that came as text is not taken for the same thing.
+ */
+const sameValue = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right)
+
+/**
+ * Where the arguments the model sent differ from the ones the tool received,
+ * key by key. A value dropped, a value whose type changed in transit, and keys
+ * lost either way are what a model that "sent" a call can still be wrong about.
+ */
+export const describeMismatch = (sent: Record<string, unknown>, received: ToolArguments): string[] => {
   const notes: string[] = []
   for (const [key, value] of Object.entries(sent)) {
-    if (value === null || value === undefined) notes.push(`${key}: sent as ${value}, not received`)
-    else if (!(key in received)) notes.push(`${key}: sent, not received`)
-    else if (typeof value === "string" ? received[key] !== value : received[key] !== JSON.stringify(value)) notes.push(`${key}: changed between sent and received`)
+    if ((value === null || value === undefined) && !(key in received)) {
+      notes.push(`${key}: sent as ${value}, not received`)
+      continue
+    }
+    if (!(key in received)) {
+      notes.push(`${key}: sent, not received`)
+      continue
+    }
+    const got = received[key]
+    if (sameValue(value, got)) continue
+    notes.push(jsonType(value) === jsonType(got)
+      ? `${key}: changed between sent and received`
+      : `${key}: sent as ${jsonType(value)}, received as ${jsonType(got)}`)
   }
   for (const key of Object.keys(received)) {
     if (!(key in sent)) notes.push(`${key}: received, not sent`)
@@ -80,7 +102,7 @@ export interface ToolFailure {
   /** Why the sent text is not JSON, when the parser said. */
   detail?: string
   /** The arguments the tool received; absent when the call was never read. */
-  received?: Record<string, string>
+  received?: ToolArguments
 }
 
 /** The sent arguments as an object, or why they are not one. A text call written whole carries its arguments inside it. */

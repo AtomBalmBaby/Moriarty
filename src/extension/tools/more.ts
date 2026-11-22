@@ -14,6 +14,7 @@ import fs from "fs"
 import path from "path"
 
 import type { AccessPreflight, AccessTarget } from "./access-preflight"
+import { argumentReader } from "./arguments"
 import {
   gitNamedPaths,
   globToRegExp,
@@ -91,7 +92,10 @@ export const findFiles = (view: WorkspaceView, search?: WorkspaceSearchProvider)
   description:
     "Find files and folders by path or glob. In automatic mode, a plain-text query with no path match may also find source symbols or content; that fallback is labeled. Use mode=path to keep the search filename-only.",
   parameters: [{ name: "pattern", description: "A filename or path glob, or a plain-text discovery query." }, { name: "mode", description: "auto (default) or path to disable symbol/content fallback.", optional: true }],
-  async run({ pattern, mode }) {
+  async run(raw) {
+    const a = argumentReader("find_files", raw)
+    const pattern = a.text("pattern")
+    const mode = a.text("mode")
     const glob = pattern?.trim().replace(/\/+$/, "")
     if (!glob) throw new ToolInputError("find_files needs a pattern.")
     const regex = globToRegExp(glob)
@@ -248,7 +252,9 @@ export const git = (view: WorkspaceView): Tool => {
       "Run a read-only git command in the workspace: status, diff, log, show, blame, branch (listing), shortlog, ls-files, rev-parse. No approval needed; nothing is changed.",
     guidance: "Use git to see what changed (git diff, git status) or the history of a file (git log -p -- path) before you edit.",
     parameters: [{ name: "args", description: "The git command without `git`, e.g. `diff --stat` or `log -5 --oneline -- src/a.ts`." }],
-    async run({ args }, context) {
+    async run(raw, context) {
+      const a = argumentReader("git", raw)
+      const args = a.text("args")
       const line = args?.trim()
       if (!line) throw new ToolInputError("git needs arguments, e.g. status.")
       const parsed = readOnlyGitArgs(line)
@@ -259,9 +265,9 @@ export const git = (view: WorkspaceView): Tool => {
       if (named) throw new ToolInputError(`${named.path} is outside the workspace or ignored by .gitignore and cannot be read.`)
       const refusal = await refuseBareArguments(parsed, context?.signal)
       if (refusal) throw new ToolInputError(refusal)
-      const { output: raw, exitCode } = await runGit(view.root, parsed, context?.signal)
+      const { output: stdout, exitCode } = await runGit(view.root, parsed, context?.signal)
       // ls-files names what git tracks, ignored or not; the hidden ones are left out.
-      const listed = parsed[0] === "ls-files" ? withoutHiddenLines(raw, hiddenHere) : { text: raw, dropped: 0 }
+      const listed = parsed[0] === "ls-files" ? withoutHiddenLines(stdout, hiddenHere) : { text: stdout, dropped: 0 }
       const diffs = withoutHiddenDiffs(listed.text, (file) => hiddenIn(file, at))
       const text = diffs.text
       const dropped = diffs.dropped + listed.dropped
@@ -323,14 +329,14 @@ const outsidePlace = (view: WorkspaceView, location: EditorLocation) => {
 }
 
 /** The position of `symbol` in `file`, for asking the language server. */
-const symbolAt = async (view: WorkspaceView, file: string | undefined, symbol: string | undefined, line?: string) => {
+const symbolAt = async (view: WorkspaceView, file: string | undefined, symbol: string | undefined, line?: number) => {
   if (!file) throw new ToolInputError("A path is needed.")
   const wanted = symbol?.trim()
   if (!wanted) throw new ToolInputError("A symbol name is needed.")
   const absolute = view.resolve(file, "file")
   const text = await view.text(absolute)
   if (text === undefined) throw new ToolInputError(`${view.relative(absolute)} is binary or too large.`)
-  const at = locateSymbol(text.replace(/\r\n/g, "\n"), wanted, line ? Number.parseInt(line, 10) || undefined : undefined)
+  const at = locateSymbol(text.replace(/\r\n/g, "\n"), wanted, line && line > 0 ? line : undefined)
   if (!at) throw new ToolInputError(`${wanted} does not appear in ${view.relative(absolute)}.`)
   return { absolute, rel: view.relative(absolute), wanted, ...at }
 }
@@ -347,7 +353,9 @@ export const diagnostics = (view: WorkspaceView, editor: EditorSink): Tool => ({
     "The errors and warnings the editor's language servers report for a file. Without a path: for every file the editor has checked, which is usually the open ones.",
   guidance: "After editing, call diagnostics on the files you changed to catch errors before you finish.",
   parameters: [{ name: "path", description: "A file; everything the editor has checked when left out.", optional: true }],
-  async run({ path: file }) {
+  async run(raw) {
+      const a = argumentReader("diagnostics", raw)
+      const file = a.text("path")
     const absolute = file ? view.resolve(file, "file") : undefined
     const found = (await editor.diagnostics(absolute)).filter(
       (d) => d.severity !== "info" && view.visible(d.file)
@@ -371,7 +379,11 @@ export const findReferences = (view: WorkspaceView, editor: EditorSink): Tool =>
   readOnly: true,
   description: "Every place a function, class, variable or type is used, from the language server; exact, unlike grep.",
   parameters: SYMBOL_PARAMETERS,
-  async run({ path: file, symbol, line }) {
+  async run(raw) {
+    const a = argumentReader("find_references", raw)
+    const file = a.text("path")
+    const symbol = a.text("symbol")
+    const line = a.line("line")
     const at = await symbolAt(view, file, symbol, line)
     const { lines, inside, outside } = await locatedLines(view, await editor.references(at.absolute, at.line, at.character))
     if (outside.length) lines.push(`… and ${plural(outside.length, "place")} outside the workspace or in ignored files`)
@@ -387,7 +399,11 @@ export const goToDefinition = (view: WorkspaceView, editor: EditorSink): Tool =>
   readOnly: true,
   description: "Where the symbol used at a place is defined, from the language server; follows imports.",
   parameters: SYMBOL_PARAMETERS,
-  async run({ path: file, symbol, line }) {
+  async run(raw) {
+    const a = argumentReader("go_to_definition", raw)
+    const file = a.text("path")
+    const symbol = a.text("symbol")
+    const line = a.line("line")
     const at = await symbolAt(view, file, symbol, line)
     const { lines, inside, outside } = await locatedLines(view, await editor.definition(at.absolute, at.line, at.character))
     // A library's definition is worth knowing about even though it cannot be opened.
@@ -405,7 +421,12 @@ export const renameSymbol = (view: WorkspaceView, editor: EditorSink, access?: A
   name: "rename_symbol",
   description: "Rename a function, class, variable or type everywhere it is used, through the language server. Better than editing each use.",
   parameters: [...SYMBOL_PARAMETERS.slice(0, 2), { name: "new_name", description: "The new name." }, SYMBOL_PARAMETERS[2]],
-  async run({ path: file, symbol, new_name, line }, context) {
+  async run(raw, context) {
+    const a = argumentReader("rename_symbol", raw)
+    const file = a.text("path")
+    const symbol = a.text("symbol")
+    const new_name = a.text("new_name")
+    const line = a.line("line")
     const newName = new_name?.trim()
     if (!newName) throw new ToolInputError("rename_symbol needs new_name.")
     const at = await symbolAt(view, file, symbol, line)
@@ -466,7 +487,9 @@ export const deleteFile = (view: WorkspaceView, ops: FileOpsSink): Tool => ({
   name: "delete_file",
   description: "Delete a file in the workspace.",
   parameters: [{ name: "path", description: "The file to delete." }],
-  async run({ path: file }, context) {
+  async run(raw, context) {
+    const a = argumentReader("delete_file", raw)
+    const file = a.text("path")
     if (!file) throw new ToolInputError("delete_file needs a path.")
     const absolute = view.resolve(file, "file")
     const rel = view.relative(absolute)
@@ -486,7 +509,10 @@ export const moveFile = (view: WorkspaceView, ops: FileOpsSink): Tool => ({
     { name: "from", description: "The file now." },
     { name: "to", description: "Where it goes; must not exist yet." }
   ],
-  async run({ from, to }, context) {
+  async run(raw, context) {
+    const a = argumentReader("move_file", raw)
+    const from = a.text("from")
+    const to = a.text("to")
     if (!from || !to) throw new ToolInputError("move_file needs from and to.")
     const source = view.resolve(from, "file")
     const target = view.resolveNew(to)

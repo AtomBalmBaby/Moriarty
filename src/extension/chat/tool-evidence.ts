@@ -65,7 +65,7 @@ export const toolObservationInput = (
     output: rawOutput,
     failed: evidence.failed,
     integrity: result.integrity,
-    origin: recorder.sourceOrigin?.(call.args.path ?? "")
+    origin: recorder.sourceOrigin?.(typeof call.args.path === "string" ? call.args.path : "")
   })
   return {
     toolName: call.name,

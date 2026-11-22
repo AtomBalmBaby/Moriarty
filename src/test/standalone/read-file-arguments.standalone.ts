@@ -317,10 +317,10 @@ test("full_file with a range keeps the whole-file limit and the full-file overri
   assert.equal(source.contentHash, await contentHash(LONG))
 })
 
-test("full_line stays accepted but is not advertised, and full_file is advertised as an optional boolean", async () => {
+test("full_line stays accepted but is not advertised, and full_file plus expected_hash are advertised", async () => {
   const tools = workspace()
   const schema = tools.tools.find((tool) => tool.name === "read_file")
-  assert.deepEqual(schema?.parameters.map((parameter) => parameter.name), ["path", "full_file", "start_line", "end_line", "start_char", "end_char"])
+  assert.deepEqual(schema?.parameters.map((parameter) => parameter.name), ["path", "full_file", "start_line", "end_line", "start_char", "end_char", "expected_hash"])
   const fullFile = schema?.parameters.find((parameter) => parameter.name === "full_file")
   assert.equal(fullFile?.type, "boolean")
   assert.equal(fullFile?.optional, true)

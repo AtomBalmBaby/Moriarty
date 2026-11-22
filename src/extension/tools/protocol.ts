@@ -16,10 +16,12 @@
  * those tags as special tokens leaves bare JSON at the end of the reply,
  * which is read as a call when it has both a name and arguments.
  */
+import type { ToolArguments } from "./arguments"
 
 export interface ToolCall {
   name: string
-  args: Record<string, string>
+  /** The call's arguments, with the JSON types the model sent them with. */
+  args: ToolArguments
 }
 
 /** Where a call sits in the reply, and what it said or why it could not be read. */
@@ -86,7 +88,13 @@ export const displayableLength = (text: string): number => {
   return text.length
 }
 
-const asArgs = (value: unknown): Record<string, string> | undefined => {
+/**
+ * The arguments of a call, kept as the values the model sent them with: text
+ * stays text, a number stays a number, a boolean stays a boolean, an array or
+ * object keeps its shape. A string that is JSON is read as JSON; nothing is
+ * flattened into text and no field is dropped on the way to a handler.
+ */
+const asArgs = (value: unknown): ToolArguments | undefined => {
   if (typeof value === "string") {
     try {
       return asArgs(JSON.parse(value))
@@ -95,11 +103,7 @@ const asArgs = (value: unknown): Record<string, string> | undefined => {
     }
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined && v !== null)
-      .map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)])
-  )
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>))
 }
 
 /** A comma-separated argument list, split where the commas are not inside quotes or brackets. */
@@ -164,7 +168,7 @@ const parseCallSyntax = (body: string): ToolCall | undefined => {
   }
   const call = text.match(/^([A-Za-z_][\w.-]*)\s*\(([\s\S]*)\)$/)
   if (!call) return undefined
-  const args: Record<string, string> = {}
+  const args: ToolArguments = {}
   splitArguments(call[2]).forEach((part, index) => {
     const named = part.match(/^([A-Za-z_]\w*)\s*=\s*([\s\S]+)$/)
     if (named) args[named[1]] = literalValue(named[2])
@@ -281,7 +285,7 @@ const outcome = (parsed: ToolCall | { error: string; detail?: string }): Pick<Fo
 const parseFunctionCall = (body: string): ToolCall | { error: string } => {
   const name = body.match(/<function=([\w.-]+)>/)?.[1]
   if (!name) return { error: "the call had no function name" }
-  const args: Record<string, string> = {}
+  const args: ToolArguments = {}
   for (const match of body.matchAll(/<parameter=([\w.-]+)>\n?([\s\S]*?)\n?<\/parameter>/g)) {
     args[match[1]] = match[2]
   }
@@ -368,7 +372,7 @@ export interface ToolParameter {
   name: string
   description: string
   optional?: boolean
-  type?: "string" | "integer" | "boolean"
+  type?: "string" | "integer" | "boolean" | "array" | "object"
 }
 
 export interface ToolSpec {
@@ -389,6 +393,11 @@ export interface ToolSpec {
    * `parameters` still names them for the text protocol.
    */
   schema?: Record<string, unknown>
+  /**
+   * Whether the tool can be pointed at a file by its content fingerprint
+   * alone, when that fingerprint names exactly one current file it may use.
+   */
+  hashAddressable?: boolean
 }
 
 /**

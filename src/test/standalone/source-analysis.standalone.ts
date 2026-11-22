@@ -23,10 +23,12 @@ const declarationsNamed = (analysis: SourceAnalysis, name: string) => analysis.d
 
 test("the native todo update tool is located by its exact registered name, and no camelCase implementation is declared", () => {
   const file = "src/extension/tools/todos.ts"
-  const analysis = analysed(file, fs.readFileSync(path.join(process.cwd(), file), "utf8"))
+  const text = fs.readFileSync(path.join(process.cwd(), file), "utf8")
+  const analysis = analysed(file, text)
   const tool = registrationOf(analysis, "twinny_todo_update")
-  assert.equal(tool.nameLine, 301)
-  assert.ok(tool.startLine <= 301 && tool.endLine > 301, JSON.stringify(tool))
+  const nameLine = text.split("\n").findIndex((line) => line.includes("name: \"twinny_todo_update\"")) + 1
+  assert.equal(tool.nameLine, nameLine)
+  assert.ok(tool.startLine <= nameLine && tool.endLine > nameLine, JSON.stringify(tool))
   assert.equal(declarationsNamed(analysis, "twinnyTodoUpdate").length, 0)
   assert.ok(analysis.registrations.every((registration) => registration.toolName !== "twinnyTodoUpdate"))
 })

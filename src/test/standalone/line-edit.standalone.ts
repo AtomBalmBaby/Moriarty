@@ -27,24 +27,26 @@ const fixture = (initial: string) => {
   roots.push(root)
   let text = initial
   let transactions = 0
+  const saved: boolean[] = []
   const sink: EditSink = {
     mode: "apply",
     read: async () => text,
     edit: async () => ({ ok: true, message: "legacy" }),
     create: async () => ({ ok: true, message: "created" }),
-    async editLines(_file, request) {
+    async editLines(_file, request, save) {
       const patches = await planLineEdits(text, request)
       await Promise.resolve()
       text = patchedText(text, patches)
       transactions++
-      return { ok: true, message: "applied", contentHash: await contentHash(text), persisted: true }
+      saved.push(save)
+      return { ok: true, message: "applied", contentHash: await contentHash(text), persisted: save }
     }
   }
   const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
   const edit = (edits: unknown, expected_hash = hash(text), file = "panel.tsx") => tools.run({
     name: "edit_lines", args: { path: file, expected_hash, edits: JSON.stringify(edits) }
   })
-  return { tools, root, sink, edit, text: () => text, change: (value: string) => { text = value }, transactions: () => transactions }
+  return { tools, root, sink, edit, text: () => text, change: (value: string) => { text = value }, transactions: () => transactions, saves: () => saved }
 }
 
 test("read_file hashes the entire authoritative dirty document, not its range or disk copy", async () => {
@@ -139,6 +141,46 @@ test("outdated hashes reject atomically and return the current hash", async () =
   assert.equal(JSON.parse(result.output).error.current_hash, await contentHash("dirty buffer\n"))
   assert.equal(f.text(), "dirty buffer\n")
   assert.equal(f.transactions(), 0)
+})
+
+test("native JSON scalars and arrays keep their types through edit_lines dispatch", async () => {
+  const f = fixture("a\nb\n")
+  const hashValue = await contentHash(f.text())
+  const result = await f.tools.run({
+    name: "edit_lines",
+    args: {
+      path: "panel.tsx",
+      expected_hash: hashValue,
+      save: false,
+      edits: [{ operation: "replace", start_line: 2, end_line: 2, content: ["B"] }]
+    }
+  })
+  assert.equal(result.failed, undefined, result.output)
+  assert.equal(f.text(), "a\nB\n")
+  assert.deepEqual(f.saves(), [false])
+
+  const read = await f.tools.run({ name: "read_file", args: { path: "panel.tsx", start_line: 2, end_line: 2, full_line: true } })
+  assert.equal(read.failed, undefined, read.output)
+  assert.match(read.output, /^panel\.tsx \(full line 2\)\n/)
+})
+
+test("explicit null is refused instead of guessed as false or absent", async () => {
+  const f = fixture("a\n")
+  const hashValue = await contentHash(f.text())
+  const saveNull = await f.tools.run({
+    name: "edit_lines",
+    args: { path: "panel.tsx", expected_hash: hashValue, save: null, edits: [{ operation: "delete", start_line: 1, end_line: 1 }] }
+  })
+  assert.equal(saveNull.failed, true)
+  assert.equal(JSON.parse(saveNull.output).error.code, "invalid_argument_type")
+  assert.equal(f.transactions(), 0)
+
+  const editsNull = await f.tools.run({
+    name: "edit_lines",
+    args: { path: "panel.tsx", expected_hash: hashValue, edits: null }
+  })
+  assert.equal(editsNull.failed, true)
+  assert.equal(JSON.parse(editsNull.output).error.code, "invalid_argument_type")
 })
 
 test("native schema, text dispatch, inventory and explicit tool selection expose edit_lines", async () => {

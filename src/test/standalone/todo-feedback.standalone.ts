@@ -5881,7 +5881,10 @@ test("edit digests normalize line endings and distinguish content", () => {
 const TODOS_FILE = "src/extension/tools/todos.ts"
 const todosText = fs.readFileSync(path.join(process.cwd(), TODOS_FILE), "utf8")
 const todosReader: CurrentSourceReader = async (file) => (file === TODOS_FILE ? todosText : undefined)
-const REGISTRATION_LINES = [262, 272] as const
+const todoUpdateNameLine = todosText.split("\n").findIndex((line) => line.includes("name: \"twinny_todo_update\"")) + 1
+const TODO_UPDATE_REGISTRATION_LINES = [todoUpdateNameLine - 1, todoUpdateNameLine + 26] as const
+const TODO_UPDATE_SPAN_LINES = [todoUpdateNameLine - 1, todoUpdateNameLine + 79] as const
+const REGISTRATION_LINES = TODO_UPDATE_REGISTRATION_LINES
 const WHOLE_TODOS_LINES = [1, todosText.split("\n").length - 1] as const
 
 /** Records a read_file observation of a repository file, fingerprinting the whole text it read as the host does. */
@@ -5942,7 +5945,7 @@ test("a registered tool's registration is accepted from the registration lines a
   const state = await evidenceFixture(todoIdentity("registration", "twinny_todo_update", "registered_tool"))
   try {
     const item = await startInvestigation(state)
-    const read = await observeSourceWindow(state, item.id, "read-registration-line", TODOS_FILE, todosText, 291, 307)
+    const read = await observeSourceWindow(state, item.id, "read-registration-line", TODOS_FILE, todosText, ...TODO_UPDATE_REGISTRATION_LINES)
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, todosReader)
     assert.equal(reconciliation.outcome, "proven", JSON.stringify(reconciliation))
@@ -5956,7 +5959,7 @@ test("an inline registered-tool implementation is proven without naming a declar
   const state = await evidenceFixture(todoLocation("implementation", "twinny_todo_update"))
   try {
     const item = await startInvestigation(state)
-    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, 291, 376)
+    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, ...TODO_UPDATE_SPAN_LINES)
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, todosReader)
     assert.equal(reconciliation.outcome, "proven", JSON.stringify(reconciliation))
@@ -5970,7 +5973,7 @@ test("a truncated registration read cannot prove the inline implementation, and 
   const state = await evidenceFixture(todoLocation("implementation", "twinny_todo_update"))
   try {
     const item = await startInvestigation(state)
-    await observeSourceWindow(state, item.id, "read-registration-only", TODOS_FILE, todosText, 291, 307)
+    await observeSourceWindow(state, item.id, "read-registration-only", TODOS_FILE, todosText, ...TODO_UPDATE_REGISTRATION_LINES)
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, todosReader)
     assert.notEqual(reconciliation.outcome, "proven", JSON.stringify(reconciliation))
@@ -5987,7 +5990,7 @@ test("a stale read cannot prove the implementation once the file has changed", a
   const state = await evidenceFixture(todoLocation("implementation", "twinny_todo_update"))
   try {
     const item = await startInvestigation(state)
-    await observeSourceWindow(state, item.id, "read-before-edit", TODOS_FILE, todosText, 291, 372)
+    await observeSourceWindow(state, item.id, "read-before-edit", TODOS_FILE, todosText, ...TODO_UPDATE_SPAN_LINES)
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, currentReader)
     assert.notEqual(reconciliation.outcome, "proven", JSON.stringify(reconciliation))
@@ -6017,7 +6020,7 @@ test("an implementation_symbol naming a registered tool says exactly which crite
   const state = await evidenceFixture(todoIdentity("declaration", "twinny_todo_update", "implementation_symbol"))
   try {
     const item = await startInvestigation(state)
-    await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, 291, 372)
+    await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, ...TODO_UPDATE_SPAN_LINES)
     const review = await reviewFor(state, item.id)
     const [reconciliation] = await reviewReconciliations(review, todosReader)
     assert.equal(reconciliation.failureReason, "invalid_identity", JSON.stringify(reconciliation))
@@ -6035,7 +6038,7 @@ test("one retained read of the registration span proves every criterion that it 
   }])
   try {
     const item = await startInvestigation(state)
-    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, 291, 376)
+    const read = await observeSourceWindow(state, item.id, "read-registration-span", TODOS_FILE, todosText, ...TODO_UPDATE_SPAN_LINES)
     const review = await reviewFor(state, item.id)
     const reconciliations = await reviewReconciliations(review, todosReader)
     for (const criterionId of ["registration", "implementation"]) {

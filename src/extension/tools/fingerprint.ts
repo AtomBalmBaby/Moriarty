@@ -41,8 +41,11 @@ export const fingerprintContent = async (
 
 export const verifyContentFingerprint = async (text: string, fingerprint: string): Promise<boolean> => {
   const separator = fingerprint.indexOf(":")
-  const algorithm = separator < 0 ? "sha256" : fingerprint.slice(0, separator)
-  const digest = separator < 0 ? fingerprint : fingerprint.slice(separator + 1)
+  const bare = separator < 0 ? fingerprint.trim().toLowerCase() : undefined
+  const algorithm = separator < 0
+    ? bare?.length === 16 ? "xxh64" : bare?.length === 32 ? "xxh3_128" : "sha256"
+    : fingerprint.slice(0, separator).toLowerCase()
+  const digest = separator < 0 ? bare ?? "" : fingerprint.slice(separator + 1)
   if (algorithm !== "xxh64" && algorithm !== "xxh3_128" && algorithm !== "sha256") {
     throw new Error(`Unsupported content fingerprint algorithm: ${algorithm}`)
   }

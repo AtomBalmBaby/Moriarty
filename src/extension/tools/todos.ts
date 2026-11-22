@@ -4,6 +4,7 @@ import { TodoRepository } from "../todos/repository"
 import { aggregateValidity } from "../todos/source-validity"
 import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
 
+import { argumentReader, textArgument, type ToolArguments } from "./arguments"
 import { Tool, ToolContext, ToolResult } from "./workspace"
 
 export interface TodoToolOptions {
@@ -92,9 +93,8 @@ const EVIDENCE_LOOKUP_LIMIT = 20
 /** A candidate is a proposal, never a verdict: the model confirms one by reading it, and the fact keeps its recorded path. */
 const MOVED_FILE_HINT = "if the file moved, read a candidate to confirm; this fact keeps its original path as history"
 
-
-const requestId = (args: Record<string, string>) => {
-  const value = args.request_id?.trim()
+const requestId = (args: ToolArguments) => {
+  const value = textArgument("native TODO tool", "request_id", args)?.trim()
   if (!value) throw new Error("request_id is required; generate a non-empty unique ID and reuse it only when retrying this exact mutation")
   return value
 }
@@ -136,8 +136,9 @@ export const todoTools = (
     readOnly: true,
     async run(args) {
       try {
-        const includeCompleted = args.include_completed === "true"
-        const other = args.conversation_id?.trim()
+        const a = argumentReader("twinny_todo_list", args)
+        const includeCompleted = a.flag("include_completed")
+        const other = a.text("conversation_id")?.trim()
         if (other && other !== scope.conversationId) {
           const snapshot = await repository.readList({ ...scope, conversationId: other, includeCompleted })
           if (!snapshot) throw new Error("No TODO list exists for that conversation in this project")
@@ -156,8 +157,10 @@ export const todoTools = (
     readOnly: true,
     async run(args) {
       try {
-        if (!args.item_id) throw new Error("item_id is required")
-        return result(await repository.getItem(scope, args.item_id), "read a native TODO")
+        const a = argumentReader("twinny_todo_get", args)
+        const itemId = a.text("item_id")
+        if (!itemId) throw new Error("item_id is required")
+        return result(await repository.getItem(scope, itemId), "read a native TODO")
       } catch (error) {
         return errorResult(error)
       }
@@ -174,8 +177,9 @@ export const todoTools = (
     readOnly: true,
     async run(args) {
       try {
-        const symbol = args.symbol?.trim() || undefined
-        const path = args.path?.trim() || undefined
+        const a = argumentReader("twinny_evidence_lookup", args)
+        const symbol = a.text("symbol")?.trim() || undefined
+        const path = a.text("path")?.trim() || undefined
         if (!symbol && !path) throw new Error("symbol or path is required")
         const facts = (await repository.listAcceptedEvidence(scope, { symbol, path })).slice(0, EVIDENCE_LOOKUP_LIMIT)
         const statuses = await assessAcceptedFacts(facts, options.readCurrentSource)
@@ -243,14 +247,19 @@ export const todoTools = (
     },
     async run(args, context?: ToolContext) {
       try {
-        const priority = args.priority as TodoPriority | undefined
+        const a = argumentReader("twinny_todo_create", args)
+        const title = a.text("title")
+        if (!title) throw new Error("title is required")
+        const details = a.text("details")
+        const reason = a.text("reason")
+        const priority = a.text("priority") as TodoPriority | undefined
         if (priority && !priorities.has(priority)) throw new Error("Invalid priority")
         const key = requestId(args)
-        const parentId = args.todo_parent_id?.trim() || undefined
+        const parentId = a.text("todo_parent_id")?.trim() || undefined
         if (!(await repository.hasAuthoritativePlan(scope)) || options.isUserAuthorized?.()) {
           const outcome = await repository.createItemOutcome(scope, {
-            title: args.title,
-            details: args.details,
+            title,
+            details,
             parentId,
             priority
           }, key)
@@ -269,16 +278,16 @@ export const todoTools = (
           }, outcome.reused ? "matched an existing native TODO" : "created a native TODO")
         }
         if (parentId) await repository.childTodoContext(scope, parentId)
-        const existing = await repository.existingTaskFor(scope, args.title, parentId)
+        const existing = await repository.existingTaskFor(scope, title, parentId)
         if (existing) return existingTaskResult(existing)
         if (!parentId) throw new Error("todo_parent_id is required: under the authoritative plan, add work only beneath an existing plan TODO")
-        if (!args.details?.trim()) throw new Error("details is required when an authoritative plan exists")
-        if (!args.reason?.trim()) throw new Error("reason is required when an authoritative plan exists")
+        if (!details?.trim()) throw new Error("details is required when an authoritative plan exists")
+        if (!reason?.trim()) throw new Error("reason is required when an authoritative plan exists")
         const proposal: ChildTodoProposal = {
           parentId,
-          title: args.title.trim(),
-          details: args.details.trim(),
-          reason: args.reason.trim(),
+          title: title!.trim(),
+          details: details!.trim(),
+          reason: reason!.trim(),
           priority: priority ?? "normal",
           requestId: key
         }
@@ -327,22 +336,26 @@ export const todoTools = (
     },
     async run(args) {
       try {
-        const expectedVersion = Number(args.expected_version)
-        if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) throw new Error("expected_version must be a positive integer")
-        const status = args.status as TodoStatus | undefined
-        const priority = args.priority as TodoPriority | undefined
+        const a = argumentReader("twinny_todo_update", args)
+        const itemId = a.text("item_id")
+        if (!itemId) throw new Error("item_id is required")
+        const expectedVersion = a.number("expected_version")
+        if (expectedVersion === undefined || !Number.isSafeInteger(expectedVersion) || expectedVersion < 1) throw new Error("expected_version must be a positive integer")
+        const status = a.text("status") as TodoStatus | undefined
+        const priority = a.text("priority") as TodoPriority | undefined
         if (status && !statuses.has(status)) throw new Error("Invalid status")
         if (priority && !priorities.has(priority)) throw new Error("Invalid priority")
         const patch: Record<string, string> = {}
         for (const [source, target] of [["title", "title"], ["details", "details"], ["status", "status"], ["priority", "priority"], ["blocked_reason", "blockedReason"]]) {
-          if (args[source] !== undefined) patch[target] = args[source]
+          const value = a.text(source)
+          if (value !== undefined) patch[target] = value
         }
         if (status === "completed") {
           const others = Object.keys(patch).filter((key) => key !== "status")
           if (others.length) throw new Error(`A completion claim must not change other fields (${others.join(", ")}); update those in a separate call first`)
           // A caller that still sends evidence_from is ignored: relevance is decided by the host, not by a declared handoff.
           const claim = await repository.claimCompletion(scope, {
-            itemId: args.item_id,
+            itemId,
             expectedVersion,
             requestId: requestId(args)
           })
@@ -361,7 +374,7 @@ export const todoTools = (
           }, claim.disposition === "accepted" ? "completion claim accepted; Feedback review is pending" : "completion claim already submitted; no change")
         }
         const item = await repository.updateItem(scope, {
-          itemId: args.item_id,
+          itemId,
           expectedVersion,
           patch,
           actor: "model" as TodoActor,
@@ -404,16 +417,24 @@ export const todoTools = (
     },
     async run(args) {
       try {
-        if (args.accepted_fact_id?.trim()) {
-          const reference = await acceptedFactReference(repository, scope, options, args.item_id, args.accepted_fact_id.trim(), requestId(args))
+        const a = argumentReader("twinny_todo_evidence", args)
+        const itemId = a.text("item_id")
+        if (!itemId) throw new Error("item_id is required")
+        const factId = a.text("accepted_fact_id")?.trim()
+        if (factId) {
+          const reference = await acceptedFactReference(repository, scope, options, itemId, factId, requestId(args))
           onChanged()
           return result(reference, "recorded a host-verified accepted fact as native TODO evidence")
         }
+        const kind = a.text("kind")
+        const summary = a.text("summary")
+        const value = a.text("result")
+        if (!kind || !summary || !value) throw new Error("item_id, kind, summary and result are required")
         const evidence = await repository.addEvidence(scope, {
-          itemId: args.item_id,
-          kind: args.kind,
-          summary: args.summary,
-          result: evidenceResult(args.result),
+          itemId,
+          kind,
+          summary,
+          result: evidenceResult(value),
           requestId: requestId(args)
         })
         onChanged()
