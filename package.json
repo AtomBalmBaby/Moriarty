@@ -1389,7 +1389,6 @@
     "react-virtuoso": "^4.12.3",
     "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.0",
-    "sqlite3": "^5.1.7",
     "tippy.js": "^6.3.7",
     "tiptap-markdown": "^0.8.10",
     "toxe": "^1.1.0",

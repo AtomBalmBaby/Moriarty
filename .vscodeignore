@@ -41,7 +41,6 @@ out/test/**
 !node_modules/bare-events/**
 !node_modules/events-universal/**
 
-!node_modules/sqlite3/**
 !node_modules/better-sqlite3/lib/**
 !node_modules/better-sqlite3/prebuilds/**
 !node_modules/better-sqlite3/package.json
