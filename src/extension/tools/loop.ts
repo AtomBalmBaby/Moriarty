@@ -19,6 +19,7 @@
 import { API_PROVIDERS, ASSISTANT, DEFAULT_AGENT_STEPS, OPEN_AI_COMPATIBLE_PROVIDERS, SYSTEM, USER } from "../../common/constants"
 import { logger } from "../../common/logger"
 import { HOSTED_PROVIDERS } from "../../common/provider-validation"
+import type { ToolResultIntegrity } from "../../common/types"
 import { diagnosticEvent } from "../diagnostics"
 import {
   ChatChunk,
@@ -35,7 +36,7 @@ import { hostedTakesTools } from "../inference/adapters/fluency"
 import { isRetryableProviderFailure } from "../inference/errors"
 import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 
-import { ContextCapacity, ContextDiagnostics, ContextPlan, fitResult, planContext, TokenEstimator, trimmedResult } from "./budget"
+import { ContextCapacity, ContextDiagnostics, ContextPlan, fitFileResult, fitResult, planContext, stripResultIntegrity, TokenEstimator, trimmedResult, withResultIntegrity } from "./budget"
 import { buildBreakdown, FullRequestPayload, RequestBreakdown, RowChars } from "./context-breakdown"
 import { logToolFailure } from "./failure-log"
 import { instructionsSection } from "./instructions"
@@ -196,6 +197,8 @@ export interface ToolStep {
   summary: string
   /** What the model was given back. */
   output: string
+  /** Structured completeness and provenance for the model-visible output. */
+  integrity?: ToolResultIntegrity
   /** The tool refused or the call went wrong (a bad path, a failing command). */
   failed?: boolean
   /** Characters of conversation sent for the request that asked for this call. */
@@ -546,6 +549,8 @@ export interface ResultBudget {
   remainingTokens?: number
   /** Whether the result's text is in the next request, rather than a notice in its place. */
   retained?: boolean
+  /** Structured delivery state after this budget decision. */
+  integrity?: ToolResultIntegrity
 }
 
 export const describeResultBudget = (entry: ResultBudget) =>
@@ -555,7 +560,8 @@ export const describeResultBudget = (entry: ResultBudget) =>
     entry.serialized === undefined ? undefined : `serialized ${entry.serialized}`,
     `budgeted ${entry.budgeted}`,
     entry.remainingTokens === undefined ? undefined : `remaining ${entry.remainingTokens} tokens`,
-    entry.retained === undefined ? undefined : entry.retained ? "retained in next request" : "not retained"
+    entry.retained === undefined ? undefined : entry.retained ? "retained in next request" : "not retained",
+    entry.integrity === undefined ? undefined : `delivery ${entry.integrity.status}`
   ]
     .filter(Boolean)
     .join(" · ")
@@ -566,6 +572,9 @@ interface ResultSlot {
   message: number
   step: number
   name: string
+  integrity?: ToolResultIntegrity
+  rawIntegrity?: ToolResultIntegrity
+  rawOutput?: string
   trimmed: boolean
   /** Left out of the conversation for lack of room, with a notice in its place. */
   omitted?: boolean
@@ -742,7 +751,7 @@ class ToolLoop {
       const limitsBeforeRequest = this._options.generationLimits?.() ?? NO_GENERATION_LIMITS
       const configuredOutputBeforeRequest = limitsBeforeRequest.maxOutputTokens > 0 ? limitsBeforeRequest.maxOutputTokens : undefined
       const maxOutputTokensBeforeRequest = configuredOutputBeforeRequest && this._plan
-        ? Math.min(configuredOutputBeforeRequest, Math.max(1, this._plan.reserved))
+        ? Math.min(configuredOutputBeforeRequest, Math.max(1, this._plan.effectiveOutputTokens))
         : configuredOutputBeforeRequest
       const requestId = `${operationId}-request-${++requestSequence}`
       diagnosticEvent("prompts", "provider.request.effective", {
@@ -774,7 +783,7 @@ class ToolLoop {
       const configuredOutput = limits.maxOutputTokens > 0 ? limits.maxOutputTokens : undefined
       // The reply may not take more than the plan kept room for; the window cannot hold more.
       const maxOutputTokens = configuredOutput && this._plan
-        ? Math.min(configuredOutput, Math.max(1, this._plan.reserved))
+        ? Math.min(configuredOutput, Math.max(1, this._plan.effectiveOutputTokens))
         : configuredOutput
       const reply = { text: "", shown: 0, toolCalls: undefined as ChatToolCall[] | undefined, reasoning: "" }
       let found: FoundCall | undefined
@@ -1103,7 +1112,6 @@ class ToolLoop {
                 summary: `${repeated.summary} · repeated, not run again`
               }
             : await this.runCall(pending.call, outer, { operationId, requestId, step: step + 1 })
-        if (pending.call && !repeated) await this._options.onToolResult?.(pending.call, ran)
         // A read that failed (a search that ran out of time, a language
         // server still starting) is worth trying again, so it is not kept.
         keys.push(repeated || ran.failed ? undefined : key)
@@ -1118,11 +1126,45 @@ class ToolLoop {
         const room = this._plan
           ? Math.max(MIN_RESULT_CHARS, Math.floor(this._plan.resultChars / calls.length) - (preface?.length ?? 0))
           : undefined
-        const fitted = room ? fitResult(ran.output, room) : ran.output
+        let fitted: { output: string; integrity?: ToolResultIntegrity } = {
+          output: ran.output,
+          integrity: ran.integrity ?? {
+            status: "complete",
+            rawChars: ran.output.length,
+            deliveredChars: ran.output.length
+          }
+        }
+        if (room) {
+          if (ran.integrity?.source?.kind === "file") {
+            fitted = fitFileResult(ran.output, room, ran.integrity)
+          } else if (ran.output.length > room) {
+            const integrity: ToolResultIntegrity = {
+              ...(ran.integrity ?? { status: "complete" }),
+              status: "partial",
+              truncation: {
+                stage: "per_result_cap",
+                reason: "per-result character budget",
+                omittedChars: ran.output.length - room
+              },
+              rawChars: ran.output.length,
+              deliveredChars: room
+            }
+            fitted = { output: withResultIntegrity(fitResult(ran.output, room), integrity), integrity }
+          }
+        }
         const result: ToolResult = {
           ...ran,
-          output: fitted + note || "(no output)"
+          output: `${fitted.output}${note}`.trim() || "(no output)",
+          integrity: fitted.integrity,
+          rawOutput: ran.rawOutput ?? ran.output,
+          rawIntegrity: ran.integrity,
+          summary: fitted.integrity?.status === "partial" && fitted.integrity.source?.kind === "file"
+            ? fitted.integrity.delivered
+              ? `read file · partial · lines ${fitted.integrity.delivered.startLine}–${fitted.integrity.delivered.endLine} of ${fitted.integrity.delivered.totalLines}`
+              : `read file · partial · line ${fitted.integrity.truncation?.nextStartLine ?? fitted.integrity.selected?.startLine ?? 1} exceeds budget`
+            : ran.summary
         }
+        if (pending.call && !repeated) await this._options.onToolResult?.(pending.call, result)
         if (ran.failed) {
           logToolFailure({
             name,
@@ -1143,7 +1185,8 @@ class ToolLoop {
           original: ran.output.length,
           serialized: result.output.length,
           budgeted: result.output.length,
-          reason: fitted.length < ran.output.length ? "per-result cap" : "kept whole"
+          reason: fitted.output.length < ran.output.length ? "per-result cap" : "kept whole",
+          integrity: result.integrity
         })
 
         // A folder's instructions go ahead of the output, where a cut to
@@ -1160,7 +1203,7 @@ class ToolLoop {
           durationMs: Date.now() - startedAt,
           rawResult: ran,
           modelVisibleResult: sent.output,
-          transformation: fitted.length < ran.output.length ? "per-result-cap" : preface ? "preface-added" : "none",
+          transformation: fitted.output.length < ran.output.length ? "per-result-cap" : preface ? "preface-added" : "none",
           failed: !!sent.failed,
           summary: sent.summary,
           continuationDecision: settled ? "settled" : this._stuck ? "stuck" : "continue"
@@ -1178,6 +1221,7 @@ class ToolLoop {
           parseError: pending.error,
           summary: result.summary,
           output: result.output,
+          integrity: result.integrity,
           failed: result.failed,
           promptChars
         })
@@ -1344,7 +1388,8 @@ class ToolLoop {
         budgeted: textOf(message?.content).length,
         reason: changed.get(slot) ?? (slot.omitted ? "omitted: no room" : "kept whole"),
         remainingTokens: plan.limit - estimate(),
-        retained: !slot.omitted
+        retained: !slot.omitted,
+        integrity: slot.integrity
       })
     }
     const used = estimate()
@@ -1363,6 +1408,8 @@ class ToolLoop {
       olderResults.results ? `${olderResults.results} older result(s) trimmed` : undefined,
       cut ? `${cut} fresh result(s) cut` : undefined,
       omitted ? `${omitted} fresh result(s) omitted` : undefined,
+      plan.outputCapped ? `configured output maximum ${plan.configuredOutputTokens} capped to ${plan.effectiveOutputTokens}` : undefined,
+      plan.limit < 512 ? "prompt capacity below 512 tokens; increase context window or reduce output maximum" : undefined,
       exhausted ? "still over budget after trimming" : undefined
     ].filter((reason): reason is string => reason !== undefined)
     this._options.onContext?.({
@@ -1383,7 +1430,10 @@ class ToolLoop {
       fresh: { total: freshSlots.length, retained: freshSlots.length - omitted, cut, omitted },
       removed: { olderResults, freshResults },
       reason: reasons.length ? reasons.join("; ") : "none",
-      exhausted
+      exhausted,
+      configuredOutputTokens: plan.configuredOutputTokens,
+      effectiveOutputTokens: plan.effectiveOutputTokens,
+      outputCapped: plan.outputCapped
     })
   }
 
@@ -1397,13 +1447,15 @@ class ToolLoop {
     const body = message.role === "tool" ? text : text.replace(/^<tool_result[^>]*>\n/, "").replace(/\n<\/tool_result>$/, "")
     // Instructions hold for the whole reply, so they outlast the output they came with.
     const preface = slot.preface && body.startsWith(slot.preface) ? slot.preface : ""
-    return { message, after, preface, output: preface ? body.slice(preface.length).trimStart() : body }
+    const output = preface ? body.slice(preface.length).trimStart() : body
+    return { message, after, preface, output: stripResultIntegrity(output) }
   }
 
   private rewrite(slot: ResultSlot, output: string) {
     const parts = this.split(slot)
     if (!parts) return
-    const kept = parts.preface ? `${parts.preface}\n\n${output}` : output
+    const outputWithIntegrity = slot.integrity ? withResultIntegrity(output, slot.integrity) : output
+    const kept = parts.preface ? `${parts.preface}\n\n${outputWithIntegrity}` : outputWithIntegrity
     const { message, after } = parts
     this.replace(slot.message, (
       message.role === "tool" ? { ...message, content: kept } : { ...message, content: toolResultMessage(slot.name, kept) + after }
@@ -1427,7 +1479,17 @@ class ToolLoop {
 
   private trim(slot: ResultSlot) {
     const parts = this.split(slot)
-    if (parts) this.rewrite(slot, trimmedResult(parts.output))
+    if (!parts) return
+    slot.integrity = {
+      ...(slot.integrity ?? { status: "complete" }),
+      status: slot.integrity?.status === "omitted" ? "omitted" : "partial",
+      truncation: {
+        stage: "context_compaction",
+        reason: "older result trimmed",
+        omittedChars: parts.output.length
+      }
+    }
+    this.rewrite(slot, trimmedResult(parts.output))
   }
 
   /**
@@ -1441,8 +1503,26 @@ class ToolLoop {
     if (parts.output.length <= MIN_FRESH_CHARS) return "kept whole"
     const room = parts.output.length - Math.ceil(excess)
     if (room >= MIN_FRESH_CHARS) {
+      slot.integrity = {
+        ...(slot.integrity ?? { status: "complete" }),
+        status: "partial",
+        truncation: {
+          stage: "context_compaction",
+          reason: "cut to remaining context room",
+          omittedChars: Math.ceil(excess)
+        }
+      }
       this.rewrite(slot, fitResult(parts.output, room))
       return "cut to remaining room"
+    }
+    slot.integrity = {
+      ...(slot.integrity ?? { status: "complete" }),
+      status: "omitted",
+      truncation: {
+        stage: "context_compaction",
+        reason: "fresh result omitted for lack of room",
+        omittedChars: parts.output.length
+      }
     }
     this.rewrite(
       slot,
@@ -1519,11 +1599,14 @@ class ToolLoop {
     step: number,
     reasoning?: string
   ): ResultSlot[] {
-    const slot = (name: string, preface: string | undefined, id: string): ResultSlot => ({
+    const slot = (name: string, preface: string | undefined, id: string, result?: ToolResult): ResultSlot => ({
       id,
       message: this._messages.length,
       step,
       name,
+      ...(result?.integrity ? { integrity: result.integrity } : {}),
+      ...(result?.rawIntegrity ? { rawIntegrity: result.rawIntegrity } : {}),
+      ...(result?.rawOutput ? { rawOutput: result.rawOutput } : {}),
       trimmed: false,
       ...(preface ? { preface } : {})
     })
@@ -1543,7 +1626,7 @@ class ToolLoop {
       if (reasoning) assistant.reasoning = reasoning
       this.keep(assistant)
       calls.forEach(({ raw }, i) => {
-        slots.push(slot(raw!.name, results[i].preface, `${step}.${i}`))
+        slots.push(slot(raw!.name, results[i].preface, `${step}.${i}`, results[i]))
         this.keep({ role: "tool", tool_call_id: raw!.id, content: results[i].output } as ChatMessage)
       })
       this._results.push(...slots)
@@ -1552,7 +1635,7 @@ class ToolLoop {
     const name = calls[0].call?.name ?? "error"
     // A call read before its closing marker arrived is recorded closed.
     this.keep({ role: ASSISTANT, content: found?.unclosed ? `${text.trimEnd()}\n${found.unclosed}` : text })
-    slots.push(slot(name, results[0].preface, `${step}.0`))
+    slots.push(slot(name, results[0].preface, `${step}.0`, results[0]))
     this._results.push(...slots)
     this.keep({ role: USER, content: toolResultMessage(name, results[0].output) })
     return slots

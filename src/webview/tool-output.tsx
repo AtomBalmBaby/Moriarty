@@ -150,6 +150,14 @@ export const ToolOutput = ({ step }: { step: ToolStepView }) => {
           </Label>
           <Code code={slice.code} language={languageForPath(slice.path)} startLine={slice.startLine} />
           {slice.note && <div className={styles.note}>{slice.note}</div>}
+          {step.integrity?.status === "partial" && (
+            <div className={styles.note}>
+              Partial delivery
+              {step.integrity.delivered ? `: lines ${step.integrity.delivered.startLine}–${step.integrity.delivered.endLine} of ${step.integrity.delivered.totalLines}` : ""}
+              {step.integrity.truncation?.nextStartLine ? `; continue at line ${step.integrity.truncation.nextStartLine}` : ""}
+              {step.integrity.truncation?.nextCharStart ? `; continue at character ${step.integrity.truncation.nextCharStart}` : ""}.
+            </div>
+          )}
         </>
       )
     }

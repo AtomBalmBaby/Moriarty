@@ -141,6 +141,55 @@ export interface ReplyChangesView {
   files: FileChangeView[]
 }
 
+export type ToolDeliveryStatus = "complete" | "partial" | "omitted"
+export type ToolTruncationStage =
+  | "source_line_limit"
+  | "per_result_cap"
+  | "context_compaction"
+  | "evidence_retention"
+  | "display"
+
+export interface ToolLineRange {
+  startLine: number
+  endLine: number
+  totalLines: number
+}
+
+export interface ToolLineFragment {
+  line: number
+  startChar: number
+  endChar: number
+  totalChars: number
+  contentHash: string
+}
+
+export interface ToolResultIntegrity {
+  status: ToolDeliveryStatus
+  requested?: {
+    kind: "whole_file" | "range" | "line" | "line_fragment" | "other"
+    range?: { startLine: number; endLine: number }
+    lineFragment?: ToolLineFragment
+  }
+  selected?: ToolLineRange
+  delivered?: ToolLineRange
+  source?: {
+    kind: "file"
+    path: string
+    contentHash: string
+    totalLines: number
+  }
+  truncation?: {
+    stage: ToolTruncationStage
+    reason: string
+    omittedChars?: number
+    omittedLines?: number
+    nextStartLine?: number
+    nextCharStart?: number
+  }
+  rawChars?: number
+  deliveredChars?: number
+}
+
 /** One tool call as the chat shows it: collapsed to a line, open to what went in and came out. */
 export interface ToolStepView {
   id: string
@@ -150,6 +199,8 @@ export interface ToolStepView {
   args?: Record<string, string>
   /** What the model was given back, kept whole up to the largest result it is given. */
   output?: string
+  /** Structured lifecycle metadata for the observation the model received. */
+  integrity?: ToolResultIntegrity
   /** Characters of the output that were cut before being kept; the full output was never stored. */
   outputOmitted?: number
   /** Characters of the arguments (all of them together) that were cut before being kept. */

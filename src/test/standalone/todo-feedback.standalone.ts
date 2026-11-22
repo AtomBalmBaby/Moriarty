@@ -1658,7 +1658,7 @@ test("a numbered read keeps its path, line range, total, and every source line",
   const preserved = preserveEvidence(output)
   assert.equal(preserved.complete, true)
   assert.equal(preserved.content, output)
-  assert.deepEqual(preserved.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText) }])
+  assert.deepEqual(preserved.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText), complete: true }])
   assert.ok(preserved.content.split("\n").includes("172:     name: \"read_file\","))
 })
 
@@ -3310,7 +3310,7 @@ test("retained evidence survives reopening the store, as it does across an autom
     const review = await reviewFor({ ...state, repository: reopened }, item.id)
     const retained = review.retainedEvidence.find((entry) => entry.observationId === observation.id)
     assert.ok(retained?.content?.includes("172:     name: \"read_file\","))
-    assert.deepEqual(retained?.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText) }])
+    assert.deepEqual(retained?.sources, [{ path: EVIDENCE_FILE, startLine: 150, endLine: 200, totalLines: 850, contentHash: await fingerprintContent(workspaceText), complete: true }])
     assert.equal(review.observations.find((entry) => entry.id === observation.id)?.evidence?.retained, true)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })

@@ -1,4 +1,4 @@
-import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, TypedCriterion } from "../../common/types"
+import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, ToolResultIntegrity, TypedCriterion } from "../../common/types"
 
 import type { EvidenceHit, EvidenceSource, ObservedSourceReference, ObservedVersion } from "./evidence"
 import type { SourceValidity, SourceValidityAssessment } from "./source-validity"
@@ -161,6 +161,10 @@ export interface TodoToolObservationInput {
   output: string
   /** Full tool output, kept for Feedback retrieval; `output` remains the bounded summary. */
   evidenceOutput?: string
+  /** Raw and model-observed completeness metadata for the same tool operation. */
+  integrity?: ToolResultIntegrity
+  /** Completeness metadata before model/context budgeting. */
+  rawIntegrity?: ToolResultIntegrity
   failed: boolean
   exitCode?: number
   requestId: string
@@ -187,6 +191,8 @@ export interface RetainedObservationEvidence {
   complete: boolean
   originalChars: number
   preservedChars: number
+  integrity?: ToolResultIntegrity
+  rawIntegrity?: ToolResultIntegrity
   content?: string
   sources: EvidenceSource[]
   hits: EvidenceHit[]

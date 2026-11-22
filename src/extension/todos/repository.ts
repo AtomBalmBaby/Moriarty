@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 
 import { logger } from "../../common/logger"
+import type { ToolResultIntegrity } from "../../common/types"
 
 import {
   displayArguments,
@@ -830,7 +831,7 @@ const retainedEvidenceFor = (
     `WHERE ${conditions.join(" AND ")} ` +
     "ORDER BY observations.list_revision, observations.created_at, observations.rowid" + (options.limit ? ` LIMIT ${options.limit}` : ""), values).map((row) => {
       const metadata = row.metadata_json
-        ? JSON.parse(row.metadata_json) as { sources: EvidenceSource[]; hits: EvidenceHit[] }
+        ? JSON.parse(row.metadata_json) as { sources: EvidenceSource[]; hits: EvidenceHit[]; integrity?: ToolResultIntegrity; rawIntegrity?: ToolResultIntegrity }
         : { sources: [], hits: [] }
       return {
         observationId: row.observation_id,
@@ -844,6 +845,8 @@ const retainedEvidenceFor = (
         complete: row.complete === 1,
         originalChars: row.original_chars ?? 0,
         preservedChars: row.preserved_chars ?? 0,
+        ...(metadata.integrity ? { integrity: metadata.integrity } : {}),
+        ...(metadata.rawIntegrity ? { rawIntegrity: metadata.rawIntegrity } : {}),
         ...(row.list_revision === null ? {} : { listRevision: row.list_revision }),
         content: withContent && row.retained === 1 ? row.content ?? undefined : undefined,
         sources: metadata.sources,
@@ -856,7 +859,9 @@ const evidenceStatus = (entry: RetainedObservationEvidence | undefined): TodoToo
   retained: entry?.retained ?? false,
   complete: entry?.complete ?? false,
   originalChars: entry?.originalChars ?? 0,
-  preservedChars: entry?.preservedChars ?? 0
+  preservedChars: entry?.preservedChars ?? 0,
+  ...(entry?.integrity ? { integrity: entry.integrity } : {}),
+  ...(entry?.rawIntegrity ? { rawIntegrity: entry.rawIntegrity } : {})
 })
 
 const enforceEvidenceBudget = (database: Database, listId: string, keepId: string, limitChars: number) => {
@@ -1389,14 +1394,17 @@ export class TodoRepository {
     if (!toolName || toolName.length > 120) throw new Error("Tool observation has an invalid tool name")
     const output = redactEvidence(input.output).slice(0, MAX_EVIDENCE_TEXT)
     const arguments_ = Object.fromEntries(Object.entries(input.arguments).map(([key, value]) => [key, redactEvidence(value)]))
-    const preserved = input.evidenceOutput === undefined ? undefined : preserveEvidence(input.evidenceOutput)
+    const preserved = input.evidenceOutput === undefined ? undefined : preserveEvidence(input.evidenceOutput, input.integrity, input.rawIntegrity)
     return this.sqlite.write((database) => {
       const list = ensureList(database, request)
       const prior = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
     "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE project_id = ? AND request_id = ?", [list.project_id, input.requestId])[0]
       if (prior) {
-        const priorEvidence = rows<{ retained: number; complete: number; original_chars: number; preserved_chars: number }>(database,
-          "SELECT retained, complete, original_chars, preserved_chars FROM todo_tool_evidence WHERE observation_id = ?", [prior.id])[0]
+        const priorEvidence = rows<{ retained: number; complete: number; original_chars: number; preserved_chars: number; metadata_json: string | null }>(database,
+          "SELECT retained, complete, original_chars, preserved_chars, metadata_json FROM todo_tool_evidence WHERE observation_id = ?", [prior.id])[0]
+        const priorMetadata = priorEvidence?.metadata_json
+          ? JSON.parse(priorEvidence.metadata_json) as { integrity?: ToolResultIntegrity; rawIntegrity?: ToolResultIntegrity }
+          : {}
         // A replayed result is checked against the source it names, as every stored reference is.
         return {
           observation: {
@@ -1408,7 +1416,9 @@ export class TodoRepository {
               retained: priorEvidence.retained === 1,
               complete: priorEvidence.complete === 1,
               originalChars: priorEvidence.original_chars,
-              preservedChars: priorEvidence.preserved_chars
+              preservedChars: priorEvidence.preserved_chars,
+              ...(priorMetadata.integrity ? { integrity: priorMetadata.integrity } : {}),
+              ...(priorMetadata.rawIntegrity ? { rawIntegrity: priorMetadata.rawIntegrity } : {})
             }
           },
           references: recordedSourceReferences(database, this.sourceRoots!, [prior.id]).get(prior.id) ?? []
@@ -1422,7 +1432,9 @@ export class TodoRepository {
         retained: retain,
         complete: preserved.complete,
         originalChars: preserved.originalChars,
-        preservedChars: preserved.preservedChars
+        preservedChars: preserved.preservedChars,
+        ...(preserved.integrity ? { integrity: preserved.integrity } : {}),
+        ...(preserved.rawIntegrity ? { rawIntegrity: preserved.rawIntegrity } : {})
       }
       const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence, executionId: input.executionId }
       const listRevision = bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
@@ -1430,7 +1442,7 @@ export class TodoRepository {
         [observation.id, list.project_id, list.id, input.itemId ?? null, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision, input.executionId ?? null])
       if (preserved) {
         execute(database, "INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits }), observation.createdAt])
+          [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits, integrity: preserved.integrity, rawIntegrity: preserved.rawIntegrity }), observation.createdAt])
         this.sourceRoots?.recordObservationSources(observation.id, references, preserved?.hits ?? [], observation.createdAt)
         enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
       }

@@ -49,11 +49,12 @@ export const toolObservationInput = (
   invocationId: string,
   executionId?: string
 ): TodoToolObservationInput => {
-  const rawOutput = result.execution?.output ?? result.output
+  const rawOutput = result.rawOutput ?? result.execution?.output ?? result.output
   const evidence = compactToolEvidence({
     name: call.name,
     args: call.args,
     output: rawOutput,
+    integrity: result.integrity,
     failed: result.failed ?? false,
     exitCode: result.execution?.exitCode,
     invocationId
@@ -63,6 +64,7 @@ export const toolObservationInput = (
     args: call.args,
     output: rawOutput,
     failed: evidence.failed,
+    integrity: result.integrity,
     origin: recorder.sourceOrigin?.(call.args.path ?? "")
   })
   return {
@@ -70,6 +72,8 @@ export const toolObservationInput = (
     arguments: observationArguments(evidence, result.observation?.arguments),
     output: compactEvidenceText(evidence),
     evidenceOutput: evidence.failed ? undefined : rawOutput,
+    integrity: result.integrity,
+    rawIntegrity: result.rawIntegrity,
     failed: evidence.failed,
     exitCode: evidence.exitCode,
     executionId,

@@ -1774,6 +1774,9 @@ export const projectCandidateEntries = (records: readonly RetainedObservationEvi
     ...(record.failed ? { failed: true } : {}),
     recorded_at: record.observedAt,
     retained: record.retained,
+    complete: record.complete,
+    ...(record.integrity ? { integrity: record.integrity } : {}),
+    ...(record.rawIntegrity ? { raw_integrity: record.rawIntegrity } : {}),
     ...(record.validity === undefined ? {} : {
       validity: record.validity.validity,
       references: record.validity.references.map((reference) => ({ path: reference.path, role: reference.role, validity: reference.validity, checked_against: reference.checkedAgainst }))

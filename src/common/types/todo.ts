@@ -1,3 +1,5 @@
+import type { ToolResultIntegrity } from "../types"
+
 export type TodoStatus = "pending" | "in_progress" | "in_review" | "blocked" | "completed" | "cancelled"
 export type TodoVerification = "not_checked" | "passed" | "failed" | "waived"
 export type TodoPriority = "low" | "normal" | "high" | "urgent"
@@ -172,6 +174,8 @@ export interface TodoToolEvidenceStatus {
   complete: boolean
   originalChars: number
   preservedChars: number
+  integrity?: ToolResultIntegrity
+  rawIntegrity?: ToolResultIntegrity
 }
 
 export interface TodoToolObservation {

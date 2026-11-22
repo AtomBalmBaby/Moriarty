@@ -9,11 +9,13 @@
  * (see `view.ts`). Every result is capped, and says so, because a small
  * model's context fills after a couple of whole files.
  */
+import type { ToolResultIntegrity } from "../../common/types"
 import { diagnosticEvent } from "../diagnostics"
 import { TodoRepository } from "../todos/repository"
 import { TodoWriteRequest } from "../todos/types"
 
 import { AccessPreflight,accessTargetsOf } from "./access-preflight"
+import { formatResultIntegrity } from "./budget"
 import { planReplacement, Replacement } from "./edit"
 import { indexChangeNote } from "./helpers"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
@@ -43,6 +45,12 @@ export interface ToolResult {
   output: string
   /** One line for the user: what was looked at and what came of it. */
   summary: string
+  /** Structured completeness and source provenance for this result and later transformations. */
+  integrity?: ToolResultIntegrity
+  /** Raw tool output before context/result budgeting; retained for evidence provenance. */
+  rawOutput?: string
+  /** Completeness and provenance of the raw tool output before context/result budgeting. */
+  rawIntegrity?: ToolResultIntegrity
   /** The tool refused or went wrong; the output says why. */
   failed?: boolean
   /**
@@ -245,6 +253,7 @@ const overLimitMessage = (rel: string, from: number, last: number, total: number
 
 const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: EditSink, allowFullFile = false): Tool => {
   const limit = clampReadLines(maxLines)
+  const MAX_LINE_FRAGMENT_CHARS = 10_000
   return {
     name: "read_file",
     readOnly: true,
@@ -254,9 +263,11 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
       { name: "path", description: "The file." },
       { name: "full_file", description: "true to read the whole file.", optional: true, type: "boolean" },
       { name: "start_line", description: "First line to read, from 1. Omit to start at the top of the file.", optional: true, type: "integer" },
-      { name: "end_line", description: "Last line to read, inclusive. Omit to read to the end of the file. Must not be before start_line.", optional: true, type: "integer" }
+      { name: "end_line", description: "Last line to read, inclusive. Omit to read to the end of the file. Must not be before start_line.", optional: true, type: "integer" },
+      { name: "start_char", description: "For one oversized source line, 1-based character offset at which to return a bounded fragment.", optional: true, type: "integer" },
+      { name: "end_char", description: "For one oversized source line, inclusive character offset. Omitting it reads up to 10,000 characters.", optional: true, type: "integer" }
     ],
-    async run({ path: file, start_line, end_line, full_line, full_file }) {
+    async run({ path: file, start_line, end_line, full_line, full_file, start_char, end_char }) {
       if (!file) throw new ToolInputError("read_file needs a path.")
       const absolute = view.resolve(file, "file")
       const rel = view.relative(absolute)
@@ -268,8 +279,20 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
       const start = fullFile ? undefined : lineArgument(rel, "start_line", start_line)
       const end = fullFile ? undefined : lineArgument(rel, "end_line", end_line)
       const lines = linesOf(text)
-      const metadata = `content_hash: ${await contentHash(text)}; total_lines: ${lines.length}`
-      if (!lines.length) return { output: `${rel} (lines 0–0 of 0)\n${metadata}`, summary: `read \`${rel}\` · empty` }
+      const fingerprint = await contentHash(text)
+      const metadata = `content_hash: ${fingerprint}; total_lines: ${lines.length}`
+      if (!lines.length) {
+        const integrity: ToolResultIntegrity = {
+          status: "complete",
+          requested: { kind: "whole_file" },
+          selected: { startLine: 0, endLine: 0, totalLines: 0 },
+          delivered: { startLine: 0, endLine: 0, totalLines: 0 },
+          source: { kind: "file", path: rel, contentHash: fingerprint, totalLines: 0 },
+          rawChars: 0,
+          deliveredChars: 0
+        }
+        return { output: `${rel} (lines 0–0 of 0)\n${metadata}`, summary: `read \`${rel}\` · empty`, integrity, rawOutput: `${rel} (lines 0–0 of 0)\n${metadata}` }
+      }
       if (single) {
         if (start === undefined) {
           throw new ToolInputError(`${rel}: full_line needs start_line, the one line to read. full_line does not choose a line; pass start_line, or drop full_line to read a range.`)
@@ -281,7 +304,79 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
           throw new ToolInputError(`${rel}: full_line returns exactly one line, but end_line ${end} differs from start_line ${start}. For a range, drop full_line and pass start_line and end_line. For one line, drop end_line.`)
         }
         const line = lines[start - 1]
-        return { output: `${rel} (full line ${start})\n${metadata}\n${start}: ${line}`, summary: `read \`${rel}:${start}\` · full line` }
+        const charStartRaw = start_char === undefined ? "" : String(start_char).trim()
+        const charEndRaw = end_char === undefined ? "" : String(end_char).trim()
+        const charStart = charStartRaw === "" ? undefined : Number(charStartRaw)
+        const charEnd = charEndRaw === "" ? undefined : Number(charEndRaw)
+        if ((charStart !== undefined && (!Number.isSafeInteger(charStart) || charStart < 1)) ||
+            (charEnd !== undefined && (!Number.isSafeInteger(charEnd) || charEnd < 1))) {
+          throw new ToolInputError(`${rel}: start_char and end_char must be positive character offsets within line ${start}.`)
+        }
+        if (charStart !== undefined && charEnd !== undefined && charEnd < charStart) {
+          throw new ToolInputError(`${rel}: end_char ${charEnd} is before start_char ${charStart} on line ${start}.`)
+        }
+        if (charStart === undefined && charEnd !== undefined) {
+          throw new ToolInputError(`${rel}: end_char needs start_char for line ${start}.`)
+        }
+        if (charStart === undefined && line.length > MAX_LINE_FRAGMENT_CHARS) {
+          const endChar = Math.min(MAX_LINE_FRAGMENT_CHARS, line.length)
+          const fragment = line.slice(0, endChar)
+          const integrity: ToolResultIntegrity = {
+            status: "partial",
+            requested: { kind: "line", range: { startLine: start, endLine: start } },
+            selected: { startLine: start, endLine: start, totalLines: lines.length },
+            delivered: { startLine: start, endLine: start, totalLines: lines.length },
+            source: { kind: "file", path: rel, contentHash: fingerprint, totalLines: lines.length },
+            truncation: { stage: "per_result_cap", reason: "oversized source line", omittedChars: line.length - endChar, omittedLines: 0, nextCharStart: endChar + 1 },
+            rawChars: line.length,
+            deliveredChars: endChar
+          }
+          const rawOutput = `${rel} (line ${start} fragment characters 1–${endChar} of ${line.length})\n${metadata}\n${start}: ${fragment}`
+          return {
+            output: `${rawOutput}\n${formatResultIntegrity(integrity)}`,
+            summary: `read \`${rel}:${start}\` · line exceeds budget · partial`,
+            integrity,
+            rawOutput
+          }
+        }
+        if (charStart !== undefined) {
+          const requestedEnd = charEnd ?? Math.min(line.length, charStart + MAX_LINE_FRAGMENT_CHARS - 1)
+          const endChar = Math.min(requestedEnd, line.length)
+          const fragment = line.slice(charStart - 1, endChar)
+          const complete = endChar >= line.length
+          const integrity: ToolResultIntegrity = {
+            status: complete ? "complete" : "partial",
+            requested: {
+              kind: "line_fragment",
+              range: { startLine: start, endLine: start },
+              lineFragment: { line: start, startChar: charStart, endChar, totalChars: line.length, contentHash: fingerprint }
+            },
+            selected: { startLine: start, endLine: start, totalLines: lines.length },
+            delivered: { startLine: start, endLine: start, totalLines: lines.length },
+            source: { kind: "file", path: rel, contentHash: fingerprint, totalLines: lines.length },
+            ...(complete ? {} : { truncation: { stage: "per_result_cap", reason: "line fragment requested", omittedChars: line.length - endChar, nextCharStart: endChar + 1 } }),
+            rawChars: line.length,
+            deliveredChars: fragment.length
+          }
+          const rawOutput = `${rel} (line ${start} fragment characters ${charStart}–${endChar} of ${line.length})\n${metadata}\n${start}: ${fragment}`
+          return {
+            output: complete ? rawOutput : `${rawOutput}\n${formatResultIntegrity(integrity)}`,
+            summary: complete ? `read \`${rel}:${start}\` · full line` : `read \`${rel}:${start}\` · partial line characters ${charStart}–${endChar}`,
+            integrity,
+            rawOutput
+          }
+        }
+        const integrity: ToolResultIntegrity = {
+          status: "complete",
+          requested: { kind: "line", range: { startLine: start, endLine: start } },
+          selected: { startLine: start, endLine: start, totalLines: lines.length },
+          delivered: { startLine: start, endLine: start, totalLines: lines.length },
+          source: { kind: "file", path: rel, contentHash: fingerprint, totalLines: lines.length },
+          rawChars: line.length,
+          deliveredChars: line.length
+        }
+        const rawOutput = `${rel} (full line ${start})\n${metadata}\n${start}: ${line}`
+        return { output: rawOutput, summary: `read \`${rel}:${start}\` · full line`, integrity, rawOutput }
       }
       const from = start ?? 1
       if (from > lines.length) {
@@ -295,13 +390,70 @@ const readFile = (view: WorkspaceView, maxLines = DEFAULT_READ_LINES, sink?: Edi
       if (last - from + 1 > limit && !(wholeFile && allowFullFile)) {
         throw new ToolInputError(overLimitMessage(rel, from, last, lines.length, limit, wholeFile))
       }
+      if (start_char !== undefined || end_char !== undefined) {
+        if (from !== last) {
+          throw new ToolInputError(`${rel}: start_char and end_char are only valid for exactly one source line; set start_line and end_line to the same line.`)
+        }
+        const charStartRaw = start_char === undefined ? "" : String(start_char).trim()
+        const charEndRaw = end_char === undefined ? "" : String(end_char).trim()
+        if (charStartRaw === "") throw new ToolInputError(`${rel}: start_char is required for a line fragment.`)
+        const charStart = Number(charStartRaw)
+        const charEnd = charEndRaw === "" ? undefined : Number(charEndRaw)
+        if (!Number.isSafeInteger(charStart) || charStart < 1 ||
+            (charEnd !== undefined && (!Number.isSafeInteger(charEnd) || charEnd < 1))) {
+          throw new ToolInputError(`${rel}: start_char and end_char must be positive character offsets within line ${from}.`)
+        }
+        if (charEnd !== undefined && charEnd < charStart) {
+          throw new ToolInputError(`${rel}: end_char ${charEnd} is before start_char ${charStart} on line ${from}.`)
+        }
+        const line = lines[from - 1]
+        if (charStart > line.length) throw new ToolInputError(`${rel}: start_char ${charStart} is past character ${line.length} on line ${from}.`)
+        const endChar = Math.min(charEnd ?? Math.min(line.length, charStart + MAX_LINE_FRAGMENT_CHARS - 1), line.length)
+        const fragment = line.slice(charStart - 1, endChar)
+        const complete = endChar >= line.length
+        const integrity: ToolResultIntegrity = {
+          status: complete ? "complete" : "partial",
+          requested: {
+            kind: "line_fragment",
+            range: { startLine: from, endLine: from },
+            lineFragment: { line: from, startChar: charStart, endChar, totalChars: line.length, contentHash: fingerprint }
+          },
+          selected: { startLine: from, endLine: from, totalLines: lines.length },
+          delivered: { startLine: from, endLine: from, totalLines: lines.length },
+          source: { kind: "file", path: rel, contentHash: fingerprint, totalLines: lines.length },
+          ...(complete ? {} : { truncation: { stage: "per_result_cap", reason: "line fragment requested", omittedChars: line.length - endChar, nextCharStart: endChar + 1 } }),
+          rawChars: line.length,
+          deliveredChars: fragment.length
+        }
+        const rawOutput = `${rel} (line ${from} fragment characters ${charStart}–${endChar} of ${line.length})\n${metadata}\n${from}: ${fragment}`
+        return {
+          output: complete ? rawOutput : `${rawOutput}\n${formatResultIntegrity(integrity)}`,
+          summary: complete ? `read \`${rel}:${from}\` · full line` : `read \`${rel}:${from}\` · partial line characters ${charStart}–${endChar}`,
+          integrity,
+          rawOutput
+        }
+      }
       const body = lines
         .slice(from - 1, last)
         .map((line, i) => `${from + i}: ${line}`)
         .join("\n")
+      const integrity: ToolResultIntegrity = {
+        status: "complete",
+        requested: wholeFile
+          ? { kind: "whole_file" }
+          : { kind: "range", range: { startLine: from, endLine: last } },
+        selected: { startLine: from, endLine: last, totalLines: lines.length },
+        delivered: { startLine: from, endLine: last, totalLines: lines.length },
+        source: { kind: "file", path: rel, contentHash: fingerprint, totalLines: lines.length },
+        rawChars: body.length,
+        deliveredChars: body.length
+      }
+      const rawOutput = `${rel} (lines ${from}–${last} of ${lines.length})\n${metadata}\n${body}`
       return {
-        output: `${rel} (lines ${from}–${last} of ${lines.length})\n${metadata}\n${body}`,
-        summary: wholeFile ? `read \`${rel}\` · whole file` : `read \`${rel}:${from}–${last}\``
+        output: rawOutput,
+        summary: wholeFile ? `read \`${rel}\` · whole file` : `read \`${rel}:${from}–${last}\``,
+        integrity,
+        rawOutput
       }
     }
   }

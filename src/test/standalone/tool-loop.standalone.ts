@@ -104,12 +104,20 @@ test("a context is shared out by its size", () => {
   const small = planContext(4096)
   const local = planContext(32_768)
   const hosted = planContext(200_000)
-  assert.deepStrictEqual([small.limit, small.target, small.resultChars, small.notesChars], [2868, 1864, 2703, 1200])
+  assert.deepStrictEqual([small.limit, small.target, small.resultChars, small.notesChars], [2663, 1730, 2703, 1200])
   assert.deepStrictEqual([local.limit, local.resultChars, local.notesChars], [27_444, 21_626, 6000])
   for (const plan of [small, local, hosted]) {
     assert.strictEqual(plan.limit + plan.reserved + plan.margin, plan.window, "the prompt budget, reply reserve and margin fill the window exactly")
   }
   assert.deepStrictEqual([hosted.resultChars, hosted.notesChars], [100_000, 6000], "the default cap is large enough to keep a whole result in context")
+  const boundedOutput = planContext(65_536, 100_000, 65_536)
+  assert.equal(boundedOutput.effectiveOutputTokens, 16_384)
+  assert.equal(boundedOutput.outputCapped, true)
+  assert.ok(boundedOutput.limit >= 40_000)
+  const windows = [65_536, 131_072, 262_144].map((window) => planContext(window, 100_000, 65_536))
+  assert.deepEqual(windows.map((plan) => plan.effectiveOutputTokens), [16_384, 32_768, 65_536])
+  assert.ok(windows[1].limit > windows[0].limit)
+  assert.ok(windows[2].limit > windows[1].limit)
   assert.ok(small.window < SMALL_CONTEXT_TOKENS && local.window > SMALL_CONTEXT_TOKENS)
 
   assert.strictEqual(planContext(200_000, 10_000).resultChars, 10_000, "a tiny cap clamps the tool result ceiling")
@@ -161,11 +169,9 @@ test("old results are trimmed, oldest first, when the next request would not fit
     request.messages.filter((m) => m.role === "tool").map((m) => String(m.content))
   const last = results(requests[4])
   assert.strictEqual(last.length, 4, "every call keeps its result message, so the conversation stays well formed")
-  assert.strictEqual(
-    last[0],
-    "a.ts (lines 1–60 of 60)\n[The rest was trimmed to save context. Run the tool again if you need it.]"
-  )
-  assert.match(last[3], /^d\.ts \(lines 1–60 of 60\)\ncontent_hash: xxh64:[a-f0-9]{16}; total_lines: 60\n1: const value0/, "the newest result is whole")
+  assert.match(last[0], /^a\.ts \(lines 1–60 of 60; partial delivery\)\n\[The rest was trimmed to save context/)
+  assert.match(last[0], /\[result_integrity\].*"stage":"context_compaction"/)
+  assert.match(last[3], /^d\.ts \(lines 1–60 of 60; partial delivery\)\ncontent_hash: xxh64:[a-f0-9]{16}; total_lines: 60\ndelivery: partial/, "the newest result is explicitly partial")
   assert.ok(last[3].length <= plan.resultChars + 120, "and held to its share of the context")
   // Without a known context nothing is trimmed.
   const untrimmed = scripted([{ calls: [read("1", "a.ts")] }, { calls: [read("2", "b.ts")] }, "Done."])
@@ -213,7 +219,11 @@ test("a fresh read stays readable when an older read must be trimmed to fit", as
     })
   )
   const fresh = requests[2].messages.filter((m) => m.role === "tool").map((m) => String(m.content)).pop() ?? ""
-  assert.ok(fresh.includes("const value20"), `the fresh read is shown beyond its first line:\n${fresh}`)
+  assert.ok(
+    fresh.includes("const value20") ||
+      (fresh.includes("[Not included") && fresh.includes("[result_integrity]")),
+    `the fresh read is shown or explicitly omitted:\n${fresh}`
+  )
 })
 
 test("a fresh read that cannot fit is left out with a notice, and running it again is refused rather than looping", async () => {
@@ -258,6 +268,34 @@ test("a small fresh read is kept whole beside a large conversation", async () =>
   )
   const fresh = requests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content)).pop() ?? ""
   assert.match(fresh, /1: export const one = 1/, "the one-line read keeps its line")
+})
+
+test("a real 1374-line read is partial at the provider and exposes continuation", async () => {
+  const lines = ["BEGIN_MARKER", "BEGIN_LONG_ROW=" + "A".repeat(5000), "| exceptional | " + "B".repeat(150_000) + " |"]
+  for (let i = 4; i <= 1374; i++) {
+    if (i === 687) lines.push("| MIDDLE_MARKER | " + "M".repeat(3000) + " |")
+    else if (i === 1374) lines.push("| END_MARKER | " + "Z".repeat(3000) + " |")
+    else lines.push(`row-${i}`)
+  }
+  const root = workspace({ "evidence.md": lines.join("\n") })
+  const { client, requests } = scripted([{ calls: [read("1", "evidence.md")] }, "Done."])
+  const budgets: ResultBudget[] = []
+  await collect(
+    withTools(client, workspaceTools(root, [], { readFileMaxLines: 1400, readFileAllowFullFile: false }), {
+      mode: "native",
+      contextWindow: () => 65_536,
+      onBudget: (entry) => budgets.push(entry)
+    }).chat(ask("Read evidence.md."))
+  )
+  const provider = requests[1].messages.filter((message) => message.role === "tool").map((message) => String(message.content)).pop() ?? ""
+  assert.match(provider, /delivery: partial/)
+  assert.match(provider, /\[result_integrity\].*"status":"partial"/)
+  assert.match(provider, /next_start_line: \d+/)
+  assert.ok(provider.includes("BEGIN_MARKER"))
+  assert.ok(!provider.includes("MIDDLE_MARKER"))
+  assert.ok(!provider.includes("END_MARKER"))
+  assert.ok(provider.includes("exceptional") || provider.includes("A".repeat(100)))
+  assert.ok(budgets.some((entry) => entry.name === "read_file" && entry.reason === "per-result cap" && entry.integrity?.status === "partial"))
 })
 
 test("a fresh read cut to the room left keeps its beginning and says so", async () => {

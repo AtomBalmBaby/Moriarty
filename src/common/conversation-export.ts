@@ -385,6 +385,25 @@ const renderTool = (step: ToolStepView): string => {
   lines.push("")
   if (step.output !== undefined) {
     lines.push("Output:", "", fenced(step.output))
+    if (step.integrity) {
+      const integrity = step.integrity
+      const coverage = integrity.delivered
+        ? `Delivered lines: ${integrity.delivered.startLine}–${integrity.delivered.endLine} of ${integrity.delivered.totalLines}.`
+        : integrity.status === "omitted"
+          ? "Delivered lines: none."
+          : undefined
+      lines.push(
+        "",
+        note([
+          `Delivery status: ${integrity.status}.`,
+          coverage,
+          integrity.truncation?.nextStartLine ? `Continuation: start_line=${integrity.truncation.nextStartLine}.` : undefined,
+          integrity.truncation?.nextCharStart ? `Line continuation character: ${integrity.truncation.nextCharStart}.` : undefined,
+          integrity.truncation ? `Truncation stage: ${integrity.truncation.stage}; reason: ${integrity.truncation.reason}.` : undefined,
+          integrity.truncation?.omittedChars !== undefined ? `Omitted characters: ${integrity.truncation.omittedChars}.` : undefined
+        ].filter((value): value is string => !!value).join(" "))
+      )
+    }
     if (step.outputOmitted) {
       lines.push(
         "",

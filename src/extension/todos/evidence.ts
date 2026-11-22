@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto"
 
+import type { ToolResultIntegrity } from "../../common/types"
+
 export interface ToolEvidenceInput {
   name: string
   args: Record<string, unknown>
   output: string
+  integrity?: ToolResultIntegrity
   failed: boolean
   exitCode?: number
   invocationId: string
@@ -107,7 +110,9 @@ export const compactToolEvidence = (input: ToolEvidenceInput): CompactToolEviden
     commandSha256: command === undefined ? undefined : commandDigest(command),
     failed: input.failed,
     exitCode: input.exitCode,
-    lineRange: (input.name === "read_file" && !input.failed ? shownRange(text) : undefined) ?? (start && end && end >= start ? { start, end } : start ? { start, end: start } : undefined),
+    lineRange: (input.name === "read_file" && input.integrity?.delivered
+      ? { start: input.integrity.delivered.startLine, end: input.integrity.delivered.endLine }
+      : input.name === "read_file" && !input.failed ? shownRange(text) : undefined) ?? (start && end && end >= start ? { start, end } : start ? { start, end: start } : undefined),
     fingerprints: unique([...text.matchAll(FINGERPRINT)].map((match) => match[0]), 8),
     resultIds: unique(resultIds, MAX_RESULT_IDS),
     summary
@@ -169,6 +174,12 @@ export interface EvidenceSource {
   totalLines?: number
   /** Fingerprint of the whole document as it was read; absent for outputs that carry none. */
   contentHash?: string
+  /** Whether the observation delivered every selected source line. */
+  complete?: boolean
+  /** The selected range, when it differs from the delivered range. */
+  selectedStartLine?: number
+  selectedEndLine?: number
+  nextStartLine?: number
 }
 /** What the tool did to a file, as its own result says. */
 export type SourceRole = "read" | "created" | "modified" | "deleted" | "moved_from" | "moved_to"
@@ -187,6 +198,8 @@ export interface PreservedEvidence {
   originalChars: number
   preservedChars: number
   complete: boolean
+  integrity?: ToolResultIntegrity
+  rawIntegrity?: ToolResultIntegrity
   sources: EvidenceSource[]
   hits: EvidenceHit[]
 }
@@ -203,6 +216,7 @@ export interface ObservedSourceInput {
   name: string
   args: Record<string, unknown>
   output: string
+  integrity?: ToolResultIntegrity
   /** A failed call changed nothing, so it proves no reference. */
   failed: boolean
   /** Where a read's text came from, reported by the workspace view, never by the model. */
@@ -238,7 +252,7 @@ const shownRange = (text: string): { start: number; end: number } | undefined =>
   return start >= 1 && end >= start ? { start, end } : undefined
 }
 
-const parseSources = (text: string): EvidenceSource[] => {
+const parseSources = (text: string, integrity?: ToolResultIntegrity): EvidenceSource[] => {
   const header = READ_HEADER.exec(text.split("\n", 1)[0] ?? "")
   if (!header) return []
   const head = text.slice(0, 400)
@@ -247,13 +261,17 @@ const parseSources = (text: string): EvidenceSource[] => {
   const start = Number(header[2] ?? header[5])
   const end = Number(header[3] ?? header[5])
   const totalLines = Number(header[4] ?? total?.[1])
-  return [{
+  const source: EvidenceSource = {
     path: header[1].slice(0, 500),
-    startLine: Number.isSafeInteger(start) ? start : undefined,
-    endLine: Number.isSafeInteger(end) ? end : undefined,
+    startLine: integrity?.delivered?.startLine ?? (Number.isSafeInteger(start) ? start : undefined),
+    endLine: integrity?.delivered?.endLine ?? (Number.isSafeInteger(end) ? end : undefined),
     totalLines: Number.isSafeInteger(totalLines) ? totalLines : undefined,
-    contentHash: hash?.[1]
-  }]
+    contentHash: integrity?.source?.contentHash ?? hash?.[1],
+    complete: integrity ? integrity.status === "complete" : true,
+    ...(integrity?.selected ? { selectedStartLine: integrity.selected.startLine, selectedEndLine: integrity.selected.endLine } : {}),
+    ...(integrity?.truncation?.nextStartLine ? { nextStartLine: integrity.truncation.nextStartLine } : {})
+  }
+  return [source]
 }
 
 const parseHits = (text: string): EvidenceHit[] => {
@@ -283,17 +301,20 @@ const parseHits = (text: string): EvidenceHit[] => {
  * cut at a line boundary, and flagged incomplete when the cap applied, so
  * no shortened copy is mistaken for the whole output.
  */
-export const preserveEvidence = (output: string): PreservedEvidence => {
+export const preserveEvidence = (output: string, integrity?: ToolResultIntegrity, rawIntegrity?: ToolResultIntegrity): PreservedEvidence => {
   const text = output ?? ""
-  const complete = text.length <= MAX_RETAINED_EVIDENCE_CHARS
-  const kept = complete ? text : text.slice(0, MAX_RETAINED_EVIDENCE_CHARS).replace(/\n[^\n]*$/, "")
+  const retainedComplete = text.length <= MAX_RETAINED_EVIDENCE_CHARS
+  const complete = retainedComplete && (!integrity || integrity.status === "complete")
+  const kept = retainedComplete ? text : text.slice(0, MAX_RETAINED_EVIDENCE_CHARS).replace(/\n[^\n]*$/, "")
   const content = redactEvidence(kept)
   return {
     content,
     originalChars: text.length,
     preservedChars: content.length,
     complete,
-    sources: parseSources(text),
+    integrity,
+    rawIntegrity,
+    sources: parseSources(text, integrity),
     hits: parseHits(text)
   }
 }
@@ -313,7 +334,7 @@ export const observedSourceReferences = (input: ObservedSourceInput): ObservedSo
     observedVersion: origin,
     ...(editorVersion === undefined ? {} : { editorVersion })
   })
-  const read = parseSources(input.output)
+  const read = parseSources(input.output, input.integrity)
   if (read.length) return read.map((source) => withOrigin({ ...source, role: "read" }))
   const reference = (file: string, role: SourceRole, hash?: string): ObservedSourceReference => withOrigin({
     path: file,
@@ -556,12 +577,17 @@ export const evidenceGaps = (anchors: EvidenceAnchors, records: EvidenceRecord[]
   const gaps: CoverageGap[] = []
   for (const path of anchors.paths) {
     const readRecords = usable.filter((record) => record.sources.some((source) => samePath(source.path, path)))
-    const readCovered = readRecords.some((record) => record.retained && record.content !== undefined)
+    const readCovered = readRecords.some((record) =>
+      record.retained &&
+      record.content !== undefined &&
+      record.complete !== false &&
+      record.sources.every((source) => source.complete !== false))
     // Reads carry sources; only records without them count as changes, so an unreadable read stays a gap.
     const changed = usable.some((record) =>
       record.sources.length === 0 && argumentPaths(record).some((value) => samePath(value, path)))
     if (readCovered || changed) continue
-    if (readRecords.some((record) => record.retained)) gaps.push({ anchor: path, reason: "inaccessible" })
+    if (readRecords.some((record) => record.retained && record.complete === false)) gaps.push({ anchor: path, reason: "incomplete" })
+    else if (readRecords.some((record) => record.retained)) gaps.push({ anchor: path, reason: "inaccessible" })
     else if (readRecords.length > 0) gaps.push({ anchor: path, reason: "evicted" })
     else gaps.push({ anchor: path, reason: "missing_source" })
   }

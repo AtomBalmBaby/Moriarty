@@ -26,6 +26,9 @@ test("a range read returns the requested lines with their numbers", async () => 
   assert.notEqual(result.failed, true)
   assert.match(result.output, /^three\.ts \(lines 1–2 of 3\)\n/)
   assert.ok(result.output.endsWith("1: const a = 1\n2: const b = 2"), result.output)
+  assert.equal(result.integrity?.status, "complete")
+  assert.deepEqual(result.integrity?.selected, { startLine: 1, endLine: 2, totalLines: 3 })
+  assert.deepEqual(result.integrity?.delivered, { startLine: 1, endLine: 2, totalLines: 3 })
 })
 
 test("a single-line read is start_line and end_line set to the same number", async () => {
@@ -317,7 +320,7 @@ test("full_file with a range keeps the whole-file limit and the full-file overri
 test("full_line stays accepted but is not advertised, and full_file is advertised as an optional boolean", async () => {
   const tools = workspace()
   const schema = tools.tools.find((tool) => tool.name === "read_file")
-  assert.deepEqual(schema?.parameters.map((parameter) => parameter.name), ["path", "full_file", "start_line", "end_line"])
+  assert.deepEqual(schema?.parameters.map((parameter) => parameter.name), ["path", "full_file", "start_line", "end_line", "start_char", "end_char"])
   const fullFile = schema?.parameters.find((parameter) => parameter.name === "full_file")
   assert.equal(fullFile?.type, "boolean")
   assert.equal(fullFile?.optional, true)
@@ -346,6 +349,54 @@ test("a partial read is recorded as the lines it showed, never as the whole file
   assert.equal(source.contentHash, await contentHash(LONG))
   const observed = compactToolEvidence({ name: "read_file", args: { path: "long.ts", start_line: "200" }, output: tail.output, failed: false, invocationId: "tail" })
   assert.deepEqual(observed.lineRange, { start: 200, end: 250 })
+})
+
+test("partial evidence retains delivered coverage and continuation metadata", async () => {
+  const raw = "three.ts (lines 1–3 of 3)\ncontent_hash: xxh64:827934a15331760b; total_lines: 3\n1: a\n2: b\n3: c"
+  const integrity = {
+    status: "partial" as const,
+    requested: { kind: "whole_file" as const },
+    selected: { startLine: 1, endLine: 3, totalLines: 3 },
+    delivered: { startLine: 1, endLine: 2, totalLines: 3 },
+    source: { kind: "file" as const, path: "three.ts", contentHash: "xxh64:827934a15331760b", totalLines: 3 },
+    truncation: { stage: "per_result_cap" as const, reason: "per-result character budget", omittedChars: 3, omittedLines: 1, nextStartLine: 3 },
+    rawChars: raw.length,
+    deliveredChars: raw.length - 3
+  }
+  const preserved = preserveEvidence(raw, integrity)
+  assert.equal(preserved.complete, false)
+  assert.equal(preserved.integrity?.status, "partial")
+  assert.equal(preserved.sources[0].startLine, 1)
+  assert.equal(preserved.sources[0].endLine, 2)
+  assert.equal(preserved.sources[0].selectedEndLine, 3)
+  assert.equal(preserved.sources[0].nextStartLine, 3)
+  assert.equal(preserved.sources[0].complete, false)
+})
+
+test("an oversized line returns deterministic fragments with source provenance", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-long-line-"))
+  const line = "X".repeat(25_000)
+  fs.writeFileSync(path.join(root, "huge-line.md"), `before\n${line}\nafter\n`)
+  const tools = workspaceTools(root, [], { readFileMaxLines: 1400 })
+
+  const first = await tools.run({ name: "read_file", args: { path: "huge-line.md", start_line: "2", end_line: "2", full_line: "true" } })
+  assert.equal(first.failed, undefined)
+  assert.equal(first.integrity?.status, "partial")
+  assert.equal(first.integrity?.source?.totalLines, 3)
+  assert.equal(first.integrity?.truncation?.nextCharStart, 10001)
+  assert.match(first.output, /line 2 fragment characters 1–10000 of 25000/)
+  assert.equal(first.output.includes(line), false)
+
+  const continuation = await tools.run({ name: "read_file", args: { path: "huge-line.md", start_line: "2", end_line: "2", start_char: "10001", end_char: "20000" } })
+  assert.equal(continuation.integrity?.status, "partial")
+  assert.equal(continuation.integrity?.requested?.lineFragment?.startChar, 10001)
+  assert.equal(continuation.integrity?.requested?.lineFragment?.endChar, 20000)
+  assert.match(continuation.output, /line 2 fragment characters 10001–20000 of 25000/)
+
+  const tail = await tools.run({ name: "read_file", args: { path: "huge-line.md", start_line: "2", end_line: "2", start_char: "20001" } })
+  assert.equal(tail.integrity?.status, "complete")
+  assert.match(tail.output, /line 2 fragment characters 20001–25000 of 25000/)
+  assert.equal(tail.integrity?.source?.contentHash, await contentHash(`before\n${line}\nafter\n`))
 })
 
 test("a refused oversized read produces no accepted source evidence", async () => {

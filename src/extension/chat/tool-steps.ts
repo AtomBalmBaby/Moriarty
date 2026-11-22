@@ -101,6 +101,7 @@ export class ToolSteps {
     this.update(step.id, {
       summary: step.summary,
       output,
+      integrity: step.integrity,
       outputOmitted: outputOmitted || undefined,
       status,
       command: undefined,

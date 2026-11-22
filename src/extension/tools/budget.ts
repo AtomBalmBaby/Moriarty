@@ -1,3 +1,5 @@
+import type { ToolResultIntegrity } from "../../common/types"
+
 /**
  * Keeping a tool conversation inside the model's context. Pure sums: the
  * loop asks how much a request may hold, how large one result may be, and
@@ -55,6 +57,9 @@ export interface ContextDiagnostics {
   }
   reason: string
   exhausted: boolean
+  configuredOutputTokens: number
+  effectiveOutputTokens: number
+  outputCapped: boolean
 }
 
 const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value))
@@ -74,12 +79,22 @@ export interface ContextPlan {
   resultChars: number
   /** Characters of tool notes kept for the next turn. */
   notesChars: number
+  /** The output maximum requested by configuration. */
+  configuredOutputTokens: number
+  /** The output allocation actually used after the context safety cap. */
+  effectiveOutputTokens: number
+  /** Whether the configured output maximum was capped. */
+  outputCapped: boolean
 }
 
 /** How a context of `window` tokens is shared out, given the output cap each request sends. */
 export const planContext = (window: number, maxResultChars = 100_000, outputTokens = 0): ContextPlan => {
   const margin = Math.floor(window * 0.1)
-  const reply = Math.max(Math.min(2048, Math.floor(window * 0.2)), outputTokens)
+  const configured = Number.isFinite(outputTokens) && outputTokens > 0 ? Math.floor(outputTokens) : 0
+  const desired = configured > 0 ? configured : 2048
+  const reserveCap = Math.floor(window * 0.25)
+  const effective = Math.max(0, Math.min(desired, reserveCap, window - margin - 512))
+  const reply = effective
   const reserved = Math.max(0, Math.min(reply, window - margin - 512))
   const limit = window - reserved - margin
   const ceiling = Number.isFinite(maxResultChars) ? Math.max(2000, Math.min(200_000, Math.round(maxResultChars))) : 100_000
@@ -90,7 +105,10 @@ export const planContext = (window: number, maxResultChars = 100_000, outputToke
     limit,
     target: Math.floor(limit * 0.65),
     resultChars: clamp(Math.floor(window * DEFAULT_CHARS_PER_TOKEN * 0.2), 2000, ceiling),
-    notesChars: clamp(Math.floor(window * DEFAULT_CHARS_PER_TOKEN * 0.08), 1200, 6000)
+    notesChars: clamp(Math.floor(window * DEFAULT_CHARS_PER_TOKEN * 0.08), 1200, 6000),
+    configuredOutputTokens: configured,
+    effectiveOutputTokens: reserved,
+    outputCapped: configured > 0 && reserved < configured
   }
 }
 
@@ -128,6 +146,137 @@ export const fitResult = (output: string, maxChars: number): string =>
   output.length <= maxChars
     ? output
     : `${cutToLine(output, maxChars)}\n… cut to fit the model's context (${output.length - maxChars} more characters); ask for less at a time`
+
+const RESULT_INTEGRITY_PREFIX = "[result_integrity]"
+const RESULT_INTEGRITY_LINE = /^\\[result_integrity\\].*$/
+
+/** A model-readable copy of structured delivery metadata, kept as a single stable line. */
+export const formatResultIntegrity = (integrity: ToolResultIntegrity): string =>
+  `${RESULT_INTEGRITY_PREFIX}${JSON.stringify(integrity)}`
+
+export const stripResultIntegrity = (output: string): string =>
+  output.split("\n").filter((line) => !RESULT_INTEGRITY_LINE.test(line)).join("\n")
+
+export const withResultIntegrity = (output: string, integrity: ToolResultIntegrity): string =>
+  `${stripResultIntegrity(output).replace(/\n$/, "")}\n${formatResultIntegrity(integrity)}`
+
+/** Fit a file read without cutting inside a source line and update the same integrity object passed to the model. */
+export const fitFileResult = (
+  output: string,
+  maxChars: number,
+  integrity: ToolResultIntegrity
+): { output: string; integrity: ToolResultIntegrity } => {
+  const clean = stripResultIntegrity(output)
+  if (clean.length <= maxChars) {
+    const next = {
+      ...integrity,
+      status: integrity.status === "partial" ? "partial" as const : integrity.status === "omitted" ? "omitted" as const : "complete" as const,
+      rawChars: output.length,
+      deliveredChars: clean.length
+    }
+    return {
+      output: next.status === "complete" ? clean : withResultIntegrity(clean, next),
+      integrity: next
+    }
+  }
+  if (integrity.source?.kind !== "file" || !integrity.selected) {
+    const omitted = clean.length - maxChars
+    const kept = fitResult(clean, maxChars)
+    const next = {
+      ...integrity,
+      status: "partial" as const,
+      truncation: {
+        stage: "per_result_cap" as const,
+        reason: "per-result character budget",
+        omittedChars: omitted
+      },
+      rawChars: clean.length,
+      deliveredChars: kept.length
+    }
+    return { output: withResultIntegrity(kept, next), integrity: next }
+  }
+
+  const lines = clean.split("\n")
+  const bodyStart = lines.findIndex((line) => /^\d+: /.test(line))
+  if (bodyStart === -1) {
+    const kept = cutToLine(clean, maxChars)
+    const next = {
+      ...integrity,
+      status: "partial" as const,
+      truncation: {
+        stage: "per_result_cap" as const,
+        reason: "per-result character budget",
+        omittedChars: clean.length - kept.length
+      },
+      rawChars: clean.length,
+      deliveredChars: kept.length
+    }
+    return { output: withResultIntegrity(kept, next), integrity: next }
+  }
+
+  const prefix = lines.slice(0, bodyStart).join("\n")
+  const body = lines.slice(bodyStart)
+  const selected = integrity.selected
+  const keptBody: string[] = []
+  let current = selected.startLine
+  let length = prefix.length
+  const bodyBudget = Math.max(1, maxChars - 800)
+  let oversizedLine: number | undefined
+
+  for (let i = 0; i < body.length; i++) {
+    const line = body[i]
+    const match = /^(\d+): /.exec(line)
+    if (!match) break
+    const candidate = keptBody.length ? 2 : 1
+    if (length + candidate + line.length > bodyBudget) {
+      if (line.length > 10_000) oversizedLine = Number(match[1])
+      break
+    }
+    keptBody.push(line)
+    length += candidate + line.length
+    current = Number(match[1])
+  }
+
+  const deliveredEnd = keptBody.length ? current : undefined
+  const omittedLines = deliveredEnd === undefined
+    ? selected.endLine - selected.startLine + 1
+    : selected.endLine - deliveredEnd
+  const nextStartLine = deliveredEnd === undefined ? selected.startLine : deliveredEnd + 1
+  const omittedChars = clean.length - (prefix.length + (keptBody.length ? 1 : 0) + keptBody.join("\n").length)
+  const next: ToolResultIntegrity = {
+    ...integrity,
+    status: "partial",
+    ...(deliveredEnd === undefined ? {} : {
+      delivered: {
+        startLine: selected.startLine,
+        endLine: deliveredEnd,
+        totalLines: selected.totalLines
+      }
+    }),
+    truncation: {
+      stage: "per_result_cap",
+      reason: "per-result character budget",
+      omittedChars,
+      omittedLines,
+      nextStartLine: nextStartLine <= selected.endLine ? nextStartLine : undefined,
+      ...(oversizedLine !== undefined ? { nextCharStart: 1 } : {})
+    },
+    rawChars: clean.length,
+    deliveredChars: prefix.length + (keptBody.length ? 1 : 0) + keptBody.join("\n").length
+  }
+
+  const qualifiedHeader = lines[0]
+  const header = qualifiedHeader.includes("; partial delivery")
+    ? qualifiedHeader
+    : qualifiedHeader.replace(/\)$/, "") + (qualifiedHeader.includes(")") ? "; partial delivery)" : "")
+  const keptPrefix = [header, ...lines.slice(1, bodyStart)]
+  const bodyText = keptBody.join("\n")
+  const continuation = deliveredEnd === undefined
+    ? `delivery: partial\nselected_lines: ${selected.startLine}–${selected.endLine} of ${selected.totalLines}\ndelivered_lines: none\nnext_start_line: ${nextStartLine}${oversizedLine !== undefined ? "\nnext_char_start: 1" : ""}\nomitted_chars: ${omittedChars}`
+    : `delivery: partial\nselected_lines: ${selected.startLine}–${selected.endLine} of ${selected.totalLines}\ndelivered_lines: ${selected.startLine}–${deliveredEnd} of ${selected.totalLines}\nnext_start_line: ${nextStartLine}${oversizedLine !== undefined ? "\nnext_char_start: 1" : ""}\nomitted_chars: ${omittedChars}`
+  const kept = [keptPrefix.join("\n"), continuation, bodyText].filter((part) => part.length > 0).join("\n")
+  return { output: withResultIntegrity(kept, next), integrity: next }
+}
 
 /** What stands in for a result trimmed out of the conversation: its first line, so the model knows what it was. */
 export const trimmedResult = (output: string): string => {
