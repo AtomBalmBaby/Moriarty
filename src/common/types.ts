@@ -163,6 +163,47 @@ export interface ToolLineFragment {
   contentHash: string
 }
 
+/**
+ * §4.2 completeness contract. Three independent questions: what the tool produced,
+ * what the host actually received, and what the store still holds. Additive on
+ * ToolResultIntegrity, so every existing consumer keeps reading the same fields.
+ */
+export type CaptureCompleteness = "complete" | "partial" | "not_captured" | "excluded"
+export type StorageCompleteness = "complete" | "partial" | "evicted" | "inaccessible" | "unknown"
+/** Which stream a completeness statement is about; "output" is the non-command default. */
+export type ResultStream = "stdout" | "stderr" | "terminal" | "payload" | "output"
+export type ResultGapReason = "capture_limit" | "storage_limit" | "eviction" | "redaction" | "failure" | "inaccessible" | "not_captured"
+
+export interface ResultCapture {
+  originalBytes: number
+  capturedBytes: number          // what the host actually received
+  storedBytes: number            // what the database holds (post-redaction where policy applies)
+  redaction: "none" | "applied" | "excluded_by_policy"
+  encoding: "utf8" | "bytes" | "mixed"
+}
+
+export interface ResultGap {
+  stream: ResultStream
+  reason: ResultGapReason
+  fromByte?: number              // where coverage stops
+  toByte?: number
+}
+
+export interface DeliveryCoverage {
+  stream: ResultStream
+  ranges: { fromByte: number; toByte: number }[]   // retained coverage, in order
+  deliveredRanges?: { fromByte: number; toByte: number }[]
+}
+
+/**
+ * §4.8 execution lifecycle, frozen here for Stage 10. The stored form adds the two
+ * states no executed process can hold: a completed one-shot run and a call refused before execution.
+ */
+export type ExecutionState = "accepted" | "queued" | "starting" | "running" | "exited" | "failed_to_start" | "cancelled" | "timed_out" | "lost" | "unknown"
+export type StoredExecutionState = ExecutionState | "completed" | "refused"
+export type TerminationReason = "exit" | "signal" | "timeout" | "cancel" | "lost" | "spawn_error"
+export type CaptureMode = "pipes" | "pty" | "terminal_merged" | "unknown" | "not_applicable"
+
 export interface ToolResultIntegrity {
   status: ToolDeliveryStatus
   requested?: {
@@ -188,6 +229,12 @@ export interface ToolResultIntegrity {
   }
   rawChars?: number
   deliveredChars?: number
+  /** Measured bytes for this result: produced, received, held; never inferred. */
+  capture?: ResultCapture
+  /** Where coverage stops and why, per stream. */
+  gaps?: ResultGap[]
+  /** Retained coverage in order, when a result reaches the model in pieces. */
+  coverage?: DeliveryCoverage[]
 }
 
 /** One tool call as the chat shows it: collapsed to a line, open to what went in and came out. */

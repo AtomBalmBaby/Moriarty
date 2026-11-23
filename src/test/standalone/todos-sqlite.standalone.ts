@@ -562,7 +562,7 @@ test("a review of a task the plan superseded names the supersession, while unkno
   }
 })
 
-test("recordToolObservation inserts one v20 read_file observation with 13 matching columns and values", async () => {
+test("recordToolObservation inserts one v21 read_file observation with 13 matching columns and values", async () => {
   await withDirectory("twinny-tool-observation-", async (directory) => {
     const databasePath = path.join(directory, "project.sqlite")
     const scope = { projectFingerprint: "project", conversationId: "chat-observation", writer: "chat-observation" }
@@ -591,7 +591,7 @@ test("recordToolObservation inserts one v20 read_file observation with 13 matchi
 
       const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
       try {
-        assert.equal(database.pragma("user_version", { simple: true }), 20)
+        assert.equal(database.pragma("user_version", { simple: true }), 21)
         const row = database.prepare(
           "SELECT tool_name, item_id, exit_code, execution_id FROM todo_tool_observations WHERE request_id = ?"
         ).get("observe-read-file") as { tool_name: string; item_id: string; exit_code: number; execution_id: string }
@@ -805,7 +805,7 @@ const blockedReason = (outcome: LegacyTodoRetirement): string => {
   return outcome.reason
 }
 
-test("a project creates .twinny/project.sqlite with the v20 schema and git-ignores it on first initialization", async () => {
+test("a project creates .twinny/project.sqlite with the v21 schema and git-ignores it on first initialization", async () => {
   await withDirectory("twinny-project-init-", async (directory) => {
     const root = makeProject(directory)
     await projectRepository(root).initialize()
@@ -814,7 +814,7 @@ test("a project creates .twinny/project.sqlite with the v20 schema and git-ignor
     assert.equal(fs.existsSync(databasePath), true)
     const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
     try {
-      assert.equal(database.pragma("user_version", { simple: true }), 20)
+      assert.equal(database.pragma("user_version", { simple: true }), 21)
       assert.equal(database.pragma("integrity_check", { simple: true }), "ok")
       assert.equal((database.prepare("SELECT COUNT(*) AS n FROM pragma_foreign_key_check").get() as { n: number }).n, 0)
 
@@ -822,27 +822,33 @@ test("a project creates .twinny/project.sqlite with the v20 schema and git-ignor
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'documents_fts_%' ORDER BY name"
       ).all().map((row) => (row as { name: string }).name)
       assert.deepEqual(tables, [
-        "documents", "documents_fts", "index_meta", "observation_source", "source_root", "symbols",
+        "context_projection_segments", "context_projections", "context_segments", "documents", "documents_fts",
+        "evidence_access_events", "evidence_blobs", "evidence_chunks", "evidence_dependencies",
+        "evidence_favourite_requests", "evidence_favourites", "evidence_io_events", "evidence_lines",
+        "evidence_outcomes", "index_meta", "observation_source", "source_root", "storage_policy", "symbols",
         "todo_accepted_evidence", "todo_assessment_current", "todo_assessment_reactions", "todo_assessments",
         "todo_child_proposals", "todo_dependencies", "todo_edit_operations", "todo_evaluations", "todo_events",
         "todo_evidence", "todo_evidence_usage", "todo_intent_plans", "todo_intent_tasks", "todo_items",
         "todo_lists", "todo_projects", "todo_requests", "todo_requirement_activations", "todo_symbol_aliases",
         "todo_tool_evidence", "todo_tool_observations"
       ])
-
       const indexes = database.prepare(
         "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name"
       ).all().map((row) => (row as { name: string }).name)
-      assert.equal(indexes.length, 29)
+      assert.equal(indexes.length, 39)
       assert.ok(indexes.includes("todo_tool_observations_item"))
       assert.ok(indexes.includes("todo_tool_observations_project"))
       assert.ok(indexes.includes("documents_fingerprint"))
       assert.ok(indexes.includes("source_root_one_home"))
-
+      // The indexes Stage 1 freezes for the later stages, named as §5.2 requires.
+      for (const name of ["evidence_outcomes_observation", "evidence_blobs_project", "evidence_chunks_order", "evidence_lines_lookup",
+        "evidence_dependencies_source", "evidence_favourites_project", "evidence_access_events_project", "context_projections_project"]) {
+        assert.ok(indexes.includes(name), `the v21 inventory names ${name}`)
+      }
       const triggers = database.prepare(
         "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name"
       ).all().map((row) => (row as { name: string }).name)
-      assert.deepEqual(triggers, ["todo_assessment_reactions_append_only", "todo_assessments_immutable"])
+      assert.deepEqual(triggers, ["todo_assessment_reactions_append_only", "todo_assessments_immutable"], "the v21 inventory keeps the v20 triggers unchanged")
     } finally {
       database.close()
     }
@@ -1194,7 +1200,7 @@ test("a project database from a newer Twinny schema is refused and left untouche
     await projectRepository(root).initialize()
     const databasePath = path.join(root, ".twinny", "project.sqlite")
     const database = new BetterSqlite(databasePath)
-    database.pragma("user_version = 21")
+    database.pragma("user_version = 22")
     database.close()
     const before = fs.readFileSync(databasePath)
 

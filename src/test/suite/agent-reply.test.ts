@@ -1733,6 +1733,40 @@ suite("Read-file acceptance, production controller", function () {
     }
   }
 
+  test("the real hook stores the raw bytes of one tool result before the loop fits them", async () => {
+    const big = Array.from({ length: 300 }, (_, index) => `export const value${index} = "é${"y".repeat(60)}"`).join("\n")
+    await withWorkspace(async (workspace) => {
+      fs.writeFileSync(path.join(workspace.root, "src", "big.ts"), big)
+      const settings = vscode.workspace.getConfiguration("twinny")
+      const previousWindow = settings.inspect<number | string>("chatContextWindow")?.globalValue
+      // A window small enough that the result has to be cut for the model, while the store keeps what was produced.
+      await settings.update("chatContextWindow", 4096, vscode.ConfigurationTarget.Global)
+      try {
+        const turn = await runTurn(workspace, {
+          conversationId: "stage1-raw-before-fitting",
+          planReply: JSON.stringify({ track: false, plan: null }),
+          replies: [call("read_file", { path: "src/big.ts" }), "Read it."]
+        })
+        const messages = (turn.agent.requests[1]?.messages ?? []).map((message) => String(message.content ?? ""))
+        const delivered = messages.filter((content) => content.includes("<tool_result name=\"read_file\">"))[0] ?? ""
+        assert.ok(delivered.length > 0, "the model's second request carries the read result as the loop fitted it")
+        assert.ok(!delivered.includes("value299"), "what the model was given is not the whole read")
+        const stored = (await turn.repository.projectObservations(turn.scope, { path: "src/big.ts", toolName: "read_file" }))[0]
+        assert.ok(stored !== undefined, "the hook recorded the call for the project")
+        const outcome = stored!.outcome
+        assert.ok(outcome !== undefined, "the invocation has an outcome in the byte store")
+        const payload = outcome!.streams[0]
+        assert.strictEqual(payload.stream, "payload", "the bytes as the tool produced them")
+        assert.ok(payload.storedBytes >= Buffer.byteLength(big, "utf8"), `the store kept the whole read: ${payload.storedBytes} bytes`)
+        assert.strictEqual(payload.storageComplete, "complete", "nothing was capped at this size")
+        assert.ok(stored!.originalChars > delivered.length, `the record reports ${stored!.originalChars} characters produced against ${delivered.length} delivered`)
+        assert.ok(delivered.length < payload.storedBytes, "what the model was given is smaller than what was stored")
+      } finally {
+        await settings.update("chatContextWindow", previousWindow, vscode.ConfigurationTarget.Global)
+      }
+    })
+  })
+
   test("the read_file investigation is controller-verified, persisted, reused after reopen, and isolated by project", async () => {
     const fingerprint = await contentHash(toolsSource)
     await withWorkspace(async (workspace) => {

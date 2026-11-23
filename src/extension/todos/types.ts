@@ -1,6 +1,8 @@
 import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, ToolResultIntegrity, TypedCriterion } from "../../common/types"
+import type { ToolErrorDetail } from "../tools/arguments"
 
 import type { EvidenceHit, EvidenceSource, ObservedSourceReference, ObservedVersion } from "./evidence"
+import type { CapturedResult, StoredOutcome } from "./evidence-store"
 import type { SourceValidity, SourceValidityAssessment } from "./source-validity"
 
 export type { TodoAssessmentReaction, TodoAssessmentScoreValue, TodoAssessmentView, TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoObservation, TodoObservationStatus, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
@@ -172,6 +174,14 @@ export interface TodoToolObservationInput {
   executionId?: string
   /** The files the tool actually touched or read, with each one's role and where its text came from. */
   sources?: ObservedSourceReference[]
+  /** Host-execution truth: a call refused before execution is recorded as an attempt, never as a run. */
+  executed?: boolean
+  /** The structured error that refused the call, when the tool could name it. */
+  error?: ToolErrorDetail
+  startedAt?: string
+  finishedAt?: string
+  /** The raw capture before any fitting: typed arguments, bytes per stream, timings and measured completeness. */
+  capture?: CapturedResult
 }
 
 /** Stored tool output for one observation, with whatever the store still holds. */
@@ -191,9 +201,11 @@ export interface RetainedObservationEvidence {
   complete: boolean
   originalChars: number
   preservedChars: number
-  integrity?: ToolResultIntegrity
   rawIntegrity?: ToolResultIntegrity
   content?: string
+  integrity?: ToolResultIntegrity
+  /** What the byte store holds for this observation, measured by the store itself rather than assumed. */
+  outcome?: StoredOutcome
   sources: EvidenceSource[]
   hits: EvidenceHit[]
   /** Each reference this result recorded, checked by the repository's validity boundary, with the aggregate for them. */
@@ -204,6 +216,8 @@ export interface RetainedObservationEvidence {
 export interface RecordedObservation extends TodoToolObservation {
   /** Each reference the observation recorded, checked when it was stored. */
   validity?: SourceValidityAssessment
+  /** What the byte store holds for this observation, as the store measured it. */
+  outcome?: StoredOutcome
 }
 
 /**

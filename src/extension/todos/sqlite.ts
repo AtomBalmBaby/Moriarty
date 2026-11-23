@@ -105,6 +105,14 @@ CREATE TABLE todo_tool_observations (
   created_at TEXT NOT NULL,
   list_revision INTEGER,
   execution_id TEXT,
+  executed INTEGER NOT NULL DEFAULT 1 CHECK (executed IN (0,1)),
+  call_id TEXT,
+  host_key TEXT NOT NULL DEFAULT '',
+  started_at TEXT,
+  finished_at TEXT,
+  outcome_id TEXT REFERENCES evidence_outcomes(id),
+  error_code TEXT CHECK (error_code IS NULL OR error_code = 'refused_before_execution'),
+  validity_class TEXT CHECK (validity_class IS NULL OR validity_class IN ('current','stale','unknown','historical','superseded')),
   UNIQUE(project_id, request_id)
 );
 CREATE INDEX todo_tool_observations_list_revision ON todo_tool_observations(list_id, list_revision);
@@ -311,13 +319,172 @@ CREATE TABLE symbols (
 );
 CREATE INDEX symbols_name ON symbols(name);
 CREATE VIRTUAL TABLE documents_fts USING fts5(uri UNINDEXED, relative_path, text);
-PRAGMA user_version = 20;
+-- §5.2 v21 additions, frozen by Stage 1 for the later stages. Additive tables only:
+-- todo_tool_observations and todo_tool_evidence keep their existing meaning; the blob is
+-- the authoritative byte store, and the evidence row stays the redacted presentation copy.
+CREATE TABLE evidence_outcomes (
+  id TEXT PRIMARY KEY,
+  observation_id TEXT NOT NULL UNIQUE REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  execution_ref TEXT,
+  session_id TEXT,
+  batch_id TEXT,
+  command_sequence INTEGER,
+  status TEXT NOT NULL CHECK (status IN ('accepted','queued','starting','running','completed','exited','failed_to_start','cancelled','timed_out','lost','refused','unknown')),
+  exit_code INTEGER,
+  signal TEXT,
+  termination_reason TEXT CHECK (termination_reason IS NULL OR termination_reason IN ('exit','signal','timeout','cancel','lost','spawn_error')),
+  stdout_blob_id TEXT REFERENCES evidence_blobs(id),
+  stderr_blob_id TEXT REFERENCES evidence_blobs(id),
+  terminal_blob_id TEXT REFERENCES evidence_blobs(id),
+  payload_blob_id TEXT REFERENCES evidence_blobs(id),
+  capture_mode TEXT NOT NULL DEFAULT 'unknown' CHECK (capture_mode IN ('pipes','pty','terminal_merged','unknown','not_applicable')),
+  captured_complete INTEGER NOT NULL DEFAULT 0 CHECK (captured_complete IN (0,1)),
+  storage_complete INTEGER NOT NULL DEFAULT 0 CHECK (storage_complete IN (0,1)),
+  gap_reason TEXT CHECK (gap_reason IS NULL OR gap_reason IN ('capture_limit','storage_limit','eviction','redaction','failure','inaccessible','not_captured','storage_error')),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX evidence_outcomes_observation ON evidence_outcomes(observation_id);
+CREATE TABLE evidence_blobs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  content_digest TEXT NOT NULL,
+  storage_kind TEXT NOT NULL CHECK (storage_kind IN ('inline','file')),
+  relative_path TEXT,
+  inline_bytes BLOB,
+  original_bytes INTEGER NOT NULL,
+  stored_bytes INTEGER NOT NULL,
+  encoding TEXT NOT NULL DEFAULT 'bytes' CHECK (encoding IN ('utf8','bytes','mixed')),
+  byte_preservation TEXT NOT NULL DEFAULT 'lossless' CHECK (byte_preservation IN ('lossless','normalized','excluded')),
+  redaction TEXT NOT NULL DEFAULT 'none' CHECK (redaction IN ('none','applied','excluded_by_policy')),
+  created_at TEXT NOT NULL,
+  evicted_at TEXT,
+  UNIQUE (project_id, content_digest)
+);
+CREATE INDEX evidence_blobs_project ON evidence_blobs(project_id, created_at);
+CREATE TABLE evidence_chunks (
+  outcome_id TEXT NOT NULL REFERENCES evidence_outcomes(id) ON DELETE CASCADE,
+  stream TEXT NOT NULL CHECK (stream IN ('stdout','stderr','terminal','payload')),
+  seq INTEGER NOT NULL,
+  byte_start INTEGER NOT NULL,
+  byte_end INTEGER NOT NULL,
+  received_at TEXT NOT NULL,
+  PRIMARY KEY (outcome_id, stream, seq)
+);
+CREATE INDEX evidence_chunks_order ON evidence_chunks(outcome_id, stream, seq);
+CREATE TABLE evidence_io_events (
+  id TEXT PRIMARY KEY,
+  outcome_id TEXT NOT NULL REFERENCES evidence_outcomes(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('stdin_write','stdin_close','spawn','exit','signal','cancel','timeout','pty_control','capture_gap')),
+  byte_count INTEGER,
+  result TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  details_json TEXT,
+  UNIQUE (outcome_id, seq)
+);
+CREATE TABLE evidence_lines (
+  blob_id TEXT NOT NULL REFERENCES evidence_blobs(id) ON DELETE CASCADE,
+  line_no INTEGER NOT NULL,
+  char_start INTEGER NOT NULL,
+  char_end INTEGER NOT NULL,
+  byte_start INTEGER NOT NULL,
+  byte_end INTEGER NOT NULL,
+  PRIMARY KEY (blob_id, line_no)
+);
+CREATE INDEX evidence_lines_lookup ON evidence_lines(blob_id, byte_start);
+CREATE TABLE evidence_dependencies (
+  derived_observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  source_observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('source_read','derived_claim','accepted_fact','supersedes')),
+  established_at TEXT NOT NULL,
+  PRIMARY KEY (derived_observation_id, source_observation_id, kind),
+  CHECK (derived_observation_id <> source_observation_id)
+);
+CREATE INDEX evidence_dependencies_source ON evidence_dependencies(source_observation_id);
+CREATE TABLE evidence_favourites (
+  observation_id TEXT PRIMARY KEY REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  marked_at TEXT NOT NULL
+);
+CREATE INDEX evidence_favourites_project ON evidence_favourites(project_id, marked_at);
+CREATE TABLE evidence_favourite_requests (
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  request_id TEXT NOT NULL,
+  observation_id TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN ('mark','unmark')),
+  result TEXT NOT NULL CHECK (result IN ('changed','already','unknown','denied')),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, request_id)
+);
+CREATE TABLE evidence_access_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  observation_id TEXT NOT NULL REFERENCES todo_tool_observations(id) ON DELETE CASCADE,
+  operation TEXT NOT NULL CHECK (operation IN ('get','range','search','find','resolve_current')),
+  arguments_json TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  execution_id TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX evidence_access_events_project ON evidence_access_events(project_id, created_at);
+CREATE TABLE context_segments (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('user_instruction','system_policy','task_state','assistant_reply','evidence_projection')),
+  observation_id TEXT REFERENCES todo_tool_observations(id),
+  protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0,1)),
+  favourite INTEGER NOT NULL DEFAULT 0 CHECK (favourite IN (0,1)),
+  age_order INTEGER NOT NULL,
+  approx_tokens INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK (kind <> 'user_instruction' OR protected = 1)
+);
+CREATE INDEX context_segments_conversation ON context_segments(conversation_id, kind, age_order);
+CREATE INDEX context_segments_observation ON context_segments(observation_id);
+CREATE TABLE context_projections (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES todo_projects(id),
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT,
+  request_seq INTEGER NOT NULL,
+  capacity_tokens INTEGER NOT NULL,
+  threshold_percent INTEGER NOT NULL,
+  utilization_before INTEGER NOT NULL,
+  utilization_after INTEGER NOT NULL,
+  removed_stale INTEGER NOT NULL DEFAULT 0,
+  removed_valid INTEGER NOT NULL DEFAULT 0,
+  compacted_favourites INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX context_projections_project ON context_projections(project_id, created_at);
+CREATE TABLE context_projection_segments (
+  projection_id TEXT NOT NULL REFERENCES context_projections(id) ON DELETE CASCADE,
+  segment_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user_instruction','system_policy','task_state','assistant_reply','evidence_projection')),
+  observation_id TEXT,
+  decision TEXT NOT NULL CHECK (decision IN ('kept','reference','compact_reference','removed')),
+  tokens INTEGER NOT NULL,
+  PRIMARY KEY (projection_id, segment_id)
+);
+CREATE TABLE storage_policy (
+  project_id TEXT PRIMARY KEY REFERENCES todo_projects(id),
+  max_project_bytes INTEGER NOT NULL,
+  max_blob_bytes INTEGER NOT NULL,
+  eviction_order TEXT NOT NULL DEFAULT 'oldest_unfavourited_first',
+  redaction_mode TEXT NOT NULL DEFAULT 'presentation_only',
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1))
+);
+PRAGMA user_version = 21;
 `
 
 /** The authoritative native connection type for the TODO database. */
 export type Database = BetterSqlite.Database
 
-const CURRENT_SCHEMA_VERSION = 20
+const CURRENT_SCHEMA_VERSION = 21
 const BUSY_TIMEOUT_MS = 5000
 
 /**
@@ -424,7 +591,7 @@ export class SqliteFile {
     }
   }
 
-  /** Version 0 initializes the development schema; version 20 reopens it; any other version is refused. */
+  /** Version 0 initializes the development schema; version 21 reopens it; any other version is refused. */
   private migrate(database: Database): void {
     const version = schemaVersion(database)
     if (version === 0) {

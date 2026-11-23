@@ -1,0 +1,11 @@
+{
+  "evidence": {
+    "storage": {
+      "maxProjectBytes": 64000000,
+      "maxBlobBytes": 2000000,
+      "evictionOrder": "oldest_unfavourited_first",
+      "redactionMode": "presentation_only",
+      "enabled": true
+    }
+  }
+}

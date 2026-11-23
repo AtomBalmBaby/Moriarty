@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 
 import { logger } from "../../common/logger"
-import type { ToolResultIntegrity } from "../../common/types"
+import type { ResultGap, ToolResultIntegrity } from "../../common/types"
 
 import {
   displayArguments,
@@ -15,6 +15,8 @@ import {
   samePath,
   type SourceRole
 } from "./evidence"
+import { createPolicySource } from "./evidence-config"
+import { ProjectEvidenceStore, storedOutcomeForObservation, textCapture } from "./evidence-store"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { rootLabelOf } from "./project-home"
 import { SourceLocation, SourceRoots } from "./source-roots"
@@ -823,8 +825,8 @@ const retainedEvidenceFor = (
     conditions.push("observations.item_id = ?")
     values.push(itemId)
   }
-  return rows<{ observation_id: string; observed_item_id: string | null; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; observed_at: string; list_revision: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
-    "SELECT observations.id AS observation_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, observations.created_at AS observed_at, observations.list_revision, evidence.retained, " +
+  return rows<{ observation_id: string; project_id: string; observed_item_id: string | null; tool_name: string; arguments_json: string; failed: number; exit_code: number | null; observed_at: string; list_revision: number | null; retained: number | null; content: string | null; complete: number | null; original_chars: number | null; preserved_chars: number | null; metadata_json: string | null }>(database,
+    "SELECT observations.id AS observation_id, observations.project_id AS project_id, observations.item_id AS observed_item_id, observations.tool_name, observations.arguments_json, observations.failed, observations.exit_code, observations.created_at AS observed_at, observations.list_revision, evidence.retained, " +
     (withContent ? "evidence.content" : "NULL AS content") +
     ", evidence.complete, evidence.original_chars, evidence.preserved_chars, evidence.metadata_json " +
     "FROM todo_tool_observations AS observations LEFT JOIN todo_tool_evidence AS evidence ON evidence.observation_id = observations.id " +
@@ -833,6 +835,7 @@ const retainedEvidenceFor = (
       const metadata = row.metadata_json
         ? JSON.parse(row.metadata_json) as { sources: EvidenceSource[]; hits: EvidenceHit[]; integrity?: ToolResultIntegrity; rawIntegrity?: ToolResultIntegrity }
         : { sources: [], hits: [] }
+      const stored = storedOutcomeForObservation(database, row.project_id, row.observation_id)
       return {
         observationId: row.observation_id,
         ...(row.observed_item_id === null ? {} : { itemId: row.observed_item_id }),
@@ -850,7 +853,7 @@ const retainedEvidenceFor = (
         ...(row.list_revision === null ? {} : { listRevision: row.list_revision }),
         content: withContent && row.retained === 1 ? row.content ?? undefined : undefined,
         sources: metadata.sources,
-        hits: metadata.hits
+        hits: metadata.hits, ...(stored === undefined ? {} : { outcome: stored })
       }
     })
   }
@@ -898,6 +901,8 @@ export class TodoRepository {
   private readonly evidenceLimits: EvidenceStorageLimits
   private sourceRoots: SourceRoots | undefined
   private boundary: SourceValidityBoundary | undefined
+  /** The byte store for this project: what was captured, not what was fitted for display. */
+  private evidenceStore: ProjectEvidenceStore | undefined
   /** What the host can tell the boundary: the documents its editor has open. A plain Node process has none, so every reference is disk content there. */
   private readonly hostSource: SourceBoundaryOptions
   // In-memory only: a scoring request in flight. Restarts clear it, and unscored items then read as not evaluated.
@@ -916,6 +921,7 @@ export class TodoRepository {
       this.boundary = new SourceValidityBoundary({ ...source, roots: sourceRoots })
       sourceRoots.home()
       for (const root of roots()) sourceRoots.register(root, rootLabelOf(root))
+      this.evidenceStore = new ProjectEvidenceStore(this.sqlite, createPolicySource(home), home)
     })
     this.evidenceLimits = evidenceLimits
   }
@@ -1395,62 +1401,96 @@ export class TodoRepository {
     const output = redactEvidence(input.output).slice(0, MAX_EVIDENCE_TEXT)
     const arguments_ = Object.fromEntries(Object.entries(input.arguments).map(([key, value]) => [key, redactEvidence(value)]))
     const preserved = input.evidenceOutput === undefined ? undefined : preserveEvidence(input.evidenceOutput, input.integrity, input.rawIntegrity)
-    return this.sqlite.write((database) => {
-      const list = ensureList(database, request)
-      const prior = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
-    "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE project_id = ? AND request_id = ?", [list.project_id, input.requestId])[0]
-      if (prior) {
-        const priorEvidence = rows<{ retained: number; complete: number; original_chars: number; preserved_chars: number; metadata_json: string | null }>(database,
-          "SELECT retained, complete, original_chars, preserved_chars, metadata_json FROM todo_tool_evidence WHERE observation_id = ?", [prior.id])[0]
-        const priorMetadata = priorEvidence?.metadata_json
-          ? JSON.parse(priorEvidence.metadata_json) as { integrity?: ToolResultIntegrity; rawIntegrity?: ToolResultIntegrity }
-          : {}
-        // A replayed result is checked against the source it names, as every stored reference is.
-        return {
-          observation: {
-            ...prior,
-            arguments: JSON.parse(prior.arguments_json) as Record<string, string>,
-            failed: prior.failed !== 0,
-            exitCode: prior.exitCode ?? undefined,
-            evidence: priorEvidence && {
-              retained: priorEvidence.retained === 1,
-              complete: priorEvidence.complete === 1,
-              originalChars: priorEvidence.original_chars,
-              preservedChars: priorEvidence.preserved_chars,
-              ...(priorMetadata.integrity ? { integrity: priorMetadata.integrity } : {}),
-              ...(priorMetadata.rawIntegrity ? { rawIntegrity: priorMetadata.rawIntegrity } : {})
-            }
-          },
-          references: recordedSourceReferences(database, this.sourceRoots!, [prior.id]).get(prior.id) ?? []
+    // The bytes are recorded as the tool produced them, before any fitting; the fitted copy is what the model saw.
+    const captured = input.capture ?? textCapture({
+      toolName,
+      arguments: arguments_,
+      text: input.evidenceOutput ?? output,
+      failed: input.failed,
+      requestId: input.requestId,
+      ...(input.executionId === undefined ? {} : { executionId: input.executionId }),
+      ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
+      ...(input.error === undefined ? {} : { error: input.error }),
+      ...(input.executed === undefined ? {} : { executed: input.executed }),
+      ...(input.startedAt === undefined ? {} : { startedAt: input.startedAt }),
+      ...(input.finishedAt === undefined ? {} : { finishedAt: input.finishedAt })
+    })
+    return this.sqlite.initialize().then(() => this.evidenceStore!.policy()).then((reading) => {
+      if (reading.state === "invalid") throw new Error(`${reading.path}: ${reading.reason}`)
+      const policy = reading.reading.policy
+      return this.sqlite.write((database) => {
+        const list = ensureList(database, request)
+        const prior = rows<{ id: string; itemId: string; toolName: string; arguments_json: string; output: string; failed: number; exitCode: number | null; createdAt: string }>(database,
+          "SELECT id, item_id AS itemId, tool_name AS toolName, arguments_json, output, failed, exit_code AS exitCode, created_at AS createdAt FROM todo_tool_observations WHERE project_id = ? AND request_id = ?", [list.project_id, input.requestId])[0]
+        if (prior) {
+          const priorEvidence = rows<{ retained: number; complete: number; original_chars: number; preserved_chars: number; metadata_json: string | null }>(database,
+            "SELECT retained, complete, original_chars, preserved_chars, metadata_json FROM todo_tool_evidence WHERE observation_id = ?", [prior.id])[0]
+          const priorMetadata = priorEvidence?.metadata_json
+            ? JSON.parse(priorEvidence.metadata_json) as { integrity?: ToolResultIntegrity; rawIntegrity?: ToolResultIntegrity }
+            : {}
+          // A replayed result is checked against the source it names, as every stored reference is. The same request
+          // answers with the same observation and outcome: no second row, and nothing is run again.
+          return {
+            observation: {
+              ...prior,
+              arguments: JSON.parse(prior.arguments_json) as Record<string, string>,
+              failed: prior.failed !== 0,
+              exitCode: prior.exitCode ?? undefined,
+              evidence: priorEvidence && {
+                retained: priorEvidence.retained === 1,
+                complete: priorEvidence.complete === 1,
+                originalChars: priorEvidence.original_chars,
+                preservedChars: priorEvidence.preserved_chars,
+                ...(priorMetadata.integrity ? { integrity: priorMetadata.integrity } : {}),
+                ...(priorMetadata.rawIntegrity ? { rawIntegrity: priorMetadata.rawIntegrity } : {})
+              },
+              ...(storedOutcomeForObservation(database, list.project_id, prior.id) === undefined ? {} : { outcome: storedOutcomeForObservation(database, list.project_id, prior.id) })
+            },
+            references: recordedSourceReferences(database, this.sourceRoots!, [prior.id]).get(prior.id) ?? []
+          }
         }
-      }
-      // A result is evidence for the project, not for the task that happened to be active: a task ID, a plan or a
-      // TODO list is provenance here, so a chat with no plan still records what its tools actually did.
-      const references: ObservedSourceReference[] = (input.sources ?? preserved?.sources ?? []).map((reference) => ({ role: "read", observedVersion: "disk", ...reference }))
-      const retain = preserved !== undefined && preserved.preservedChars <= this.evidenceLimits.listChars
-      const evidence: TodoToolEvidenceStatus | undefined = preserved && {
-        retained: retain,
-        complete: preserved.complete,
-        originalChars: preserved.originalChars,
-        preservedChars: preserved.preservedChars,
-        ...(preserved.integrity ? { integrity: preserved.integrity } : {}),
-        ...(preserved.rawIntegrity ? { rawIntegrity: preserved.rawIntegrity } : {})
-      }
-      const observation: TodoToolObservation = { id: randomUUID(), itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: now(), evidence, executionId: input.executionId }
-      const listRevision = bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode })
-      execute(database, "INSERT INTO todo_tool_observations(id, project_id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [observation.id, list.project_id, list.id, input.itemId ?? null, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, observation.createdAt, listRevision, input.executionId ?? null])
-      if (preserved) {
-        execute(database, "INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          [observation.id, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits, integrity: preserved.integrity, rawIntegrity: preserved.rawIntegrity }), observation.createdAt])
-        this.sourceRoots?.recordObservationSources(observation.id, references, preserved?.hits ?? [], observation.createdAt)
-        enforceEvidenceBudget(database, list.id, observation.id, this.evidenceLimits.listChars)
-      }
-      // Evidence does not change the task's content or status, so it does not bump its version: an unrelated observation
-      // made during review must not invalidate that review. The list revision above records it for review packages.
-      logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId ?? null, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
-      // Storage is where a reference is first checked; a fingerprint that does not match the source it names is reported as stale, and the record is kept as history.
-      return { observation, references }
+        // A result is evidence for the project, not for the task that happened to be active: a task ID, a plan or a
+        // TODO list is provenance here, so a chat with no plan still records what its tools actually did.
+        const references: ObservedSourceReference[] = (input.sources ?? preserved?.sources ?? []).map((reference) => ({ role: "read", observedVersion: "disk", ...reference }))
+        const retain = preserved !== undefined && preserved.preservedChars <= this.evidenceLimits.listChars
+        const observationId = randomUUID()
+        const recordedAt = now()
+        execute(database,
+          "INSERT INTO todo_tool_observations(id, project_id, list_id, item_id, request_id, tool_name, arguments_json, output, failed, exit_code, created_at, list_revision, execution_id, executed, call_id, host_key, started_at, finished_at, error_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?, ?, ?)",
+          [observationId, list.project_id, list.id, input.itemId ?? null, input.requestId, toolName, JSON.stringify(arguments_), output, input.failed ? 1 : 0, input.exitCode ?? null, recordedAt, bumpList(database, list.id, input.itemId, "tool_observed", "system", input.requestId, { toolName, failed: input.failed, exitCode: input.exitCode }), input.executionId ?? null,
+            captured.executed ? 1 : 0, captured.startedAt, captured.finishedAt ?? null, captured.error === undefined ? null : "refused_before_execution"])
+        const stored = this.evidenceStore!.recordInTransaction(database, captured, { projectId: list.project_id, listId: list.id, ...(input.itemId === undefined ? {} : { itemId: input.itemId }) }, policy)
+        execute(database, "UPDATE todo_tool_observations SET outcome_id = ? WHERE id = ?", [stored.outcomeId, observationId])
+        const payload = stored.streams.find((state) => state.stream === "payload") ?? stored.streams[0]
+        const measuredIntegrity = preserved?.integrity && {
+          ...preserved.integrity,
+          ...(payload ? { capture: { originalBytes: payload.originalBytes, capturedBytes: payload.capturedBytes, storedBytes: payload.storedBytes, redaction: payload.redaction, encoding: payload.encoding } } : {}),
+          ...(stored.streams.some((state) => state.gapReason !== undefined) ? { gaps: stored.streams.filter((state) => state.gapReason !== undefined).map((state) => ({ stream: state.stream, reason: state.gapReason === "storage_error" ? "failure" : state.gapReason as ResultGap["reason"], fromByte: 0, toByte: state.originalBytes })) } : {})
+        }
+        const evidence: TodoToolEvidenceStatus | undefined = preserved && {
+          retained: retain,
+          complete: preserved.complete,
+          originalChars: preserved.originalChars,
+          preservedChars: preserved.preservedChars,
+          ...(measuredIntegrity ? { integrity: measuredIntegrity } : {}),
+          ...(preserved.rawIntegrity ? { rawIntegrity: preserved.rawIntegrity } : {})
+        }
+        if (preserved) {
+          execute(database, "INSERT INTO todo_tool_evidence(observation_id, list_id, content, retained, complete, original_chars, preserved_chars, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [observationId, list.id, retain ? preserved.content : null, retain ? 1 : 0, preserved.complete ? 1 : 0, preserved.originalChars, preserved.preservedChars, JSON.stringify({ sources: preserved.sources, hits: preserved.hits, integrity: measuredIntegrity, rawIntegrity: preserved.rawIntegrity }), recordedAt])
+          this.sourceRoots?.recordObservationSources(observationId, references, preserved.hits ?? [], recordedAt)
+          enforceEvidenceBudget(database, list.id, observationId, this.evidenceLimits.listChars)
+        }
+        // Evidence does not change the task's content or status, so it does not bump its version: an unrelated observation
+        // made during review must not invalidate that review. The list revision above records it for review packages.
+        logTodoEvent("todo.evidence.recorded", { operation_id: list.id, item_id: input.itemId ?? null, tool_name: toolName, failed: input.failed, exit_code: input.exitCode ?? null, request_id: input.requestId }, input.failed ? "info" : "debug")
+        // Storage is where a reference is first checked; a fingerprint that does not match the source it names is reported as stale, and the record is kept as history.
+        const observation: TodoToolObservation = { id: observationId, itemId: input.itemId, toolName, arguments: arguments_, output, failed: input.failed, exitCode: input.exitCode, createdAt: recordedAt, evidence, executionId: input.executionId }
+        return {
+          observation: { ...observation, outcome: stored },
+          references
+        }
+      })
     }).then(async (stored) => ({ ...stored.observation, validity: await this.sourceValidity().assess(stored.references) }))
   }
 

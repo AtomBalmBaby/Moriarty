@@ -324,7 +324,7 @@ suite("Persistent workspace intelligence index", () => {
     }
   })
 
-  test("the index lives in the project database: after rebuild the file holds indexed documents and PRAGMA user_version is 20", async function () {
+  test("the index lives in the project database: after rebuild the file holds indexed documents and PRAGMA user_version is 21", async function () {
     this.timeout(120000)
     const databasePath = path.join(storage, "project.sqlite")
     index = new WorkspaceIntelligenceIndex(databasePath)
@@ -335,7 +335,7 @@ suite("Persistent workspace intelligence index", () => {
     index.dispose()
     const database = new BetterSqlite(databasePath, { readonly: true, fileMustExist: true })
     try {
-      assert.equal(database.pragma("user_version", { simple: true }), 20, "the schema version belongs to todos/sqlite.ts")
+      assert.equal(database.pragma("user_version", { simple: true }), 21, "the schema version belongs to todos/sqlite.ts")
       const tables = new Set((database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name))
       assert.ok(tables.has("documents") && tables.has("todo_items"), "one database holds both table groups")
       assert.ok((database.prepare("SELECT COUNT(*) AS n FROM documents").get() as { n: number }).n > 0, "the rebuilt file holds indexed documents")

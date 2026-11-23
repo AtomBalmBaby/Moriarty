@@ -9,7 +9,7 @@
  * (see `view.ts`). Every result is capped, and says so, because a small
  * model's context fills after a couple of whole files.
  */
-import type { ToolResultIntegrity } from "../../common/types"
+import type { CaptureMode, ToolResultIntegrity } from "../../common/types"
 import { diagnosticEvent } from "../diagnostics"
 import { TodoRepository } from "../todos/repository"
 import { TodoWriteRequest } from "../todos/types"
@@ -65,7 +65,18 @@ export interface ToolResult {
    * the step: the instructions of a folder the call reached.
    */
   preface?: string
-  execution?: { command: string; exitCode?: number; output: string }
+  execution?: {
+    command: string
+    exitCode?: number
+    output: string
+    /** Which stored byte stream each part of this result refers to, when the host captured them apart.
+     * A reference names bytes that exist; it never stands in for bytes that were not received.
+     */
+    streams?: { stdout?: string; stderr?: string; terminal?: string }
+    captureMode?: CaptureMode
+  }
+  /** The bytes as they arrived on each stream, before any presentation view. Stage 10 fills these from the real command sink. */
+  rawStreams?: { stdout?: Buffer; stderr?: Buffer; terminal?: Buffer }
   /** Structured fields the host records with this observation. Verification reads them; the model does not see them. */
   observation?: { arguments: Record<string, string> }
   /** Why the call was refused, when the tool can name the condition precisely. */
@@ -878,6 +889,11 @@ export interface CommandOutcome {
   timedOut?: "running" | "stopped"
   /** It was stopped by the user's stop on its step; the reply carries on. */
   stoppedByUser?: boolean
+  /** Per-stream byte references, when separate pipes were attached at launch. Never invented after the fact.
+   * A merged PTY transcript is one `terminal` stream, not a stdout and a stderr.
+   */
+  streams?: { stdout?: string; stderr?: string; terminal?: string }
+  captureMode?: CaptureMode
 }
 
 /** A hit from the embeddings index. Lines are 0-based, inclusive. */
@@ -938,7 +954,7 @@ const runCommand = (sink: CommandSink): Tool => ({
       : outcome.exitCode === undefined ? "done" : `exit ${outcome.exitCode}`
     return {
       failed: outcome.timedOut === "running" || (outcome.exitCode !== undefined && outcome.exitCode !== 0),
-      execution: { command: line, output: outcome.output, exitCode: outcome.exitCode },
+      execution: { command: line, output: outcome.output, exitCode: outcome.exitCode, ...(outcome.streams === undefined ? {} : { streams: outcome.streams }), ...(outcome.captureMode === undefined ? {} : { captureMode: outcome.captureMode }) },
       output: `$ ${line}\n(${status})\n${outcome.output.trim() || "(no output)"}`,
       summary: `ran \`${line}\` · ${outcomeWord}`
     }

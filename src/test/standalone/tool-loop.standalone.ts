@@ -13,9 +13,12 @@ import { test } from "node:test"
 import { CARRY_ON_PROMPT, CONTINUE_PROMPT, isContinuationText, requestBehindContinuation } from "../../common/messaging/chat-continuation"
 import { shouldResumeQueuedChat } from "../../common/messaging/chat-stop"
 import { ChatCompletionMessage } from "../../common/types"
+import { recordToolResult } from "../../extension/chat/tool-evidence"
 import { buildChatTurn } from "../../extension/chat/turn"
 import { ChatChunk, ChatRequest, InferenceClient, InferenceError, InferenceErrorKind, InferenceOptions, isCancelled, isInferenceError } from "../../extension/inference"
 import { abortable } from "../../extension/inference/stream"
+import { DEFAULT_EVIDENCE_STORAGE_LIMITS, TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { prepareProjectTodoStorage, resolveProjectTodoStorage } from "../../extension/todos/sqlite"
 import {
   ContextDiagnostics,
   DEFAULT_CHARS_PER_TOKEN,
@@ -38,6 +41,7 @@ import {
   ToolStep,
   withTools
 } from "../../extension/tools/loop"
+import { ToolCall } from "../../extension/tools/protocol"
 import { EditSink,ToolResult, WorkspaceTools, workspaceTools } from "../../extension/tools/workspace"
 import { parsePeerFrame } from "../../protocol/peer"
 
@@ -1709,4 +1713,51 @@ test("a call that succeeds writes no failure warning", async () => {
   const { client } = scripted([{ calls: [read("1", "a.ts")] }, "Read it."])
   const log = await captureStderr(() => collect(withTools(client, workspaceTools(root), { mode: "native", provider: "llamacpp" }).chat(ask("Read."))))
   assert.doesNotMatch(log, /tool failed/)
+})
+
+test("the whole 1374-line read is stored complete while the copy the model is given is cut", async () => {
+  const lines: string[] = []
+  for (let index = 1; index <= 1374; index += 1) lines.push(`row ${index} é${"A".repeat(140)}`)
+  const content = lines.join("\n")
+  assert.ok(content.length > 200_000, `the case is over the presentation cap: ${content.length} characters`)
+  const root = workspace({ "plan.md": content })
+  const databasePath = await prepareProjectTodoStorage(resolveProjectTodoStorage([{ scheme: "file", fsPath: root }]))
+  const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+  const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${root}`]), conversationId: "stage1-1374", writer: "stage1-1374" }
+  await repository.initialize()
+  await repository.getList(scope)
+  const recorded: { call: ToolCall; result: ToolResult }[] = []
+  const budgets: ResultBudget[] = []
+  const { client, requests } = scripted([{ calls: [read("1", "plan.md")] }, "Read the plan."])
+  try {
+    await collect(withTools(client, workspaceTools(root, [], { readFileAllowFullFile: true }), {
+      mode: "native",
+      contextWindow: () => 65_536,
+      onToolResult: (call, result) => void recorded.push({ call, result }),
+      onBudget: (entry) => budgets.push(entry)
+    }).chat(ask("Read the plan.")))
+    assert.strictEqual(recorded.length, 1, "the loop handed the hook the result it really got")
+    const observation = await recordToolResult({ repository, scope }, recorded[0].call, recorded[0].result, { invocationId: "stage1-1374-1" })
+    const stored = (await repository.projectObservations(scope, { path: "plan.md", toolName: "read_file" }))[0]
+    assert.ok(stored !== undefined, "the production reader finds the record the hook wrote")
+    assert.strictEqual(stored!.observationId, observation.id)
+    const outcome = stored!.outcome
+    assert.ok(outcome !== undefined, "the invocation has an outcome in the byte store")
+    const payload = outcome!.streams[0]
+    assert.strictEqual(payload.storageComplete, "complete", "the storage layer retained all of it; there is no silent cap here")
+    assert.strictEqual(payload.storedBytes, Buffer.byteLength(recorded[0].result.rawOutput ?? recorded[0].result.output, "utf8"))
+    assert.deepStrictEqual(payload.coverage, [{ fromByte: 0, toByte: payload.storedBytes }], "the coverage reported is the whole read")
+    assert.strictEqual(stored!.originalChars, (recorded[0].result.rawOutput ?? recorded[0].result.output).length, "what was produced, counted as characters")
+    assert.ok(payload.storedBytes > stored!.originalChars, "the multibyte characters make extra bytes, so the two are reported apart")
+    assert.ok(stored!.preservedChars < stored!.originalChars, "the presentation copy is the capped one and says so")
+    assert.strictEqual(stored!.complete, false, "the capped presentation copy is not the storage state")
+    assert.ok(outcome!.lineIndex.lines >= 1374, `the index covers every line of the read, not a prefix: ${outcome!.lineIndex.lines} lines`)
+    assert.strictEqual(outcome!.lineIndex.bounded, false)
+    const sent = requests[1].messages.filter((message) => message.role === "tool").map((message) => String(message.content))
+    assert.ok(sent.length === 1 && sent[0].length < payload.storedBytes, `the model was given ${sent[0]?.length} characters of ${payload.storedBytes} stored bytes`)
+    assert.ok(budgets.some((entry) => entry.name === "read_file" && entry.reason === "per-result cap"), "the cut is reported as delivery, not as storage")
+  } finally {
+    repository.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

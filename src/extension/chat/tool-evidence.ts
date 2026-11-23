@@ -13,6 +13,7 @@ import {
   observedSourceReferences,
   type ObservedVersion
 } from "../todos/evidence"
+import { type CapturedResult, type EvidenceStream, textCapture } from "../todos/evidence-store"
 import type { TodoRepository } from "../todos/repository"
 import type { TodoToolObservation, TodoToolObservationInput, TodoWriteRequest } from "../todos/types"
 import type { ToolCall } from "../tools/protocol"
@@ -34,14 +35,43 @@ export interface ToolResultRecord {
   itemId?: string
 }
 
-/** A declined command ran nothing, and the TODO tools record their own results: neither is a tool observation. */
+/**
+ * A declined command ran nothing and carries no refusal detail, so it is not an observation, and any other
+ * result stays recordable. A command refused before execution is still an attempt: the record keeps what was asked for and says that nothing ran
+ */
 export const isRecordableToolResult = (call: ToolCall, result: ToolResult): boolean =>
-  !call.name.startsWith("twinny_todo_") && !(call.name === "run_command" && !result.execution)
+  !call.name.startsWith("twinny_todo_") && !(call.name === "run_command" && result.execution === undefined && result.error?.executed !== false)
 
 /**
- * The observation one result becomes: bounded display text, the stored output, and the file
- * references the tool's own result proves. A failed call proves no file reference.
+ * A tool result as it reached the host: the bytes as they were produced, before any fitting. A failed
+ * call carries them too, because what a call printed is evidence even when the call went wrong.
  */
+const captureOf = (call: ToolCall, result: ToolResult, rawOutput: string, invocationId: string, executionId?: string): CapturedResult => {
+  const base = textCapture({
+    toolName: call.name,
+    arguments: call.args,
+    text: rawOutput,
+    failed: result.failed ?? false,
+    requestId: invocationId,
+    executionId,
+    captureMode: result.execution?.captureMode ?? "not_applicable",
+    exitCode: result.execution?.exitCode,
+    error: result.error,
+    executed: result.error?.executed ?? true
+  })
+  const streams = result.rawStreams ?? {}
+  const received = Object.entries(streams).filter(([, bytes]) => bytes !== undefined) as [EvidenceStream, Buffer][]
+  if (received.length === 0) return base
+  const chunks = received.map(([stream, bytes], index) => ({ stream, seq: index, bytes, receivedAt: base.startedAt }))
+  const capturedBytes = chunks.reduce((sum, chunk) => sum + chunk.bytes.length, 0)
+  return {
+    ...base,
+    streams,
+    chunks,
+    capture: { originalBytes: Math.max(capturedBytes, base.capture.originalBytes), capturedBytes, storedBytes: 0, redaction: base.capture.redaction, encoding: base.capture.encoding }
+  }
+}
+
 export const toolObservationInput = (
   recorder: ToolResultRecorder,
   call: ToolCall,
@@ -71,14 +101,17 @@ export const toolObservationInput = (
     toolName: call.name,
     arguments: observationArguments(evidence, result.observation?.arguments),
     output: compactEvidenceText(evidence),
-    evidenceOutput: evidence.failed ? undefined : rawOutput,
+    evidenceOutput: rawOutput,
     integrity: result.integrity,
     rawIntegrity: result.rawIntegrity,
     failed: evidence.failed,
     exitCode: evidence.exitCode,
     executionId,
     requestId: invocationId,
-    sources
+    sources,
+    executed: result.error?.executed ?? true,
+    ...(result.error === undefined ? {} : { error: result.error }),
+    capture: captureOf(call, result, rawOutput, invocationId, executionId)
   }
 }
 

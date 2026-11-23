@@ -11,14 +11,18 @@ import { test } from "node:test"
 
 import { replyParts } from "../../common/reply-parts"
 import { ToolStepView } from "../../common/types"
+import { isRecordableToolResult, recordToolResult } from "../../extension/chat/tool-evidence"
 import { ToolSteps } from "../../extension/chat/tool-steps"
 import { ChatChunk, ChatRequest, InferenceClient } from "../../extension/inference"
+import { DEFAULT_EVIDENCE_STORAGE_LIMITS, TodoRepository, workspaceProjectFingerprint } from "../../extension/todos/repository"
+import { prepareProjectTodoStorage, resolveProjectTodoStorage } from "../../extension/todos/sqlite"
+import { fitResult } from "../../extension/tools/budget"
 import { planReplacement } from "../../extension/tools/edit"
 import { fingerprintContent } from "../../extension/tools/fingerprint"
 import { toolModeFor, withTools } from "../../extension/tools/loop"
 import { displayableLength, findToolCall, nameArguments, repairJson } from "../../extension/tools/protocol"
 import { WorkspaceView } from "../../extension/tools/view"
-import { EditOutcome, IndexRefreshOutcome, workspaceTools } from "../../extension/tools/workspace"
+import { CommandSink, EditOutcome, IndexRefreshOutcome, workspaceTools } from "../../extension/tools/workspace"
 
 test("reads the JSON form as soon as its object closes, and not before", () => {
   const text = "Let me look.\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"foo\"}}\n</tool_call>"
@@ -945,4 +949,67 @@ test("handing off a saved reply's steps leaves the next steps to show alone, wit
   steps.handOff()
   steps.start({ id: "1.0", name: "read_file", args: { path: "src/a.ts" } })
   assert.deepStrictEqual(sent[sent.length - 1].map((step) => step.id), ["1.0"], "a continuation's first call shows without the review")
+})
+
+test("the hook stores the bytes a real tool produced before fitting, and counts characters and bytes apart", async () => {
+  const root = makeWorkspace()
+  const body = Array.from({ length: 300 }, (_, index) => `export const value${index} = "éééé${"y".repeat(36)}"`).join("\n")
+  fs.writeFileSync(path.join(root, "src", "big.ts"), body)
+  const databasePath = await prepareProjectTodoStorage(resolveProjectTodoStorage([{ scheme: "file", fsPath: root }]))
+  const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+  const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${root}`]), conversationId: "stage1-hook", writer: "stage1-hook" }
+  await repository.initialize()
+  await repository.getList(scope)
+  try {
+    const call = { name: "read_file", args: { path: "src/big.ts", start_line: 1, end_line: 300 } }
+    const result = await workspaceTools(root).run(call)
+    assert.strictEqual(result.integrity?.status, "complete", "the tool delivered the whole range it was asked for")
+    assert.strictEqual(isRecordableToolResult(call, result), true, "a real run is recordable by the hook")
+    const delivered = fitResult(result.output, 500)
+    assert.ok(delivered.length < result.output.length, "what the model is given is a smaller copy than what was produced")
+    const observation = await recordToolResult({ repository, scope }, call, { ...result, output: delivered }, { invocationId: "stage1-hook-1" })
+    const stored = (await repository.projectObservations(scope, { path: "src/big.ts", toolName: "read_file" }))[0]
+    assert.ok(stored !== undefined, "the production reader finds the record the hook wrote")
+    assert.strictEqual(stored!.observationId, observation.id)
+    const outcome = stored!.outcome
+    assert.ok(outcome !== undefined, "the invocation has an outcome in the byte store")
+    const payload = outcome!.streams[0]
+    assert.strictEqual(payload.stream, "payload", "a string-only result stays one truthfully named stream")
+    assert.strictEqual(stored!.originalChars, result.output.length, "the record reports what was produced, counted as characters")
+    assert.strictEqual(payload.storedBytes, Buffer.byteLength(result.output, "utf8"), "and the same thing counted as bytes")
+    assert.ok(payload.storedBytes > stored!.originalChars, "four multibyte characters make four extra bytes, so the two are measured apart")
+    assert.ok(payload.storedBytes > delivered.length, "storage is not the display copy")
+    assert.strictEqual(payload.storageComplete, "complete", "no cap was reached at this size")
+  } finally {
+    repository.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a command result keeps the stream references its sink named and invents no stream for them", async () => {
+  const root = makeWorkspace()
+  const databasePath = await prepareProjectTodoStorage(resolveProjectTodoStorage([{ scheme: "file", fsPath: root }]))
+  const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+  const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${root}`]), conversationId: "stage1-stream-refs", writer: "stage1-stream-refs" }
+  await repository.initialize()
+  await repository.getList(scope)
+  try {
+    const sink: CommandSink = { mode: "allow", run: async () => ({ ran: true, output: "printed on fd 1\n", exitCode: 0, streams: { stdout: "stdout-bytes", stderr: "stderr-bytes" }, captureMode: "pipes" }) }
+    const call = { name: "run_command", args: { command: "node --version" } }
+    const result = await workspaceTools(root, [], { commands: sink }).run(call)
+    assert.strictEqual(result.output, "$ node --version\n(exit code 0)\nprinted on fd 1", "the text the model sees is exactly what it was")
+    assert.deepStrictEqual(result.execution?.streams, { stdout: "stdout-bytes", stderr: "stderr-bytes" }, "the references the sink named reach the result")
+    assert.strictEqual(result.execution?.captureMode, "pipes", "the transport the sink used is recorded as what it was")
+    assert.strictEqual(result.rawStreams, undefined, "Stage 1 records no bytes a sink never handed over; Stage 10 supplies them")
+    const observation = await recordToolResult({ repository, scope }, call, result, { invocationId: "stage1-stream-refs-1" })
+    const outcome = (await repository.projectObservations(scope, { toolName: "run_command" }))[0]?.outcome
+    assert.ok(outcome !== undefined)
+    assert.strictEqual(outcome!.observationId, observation.id)
+    assert.strictEqual(outcome!.streams.length, 1, "a reference that names no stored bytes earns no invented stream")
+    assert.strictEqual(outcome!.streams[0].stream, "payload", "the payload is the text the tool actually produced")
+    assert.strictEqual(outcome!.captureMode, "pipes", "the mode is what the tool saw, not what the store assumed")
+  } finally {
+    repository.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
