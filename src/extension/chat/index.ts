@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "crypto"
 import { promises as fs } from "fs"
 import os from "os"
 import path from "path"
-import { ExtensionContext, RelativePattern, Uri, workspace } from "vscode"
+import { ExtensionContext, RelativePattern, Uri, window, workspace } from "vscode"
 
 import type { AgentSelection } from "../../common/agents"
 import { AGENT_SELECTION_STORAGE_KEY, AGENT_STARTUP_SELECTION_SETTING, agentStepLimit, agentStepLimitNotice, isAgentSelectionEnabled, LAST_AGENT_SELECTION_STORAGE_KEY, normalizeAgentSelection, normalizeAgentStartupSelection, resolveAgentSelection, resolveStartupAgentSelection } from "../../common/agents"
@@ -56,7 +56,7 @@ import type { EditorVisibility } from "../edit/line-edit"
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
-import { isCancelled, isRetryableProviderFailure, readReply, readText, resolveInferenceProvider } from "../inference"
+import { isCancelled, isRetryableProviderFailure, readReply, readText, resolveAgentInferenceProvider, resolveInferenceProvider } from "../inference"
 import {
   contextCapacityOf,
   forgetContextWindows,
@@ -73,6 +73,7 @@ import { checkDelivery } from "../todos/delivery"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
 import { type AcceptedFactStatus, assessProvenTodo, type CurrentSource, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
+import { currentProjectTodoStorage } from "../todos/project-storage"
 import { editDigest, PROJECT_FINGERPRINT, TodoRepository } from "../todos/repository"
 import { SourceValidityBoundary } from "../todos/source-validity"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
@@ -94,6 +95,7 @@ import { getLanguage } from "../utils"
 import { chatAccessApprover, pickAlwaysGrantsToRevoke } from "./access-approval"
 import { ChatContextBuilder } from "./context"
 import { ContextEntry, formatContextEntries } from "./context-files"
+import { DestructiveApprovalStore } from "./destructive-approvals"
 import { allIntentTasksComplete, classifyUnresolvedPlan, continuationContext, ExecutionReconciliationController, observationReference, unresolvedPlanMessage } from "./execution-reconciliation"
 import { ChildTodoReviewer, FeedbackGate, FeedbackPlanner, type FeedbackPlanOutcome, type FeedbackRetryOutcome, reconcileAdministrativeCriteria, userRequestsTodoCreation } from "./feedback-planner"
 import { ChatGeneration } from "./generation"
@@ -352,6 +354,7 @@ export class Chat extends Base {
   private readonly _steps: ToolSteps
   /** The files outside the workspace the user has allowed: once and session in memory, always in global storage. */
   private readonly _accessStore: AccessStore
+  private readonly _destructiveApprovals: DestructiveApprovalStore
   private readonly _stopSubscription: { dispose(): void }
   /** What agent replies changed, kept so each can be compared or undone from the chat. */
   private _changes?: { store: ChangeStore; editor: ReplyChangesEditor }
@@ -425,6 +428,16 @@ export class Chat extends Base {
     this._agents = agents
     this._workspaceSearch = workspaceSearch
     this._accessStore = new AccessStore(extensionContext.globalState, currentAccessHostKey())
+    this._destructiveApprovals = new DestructiveApprovalStore(
+      extensionContext.globalState,
+      () => {
+        try {
+          return currentProjectTodoStorage().home
+        } catch {
+          return ""
+        }
+      }
+    )
     this._steps = new ToolSteps((steps) => {
       const last = steps[steps.length - 1]
       logger.debug(`[ToolSteps] emit count=${steps.length} last=${last ? `${last.id}:${last.status}` : "none"} at=${Date.now()}`)
@@ -592,8 +605,12 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * Run, Always run or Skip, on a command waiting in the tool steps.
    * Always run keeps that exact command, to run unasked from then on.
    */
-  public answerToolApproval(id: string, run: boolean, always = false) {
+  public answerToolApproval(id: string, run: boolean, always = false, project = false) {
     const step = this._steps.steps.find((s) => s.id === id)
+    if (run && step?.approval === "change" && step.operation && step.resource) {
+      if (always) void this._destructiveApprovals.add(step.operation, step.resource, "session")
+      if (project) void this._destructiveApprovals.add(step.operation, step.resource, "project")
+    }
     if (run && always && step?.approval === "command" && step.command && !currentTeamPolicy()?.agent?.commands) {
       // An MCP tool is kept by name: its arguments differ from call to call.
       const list = step.mcpTool ? GLOBAL_STORAGE_KEY.alwaysRunMcpTools : GLOBAL_STORAGE_KEY.alwaysRunCommands
@@ -1411,6 +1428,21 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     const picked = await pickAlwaysGrantsToRevoke(this._accessStore.always())
     if (!picked?.length) return 0
     return this._accessStore.revoke((grant) => picked.includes(grant))
+  }
+
+  public async revokeDestructiveProjectApprovals(): Promise<number> {
+    const grants = this._destructiveApprovals.projectApprovals()
+    if (!grants.length) return 0
+    const picked = await window.showQuickPick(
+      grants.map((grant) => ({
+        label: `${grant.operation} · ${grant.resource}`,
+        description: grant.projectHome,
+        grant
+      })),
+      { title: "Twinny: revoke project destructive approvals", canPickMany: true, ignoreFocusOut: true }
+    )
+    if (!picked?.length) return 0
+    return this._destructiveApprovals.revokeProject((grant) => picked.some((item: { grant: typeof grant }) => item.grant === grant))
   }
 
   public async evaluateTodoTask(scope: TodoWriteRequest, itemId: string): Promise<TodoListSnapshot> {
@@ -2436,7 +2468,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       ? this.toolsClient(provider, view, inventoryHooks, intentAtStart?.goal, activeCheckpoints, onCatastrophic)
       : todoOnly && todoScope
         ? this.todoToolsClient(provider, todoScope, inventoryHooks)
-        : resolveInferenceProvider(provider)
+        : resolveAgentInferenceProvider(provider)
     const reply = await this._generation.generate(
       client,
       { model: provider.modelName, messages: this._conversation },
@@ -2554,6 +2586,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     return limit.effective
   }
 
+  private clampedNoProgressSteps(): number {
+    return clampNumericSetting(
+      this.config.get<number>("chatToolsMaxNoProgressSteps", 8),
+      2,
+      100,
+      8
+    )
+  }
+
   /**
    * The provider's client with the workspace's tools: reading and
    * searching (by meaning too, when there is an index), what the language
@@ -2589,10 +2630,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       MAX_RESULT_CHARS,
       DEFAULT_RESULT_CHARS
     )
-    return withTools(resolveInferenceProvider(provider), available, {
+    return withTools(resolveAgentInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       provider: provider.provider,
       maxSteps: this.agentStepsForReply(),
+      maxNoProgressSteps: this.clampedNoProgressSteps(),
       ...this.generationOptions(),
       maxResultChars,
       reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
@@ -2676,8 +2718,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       recordEditOperation: this.editOperationLedger(this.activeTodoScope())
     }
     hooks.onChanges(changes)
-    const approveChange = (detail: string, approval: "command" | "change") =>
-      this._steps.approve(detail, approval)
+    const approveChange = (
+      detail: string,
+      approval: "command" | "change",
+      options?: { operation?: "remove" | "move" | "rename" | "delete-recreate"; resource?: string }
+    ) => options?.operation && options.resource && this._destructiveApprovals.allows(options.operation, options.resource)
+      ? Promise.resolve(true)
+      : this._steps.approve(detail, approval, options)
     const search = this._search
     const maxResultChars = clampNumericSetting(
       this.config.get<number>("chatToolsMaxResultChars", DEFAULT_RESULT_CHARS),
@@ -2809,10 +2856,11 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
     hooks.onTools(available)
 
-    return withTools(resolveInferenceProvider(provider), available, {
+    return withTools(resolveAgentInferenceProvider(provider), available, {
       mode: toolModeFor(provider.provider),
       provider: provider.provider,
       maxSteps: this.agentStepsForReply(),
+      maxNoProgressSteps: this.clampedNoProgressSteps(),
       ...this.generationOptions(),
       maxResultChars,
       // OpenAI's reasoning models think silently on the chat route; at their

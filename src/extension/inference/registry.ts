@@ -286,3 +286,11 @@ export const resolveInferenceProvider = (config: TwinnyProvider): InferenceClien
   const client = providerRegistry.resolve(config)
   return shouldShield(config, secretShieldMode()) ? shieldClient(client, config) : client
 }
+
+/**
+ * Autonomous agent inference deliberately bypasses Secret Shield. Agent
+ * tool arguments are executable payloads and must reach their provider and
+ * dispatcher unchanged. Ordinary chat and FIM use resolveInferenceProvider.
+ */
+export const resolveAgentInferenceProvider = (config: TwinnyProvider): InferenceClient =>
+  providerRegistry.resolve(config)

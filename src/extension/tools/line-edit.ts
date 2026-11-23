@@ -66,7 +66,14 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
     const hash = await contentHash(text)
     throw new LineEditError(lineEditFailure("hash_mismatch", "The document changed. Reread it before editing; no changes were applied.", hash))
   }
-  if (!Array.isArray(request.edits) || !request.edits.length) invalid("edits must be a nonempty array.")
+  if (!Array.isArray(request.edits) || !request.edits.length) {
+    throw new LineEditError(lineEditFailure(
+      "invalid_argument_type",
+      "edits must be a nonempty JSON array of operation objects, not a string or another value.",
+      undefined,
+      { required_argument: "edits", recovery: "Send edits as an array; for example [{\"operation\":\"replace\",\"start_line\":1,\"end_line\":1,\"content\":[\"new\"]}]." }
+    ))
+  }
   const lines = linesOf(text)
   const starts = [0]
   for (const match of text.matchAll(/\r?\n/g)) starts.push(match.index! + match[0].length)

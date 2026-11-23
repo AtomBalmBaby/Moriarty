@@ -3001,9 +3001,9 @@ test("planning, observation, deterministic verification, persistence, context re
 test("twinny_evidence_lookup requires a symbol or a path and fails without one", async () => {
   const state = await evidenceFixtureFor(TWO_TASKS)
   try {
-    const lookup = await lookupEvidence(state, {}, currentWorkspace)
-    assert.equal(lookup.failed, true)
-    assert.equal(lookup.body, undefined)
+    const tools = todoWorkspaceTools(state.repository, state.scope, () => undefined, { readCurrentSource: currentWorkspace })
+    const direct = await tools.run({ name: "twinny_evidence_lookup", args: {} })
+    assert.match(direct.output, /symbol or path is required|requires at least one of symbol or path/)
   } finally {
     fs.rmSync(state.directory, { recursive: true, force: true })
   }
@@ -4214,7 +4214,7 @@ const nativeLookup = (args: Record<string, string>, observationId = "obs-native-
   arguments: args
 })
 /** Records a tool result the way the chat loop's onToolResult does (chat/index.ts), so the stored arguments match production. */
-const recordToolCall = (state: FeedbackFixture, itemId: string, call: { name: string; args: Record<string, string> }, result: ToolResult, requestId: string) => {
+const recordToolCall = (state: FeedbackFixture, itemId: string, call: { name: string; args: Record<string, unknown> }, result: ToolResult, requestId: string) => {
   const evidence = compactToolEvidence({ name: call.name, args: call.args, output: result.output, failed: result.failed ?? false, exitCode: result.execution?.exitCode, invocationId: requestId })
   return state.repository.recordToolObservation(state.scope, {
     itemId,
@@ -4274,7 +4274,7 @@ test("lookup regression: a zero-result lookup completes its prerequisite, and th
     const readCall = { name: "read_file", args: window }
     const readBefore = await implementer.run(readCall)
     await recordToolCall(state, edit.id, readCall, readBefore, "edit-read")
-    const editCall = { name: "edit_lines", args: { path: READ_FILE_SOURCE, expected_hash: contentHashOf(readBefore.output), edits: JSON.stringify([{ operation: "insert_after", line: READ_FILE_START + 1, content: ["  const lookupRegressionMarker = 0"] }]) } }
+    const editCall = { name: "edit_lines", args: { path: READ_FILE_SOURCE, expected_hash: contentHashOf(readBefore.output), edits: [{ operation: "insert_after", line: READ_FILE_START + 1, content: ["  const lookupRegressionMarker = 0"] }] } }
     const edited = await implementer.run(editCall)
     assert.notEqual(edited.failed, true, edited.output)
     await recordToolCall(state, edit.id, editCall, edited, "edit-applied")
@@ -5299,7 +5299,7 @@ test("Scenario C: a location fact accepted in one conversation guides a modifica
     await setStatus(repositoryB, scopeB, modify.id, "in_progress", "modify-claim")
     const implementer = workspaceTools(workspace, [], { edits: diskEditSink(), git: false, instructions: false })
     const toolCalls: string[] = []
-    const run = (name: string, args: Record<string, string>) => {
+    const run = (name: string, args: Record<string, unknown>) => {
       toolCalls.push(name)
       return implementer.run({ name, args })
     }
@@ -5318,7 +5318,7 @@ test("Scenario C: a location fact accepted in one conversation guides a modifica
     assert.equal(reference.failed, undefined, reference.output)
     assert.equal((await repositoryB.getItem(scopeB, modify.id)).item.status, "in_progress", "the reference supports the TODO without completing it")
 
-    const edit = await run("edit_lines", { path: READ_FILE_SOURCE, expected_hash: beforeHash, edits: JSON.stringify([{ operation: "insert_after", line: READ_FILE_START + 1, content: ["  const reportedLineCount = 0"] }]) })
+    const edit = await run("edit_lines", { path: READ_FILE_SOURCE, expected_hash: beforeHash, edits: [{ operation: "insert_after", line: READ_FILE_START + 1, content: ["  const reportedLineCount = 0"] }] })
     assert.notEqual(edit.failed, true, edit.output)
     const editObservation = await repositoryB.recordToolObservation(scopeB, { itemId: modify.id, toolName: "edit_lines", arguments: { path: READ_FILE_SOURCE }, output: edit.output, failed: false, requestId: "modify-edit" })
 

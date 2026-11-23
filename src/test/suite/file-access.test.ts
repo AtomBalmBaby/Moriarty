@@ -185,7 +185,7 @@ suite("Native file access outside the workspace, in the extension host", functio
   const edited = "first line\nsecond, edited\nthird line\n"
   const editLines = (file: string, hash: string): ToolCall => ({
     name: "edit_lines",
-    args: { path: file, expected_hash: hash, edits: JSON.stringify([{ operation: "replace", start_line: 2, end_line: 2, content: ["second, edited"] }]) }
+    args: { path: file, expected_hash: hash, edits: [{ operation: "replace", start_line: 2, end_line: 2, content: ["second, edited"] }] }
   })
 
   test("approved outside writes reach the real editor edit sink, and each applies once", async () => {

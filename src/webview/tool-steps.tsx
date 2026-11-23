@@ -41,11 +41,13 @@ const Summary = ({ text }: { text: string }) => (
  * that exact command to run unasked from then on, or skip it. The
  * composer's keys answer through this too.
  */
-export const answerToolStep = (step: ToolStepView, how: "run" | "always" | "skip") =>
+export const answerToolStep = (step: ToolStepView, how: "run" | "session" | "project" | "always" | "skip") =>
   emit(EVENT_NAME.twinnyToolApproval, {
     id: step.id,
     run: how !== "skip",
-    ...(how === "always" && step.approval !== "change" && !step.noAlways ? { always: true } : {})
+    ...(how === "always" && step.approval !== "change" && !step.noAlways ? { always: true } : {}),
+    ...(how === "session" && step.approval === "change" ? { always: true } : {}),
+    ...(how === "project" && step.approval === "change" ? { project: true } : {})
   })
 
 const Step = ({ step }: { step: ToolStepView }) => {
@@ -136,8 +138,18 @@ const Step = ({ step }: { step: ToolStepView }) => {
           <div className={styles.actions}>
             <button type="button" className={styles.run} onClick={() => answerToolStep(step, "run")}>
               <span className={cx("codicon", step.approval === "change" ? "codicon-check" : "codicon-play")} aria-hidden="true" />
-              {t(step.approval === "change" ? "tool-apply" : "tool-run")}
+              {t(step.approval === "change" ? "tool-allow-once" : "tool-run")}
             </button>
+            {step.approval === "change" && (
+              <>
+                <button type="button" className={styles.skip} onClick={() => answerToolStep(step, "session")}>
+                  {t("tool-allow-session")}
+                </button>
+                <button type="button" className={styles.skip} onClick={() => answerToolStep(step, "project")}>
+                  {t("tool-allow-project")}
+                </button>
+              </>
+            )}
             {step.approval !== "change" && !step.noAlways && (
               <button
                 type="button"

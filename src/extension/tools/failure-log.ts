@@ -156,7 +156,12 @@ export const logToolFailure = (failure: ToolFailure): void => {
 
   logger.warn(lines.join("\n"))
   logger.block(
-    `tool failed · ${failure.name} ${failure.id}, as sent, received and returned`,
-    JSON.stringify({ sent: failure.sent, received: failure.received, output: failure.output }, null, 2)
+    `tool failed · ${failure.name} ${failure.id}, bounded raw/parsed/dispatched shapes`,
+    JSON.stringify({
+      sent: sent ?? (failure.sent ? `<${failure.sent.length} chars>` : "not-recorded"),
+      received: failure.received ? shapeOf("", failure.received) : "not-read",
+      mismatch: sent && failure.received ? describeMismatch(sent, failure.received) : [],
+      output: oneLine(failure.output)
+    }, null, 2)
   )
 }

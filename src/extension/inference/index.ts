@@ -17,6 +17,7 @@ export {
   ProviderRegistry,
   providerRegistry,
   remoteAdapter,
+  resolveAgentInferenceProvider,
   resolveInferenceProvider
 } from "./registry"
 export { leavesMachine, type SecretShieldMode, shieldClient, shouldShield } from "./shield"

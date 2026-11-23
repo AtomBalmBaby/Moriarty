@@ -623,6 +623,8 @@ export async function activate(context: ExtensionContext) {
     commands.registerCommand(TWINNY_COMMAND_NAME.revokeFileAccess, async () => {
       const chat = await requireChat()
       const revoked = (await chat?.revokeAlwaysAccess()) ?? 0
+      const destructive = (await chat?.revokeDestructiveProjectApprovals()) ?? 0
+      if (destructive) window.showInformationMessage(`Twinny revoked ${destructive === 1 ? "one project destructive approval" : `${destructive} project destructive approvals`}.`)
       if (revoked) window.showInformationMessage(`Twinny revoked ${revoked === 1 ? "one always-allowed grant" : `${revoked} always-allowed grants`}.`)
     }),
     commands.registerCommand(TWINNY_COMMAND_NAME.openPanelChat, () => {

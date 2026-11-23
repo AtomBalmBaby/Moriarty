@@ -2040,10 +2040,17 @@ export class GatewayServer {
         capture,
         ...(agentRules
           ? {
-              inspect: (route, body) =>
-                route === "chat" && isAgentRequest(body)
-                  ? new RemoteRequestError(OUTDATED_AGENT_CLIENT, 403, true)
-                  : undefined
+              inspect: (route: string, body: unknown) => {
+                if (route !== "chat" || !isAgentRequest(body)) return undefined
+                if ((routes.policy()?.secretShield ?? "offMachine") !== "off") {
+                  return new RemoteRequestError(
+                    "Autonomous agent mode is incompatible with gateway Secret Shield. Set gateway policy secretShield to off; ordinary chat and FIM may retain shielding.",
+                    403,
+                    true
+                  )
+                }
+                return new RemoteRequestError(OUTDATED_AGENT_CLIENT, 403, true)
+              }
             }
           : {})
       })

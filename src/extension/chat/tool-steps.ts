@@ -189,7 +189,7 @@ export class ToolSteps {
   public approve(
     detail: string,
     approval: "command" | "change" = "command",
-    options: { always?: boolean; mcpTool?: string } = {}
+    options: { always?: boolean; mcpTool?: string; operation?: "remove" | "move" | "rename" | "delete-recreate"; resource?: string } = {}
   ): Promise<boolean> {
     const step = [...this._steps].reverse().find((s) => s.status === "running")
     if (!step) return Promise.resolve(false)
@@ -198,7 +198,9 @@ export class ToolSteps {
       command: detail,
       approval,
       ...(approval === "command" && options.always === false ? { noAlways: true } : {}),
-      ...(options.mcpTool ? { mcpTool: options.mcpTool } : {})
+      ...(options.mcpTool ? { mcpTool: options.mcpTool } : {}),
+      ...(options.operation ? { operation: options.operation } : {}),
+      ...(options.resource ? { resource: options.resource } : {})
     })
     return new Promise((resolve) => {
       this._waiting.set(step.id, (run) => {

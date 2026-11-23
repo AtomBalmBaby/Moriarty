@@ -476,7 +476,7 @@ suite("Hash-verified native line edits", () => {
     })
     const read = await tools.run({ name: "read_file", args: { path: "source.txt", start_line: "1", end_line: "1" } })
     assert.ok(read.output.includes(await contentHash(original)))
-    const args = { path: "source.txt", expected_hash: await contentHash(original), edits: JSON.stringify([{ operation: "replace", start_line: 2, end_line: 2, content: ["approved"] }]) }
+    const args = { path: "source.txt", expected_hash: await contentHash(original), edits: [{ operation: "replace", start_line: 2, end_line: 2, content: ["approved"] }] }
     const denied = await tools.run({ name: "edit_lines", args })
     assert.strictEqual(JSON.parse(denied.output).error.code, "permission_denied")
     assert.strictEqual(document.getText(), original)
@@ -502,7 +502,7 @@ suite("Hash-verified native line edits", () => {
     const tools = workspaceTools(root, [], { edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { checkpoints }), git: false, instructions: false })
     const read = await tools.run({ name: "read_file", args: { path: "encoded.txt" } })
     assert.ok(read.output.includes(await contentHash(source)), read.output)
-    const result = await tools.run({ name: "edit_lines", args: { path: "encoded.txt", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["after"] }]) } })
+    const result = await tools.run({ name: "edit_lines", args: { path: "encoded.txt", expected_hash: await contentHash(source), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["after"] }] } })
     assert.ok(!result.failed, result.output)
     assert.deepStrictEqual(fs.readFileSync(file), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("after\r\nuntouched\r\n", "utf16le")]))
     assert.ok(!document.isDirty)
@@ -522,11 +522,11 @@ suite("Hash-verified native line edits", () => {
     let recoveries = 0
     const tools = workspaceTools(root, [], { edits: editorEdits(new WorkspaceView(root), "apply", async () => true, undefined, { onCatastrophic: () => { recoveries++ } }), git: false, instructions: false })
     try {
-      const result = await tools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: await contentHash(source), edits: JSON.stringify([
+      const result = await tools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: await contentHash(source), edits: [
         { operation: "replace", start_line: 2, end_line: 2, content: ["export function Panel() {"] },
         { operation: "replace", start_line: 3, end_line: 3, content: ["  return " + jsx] },
         { operation: "replace", start_line: 4, end_line: 4, content: ["}"] }
-      ]) } })
+      ] } })
       assert.ok(!result.failed, result.output)
       assert.deepStrictEqual(observed, ["// @ts-nocheck\nexport function Panel() {\n  return " + jsx + "\n}\n"])
       assert.strictEqual(recoveries, 0)
@@ -559,12 +559,12 @@ suite("Hash-verified native line edits", () => {
       const invalid = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: "{not-json" } })
       assert.strictEqual(invalid.failed, true, invalid.output)
       assert.strictEqual(recoveries, 0, "invalid arguments must not trigger recovery")
-      const result = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
+      const result = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(source), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }] } })
       assert.strictEqual(result.failed, undefined, result.output)
       assert.strictEqual(recoveries, 0)
       assert.strictEqual(document.getText(), "export const BROKEN = 1\n", "new diagnostics do not roll back the applied edit")
       const brokenSource = "export const BROKEN = 1\n"
-      const corrected = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(brokenSource), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
+      const corrected = await tools.run({ name: "edit_lines", args: { path: "regression.ts", expected_hash: await contentHash(brokenSource), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }] } })
       assert.strictEqual(corrected.failed, undefined, corrected.output)
       assert.strictEqual(document.getText(), "export const value = 2\n")
       assert.strictEqual(JSON.parse(corrected.output).content_hash, await contentHash("export const value = 2\n"))
@@ -605,18 +605,18 @@ suite("Hash-verified native line edits", () => {
       git: false, instructions: false
     })
     try {
-      const result = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(source), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
+      const result = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(source), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }] } })
       assert.strictEqual(result.failed, undefined, result.output)
       assert.strictEqual(recoveries, 0)
       const broken = document.getText()
       assert.match(broken, /BROKEN/)
-      const corrected = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(broken), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }]) } })
+      const corrected = await tools.run({ name: "edit_lines", args: { path: "refused.ts", expected_hash: await contentHash(broken), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const value = 2"] }] } })
       assert.strictEqual(corrected.failed, undefined, corrected.output)
       assert.strictEqual(document.getText(), "export const value = 2\n")
       const unrelated = path.join(root, "unrelated.ts")
       fs.writeFileSync(unrelated, "export const safe = 1\n")
       const unrelatedDocument = await vscode.workspace.openTextDocument(unrelated)
-      const unrelatedEdit = await tools.run({ name: "edit_lines", args: { path: "unrelated.ts", expected_hash: await contentHash("export const safe = 1\n"), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const safe = 2"] }]) } })
+      const unrelatedEdit = await tools.run({ name: "edit_lines", args: { path: "unrelated.ts", expected_hash: await contentHash("export const safe = 1\n"), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const safe = 2"] }] } })
       assert.strictEqual(unrelatedEdit.failed, undefined, unrelatedEdit.output)
       assert.strictEqual(unrelatedDocument.getText(), "export const safe = 2\n")
     } finally {
@@ -651,9 +651,9 @@ suite("Hash-verified native line edits", () => {
       git: false, instructions: false
     })
     try {
-      const verified = await tools.run({ name: "edit_lines", args: { path: "isolated-clean.ts", expected_hash: await contentHash(cleanSource), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const other = 2"] }]) } })
+      const verified = await tools.run({ name: "edit_lines", args: { path: "isolated-clean.ts", expected_hash: await contentHash(cleanSource), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const other = 2"] }] } })
       assert.strictEqual(verified.failed, undefined, verified.output)
-      const broke = await tools.run({ name: "edit_lines", args: { path: "isolated-broken.ts", expected_hash: await contentHash(brokenSource), edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }]) } })
+      const broke = await tools.run({ name: "edit_lines", args: { path: "isolated-broken.ts", expected_hash: await contentHash(brokenSource), edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const BROKEN = 1"] }] } })
       assert.strictEqual(broke.failed, undefined, broke.output)
       assert.strictEqual(recoveries, 0)
       assert.strictEqual(brokenDocument.getText(), "export const BROKEN = 1\n", "diagnostics keep the valid edit applied")
@@ -796,7 +796,7 @@ suite("Hash-verified native line edits", () => {
         return true
       }), git: false, instructions: false
     })
-    const result = await tools.run({ name: "edit_lines", args: { path: "source.txt", expected_hash: await contentHash(original), edits: JSON.stringify([{ operation: "delete", start_line: 2, end_line: 2 }]) } })
+    const result = await tools.run({ name: "edit_lines", args: { path: "source.txt", expected_hash: await contentHash(original), edits: [{ operation: "delete", start_line: 2, end_line: 2 }] } })
     assert.strictEqual(result.failed, true)
     const error = JSON.parse(result.output).error
     assert.strictEqual(error.code, "hash_mismatch")

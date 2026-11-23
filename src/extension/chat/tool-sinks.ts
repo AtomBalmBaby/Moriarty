@@ -225,7 +225,11 @@ const SEARCH_HITS = 6
 const SEARCH_CHARS = 8000
 
 /** Asks the user to approve something in the chat's tool steps; true to go ahead. */
-export type ApproveChange = (detail: string, approval: "command" | "change") => Promise<boolean>
+export type ApproveChange = (
+  detail: string,
+  approval: "command" | "change",
+  options?: { operation?: "remove" | "move" | "rename" | "delete-recreate"; resource?: string }
+) => Promise<boolean>
 
 /** A file as the editor has it when it is open there, unsaved changes included. */
 export const openDocumentText = async (file: string): Promise<string | undefined> =>
@@ -711,7 +715,7 @@ export const editorEdits = (
       const conflict = safety.goal ? forbiddenDeleteReason(safety.goal, relative) : undefined
       if (conflict) return { ok: false, message: `Not deleted: ${conflict}` }
       const lost = mode === "apply" && !isProtected(file) && !(await recoverableFromGit(file))
-      if ((mode === "review" || isProtected(file) || lost) && !(await approve(`delete ${relative}${lost ? "\n(git has no copy of it as it is now)" : ""}`, "change"))) {
+      if ((mode === "review" || isProtected(file) || lost) && !(await approve(`delete ${relative}${lost ? "\n(git has no copy of it as it is now)" : ""}`, "change", { operation: "remove", resource: file }))) {
         return { ok: false, message: "The user chose not to delete it." }
       }
       return held(async () => {
@@ -734,7 +738,7 @@ export const editorEdits = (
       const refused = outsideRefusal(relocation, write)
       if (refused) return { ok: false, message: `Not moved: ${refused}` }
       const [source, target] = [view.relative(from), view.relative(to)]
-      if ((mode === "review" || isProtected(from) || isProtected(to)) && !(await approve(`move ${source} → ${target}`, "change"))) {
+      if ((mode === "review" || isProtected(from) || isProtected(to)) && !(await approve(`move ${source} → ${target}`, "change", { operation: "move", resource: `${from}→${to}` }))) {
         return { ok: false, message: "The user chose not to move it." }
       }
       return held(async () => {
@@ -900,7 +904,7 @@ export const editorKnowledge = (
     const changes = edit.entries().reduce((n, [, edits]) => n + edits.length, 0)
     if (
       (mode === "review" || files.some(isProtectedPath)) &&
-      !(await approve(`rename to ${newName}: ${changes} changes in ${files.join(", ")}`, "change"))
+      !(await approve(`rename to ${newName}: ${changes} changes in ${files.join(", ")}`, "change", { operation: "rename", resource: files.join(",") }))
     ) {
       return { ok: false, message: "The user chose not to rename it." }
     }

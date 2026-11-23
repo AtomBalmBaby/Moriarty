@@ -363,7 +363,7 @@
       },
       {
         "command": "twinny.revokeFileAccess",
-        "title": "Twinny - Review and revoke always-allowed file access"
+        "title": "Twinny - Review and revoke always-allowed file and destructive approvals"
       },
       {
         "command": "twinny.newConversation",
@@ -1200,6 +1200,15 @@
           "minimum": 4,
           "maximum": 1000,
           "markdownDescription": "How many tool steps one agent reply may take before the model is asked to answer with what it has (with `#twinny.chatTools#` on). More lets a capable model finish longer tasks in one reply; each step is another request to the model.",
+          "scope": "machine"
+        },
+        "twinny.chatToolsMaxNoProgressSteps": {
+          "order": 21,
+          "type": "number",
+          "default": 8,
+          "minimum": 2,
+          "maximum": 100,
+          "markdownDescription": "How many consecutive genuinely non-progressing agent tool turns pause Moriarty. Recoverable validation and execution failures do not count unless calls are identical; successful reads and mutations reset progress. This is independent of `#twinny.chatToolsMaxSteps#`. A pause keeps the task resumable with Continue.",
           "scope": "machine"
         },
         "twinny.chatInferenceMaxDurationSeconds": {

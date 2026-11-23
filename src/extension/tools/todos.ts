@@ -4,7 +4,7 @@ import { TodoRepository } from "../todos/repository"
 import { aggregateValidity } from "../todos/source-validity"
 import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
 
-import { argumentReader, textArgument, type ToolArguments } from "./arguments"
+import { argumentFailure, argumentReader, textArgument, ToolArgumentError, type ToolArguments } from "./arguments"
 import { Tool, ToolContext, ToolResult } from "./workspace"
 
 export interface TodoToolOptions {
@@ -173,6 +173,15 @@ export const todoTools = (
       { name: "symbol", description: "Exact symbol name, such as readFile.", optional: true },
       { name: "path", description: "Workspace-relative source path, such as src/extension/tools/workspace.ts.", optional: true }
     ],
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        symbol: { type: "string", minLength: 1, description: "Exact symbol name, such as readFile." },
+        path: { type: "string", minLength: 1, description: "Workspace-relative source path, such as src/extension/tools/workspace.ts." }
+      },
+      anyOf: [{ required: ["symbol"] }, { required: ["path"] }]
+    },
     guidance: "Call this before searching or reading source for a fact that a previous task may already have established. A current fact is proven: cite its observation_id in your completion claim instead of searching again, or attach it to the TODO with twinny_todo_evidence using accepted_fact_id set to its evidence_id. A historical fact no longer matches the source; read only the listed lines again. Provide at least one of symbol or path.",
     readOnly: true,
     async run(args) {
@@ -180,7 +189,12 @@ export const todoTools = (
         const a = argumentReader("twinny_evidence_lookup", args)
         const symbol = a.text("symbol")?.trim() || undefined
         const path = a.text("path")?.trim() || undefined
-        if (!symbol && !path) throw new Error("symbol or path is required")
+        if (!symbol && !path) throw new ToolArgumentError(
+          argumentFailure("missing_argument", "twinny_evidence_lookup requires at least one of symbol or path.", {
+            required_argument: "symbol or path",
+            recovery: "Send symbol for an exact source symbol, path for an exact workspace-relative file, or both."
+          })
+        )
         const facts = (await repository.listAcceptedEvidence(scope, { symbol, path })).slice(0, EVIDENCE_LOOKUP_LIMIT)
         const statuses = await assessAcceptedFacts(facts, options.readCurrentSource)
         const resolution = resolveAcceptedFacts(statuses)

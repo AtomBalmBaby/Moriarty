@@ -589,7 +589,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       else this.scheduleUris([uri], source)
     }, (error) => {
       const message = error instanceof Error ? error.message : String(error)
-      if (/FileNotFound|ENOENT/i.test(message)) this.workspaceIndexDebug(`Workspace file changed then disappeared: ${uri.toString()}`)
+      if (/FileNotFound|ENOENT|EntryNotFound/i.test(message)) this.workspaceIndexDebug(`Workspace file changed then disappeared; no baseline required: ${uri.toString()}`)
       else this.reportError(`Could not stat changed workspace file ${uri.toString()}`, error)
     })
   }

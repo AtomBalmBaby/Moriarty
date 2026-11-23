@@ -803,7 +803,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   /* A command or change waiting on the user, answered from the keys. */
   const waitingStepRef = useRef<ToolStepView>()
   waitingStepRef.current = toolSteps.find((step) => step.status === "waiting")
-  const approveWaiting = useCallback((how: "run" | "always" | "skip") => {
+  const approveWaiting = useCallback((how: "run" | "session" | "project" | "always" | "skip") => {
     const step = waitingStepRef.current
     if (!step) return false
     // Shift+Enter means Always run, which only a command the team lets

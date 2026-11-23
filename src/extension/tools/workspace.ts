@@ -805,8 +805,13 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     const absolute = source.absolute
     // A real boolean stays a boolean: false means do not save, and an absent field keeps the default.
     const save = a.sent("save") ? a.flag("save") : true
-    const operations = a.structure("edits")
-    if (!Array.isArray(operations)) return lineEditErrorResult(lineEditFailure("invalid_range", "edits must be a JSON array of line operations.", undefined, { required_argument: "edits" }))
+    const operations = a.raw("edits")
+    if (!Array.isArray(operations)) return lineEditErrorResult(lineEditFailure(
+      "invalid_argument_type",
+      "edit_lines requires edits to be a JSON array of operation objects, not a string or other value.",
+      undefined,
+      { required_argument: "edits", recovery: "Read the file again if stale, then send edits as an array, for example [{\"operation\":\"replace\",\"start_line\":1,\"end_line\":1,\"content\":[\"new\"]}]." }
+    ))
     const outcome = await apply(source.absolute, { expected_hash: hash, edits: operations }, save, context?.write ?? source.write)
     if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
     if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))

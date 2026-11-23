@@ -431,7 +431,7 @@ test("edit_lines reports an index refresh failure as a completed edit and tells 
     editLines: async () => ({ ok: true, message: "Applied.", contentHash: hash, contentSource: "disk", persisted: true, indexRefresh: { status: "failed", reason } }),
     create: async () => ({ ok: true, message: "Created." })
   } })
-  const result = await tools.run({ name: "edit_lines", args: { path: "src/warmer.ts", expected_hash: hash, edits: "[{\"operation\":\"delete\",\"start_line\":1,\"end_line\":1}]" } })
+  const result = await tools.run({ name: "edit_lines", args: { path: "src/warmer.ts", expected_hash: hash, edits: [{ operation: "delete", start_line: 1, end_line: 1 }] } })
   assert.strictEqual(result.failed, undefined, "the change itself is still reported as a success")
   const json = JSON.parse(result.output)
   assert.strictEqual(json.ok, true)
@@ -448,7 +448,7 @@ test("a synced or skipped refresh leaves the edit_lines output unchanged", async
     edit: async () => ({ ok: true, message: "Applied." }),
     editLines: async () => ({ ok: true, message: "Applied.", contentHash: hash, contentSource: "disk", persisted: true, indexRefresh }),
     create: async () => ({ ok: true, message: "Created." })
-  } }).run({ name: "edit_lines", args: { path: "src/warmer.ts", expected_hash: hash, edits: "[{\"operation\":\"delete\",\"start_line\":1,\"end_line\":1}]" } })
+  } }).run({ name: "edit_lines", args: { path: "src/warmer.ts", expected_hash: hash, edits: [{ operation: "delete", start_line: 1, end_line: 1 }] } })
   const plain = await run(undefined)
   assert.strictEqual(JSON.parse(plain.output).index_refresh, undefined, "a result with nothing to say about the index is as it was")
   assert.deepStrictEqual(await run({ status: "synced" }), plain)

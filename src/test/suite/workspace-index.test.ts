@@ -175,7 +175,7 @@ suite("Persistent workspace intelligence index", () => {
     const edit = await tools.run({ name: "edit_lines", args: {
       path: sourcePath,
       expected_hash: expectedHash,
-      edits: JSON.stringify([{ operation: "replace", start_line: markerLine, end_line: markerLine, content: ["export const workspaceSearchAcceptanceMarker = 'after'"] }])
+      edits: [{ operation: "replace", start_line: markerLine, end_line: markerLine, content: ["export const workspaceSearchAcceptanceMarker = 'after'"] }]
     } })
     assert.match(edit.output, /"ok":true/)
     const sourceDocument = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(root, sourcePath)))
@@ -631,7 +631,7 @@ suite("Persistent workspace intelligence index", () => {
     const read = await tools.run({ name: "read_file", args: { path: "src/immediate-visibility.ts" } })
     const expectedHash = read.output.match(/content_hash: ([^;]+);/)?.[1]
     assert.ok(expectedHash, read.output)
-    const edit = await tools.run({ name: "edit_lines", args: { path: "src/immediate-visibility.ts", expected_hash: expectedHash, edits: JSON.stringify([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const stageEightToken = 'after'"] }]) } })
+    const edit = await tools.run({ name: "edit_lines", args: { path: "src/immediate-visibility.ts", expected_hash: expectedHash, edits: [{ operation: "replace", start_line: 1, end_line: 1, content: ["export const stageEightToken = 'after'"] }] } })
     assert.ok(!edit.failed, edit.output)
     const found = JSON.parse(edit.output)
     assert.equal(found.index_refresh, undefined, "the sink refreshed this file through the wired provider")

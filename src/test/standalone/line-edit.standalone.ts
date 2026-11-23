@@ -44,7 +44,7 @@ const fixture = (initial: string) => {
   }
   const tools = workspaceTools(root, [], { edits: sink, git: false, instructions: false })
   const edit = (edits: unknown, expected_hash = hash(text), file = "panel.tsx") => tools.run({
-    name: "edit_lines", args: { path: file, expected_hash, edits: JSON.stringify(edits) }
+    name: "edit_lines", args: { path: file, expected_hash, edits }
   })
   return { tools, root, sink, edit, text: () => text, change: (value: string) => { text = value }, transactions: () => transactions, saves: () => saved }
 }
@@ -120,7 +120,7 @@ const rejected: [string, unknown, string][] = [
   ["unknown fields", [{ operation: "insert_before", line: 1, start_line: 1, content: ["x"] }], "invalid_range"],
   ["non-string operation", [{ operation: ["replace"], start_line: 1, end_line: 1, content: ["x"] }], "invalid_range"],
   ["unknown operation", [{ operation: "append", line: 1, content: ["x"] }], "invalid_range"],
-  ["empty batch", [], "invalid_range"]
+  ["empty batch", [], "invalid_argument_type"]
 ]
 for (const [name, edits, code] of rejected) test("rejects " + name + " without modification", async () => {
   const f = fixture("a\nb\nc\n")
@@ -181,6 +181,13 @@ test("explicit null is refused instead of guessed as false or absent", async () 
   })
   assert.equal(editsNull.failed, true)
   assert.equal(JSON.parse(editsNull.output).error.code, "invalid_argument_type")
+})
+
+test("ordinary edit_lines changes an untracked file without delete/recreate approval", async () => {
+  const f = fixture("export const untracked = 1\n")
+  const result = await f.edit([{ operation: "replace", start_line: 1, end_line: 1, content: ["export const untracked = 2"] }])
+  assert.equal(result.failed, undefined, result.output)
+  assert.equal(f.text(), "export const untracked = 2\n")
 })
 
 test("native schema, text dispatch, inventory and explicit tool selection expose edit_lines", async () => {
@@ -251,7 +258,7 @@ test("concurrent Twinny requests serialize and revalidate instead of racing", as
   const expected = hash(f.text())
   const edit = [{ operation: "replace", start_line: 1, end_line: 1, content: ["new"] }]
   const otherTools = workspaceTools(f.root, [], { edits: f.sink, git: false, instructions: false })
-  const results = await Promise.all([f.edit(edit, expected), otherTools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: expected, edits: JSON.stringify(edit) } })])
+  const results = await Promise.all([f.edit(edit, expected), otherTools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: expected, edits: edit } })])
   assert.equal(results.filter((result) => !result.failed).length, 1)
   assert.equal(JSON.parse(results.find((result) => result.failed)!.output).error.code, "hash_mismatch")
   assert.equal(f.transactions(), 1)
@@ -268,7 +275,7 @@ test("missing and forbidden documents return structured errors", async () => {
 test("cancelled queued edits never mutate the document", async () => {
   const f = fixture("a\n")
   const stop = new AbortController()
-  const pending = f.tools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: hash(f.text()), edits: JSON.stringify([{ operation: "delete", start_line: 1, end_line: 1 }]) } }, { signal: stop.signal })
+  const pending = f.tools.run({ name: "edit_lines", args: { path: "panel.tsx", expected_hash: hash(f.text()), edits: [{ operation: "delete", start_line: 1, end_line: 1 }] } }, { signal: stop.signal })
   stop.abort()
   const result = await pending
   assert.equal(result.failed, true)

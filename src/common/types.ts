@@ -258,6 +258,9 @@ export interface ToolStepView {
   command?: string
   /** What the user is asked to approve: a shell command, or a change with no diff to review (a rename, a delete). */
   approval?: "command" | "change"
+  /** Destructive change authorization key, when approval is for a change rather than a shell command. */
+  operation?: "remove" | "move" | "rename" | "delete-recreate"
+  resource?: string
   /**
    * How much of the reply's text (thinking left out) was written when the
    * step started, so the chat shows it at that point in the reply rather

@@ -17,7 +17,6 @@
  * through the secret shield like the rest of the conversation.
  */
 import { API_PROVIDERS, ASSISTANT, DEFAULT_AGENT_STEPS, OPEN_AI_COMPATIBLE_PROVIDERS, SYSTEM, USER } from "../../common/constants"
-import { logger } from "../../common/logger"
 import { HOSTED_PROVIDERS } from "../../common/provider-validation"
 import type { ToolResultIntegrity } from "../../common/types"
 import { diagnosticEvent } from "../diagnostics"
@@ -66,7 +65,10 @@ const MIN_FRESH_CHARS = 400
 /** Calls repeated in one reply, or requests in a row of calls that cannot be read, before the model is asked to answer. */
 const MAX_REPEATED_CALLS = 3
 const MAX_UNREADABLE_IN_A_ROW = 3
-const MAX_NO_PROGRESS_STEPS = 3
+/** Default bounded tool-loop no-progress safeguard. Independently configurable and independent of maxSteps. */
+export const DEFAULT_NO_PROGRESS_STEPS = 8
+export const MIN_NO_PROGRESS_STEPS = 2
+export const MAX_NO_PROGRESS_STEPS_SETTING = 100
 /** Provider requests re-sent after a failure that showed the user nothing. */
 const MAX_PROVIDER_RETRIES = 2
 const PROVIDER_RETRY_DELAY_MS = 750
@@ -226,6 +228,8 @@ export interface ToolLoopOptions {
   /** The provider kind the calls go to; named in the log of a failed call. */
   provider?: string
   maxSteps?: number
+  /** Genuine tool-loop non-progress turns. Validation/recoverable execution failures do not set this unless the call is unchanged. */
+  maxNoProgressSteps?: number
   /** Upper ceiling for one tool result kept in the model's context, after scaling by the context window. */
   maxResultChars?: number
   /**
@@ -620,10 +624,10 @@ class ToolLoop {
   private readonly _answered = new Map<string, { summary: string; slot?: ResultSlot }>()
   /** Calls not run because they repeated one already answered. */
   private _repeats = 0
+  /** Last identical failed call signature, independent of successful read caching. */
+  private _lastFailedCall: string | undefined
   /** Requests in a row whose every call could not be read. */
   private _unreadable = 0
-  /** Tool turns in a row that all fail or return no search results. */
-  private _noProgressSteps = 0
   /** Set when the model goes round in circles: the next request asks for its answer. */
   private _stuck = false
 
@@ -702,6 +706,10 @@ class ToolLoop {
 
   private async *steps(request: ChatRequest, options?: InferenceOptions): AsyncGenerator<ChatChunk> {
     const maxSteps = this._options.maxSteps ?? DEFAULT_MAX_STEPS
+    const configuredNoProgress = this._options.maxNoProgressSteps ?? DEFAULT_NO_PROGRESS_STEPS
+    const maxNoProgressSteps = Number.isFinite(configuredNoProgress)
+      ? Math.min(MAX_NO_PROGRESS_STEPS_SETTING, Math.max(MIN_NO_PROGRESS_STEPS, Math.floor(configuredNoProgress)))
+      : DEFAULT_NO_PROGRESS_STEPS
     const outer = options?.signal
     const definitions = this._workspace.tools.map(toolDefinition)
     const definitionChars = JSON.stringify(definitions).length
@@ -1081,9 +1089,16 @@ class ToolLoop {
         })
         this._options.onToolStart?.({ id, name, args: displayArguments(pending.call?.args ?? {}) })
         const key = pending.call ? this.answerKey(pending.call) : undefined
-        // Anything that may change the workspace makes every earlier read stale.
+        const failureKey = pending.call ? this.failureKey(pending.call) : undefined
+        // Mutations make earlier successful reads stale. Failed calls are kept
+        // by their exact signature so the existing repeat guard can stop them.
         if (pending.call && !key) this._answered.clear()
-        const earlier = key ? this._answered.get(key) : undefined
+        const earlier = key
+          ? this._answered.get(key)
+          : failureKey
+            ? this._answered.get(failureKey)
+            : undefined
+        if (failureKey && earlier) this._repeats++
         // A result trimmed out of the context is gone from the model's view, and is run again;
         // one left out for lack of room is refused, since running it again would give the same answer.
         const repeated = earlier && (!earlier.slot?.trimmed || earlier.slot.omitted) ? earlier : undefined
@@ -1114,7 +1129,18 @@ class ToolLoop {
             : await this.runCall(pending.call, outer, { operationId, requestId, step: step + 1 })
         // A read that failed (a search that ran out of time, a language
         // server still starting) is worth trying again, so it is not kept.
-        keys.push(repeated || ran.failed ? undefined : key)
+        if (ran.failed && failureKey) {
+          if (this._lastFailedCall === failureKey) this._repeats++
+          else {
+            this._lastFailedCall = failureKey
+            this._repeats = 1
+          }
+          this._answered.set(failureKey, { summary: ran.summary })
+        } else if (!ran.failed) {
+          this._lastFailedCall = undefined
+          this._repeats = 0
+        }
+        keys.push(repeated ? undefined : ran.failed ? undefined : key)
         const left = (reply.toolCalls?.length ?? 0) - calls.length
         const note =
           left > 0 && i === calls.length - 1
@@ -1234,27 +1260,14 @@ class ToolLoop {
         if (key) this._answered.set(key, { summary: results[i].summary, slot: slots[i] })
       })
       this._unreadable = calls.every((pending) => !pending.call) ? this._unreadable + 1 : 0
-      const noProgress = results.length > 0 && results.every((result, index) => {
-        if (result.failed) return true
-        const name = calls[index]?.call?.name
-        if (name === "find_files") return result.summary.endsWith(" · none")
-        if (name === "search_workspace") {
-          try {
-            return JSON.parse(result.output).total === 0
-          } catch {
-            return false
-          }
-        }
-        return false
-      })
-      this._noProgressSteps = noProgress ? this._noProgressSteps + 1 : 0
+      const repeatLimit = this._lastFailedCall ? maxNoProgressSteps : MAX_REPEATED_CALLS
       // A small model that keeps asking for what it has, or keeps writing
       // calls that cannot be read, is not getting anywhere with more steps.
-      if (this._repeats >= MAX_REPEATED_CALLS || this._unreadable >= MAX_UNREADABLE_IN_A_ROW || this._noProgressSteps >= MAX_NO_PROGRESS_STEPS) {
+      if (
+        this._repeats >= repeatLimit ||
+        (calls.every((pending) => !pending.call) && this._unreadable >= MAX_UNREADABLE_IN_A_ROW)
+      ) {
         this._stuck = true
-        if (this._noProgressSteps >= MAX_NO_PROGRESS_STEPS) {
-          logger.warn("Agent tool loop stopped after " + this._noProgressSteps + " consecutive tool steps without progress; asking the model to answer with the information it has.")
-        }
       }
       settled = results.some((result) => result.final)
       if (this._options.shouldStop?.()) return
@@ -1270,6 +1283,14 @@ class ToolLoop {
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     return JSON.stringify([call.name, args])
   }
+
+  private failureKey(call: ToolCall): string {
+    const args = Object.entries(call.args)
+      .map(([name, value]) => [name, typeof value === "string" ? value.trim() : JSON.stringify(value)])
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    return "failed:" + JSON.stringify([call.name, args])
+  }
+
 
   /**
    * What the user sent while the reply worked, put where the model reads

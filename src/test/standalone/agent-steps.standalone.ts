@@ -61,6 +61,15 @@ const workspace = (files: Record<string, string>) => {
 const read = (id: string, file: string): Call => ({ id, name: "read_file", arguments: JSON.stringify({ path: file }) })
 const ask = (content: string): ChatRequest => ({ model: "m", messages: [{ role: "user", content }] })
 
+test("the emergency no-progress setting is bounded and independent of the normal step limit", () => {
+  const setting = properties["twinny.chatToolsMaxNoProgressSteps"]
+  assert.equal(setting.type, "number")
+  assert.equal(setting.minimum, 2)
+  assert.equal(setting.maximum, 100)
+  assert.equal(setting.default, 8)
+  assert.equal(properties["twinny.chatToolsMaxSteps"].maximum, 1000)
+})
+
 test("the range the settings declare is the range the code uses", () => {
   const setting = properties["twinny.chatToolsMaxSteps"]
   assert.equal(setting.type, "number")
