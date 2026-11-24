@@ -1651,3 +1651,35 @@ test("project evidence survives the deletion of the task and the list that recor
     }
   })
 })
+
+test("the repository exposes the read-only access service through its own project and validity boundary", async () => {
+  await withDirectory("twinny-access-boundary-", async (directory) => {
+    const root = makeProject(directory)
+    const repository = projectRepository(root)
+    try {
+      await repository.initialize()
+      const scope = projectScope(root, "access-chat")
+      const stored = await repository.recordToolObservation(scope, {
+        toolName: "read_file",
+        arguments: { path: "src/a.ts" },
+        output: "line one\nline two",
+        failed: false,
+        exitCode: 0,
+        requestId: "observe-access",
+        executionId: "execution-access"
+      })
+      const access = await repository.evidenceAccess(scope)
+      const looked = await access.get(stored.id)
+      assert.equal(looked.access, "found", "the service answers for the project the repository resolved")
+      assert.equal(looked.observationId, stored.id)
+      assert.equal((await access.range(stored.id, { startLine: 1, endLine: 1 })).text, "line one", "the text as it was recorded, not a reread of the source")
+      await assert.rejects(async () => repository.evidenceAccess({ ...scope, projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]) }), /holds no project for this fingerprint/, "a second project is not reached through this boundary")
+      const before = JSON.stringify(await repository.projectObservations(scope))
+      await access.search(stored.id, { query: "line" })
+      await access.find({ toolName: "read_file", limit: 5 })
+      assert.equal(JSON.stringify(await repository.projectObservations(scope)), before, "a read-only service changes no record the boundary decided")
+    } finally {
+      repository.close()
+    }
+  })
+})

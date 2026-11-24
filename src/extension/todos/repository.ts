@@ -15,11 +15,12 @@ import {
   samePath,
   type SourceRole
 } from "./evidence"
-import { createPolicySource } from "./evidence-config"
+import { ProjectEvidenceAccess } from "./evidence-access"
+import { createPolicySource, type PolicySource } from "./evidence-config"
 import { ProjectEvidenceStore, storedOutcomeForObservation, textCapture } from "./evidence-store"
 import { validateIntentTaskPlan } from "./intent-plan"
 import { rootLabelOf } from "./project-home"
-import { SourceLocation, SourceRoots } from "./source-roots"
+import { SourceLocation, SourceRoots, toPosixPath } from "./source-roots"
 import { type RecordedSourceReference, type SourceBoundaryOptions, SourceValidityBoundary } from "./source-validity"
 import { type Database, SqliteFile, type SqliteLocation } from "./sqlite"
 import {
@@ -36,6 +37,8 @@ import {
   type EditOperationInput,
   type EditOperationRecord,
   type EditOperationStatus,
+  type EvidenceAccess,
+  type EvidenceAccessScope,
   type EvidenceUseKind,
   type IntentPlanContext,
   type IntentPlanOutline,
@@ -903,8 +906,15 @@ export class TodoRepository {
   private boundary: SourceValidityBoundary | undefined
   /** The byte store for this project: what was captured, not what was fitted for display. */
   private evidenceStore: ProjectEvidenceStore | undefined
+  /** The effective storage policy, read from the project's own config file. */
+  private policySource: PolicySource | undefined
   /** What the host can tell the boundary: the documents its editor has open. A plain Node process has none, so every reference is disk content there. */
   private readonly hostSource: SourceBoundaryOptions
+  /** The roots this repository was given. They scope a read; they never grant one. */
+  private readonly rootsOf: () => readonly string[]
+  /** The extension host this repository runs on, when its caller names one. */
+  private readonly hostKey: string
+  private homePath = ""
   // In-memory only: a scoring request in flight. Restarts clear it, and unscored items then read as not evaluated.
   private readonly pendingObservations = new Map<string, Set<string>>()
 
@@ -912,16 +922,21 @@ export class TodoRepository {
     databasePath: SqliteLocation,
     evidenceLimits: EvidenceStorageLimits = DEFAULT_EVIDENCE_STORAGE_LIMITS,
     roots: () => readonly string[] = () => [],
-    source: SourceBoundaryOptions = {}
+    source: SourceBoundaryOptions = {},
+    access: { hostKey?: string } = {}
   ) {
     this.hostSource = source
+    this.rootsOf = roots
+    this.hostKey = access.hostKey ?? ""
     this.sqlite = new SqliteFile(databasePath, (database, home) => {
       const sourceRoots = new SourceRoots(database, home)
       this.sourceRoots = sourceRoots
       this.boundary = new SourceValidityBoundary({ ...source, roots: sourceRoots })
+      this.policySource = createPolicySource(home)
+      this.homePath = home
       sourceRoots.home()
       for (const root of roots()) sourceRoots.register(root, rootLabelOf(root))
-      this.evidenceStore = new ProjectEvidenceStore(this.sqlite, createPolicySource(home), home)
+      this.evidenceStore = new ProjectEvidenceStore(this.sqlite, this.policySource, home)
     })
     this.evidenceLimits = evidenceLimits
   }
@@ -943,6 +958,27 @@ export class TodoRepository {
   sourceValidity(): SourceValidityBoundary {
     if (!this.boundary) throw new Error("the project database is not open, so the validity boundary is unavailable")
     return this.boundary
+  }
+
+  /**
+   * The read-only access service over the store and boundary this repository already owns. It decides scope
+   * by project, host key and the roots this repository was given before any content is read, and it grants
+   * nothing: a known observation id or a matching hash conveys no permission (Rule 7).
+   */
+  evidenceAccess(request: ProjectEvidenceRequest): Promise<EvidenceAccess> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) throw new Error("the project database holds no project for this fingerprint, so no evidence can be read from it")
+      const namedRoots = this.rootsOf().map((root) => toPosixPath(root))
+      const roots = this.sourceRoots!
+      const scope: EvidenceAccessScope = {
+        projectId: project.id,
+        ...(this.hostKey === "" ? {} : { hostKey: this.hostKey }),
+        roots,
+        authorized: (root) => root.kind === "home" || namedRoots.includes(root.locator)
+      }
+      return new ProjectEvidenceAccess(this.sqlite, scope, this.policySource!, this.homePath, { boundary: this.boundary })
+    })
   }
 
   /**

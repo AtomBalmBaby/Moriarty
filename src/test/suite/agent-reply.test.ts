@@ -2426,23 +2426,32 @@ suite("Read-file acceptance, production controller", function () {
   })
 
   test("repeated failed tool calls with no new evidence stop the task with a no-progress reason", async () => {
-  await withWorkspace(async (workspace) => {
-    const missing = () => call("read_file", { path: "src/missing.ts" })
-    // Twenty identical failing reads are scripted; the controller must stop long before they are spent.
-    const turn = await runTurn(workspace, {
-      conversationId: "read-file-no-progress",
-      planReply: readFilePlanReply("read-file-plan-no-progress"),
-      replies: ["Checked accepted evidence: nothing is recorded for read_file yet.", ...Array.from({ length: 20 }, missing)]
-    })
+  const settings = vscode.workspace.getConfiguration("twinny")
+  const previous = settings.inspect<number>("chatToolsMaxNoProgressSteps")?.globalValue
+  await settings.update("chatToolsMaxNoProgressSteps", 3, vscode.ConfigurationTarget.Global)
+  try {
+    await withWorkspace(async (workspace) => {
+      const missing = () => call("read_file", { path: "src/missing.ts" })
+      // This test verifies the historical three-repeat bound. The current
+      // product default is higher, so configure the threshold explicitly.
+      const turn = await runTurn(workspace, {
+        conversationId: "read-file-no-progress",
+        planReply: readFilePlanReply("read-file-plan-no-progress"),
+        replies: ["Checked accepted evidence: nothing is recorded for read_file yet.", ...Array.from({ length: 20 }, missing)]
+      })
 
-    assert.notEqual(await statusOf(turn, investigateTitle), "completed")
-    const stopped = turn.posted.find((message) => message.type === EVENT_NAME.twinnyAddMessage && JSON.stringify(message.data).includes("Execution stopped"))
-    assert.ok(stopped, "the stop is reported to the user")
-    assert.ok(JSON.stringify(stopped.data).includes("no measurable progress"), "the stop names the no-progress cause")
-    // The baseline turn, then two turns without progress: each is a continuation request, the identical read with its three repeats, and the answer-only request.
-    assert.ok(turn.agent.requests.length <= 13, `the same failed call must not repeat until the context is spent (saw ${turn.agent.requests.length} requests of 21 scripted)`)
-    assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
+      assert.notEqual(await statusOf(turn, investigateTitle), "completed")
+      const stopped = turn.posted.find((message) => message.type === EVENT_NAME.twinnyAddMessage && JSON.stringify(message.data).includes("Execution stopped"))
+      assert.ok(stopped, "the stop is reported to the user")
+      assert.ok(JSON.stringify(stopped.data).includes("no measurable progress"), "the stop names the no-progress cause")
+      // Three tool-loop iterations plus the baseline and continuation/evaluation
+      // requests stay within the original bounded integration count.
+      assert.ok(turn.agent.requests.length <= 13, `the same failed call must not repeat beyond the configured three-step bound (saw ${turn.agent.requests.length} requests)`)
+      assert.deepEqual(await turn.repository.listAcceptedEvidence(turn.scope), [])
     })
+  } finally {
+    await settings.update("chatToolsMaxNoProgressSteps", previous, vscode.ConfigurationTarget.Global)
+  }
   })
 
   test("a restarted conversation reuses the persisted read and resumes the blocked task without re-reading", async () => {

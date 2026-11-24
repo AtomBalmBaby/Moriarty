@@ -1,8 +1,9 @@
-import type { AnswerRequirement, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, ToolResultIntegrity, TypedCriterion } from "../../common/types"
+import type { AnswerRequirement, CaptureCompleteness, ResultStream, StorageCompleteness, TodoEvaluation, TodoEvidence, TodoItem, TodoPriority, TodoSourceFact, TodoStatus, TodoToolObservation, TodoVerification, ToolResultIntegrity, TypedCriterion } from "../../common/types"
 import type { ToolErrorDetail } from "../tools/arguments"
 
 import type { EvidenceHit, EvidenceSource, ObservedSourceReference, ObservedVersion } from "./evidence"
 import type { CapturedResult, StoredOutcome } from "./evidence-store"
+import type { SourceRootRecord, SourceRoots } from "./source-roots"
 import type { SourceValidity, SourceValidityAssessment } from "./source-validity"
 
 export type { TodoAssessmentReaction, TodoAssessmentScoreValue, TodoAssessmentView, TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoObservation, TodoObservationStatus, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
@@ -376,4 +377,170 @@ export interface EditOperationRecord extends EditOperationInput {
 export interface UnresolvedEditOperation extends EditOperationRecord {
   status: "dispatched" | "diverged"
   conversationId: string | null
+}
+
+/**
+ * §4.3 read-only evidence access contract (Stage 2). These are new shapes, not replacements for
+ * `EvidenceSource` or `EvidenceHit`: a result reports only what the store can prove about the content
+ * it holds, and never claims coverage it does not have.
+ */
+export type RetrievalState = "retained" | "partial_prefix" | "missing_tail" | "unknown_content" | "evicted" | "not_retrievable"
+export type SearchMode = "literal" | "regex"
+/** Where a lookup landed. A denied one names nothing it cannot name. */
+export type EvidenceAccessDecision = "found" | "missing" | "denied"
+/** Stored bytes, zero-based half-open [start,end). */
+export interface ByteRange {
+  fromByte: number
+  toByte: number
+}
+
+/** The scope a retrieval is decided in, before any content is read. Identity and permission stay separate. */
+export interface EvidenceAccessScope {
+  projectId: string
+  /** An observation recorded on another extension host is not read here; a row that names no host makes no claim. */
+  hostKey?: string
+  /** The canonical path identity this project already owns. */
+  roots: SourceRoots
+  /** Whether one root is inside what this caller may read. Outside-workspace content needs the editor's grant. */
+  authorized?: (root: SourceRootRecord) => boolean
+}
+
+export interface EvidenceAccess {
+  /** Resolve one observation by UUID; optional invocation-id alias. Enforces project/host/root scope. */
+  get(observationId: string, options?: { invocationId?: string }): Promise<EvidenceObservation>
+  /** Bounded inclusive retrieval over retained content. Never re-runs the original tool. */
+  range(observationId: string, request: RangeRequest): Promise<RetrievedSpan>
+  /** Literal and optional regex search over retained output with continuation. Zero matches is success. */
+  search(observationId: string, request: SearchRequest): Promise<SearchPage>
+  /** Filter observations by source path, fingerprint, tool, time, status, project - bounded. */
+  find(filter: EvidenceFilter): Promise<EvidenceMatch[]>
+}
+
+/** One observation as the store can prove it, with no content attached. */
+export interface EvidenceObservation {
+  observationId: string
+  access: EvidenceAccessDecision
+  invocationId?: string
+  toolName?: string
+  path?: string
+  observedAt?: string
+  executionId?: string
+  executed?: boolean
+  failed?: boolean
+  status?: string
+  exitCode?: number
+  /** The fingerprint as it was observed, never a current one (Rule 3). */
+  originalHash?: string
+  completeness?: { captured: CaptureCompleteness; stored: StorageCompleteness }
+  streams?: { stream: ResultStream; coverage: ByteRange[] }[]
+  lineIndex?: { lines: number; bounded: boolean }
+  /** Set when the recorded source no longer matches: historical evidence, not current source. */
+  historical?: boolean
+  /** Reported only when something is claimed it cannot, or a scope refused the lookup. */
+  reason?: string
+}
+
+export interface RangeRequest {
+  stream?: ResultStream
+  startLine?: number; endLine?: number                  // 1-based, inclusive
+  startChar?: number; endChar?: number                  // 1-based character offsets on one line
+  startByte?: number; endByte?: number                  // zero-based, half-open [startByte,endByte) in original bytes
+}
+
+export interface SpanCoverage {
+  fromLine?: number; toLine?: number
+  fromByte: number; toByte: number
+}
+
+export interface RetrievedSpan {
+  observationId: string
+  stream: ResultStream
+  requested: RangeRequest
+  coverage: SpanCoverage
+  /** The pieces actually served, in byte order, when the span is not one continuous piece. */
+  servedRanges?: ByteRange[]
+  text?: string
+  state: RetrievalState
+  /** Measured by the store, never inferred: absent when nothing could be measured. */
+  completeness?: { captured: CaptureCompleteness; stored: StorageCompleteness }
+  /** The fingerprint as it was observed, not a current one. */
+  originalHash?: string
+  /** What the result is an account of. Absent when nothing was resolved to report. */
+  provenance?: { toolName: string; path?: string; observedAt: string; executionId?: string }
+  continuation?: { nextByte?: number; cursor?: string }
+  /** Set when the recorded source no longer matches: historical evidence, never presented as current source. */
+  historical?: boolean
+  /** Why the state is what it is, in the store's own words. */
+  reason?: string
+  /** What the stored bytes are: a decoded view exists only for content that is valid UTF-8. */
+  encoding?: "utf8" | "bytes" | "mixed"
+  bytePreservation?: "lossless" | "normalized" | "excluded"
+  /** True when the returned text is the redacted presentation view, not the stored bytes. */
+  redactionApplied?: boolean
+  /** A merged view is named as one: which streams it came from, in the order their chunks arrived. */
+  mergedFrom?: { stream: ResultStream; coverage: ByteRange[] }[]
+  coordinates?: "stored_bytes" | "merged_view"
+}
+
+export interface SearchRequest {
+  query: string
+  mode?: SearchMode                                     // literal by default; regex when asked for
+  stream?: ResultStream
+  contextLines?: number
+  limit?: number
+  cursor?: string                                       // deterministic continuation, not a rerun
+}
+
+export interface SearchPage {
+  observationId: string
+  query: string
+  mode: SearchMode
+  stream: ResultStream
+  /** Matches in the bytes actually scanned; never a total over content the scan did not reach. */
+  matchCount: number
+  /** Set when the recorded source no longer matches: historical evidence, never presented as current source. */
+  historical?: boolean
+  matches: { line?: number; byte?: number; preview: string; withheld?: boolean; context?: string[] }[]
+  contextLines?: number
+  cursor?: string
+  state: RetrievalState
+  reason?: string
+  /** What the bounded scan reached, so a bound is reported as a bound and not as a total. */
+  scannedBytes?: number
+  matchLimit?: number
+}
+
+export interface EvidenceFilter {
+  project?: string
+  path?: string
+  contentHash?: string
+  toolName?: string
+  status?: string
+  failed?: boolean
+  executed?: boolean
+  executionId?: string
+  since?: string
+  until?: string
+  limit?: number
+  cursor?: string
+}
+
+export interface EvidenceMatch {
+  observationId: string
+  toolName: string
+  /** A path is named only when it is inside what this caller may read. */
+  path?: string
+  contentHash?: string
+  observedAt: string
+  status: string
+  failed: boolean
+  executed: boolean
+  exitCode?: number
+  state: RetrievalState
+  completeness?: { captured: CaptureCompleteness; stored: StorageCompleteness }
+  streams?: { stream: ResultStream; coverage: ByteRange[] }[]
+  /** Set when the recorded source no longer matches: historical evidence, never presented as current source. */
+  historical?: boolean
+  /** The page position, so a bounded lookup can be continued without dumping the whole list. */
+  cursor?: string
 }
