@@ -7859,3 +7859,42 @@ test("one authoritative read supplies both the state the boundary decides and th
     removeAll(state.directory, root)
   }
 })
+/* Stage 4: the classes, recorded dependencies and stale notices through the production lookup path. */
+
+test("the lookup reports the class the boundary decided and writes a stale notice only when the active plan depends on that fact", async () => {
+  const root = sourceWorkspace()
+  const state = await fixture(acceptedFactPlan, false, EVIDENCE_REQUEST, () => [root])
+  try {
+    const { observation } = await establishFact(state, root, { count: 0 })
+    const facts = await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: READ_FILE_SOURCE })
+    const current = (await assessAcceptedFacts(facts, boundaryOf(state)))[0]
+    assert.equal(current.class, "current", "a fact that still matches its source is reported as current and gets no notice")
+
+    const changed = `${realWorkspaceSource}// changed
+`
+    const newHash = await fingerprintContent(changed)
+    fs.writeFileSync(path.join(root, READ_FILE_SOURCE), changed)
+    const stale = (await assessAcceptedFacts(await state.repository.listAcceptedEvidence(state.scope, { symbol: "read_file", path: READ_FILE_SOURCE }), boundaryOf(state)))[0]
+    assert.equal(stale.class, "stale", "the class reports the state the boundary decided for the fact's own reference")
+
+    // The task the fact was accepted for is open in the active plan again, so this fact is part of its proof.
+    const locate = itemTitled(state, "locate").id
+    await setStatus(state.repository, state.scope, locate, "in_progress", "reopen-locate")
+    const found = await lookupEvidence(state, { symbol: "read_file", path: READ_FILE_SOURCE }, boundaryOf(state))
+    const reported = found.body!.facts[0] as { reference?: { class?: string }; notice?: Record<string, unknown> }
+    assert.equal(reported.reference?.class, "stale", "the lookup reports the class through the reference the boundary decided")
+    assert.deepEqual({ ...(reported.notice ?? {}) }, { observationId: observation.id, originalHash: facts[0].sourceHash, reason: "source_modified" }, `DIAG ${JSON.stringify({ item: facts[0].itemId, plan: (await state.repository.getIntentTaskPlan(state.scope))?.tasks.map((task) => task.id), notice: reported.notice })}`)
+    assert.ok(!JSON.stringify(found.body).includes(newHash), `the reply carries no current hash: ${JSON.stringify(found.body)}`)
+
+    // A conversation with no authoritative plan cannot depend on the fact, so the same stale record is reported
+    // without a notice: the notice is written only for a fact the active plan depends on.
+    const unplanned = { projectFingerprint: state.scope.projectFingerprint, conversationId: "stage4-no-plan", writer: "stage4-no-plan" }
+    assert.equal(await state.repository.hasAuthoritativePlan(unplanned), false, "this conversation has no active plan")
+    const after = await lookupEvidence({ repository: state.repository, scope: unplanned }, { symbol: "read_file", path: READ_FILE_SOURCE }, boundaryOf(state))
+    const untouched = after.body!.facts[0] as { reference?: { class?: string }; notice?: Record<string, unknown> }
+    assert.equal(untouched.reference?.class, "stale", "the fact is still stale as history")
+    assert.equal(untouched.notice, undefined, "and no notice is inserted for a fact the active plan does not depend on")
+  } finally {
+    removeAll(state.directory, root)
+  }
+})

@@ -5,6 +5,7 @@ import path from "node:path"
 import * as vscode from "vscode"
 
 import { logger } from "../../common/logger"
+import type { SourceEvent } from "../todos/dependency-index"
 import { currentProjectTodoStorage } from "../todos/project-storage"
 import { toPosixPath } from "../todos/source-roots"
 import { type Database, SqliteFile, type SqliteLocation } from "../todos/sqlite"
@@ -215,6 +216,8 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
   private activeSourceBytes = 0
   private symbolProviderCalls = 0
   private readonly listeners: vscode.Disposable[] = []
+  /** Stage 4: the host watches the source changes this index sees; reporting one decides no state. */
+  private readonly sourceEventListeners = new Set<(event: SourceEvent) => void>()
   private readonly emitter = new vscode.EventEmitter<WorkspaceIndexState>()
   readonly onDidChange = this.emitter.event
   private state: WorkspaceIndexState = {
@@ -239,6 +242,12 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       vscode.workspace.onDidCloseTextDocument((document) => {
         this.dirtyUris.delete(document.uri.toString())
         if (this.automaticSyncEnabled()) this.scheduleUris([document.uri], "text-document-close")
+      }),
+      vscode.workspace.onDidRenameFiles((event) => {
+        for (const file of event.files) {
+          if (!this.isEligibleUri(file.oldUri) && !this.isEligibleUri(file.newUri)) continue
+          this.reportSourceEvent({ path: toPosixPath(file.newUri.fsPath || file.newUri.path), reason: "rename", origin: "recorded_operation", from: toPosixPath(file.oldUri.fsPath || file.oldUri.path) })
+        }
       }),
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
         this.resetFileWatchers()
@@ -267,6 +276,16 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
 
   get snapshot(): WorkspaceIndexState {
     return { ...this.state }
+  }
+
+  /** Registers a listener for source events. The index reports what it saw; the dependency index decides nothing. */
+  observeSourceEvents(listener: (event: SourceEvent) => void): void {
+    this.sourceEventListeners.add(listener)
+  }
+
+  /** Reports one event to every listener the host registered. A reported event claims no state. */
+  private reportSourceEvent(event: SourceEvent): void {
+    for (const listener of this.sourceEventListeners) listener(event)
   }
 
   /** Fingerprint candidates for hash-first source resolution. */
@@ -396,6 +415,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       for (const change of changes) {
         if (seen.has(change.path)) continue
         seen.add(change.path)
+        this.reportSourceEvent({ path: toPosixPath(change.path), reason: change.kind === "delete" ? "source_deleted" : "source_modified", origin: "native_edit" })
         const uri = vscode.Uri.file(change.path)
         if (!this.folderFor(uri)) {
           results.push({ path: change.path, status: "skipped", reason: "outside the indexed workspace folders" })
@@ -579,6 +599,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       void this.synchronize(false, true, "gitignore-change")
       return
     }
+    this.reportSourceEvent({ path: toPosixPath(uri.fsPath || uri.path), reason: "source_modified", origin: "file_watcher" })
     void vscode.workspace.fs.stat(uri).then((stat) => {
       if (!this.automaticSyncEnabled()) return
       if (this.isInternalStorageArtifact(uri)) return
@@ -600,6 +621,7 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
       this.workspaceIndexDebug(`[WorkspaceIndex] ignored internal storage file event path=${uri.fsPath || uri.path} type=delete`)
       return
     }
+    this.reportSourceEvent({ path: toPosixPath(uri.fsPath || uri.path), reason: "source_deleted", origin: "file_watcher" })
     if (uri.path.endsWith("/.gitignore")) void this.synchronize(false, true, "gitignore-delete")
     else void this.deleteUris([uri.toString()]).catch((error) => this.reportError("Workspace index deletion failed", error))
   }

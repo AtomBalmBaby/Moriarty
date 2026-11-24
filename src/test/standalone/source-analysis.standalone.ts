@@ -3,7 +3,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { test } from "node:test"
 
-import { analyzeSource, type SourceAnalysis, type ToolRegistration } from "../../extension/todos/source-analysis"
+import { analyzeSource, type SourceAnalysis, type ToolRegistration, type UnanalysedSource } from "../../extension/todos/source-analysis"
 
 const lines = (...text: string[]) => text.join("\n")
 
@@ -198,4 +198,20 @@ test("re-exports and CommonJS exports are reported as opaque names", () => {
 test("syntax errors and unsupported languages are unanalysed rather than partially answered", () => {
   assert.equal(analyzeSource("broken.ts", "export const = ;").status, "unanalysed")
   assert.equal(analyzeSource("notes.md", "# heading").status, "unanalysed")
+})
+test("arbitrary command text is never read as a dependency: the analysis reports what it can see and nothing more", () => {
+  const run = analyzeSource("check.sh", lines(
+    "cat src/extension/todos/evidence.ts # the read that established alias",
+    "export const readFile = 1"
+  ))
+  assert.equal(run.status, "unanalysed")
+  assert.ok((run as UnanalysedSource).reason.includes("not a TypeScript or JavaScript source file"), JSON.stringify(run))
+
+  // Inside a real source file, a name in a comment is not a declaration, so a sentence about a dependency
+  // establishes none. The dependency index records edges only from operations, never from this text.
+  const commented = analysed("entry.ts", lines("// the read that established alias", "export const readFile = 1"))
+  assert.equal(commented.status, "analyzed")
+  assert.deepEqual(declarationsNamed(commented, "alias"), [])
+  assert.deepEqual(commented.registrations, [])
+  assert.deepEqual(commented.opaqueNames, [])
 })

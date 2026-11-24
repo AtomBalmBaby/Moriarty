@@ -11,6 +11,7 @@
  */
 import type { CaptureMode, ToolResultIntegrity } from "../../common/types"
 import { diagnosticEvent } from "../diagnostics"
+import type { SourceEvent } from "../todos/dependency-index"
 import { TodoRepository } from "../todos/repository"
 import type { EvidenceAccess, TodoWriteRequest } from "../todos/types"
 
@@ -1370,4 +1371,6 @@ export interface WorkspaceSearchProvider {
   /** Optional fingerprint leads and coverage from the unified project index. */
   candidatesFor?(fingerprint: string): Promise<string[]>
   coverage?(shown: string[]): Promise<{ complete: boolean; fresh: boolean; unexamined?: number; reason?: string }>
+  /** Stage 4: the source changes an index observed (rename, create, delete, external change). Reporting one claims no state. */
+  observeSourceEvents?(listener: (event: SourceEvent) => void): void
 }

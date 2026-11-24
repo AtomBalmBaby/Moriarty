@@ -5,7 +5,7 @@ import type { CriterionFailureReason, ReplyChangesView, SourceIdentity, TodoAsse
 
 import { codeIdentifiers, commandDigest, type ObservedVersion, samePath } from "./evidence"
 import { analyzeSource, isAnalysableSource, type RegistrationImplementation, type SourceAnalysis } from "./source-analysis"
-import { aggregateValidity, type CheckedSourceReference, type RecordedSourceReference, type SourceRead, type SourceValidity, SourceValidityBoundary } from "./source-validity"
+import { aggregateValidity, type CheckedSourceReference, type ClassificationContext, type ClassifiedSourceReference, type RecordedSourceReference, type SourceRead, type SourceValidity, SourceValidityBoundary, type StaleNotice, type ValidityClass } from "./source-validity"
 import { type AcceptedFact, type CriterionVerification, type IntentPlanContext, type RequirementActivation, type RetainedObservationEvidence, type TodoReviewPackage } from "./types"
 import { capabilityOf } from "./verification-capabilities"
 
@@ -209,6 +209,10 @@ export interface AcceptedFactStatus {
   validity: SourceValidity
   reference: CheckedSourceReference
   reason?: string
+  /** The class the boundary gave this fact: its own reference plus what the dependency index recorded for it. */
+  class?: ValidityClass
+  /** The notice for a stale fact, with the hash as it was observed and never a new one (Rule 3). */
+  notice?: StaleNotice
 }
 
 const reconciled = (
@@ -241,6 +245,8 @@ export const factMatchesSymbol = (candidate: AcceptedFact, symbol: string): bool
 export interface SourceReader {
   read: (path: string) => Promise<string | undefined>
   check: (reference: RecordedSourceReference) => Promise<CheckedSourceReference>
+  /** Stage 4: the same decision as a class, from what an operation recorded for that reference. */
+  classify?: (reference: RecordedSourceReference, context?: ClassificationContext) => Promise<ClassifiedSourceReference>
 }
 
 /** The boundary a consumer reads through: the one the repository owns, or one built from the host's own source. One authoritative read is shared per path, so a file is not read twice. */
@@ -249,7 +255,8 @@ export const sourceReaderFor = (source?: CurrentSource): SourceReader => {
   const cache = new Map<string, SourceRead>()
   return {
     read: (path: string) => boundary.read(path, "buffer", cache).then((read) => "text" in read ? read.text : undefined),
-    check: (reference: RecordedSourceReference) => boundary.check(reference, cache)
+    check: (reference: RecordedSourceReference) => boundary.check(reference, cache),
+    classify: boundary.recorded() === undefined ? undefined : async (reference: RecordedSourceReference, context: ClassificationContext = {}) => boundary.classify(reference, context, cache)
   }
 }
 
@@ -280,11 +287,16 @@ export const assessAcceptedFacts = async (
 ): Promise<AcceptedFactStatus[]> => {
   const reader = source === undefined ? undefined : sourceReaderFor(source)
   return Promise.all(facts.map(async (fact): Promise<AcceptedFactStatus> => {
-    const reference = reader ? await reader.check(recordedReference(fact)) : decidedReference(fact)
+    // The boundary decides the state and, from what the index recorded for it, the class. One read answers both.
+    const classified = reader?.classify ? await reader.classify(recordedReference(fact), contextForFact(fact)) : undefined
+    const reference = classified ?? (reader ? await reader.check(recordedReference(fact)) : decidedReference(fact))
     const reason = factReason(fact, reference)
-    return { fact, freshness: fact.supersededBy ? "historical" : FRESHNESS_OF[reference.validity], validity: reference.validity, reference, ...(reason ? { reason } : {}) }
+    return { fact, freshness: fact.supersededBy ? "historical" : FRESHNESS_OF[reference.validity], validity: reference.validity, reference, ...(reason ? { reason } : {}), ...(classified === undefined ? {} : { class: classified.class }), ...(classified?.notice === undefined ? {} : { notice: classified.notice }) }
   }))
 }
+
+/** What the index recorded for one fact: its own record and the decision that replaced it, when there was one. */
+const contextForFact = (fact: AcceptedFact): ClassificationContext => ({ observationId: fact.observationId, ...(fact.supersededBy === undefined ? {} : { supersededBy: fact.supersededBy }) })
 
 /** The reference an accepted fact records: the read it was proven from. */
 const recordedReference = (fact: AcceptedFact): RecordedSourceReference => ({ path: fact.path, role: "read", contentHash: fact.sourceHash, observedVersion: fact.observedVersion ?? "disk", ...(fact.editorVersion === undefined ? {} : { editorVersion: fact.editorVersion }) })

@@ -4,9 +4,10 @@ import type { ToolErrorDetail } from "../tools/arguments"
 import type { EvidenceHit, EvidenceSource, ObservedSourceReference, ObservedVersion } from "./evidence"
 import type { CapturedResult, StoredOutcome } from "./evidence-store"
 import type { SourceRootRecord, SourceRoots } from "./source-roots"
-import type { SourceValidity, SourceValidityAssessment } from "./source-validity"
-
+import type { SourceValidity, SourceValidityAssessment, ValidityClass } from "./source-validity"
+/** Stage 4's validity contract (§6): the classes, what an operation recorded as a dependency, and the notice a stale record may be rendered as. */
 export type { TodoAssessmentReaction, TodoAssessmentScoreValue, TodoAssessmentView, TodoEvaluation, TodoEvaluationCriterion, TodoEvaluationDecision, TodoEvidence, TodoItem, TodoListSnapshot, TodoObservation, TodoObservationStatus, TodoPriority, TodoSource, TodoStatus, TodoToolEvidenceStatus, TodoToolObservation, TodoVerification } from "../../common/types"
+export type { ClassificationContext, ClassifiedSourceReference, DependencyEdge, DependencyKind, RecordedContextSource, StaleNotice, StaleReason, ValidityClass, ValidityEvent } from "./source-validity"
 export type TodoActor = "user" | "model"
 
 export type { AnswerField, AnswerRequirement, CriterionVerification,IntentTaskDefinition, IntentTaskPlan, TypedCriterion } from "../../common/types"
@@ -211,12 +212,16 @@ export interface RetainedObservationEvidence {
   hits: EvidenceHit[]
   /** Each reference this result recorded, checked by the repository's validity boundary, with the aggregate for them. */
   validity?: SourceValidityAssessment
+  /** The class the boundary gave this record: the state it decided plus what an operation recorded for it. */
+  class?: ValidityClass
 }
 
 /** A stored observation, with the validity the boundary decided for the references it recorded. */
 export interface RecordedObservation extends TodoToolObservation {
   /** Each reference the observation recorded, checked when it was stored. */
   validity?: SourceValidityAssessment
+  /** The class the boundary gave this record when it was stored. */
+  class?: ValidityClass
   /** What the byte store holds for this observation, as the store measured it. */
   outcome?: StoredOutcome
 }

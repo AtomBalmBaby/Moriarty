@@ -11,6 +11,7 @@ import { editorEdits } from "../../extension/chat/tool-sinks"
 import { applyDocumentLineEdits } from "../../extension/edit/line-edit"
 import { GenerationTracker } from "../../extension/generations"
 import { TwinnyStatusBar } from "../../extension/status-bar"
+import type { SourceEvent } from "../../extension/todos/dependency-index"
 import { projectTodoStorageOf } from "../../extension/todos/project-home"
 import { currentProjectTodoStorage } from "../../extension/todos/project-storage"
 import { DEFAULT_EVIDENCE_STORAGE_LIMITS, PROJECT_FINGERPRINT, TodoRepository } from "../../extension/todos/repository"
@@ -733,6 +734,48 @@ suite("Persistent workspace intelligence index", () => {
       assert.deepEqual(candidates, [{ path: to, source: "matching_hash" }], "the row the refresh wrote at the new path is offered, and the recorded path is not its own candidate")
     } finally {
       repository.close()
+    }
+  })
+
+  test("a rename reaches the dependency index with its link, and the index reports the new path through onDidRenameFiles", async function () {
+    this.timeout(120000)
+    const databasePath = path.join(root, ".twinny", "project.sqlite")
+    const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+    const scope = { projectFingerprint: PROJECT_FINGERPRINT, conversationId: "stage-four-rename", writer: "stage-four-rename" }
+    const events: SourceEvent[] = []
+    index = new WorkspaceIntelligenceIndex(databasePath)
+    index.observeSourceEvents((event) => events.push(event))
+    try {
+      await repository.initialize()
+      await repository.getList(scope)
+      const recorded = repository.dependencyIndex()
+      const content = "export const stageFourRenameMarker = 1\n"
+      const hash = await fingerprintContent(content)
+      const from = "src/stage-four-from.ts"
+      const to = "src/stage-four-to.ts"
+      fs.writeFileSync(path.join(root, from), content)
+      await repository.recordToolObservation(scope, { toolName: "read_file", arguments: { path: from }, output: `read ${from}`, evidenceOutput: `content_hash: ${hash}; total_lines: 1\n1: export const stageFourRenameMarker = 1`, failed: false, requestId: "stage-four-rename-read", sources: [{ path: from, role: "read", observedVersion: "disk", contentHash: hash }] })
+      const canonicalFrom = path.posix.join(toPosixPath(root), from)
+      assert.equal(recorded.recordsSource(canonicalFrom), true, "the recorded path is known as a source by its identity")
+
+      const edit = new vscode.WorkspaceEdit()
+      edit.renameFile(vscode.Uri.file(path.join(root, from)), vscode.Uri.file(path.join(root, to)))
+      assert.equal(await vscode.workspace.applyEdit(edit), true, "the editor renamed the file")
+      const event = events.find((entry) => entry.reason === "rename")
+      assert.ok(event !== undefined, `no rename event was reported: ${JSON.stringify(events)}`)
+      assert.equal(event?.path, path.posix.join(toPosixPath(root), to), "the index reports the new path")
+      assert.equal(event?.from, canonicalFrom, "and keeps the recorded path it moved from as the link")
+
+      // The event reaches the dependency index through the host's wiring point, and only a path this project
+      // recorded is accepted. A rename of a file no record names names nothing.
+      const applied = recorded.noteEvent(event!)
+      assert.ok(applied.event !== undefined, `the rename was not recorded: ${applied.reason ?? ""}`)
+      assert.equal(recorded.recordsSource(path.posix.join(toPosixPath(root), "src/stage-four-unrecorded.ts")), false, "a file no record names is not a source")
+      const unrecorded = recorded.noteEvent({ path: path.posix.join(toPosixPath(root), "src/stage-four-unrecorded.ts"), reason: "rename", origin: "recorded_operation" })
+      assert.equal(unrecorded.event, undefined, "and no claim is invalidated by a change it does not depend on")
+    } finally {
+      repository.close()
+      index.dispose()
     }
   })
 

@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { logger } from "../../common/logger"
 import type { ResultGap, ToolResultIntegrity } from "../../common/types"
 
+import { DependencyIndex } from "./dependency-index"
 import {
   displayArguments,
   type EvidenceHit,
@@ -720,7 +721,8 @@ const recordAcceptedFacts = (
     itemId: string,
     evaluation: TodoEvaluation,
     observations: Map<string, { tool_name: string; failed: number; evidence_metadata: string | null }>,
-    acceptedAt: string
+    acceptedAt: string,
+    recorded: DependencyIndex | undefined
 ): void => {
     function refuse(index: number, reason: string): never {
       logger.debug(`[Evidence] fact not promoted task=${itemId} criterion=${index} reason=${reason}`)
@@ -740,6 +742,8 @@ const recordAcceptedFacts = (
     }
     if (fact.registeredTool !== undefined && !fact.registeredTool.trim()) refuse(index, "registered tool name is empty")
     const id = randomUUID()
+      // The supersession is decided by this operation, so the pair it names is a recorded relationship.
+      const prior = rows<{ observation_id: string }>(database, "SELECT observation_id FROM todo_accepted_evidence WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?", [listId, fact.symbol, fact.path, id])
     execute(database,
       "INSERT INTO todo_accepted_evidence(id, project_id, list_id, plan_id, plan_revision, item_id, criterion_index, criterion, observation_id, tool_name, symbol, path, start_line, end_line, source_hash, superseded_by, registered_tool, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
       [id, projectId, listId, plan.plan_id, plan.revision, itemId, index, criterion.criterion, fact.observationId, observation.tool_name, fact.symbol, fact.path, fact.startLine, fact.endLine, fact.sourceHash, fact.registeredTool ?? null, acceptedAt]
@@ -748,6 +752,11 @@ const recordAcceptedFacts = (
       "UPDATE todo_accepted_evidence SET superseded_by = ? WHERE list_id = ? AND symbol = ? AND path = ? AND superseded_by IS NULL AND id <> ?",
       [id, listId, fact.symbol, fact.path, id]
     )
+    // A dependency is recorded only when an operation established it: the claim was reconciled against another
+    // record's analysis, or this fact replaced an earlier one for the same symbol and path. Nothing is inferred
+    // from a file name, a command string or a matching fingerprint.
+    for (const supporting of criterion.reconciliation?.supportingObservationIds ?? []) recorded?.recordEdge({ derivedObservationId: fact.observationId, sourceObservationId: supporting, kind: "accepted_fact" }, acceptedAt)
+    for (const previous of prior) recorded?.recordEdge({ derivedObservationId: fact.observationId, sourceObservationId: previous.observation_id, kind: "supersedes" }, acceptedAt)
     logger.debug(`[Evidence] promoted task=${itemId} criterion=${index} symbol=${fact.symbol} path=${fact.path} lines=${fact.startLine}-${fact.endLine} observation=${fact.observationId}`)
   }
 
@@ -904,6 +913,8 @@ export class TodoRepository {
   private readonly evidenceLimits: EvidenceStorageLimits
   private sourceRoots: SourceRoots | undefined
   private boundary: SourceValidityBoundary | undefined
+  /** Stage 4's recorded dependency and event context. It reports what operations established; the boundary decides. */
+  private recordedIndex: DependencyIndex | undefined
   /** The byte store for this project: what was captured, not what was fitted for display. */
   private evidenceStore: ProjectEvidenceStore | undefined
   /** The effective storage policy, read from the project's own config file. */
@@ -930,8 +941,10 @@ export class TodoRepository {
     this.hostKey = access.hostKey ?? ""
     this.sqlite = new SqliteFile(databasePath, (database, home) => {
       const sourceRoots = new SourceRoots(database, home)
+      // The roots scope an event; they never grant one, and a denied event names nothing it cannot name.
+      this.recordedIndex = new DependencyIndex(database, sourceRoots, { authorized: (root) => root.kind === "home" || roots().map((entry) => toPosixPath(entry)).includes(root.locator) })
       this.sourceRoots = sourceRoots
-      this.boundary = new SourceValidityBoundary({ ...source, roots: sourceRoots })
+      this.boundary = new SourceValidityBoundary({ ...source, roots: sourceRoots, recorded: this.recordedIndex })
       this.policySource = createPolicySource(home)
       this.homePath = home
       sourceRoots.home()
@@ -949,6 +962,7 @@ export class TodoRepository {
     this.sqlite.close()
     this.sourceRoots = undefined
     this.boundary = undefined
+    this.recordedIndex = undefined
   }
 
   /**
@@ -958,6 +972,15 @@ export class TodoRepository {
   sourceValidity(): SourceValidityBoundary {
     if (!this.boundary) throw new Error("the project database is not open, so the validity boundary is unavailable")
     return this.boundary
+  }
+
+  /**
+   * Stage 4's recorded context for this project: the edges an operation established and the events the host
+   * reported. It records and reports; it decides no state, because the boundary stays the single decider.
+   */
+  dependencyIndex(): DependencyIndex {
+    if (!this.recordedIndex) throw new Error("the project database is not open, so the dependency index is unavailable")
+    return this.recordedIndex
   }
 
   /**
@@ -990,7 +1013,12 @@ export class TodoRepository {
     if (!observationIds.length) return
     const references = await this.sqlite.read((database) => recordedSourceReferences(database, this.sourceRoots!, observationIds))
     const boundary = this.sourceValidity()
-    for (const record of records) record.validity = await boundary.assess(references.get(record.observationId) ?? [])
+    for (const record of records) {
+      const assessment = await boundary.classifyRecord(references.get(record.observationId) ?? [], record.observationId)
+      record.validity = assessment
+      if (assessment.class === undefined) continue
+      record.class = assessment.class
+    }
     for (const fact of facts) {
       const recorded = (references.get(fact.observationId) ?? []).find((reference) => samePath(reference.path, fact.path))
       // The version the read saw is part of the reference's identity, so the fact is judged against that same version.
@@ -1527,7 +1555,15 @@ export class TodoRepository {
           references
         }
       })
-    }).then(async (stored) => ({ ...stored.observation, validity: await this.sourceValidity().assess(stored.references) }))
+    }).then(async (stored) => {
+      // The class is decided at storage by the same boundary, from what the index recorded for this record. The
+      // audit column keeps what was decided then; it is never authority, because a later read decides again.
+      const classified = await this.sourceValidity().classifyRecord(stored.references, stored.observation.id)
+      return this.sqlite.write((database) => {
+        execute(database, "UPDATE todo_tool_observations SET validity_class = ? WHERE id = ?", [classified.class ?? null, stored.observation.id])
+        return { ...stored.observation, validity: classified, ...(classified.class === undefined ? {} : { class: classified.class }) }
+      })
+    })
   }
 
   /**
@@ -1719,7 +1755,7 @@ export class TodoRepository {
         [status, verification, blockedReason, updatedAt, itemId, expectedVersion])
       if (updateResult.changes !== 1) throw new TodoConflictError("TODO changed while applying its evaluation")
       if (observation) recordAssessment(database, list.id, itemId, evaluationId, requestId, observation, expectedVersion + 1)
-      if (evaluation.decision === "accept") recordAcceptedFacts(database, list.id, list.project_id, currentPlan, itemId, evaluation, new Map(observations.map((observation) => [observation.id, observation])), updatedAt)
+      if (evaluation.decision === "accept") recordAcceptedFacts(database, list.id, list.project_id, currentPlan, itemId, evaluation, new Map(observations.map((observation) => [observation.id, observation])), updatedAt, this.recordedIndex)
       bumpList(database, list.id, itemId, "evaluation_recorded", "system", requestId, { decision: evaluation.decision, evaluation: recorded })
       logTodoEvent("feedback.reconciled", { operation_id: list.id, item_id: itemId, decision: evaluation.decision, status, verification, request_id: requestId })
       if (status === "completed") logTodoEvent("todo.completed", { operation_id: list.id, item_id: itemId, verification, request_id: requestId })
@@ -1984,6 +2020,19 @@ export class TodoRepository {
       const list = findList(database, request)
       if (!list) return false
       return rows<{ plan_id: string }>(database, "SELECT plan_id FROM todo_intent_plans WHERE list_id = ?", [list.id]).length > 0
+    })
+  }
+
+  /**
+   * Whether one TODO is a task of this conversation's authoritative plan. A stale notice is written only for a fact
+   * the active plan depends on, so this is the check the tool asks, never a guess from wording.
+   */
+  itemIsPlanTask(request: TodoListRequest, itemId: string): Promise<boolean> {
+    return this.sqlite.read((database) => {
+      const list = findList(database, request)
+      if (!list) return false
+      if (rows<{ plan_id: string }>(database, "SELECT plan_id FROM todo_intent_plans WHERE list_id = ?", [list.id]).length === 0) return false
+      return rows<{ task_id: string }>(database, "SELECT tasks.task_id FROM todo_intent_tasks AS tasks JOIN todo_items AS items ON items.id = tasks.item_id WHERE tasks.list_id = ? AND tasks.item_id = ? AND tasks.active = 1", [list.id, itemId]).length > 0
     })
   }
 

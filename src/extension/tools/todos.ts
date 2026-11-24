@@ -2,7 +2,7 @@ import { logger } from "../../common/logger"
 import { assessAcceptedFacts, type CurrentSource, evidenceLookupArguments, factNamedBy, projectCandidateEntries, resolveAcceptedFacts } from "../todos/feedback"
 import { TodoRepository } from "../todos/repository"
 import { aggregateValidity } from "../todos/source-validity"
-import { ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
+import { AcceptedFact, ChildTodoOutcome, ChildTodoProposal, ChildTodoReview, TodoActor, TodoItem, TodoPriority, TodoStatus, TodoWriteRequest } from "../todos/types"
 
 import { argumentFailure, argumentReader, textArgument, ToolArgumentError, type ToolArguments } from "./arguments"
 import { Tool, ToolContext, ToolResult } from "./workspace"
@@ -222,7 +222,8 @@ export const todoTools = (
             validity, reference,
             ...(candidates.length ? { relocation_candidates: candidates } : {}),
             ...(reason ? { reason } : {}),
-            ...(freshness !== "current" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again${candidates.length ? `; ${MOVED_FILE_HINT}` : ""}` } : {})
+            ...(freshness !== "current" && !fact.supersededBy ? { refresh: `read ${fact.path} lines ${fact.startLine}-${fact.endLine} again${candidates.length ? `; ${MOVED_FILE_HINT}` : ""}` } : {}),
+            ...(status.notice === undefined || !(await planDependsOnFact(repository, scope, fact)) ? {} : { notice: status.notice })
           }
         }))
         const referenceValidity = aggregateValidity(statuses.map((status) => status.reference))
@@ -459,6 +460,17 @@ export const todoTools = (
     }
   }
 ]
+
+/**
+ * §6's wire rule: a stale notice is written only when the active plan depends on the fact it names. A fact no
+ * active plan task relies on gets no notice, so notices are never inserted indiscriminately.
+ */
+const planDependsOnFact = async (repository: TodoRepository, scope: TodoWriteRequest, fact: AcceptedFact): Promise<boolean> => {
+  if (fact.itemId === undefined) return false
+  if (!(await repository.itemIsPlanTask(scope, fact.itemId))) return false
+  const { item } = await repository.getItem(scope, fact.itemId)
+  return item.status !== "completed" && item.status !== "cancelled"
+}
 
 /**
  * Validates a model's reference to an accepted fact on the host, then records it as this TODO's evidence. The fact must

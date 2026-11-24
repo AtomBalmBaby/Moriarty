@@ -70,11 +70,13 @@ import { describeProviderError, describeProviderErrorPlain, stripThinking } from
 import { ProviderStore } from "../providers/store"
 import { TemplateProvider } from "../templates/provider"
 import { checkDelivery } from "../todos/delivery"
+import { type SourceEvent } from "../todos/dependency-index"
 import { EVIDENCE_BUDGET, fitForSection, projectEvidence, renderRecentObservations, renderRequiredEvidence, unresolvedFailures } from "../todos/evidence-context"
 import { type AcceptedFactStatus, assessProvenTodo, type CurrentSource, dependenciesComplete, evaluateTodoReview, EVIDENCE_CHECK_TOOL, type EvidenceAssessment, evidenceCheckRecord, evidencePreflight, feedbackContext, hostDecidesReview, isEvidenceFirstRequest, renderEvidencePreflight, reviewCandidates, taskHasVerifiedMutation, taskRequiresWorkspaceChanges, TodoEvaluationProviderError, todoObservationSystemPrompt, todoReviewInput, todoReviewSystemPrompt } from "../todos/feedback"
 import { authoritativeExecutionReport, renderPlanContext } from "../todos/plan-context"
 import { currentProjectTodoStorage } from "../todos/project-storage"
 import { editDigest, PROJECT_FINGERPRINT, TodoRepository } from "../todos/repository"
+import { toPosixPath } from "../todos/source-roots"
 import { SourceValidityBoundary } from "../todos/source-validity"
 import { EditOperationStatus, RUNTIME_INVENTORY_TOOL, TodoEvaluation, TodoListRequest, TodoWriteRequest, UnresolvedEditOperation } from "../todos/types"
 import { AccessStore } from "../tools/access-grants"
@@ -342,6 +344,8 @@ export class Chat extends Base {
   private _awaitingDelivery?: { execution: ExecutionReconciliationController; intent: NonNullable<Awaited<ReturnType<TodoRepository["getActiveIntentContext"]>>> }
   private readonly _search: WorkspaceSearch | undefined
   private readonly _workspaceSearch: WorkspaceSearchProvider | undefined
+  /** Stage 4: the host's source changes are forwarded to the repository's dependency index. */
+  private readonly _sourceEventSubscriptions: { dispose(): void }[] = []
   private readonly _agents: AgentRegistry
   private _requestAgentSelection: AgentSelection = "off"
   private _activeAgent?: LoadedAgent
@@ -428,6 +432,13 @@ export class Chat extends Base {
     this._search = search
     this._agents = agents
     this._workspaceSearch = workspaceSearch
+    // Stage 4's wiring point: an event names what an operation reported. The index records it for a path this
+    // project already recorded as a source; it decides no state, and a path outside the roots names nothing.
+    workspaceSearch?.observeSourceEvents?.((event) => this.recordSourceEvent(event))
+    this._sourceEventSubscriptions.push(workspace.onDidSaveTextDocument((document) => {
+      if (document.uri.scheme !== "file") return
+      this.recordSourceEvent({ path: toPosixPath(document.uri.fsPath), reason: "source_modified", origin: "editor_save" })
+    }))
     this._accessStore = new AccessStore(extensionContext.globalState, currentAccessHostKey())
     this._destructiveApprovals = new DestructiveApprovalStore(
       extensionContext.globalState,
@@ -709,6 +720,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     this._lifetime.abort()
     this._mcp.dispose()
     this._generation.dispose()
+    for (const subscription of this._sourceEventSubscriptions) subscription.dispose()
   }
 
   public resetConversation() {
@@ -1585,6 +1597,21 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       return repository.sourceValidity()
     } catch {
       return undefined
+    }
+  }
+
+  /**
+   * Stage 4: the one place a reported source event reaches the index the repository owns. Reporting is not deciding:
+   * the boundary stays the single decider, and an event for a file no record names is refused here.
+   */
+  private recordSourceEvent(event: SourceEvent): void {
+    const repository = this._todoRepository
+    if (!repository) return
+    try {
+      const recorded = repository.dependencyIndex().noteEvent(event)
+      if (recorded.event === undefined) logger.debug(`[Evidence] source event not recorded: ${redact(recorded.reason ?? "")}`)
+    } catch (error) {
+      logger.debug(`[Evidence] source event could not be recorded: ${String(error)}`)
     }
   }
 

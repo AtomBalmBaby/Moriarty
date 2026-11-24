@@ -1683,3 +1683,44 @@ test("the repository exposes the read-only access service through its own projec
     }
   })
 })
+test("Stage 4 records into Stage 1's v21 objects and adds no schema of its own", async () => {
+  await withDirectory("stage4-no-new-ddl-", async (directory) => {
+    const root = makeProject(directory)
+    const repository = projectRepository(root)
+    await repository.initialize()
+    const scope = projectScope(root)
+    await repository.getList(scope)
+    const index = repository.dependencyIndex()
+    const text = "export const a = 1\n"
+    fs.writeFileSync(path.join(root, "src", "a.ts"), text)
+    const hash = await fingerprintContent(text)
+    const read = await repository.recordToolObservation(scope, { toolName: "read_file", arguments: { path: "src/a.ts" }, output: "read src/a.ts", evidenceOutput: `content_hash: ${hash}; total_lines: 1\n1: export const a = 1`, failed: false, requestId: "stage4-read", sources: [{ path: "src/a.ts", role: "read", observedVersion: "disk", contentHash: hash }] })
+    const claim = await repository.recordToolObservation(scope, { toolName: "grep", arguments: { pattern: "a" }, output: "one hit", evidenceOutput: "src/a.ts:1", failed: false, requestId: "stage4-claim" })
+    assert.ok(index.recordEdge({ derivedObservationId: claim.id, sourceObservationId: read.id, kind: "source_read" }, new Date().toISOString()), "the relationship an operation established is recorded")
+    assert.deepEqual(index.edgesFor(claim.id).map((edge) => [edge.kind, edge.sourceObservationId]), [["source_read", read.id]], "and it is read back from Stage 1's table")
+
+    const database = new BetterSqlite(path.join(root, ".twinny", "project.sqlite"), { readonly: true, fileMustExist: true })
+    try {
+      assert.equal(database.pragma("user_version", { simple: true }), 21, "Stage 4 does not bump the schema")
+      const tables = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'documents_fts_%'").all().map((row) => (row as { name: string }).name)
+      assert.equal(tables.length, 40, "the v21 object inventory is the one Stage 1 recorded")
+      assert.ok(tables.includes("evidence_dependencies"), "the edges live in Stage 1's table")
+      const indexes = database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'").all().map((row) => (row as { name: string }).name)
+      const triggers = database.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all().map((row) => (row as { name: string }).name)
+      assert.equal(indexes.length, 39, "Stage 4 added no index of its own")
+      assert.equal(triggers.length, 2, "Stage 4 added no trigger of its own")
+      assert.ok(!tables.some((name) => name.includes("invalidation") || name.includes("validity")), "and no table of its own: events stay the boundary's recorded context")
+      const stored = database.prepare("SELECT validity_class FROM todo_tool_observations WHERE id = ?").get(read.id) as { validity_class: string | null }
+      assert.equal(stored.validity_class, "current", "the audit column holds what was decided when the record was stored")
+    } finally {
+      database.close()
+    }
+
+    // The audit column is not authority: a read through the boundary decides the class again from the source.
+    fs.writeFileSync(path.join(root, "src", "a.ts"), `${text}// changed\n`)
+    const reread = (await repository.projectObservations(scope, { path: "src/a.ts" }))[0]
+    assert.equal(reread.class, "stale", "the boundary re-decided it from the current source")
+    assert.equal(reread.validity?.references[0].contentHash, hash, "and the recorded fingerprint is still the one as it was observed")
+    repository.close()
+  })
+})
