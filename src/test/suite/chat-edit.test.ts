@@ -18,6 +18,7 @@ import {
 import { ChatEditMode, InlineEditService } from "../../extension/edit/service"
 import { GenerationTracker } from "../../extension/generations"
 import { planReplacement, Replacement } from "../../extension/tools/edit"
+import { contentHash } from "../../extension/tools/line-edit"
 import { WorkspaceView } from "../../extension/tools/view"
 
 const fakeContext = {
@@ -198,6 +199,35 @@ suite("Chat edit_file", () => {
       assert.deepStrictEqual([said.ok, said.message.startsWith("Not changed: the file changed")], [false, true])
     }
   })
+
+    test("create_file save-time formatting is reconciled and duplicate invocation is idempotent", async () => {
+      const target = path.join(path.dirname(file), "formatted-create.ts")
+      const documentUri = vscode.Uri.file(target)
+      let applied = false
+      const listener = vscode.workspace.onWillSaveTextDocument((event) => {
+        if (event.document.uri.toString() !== documentUri.toString() || applied) return
+        applied = true
+        event.waitUntil(Promise.resolve([vscode.TextEdit.insert(new vscode.Position(0, 0), "// formatted\n")]))
+      })
+      try {
+        const first = await service.chatCreate(target, "export const created = 1\n", "apply", undefined, "create-formatted-1")
+        assert.strictEqual(first.ok, true, first.message)
+        assert.strictEqual(first.createStatus, "created_and_transformed")
+        assert.strictEqual(first.postSave, "applied_and_transformed")
+        assert.strictEqual(fs.readFileSync(target, "utf8"), "// formatted\nexport const created = 1\n")
+        assert.strictEqual(first.contentHash, await contentHash("// formatted\nexport const created = 1\n"))
+        assert.strictEqual(first.finalText, "// formatted\nexport const created = 1\n")
+        const duplicate = await service.chatCreate(target, "different\n", "apply", undefined, "create-formatted-1")
+        assert.strictEqual(duplicate.ok, true)
+        assert.strictEqual(duplicate.createStatus, "created_and_transformed")
+        assert.strictEqual(duplicate.finalText, first.finalText)
+        const fresh = await service.chatCreate(target, "different\n", "apply", undefined, "create-fresh-id")
+        assert.strictEqual(fresh.ok, false)
+        assert.strictEqual(fresh.createStatus, "already_exists")
+      } finally {
+        listener.dispose()
+      }
+    })
 
   test("create_file in apply mode makes the folders and the file, and refuses an existing one", async () => {
     const target = path.join(path.dirname(file), "deep", "er", "b.ts")

@@ -8,7 +8,7 @@ import { test } from "node:test"
 import { parseReadFile } from "../../common/tool-output"
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { buildStreamingRequest } from "../../extension/inference/adapters/fluency"
-import { contentHash, LINE_EDIT_OPERATIONS, patchedText, planLineEdits } from "../../extension/tools/line-edit"
+import { contentHash, LINE_EDIT_OPERATIONS, patchedText, planLineEdits, reconcileLineEdits, refreshedRangesForEdit } from "../../extension/tools/line-edit"
 import { findToolCall, toolDefinition } from "../../extension/tools/protocol"
 import { EditSink, workspaceTools } from "../../extension/tools/workspace"
 
@@ -143,6 +143,34 @@ test("outdated hashes reject atomically and return the current hash", async () =
   assert.equal(f.transactions(), 0)
 })
 
+test("native create_file returns the complete transformed final file and fingerprint", async () => {
+  const f = fixture("a\n")
+  f.sink.create = async (_file, content) => {
+    const finalText = "// formatted\n" + content
+    return {
+      ok: true,
+      message: "Created and transformed",
+      contentHash: await contentHash(finalText),
+      contentSource: "disk",
+      persisted: true,
+      postSave: "applied_and_transformed",
+      requestedEdits: "verified",
+      sourceVersion: "changed",
+      previousSourceVersion: "superseded",
+      finalText,
+      totalLines: 2,
+      createStatus: "created_and_transformed",
+      operationId: "create-op-1"
+    }
+  }
+  const result = await f.tools.run({ name: "create_file", args: { path: "created.ts", content: "export const x = 1\n" } })
+  assert.equal(result.failed, undefined)
+  assert.match(result.output, /create_file: created_and_transformed/)
+  assert.match(result.output, /1: \/\/ formatted/)
+  assert.match(result.output, /2: export const x = 1/)
+  assert.match(result.output, /next_expected_hash: xxh64:/)
+})
+
 test("native JSON scalars and arrays keep their types through edit_lines dispatch", async () => {
   const f = fixture("a\nb\n")
   const hashValue = await contentHash(f.text())
@@ -227,6 +255,52 @@ test("the logged type-keyed request is rejected through native dispatch, naming 
   assert.equal(f.transactions(), 0)
 })
 
+test("native success carries a final hash and refreshed final-source ranges after transformation", async () => {
+  const f = fixture("top\nold\nbottom\n")
+  const transformedSink: EditSink = {
+    mode: "apply",
+    read: async () => f.text(),
+    edit: async () => ({ ok: true, message: "legacy" }),
+    create: async () => ({ ok: true, message: "created" }),
+    editLines: async (_file, request) => {
+    const patches = await planLineEdits("top\nold\nbottom\n", request)
+    const intended = patchedText("top\nold\nbottom\n", patches)
+    const finalText = "top\nNEW\nformatter\nbottom\n"
+    return {
+      ok: true,
+      message: "Applied and transformed",
+      contentHash: await contentHash(finalText),
+      contentSource: "disk",
+      persisted: true,
+      postSave: "applied_and_transformed",
+      requestedEdits: "verified",
+      previousHash: await contentHash("top\nold\nbottom\n"),
+      intendedHash: await contentHash(intended),
+      sourceVersion: "changed",
+      previousSourceVersion: "superseded",
+      transformationNotice: "Save-time formatting changed distant lines.",
+      refreshedRanges: [{ startLine: 2, endLine: 3 }],
+      totalLines: 4,
+      finalText
+    }
+  }
+  }
+  const tools = workspaceTools(f.root, [], { edits: transformedSink, git: false, instructions: false })
+  const hashValue = await contentHash(f.text())
+  const result = await tools.run({
+    name: "edit_lines",
+    args: { path: "panel.tsx", expected_hash: hashValue, edits: [{ operation: "replace_text", line: 2, old_text: "old", new_text: "NEW" }] }
+  })
+  assert.equal(result.failed, undefined)
+  const output = JSON.parse(result.output.split("\n\n")[0])
+  assert.equal(output.post_save, "transformed")
+  assert.equal(output.requested_edits, "verified")
+  assert.equal(output.next_expected_hash, await contentHash("top\nNEW\nformatter\nbottom\n"))
+  assert.equal(output.source_version, "changed")
+  assert.deepEqual(output.refreshed_ranges, [{ path: "panel.tsx", start_line: 2, end_line: 3 }])
+  assert.match(result.output, /3: formatter/)
+})
+
 test("a legitimate replace through native dispatch is applied and returns the resulting hash", async () => {
   const f = fixture("a\nb\nc\n")
   const result = await f.edit([{ operation: "replace", start_line: 2, end_line: 2, content: ["B"] }])
@@ -251,6 +325,18 @@ test("invalid operations name the unsupported field or value", async () => {
     assert.match(JSON.parse(result.output).error.message, pattern, name)
     assert.equal(f.transactions(), 0, name)
   }
+})
+
+test("rapid sequential edits use the returned final hash after a transformed save", async () => {
+  const f = fixture("a\nb\nc\n")
+  const first = await f.edit([{ operation: "replace_text", line: 2, old_text: "b", new_text: "B" }])
+  assert.equal(first.failed, undefined)
+  const firstOutput = JSON.parse(first.output.split("\n\n")[0])
+  const returned = (firstOutput.next_expected_hash ?? firstOutput.content_hash) as string
+  assert.equal(returned, await contentHash(f.text()))
+  const second = await f.edit([{ operation: "replace_text", line: 2, old_text: "B", new_text: "B2" }], returned)
+  assert.equal(second.failed, undefined)
+  assert.equal(f.text(), "a\nB2\nc\n")
 })
 
 test("concurrent Twinny requests serialize and revalidate instead of racing", async () => {
@@ -322,6 +408,36 @@ test("the planned ranges address the original snapshot and are ordered bottom-to
     }
     assert.equal(patchedText(source, patches), orderExpected)
   }
+})
+
+test("save-time reconciliation distinguishes exact, transformed, and conflicting final text", async () => {
+  const original = "import { b } from './b'\nconst value = 1\nfunction run() {\n  return value\n}\n"
+  const edits = [{ operation: "replace", start_line: 2, end_line: 2, content: ["const value = 2"] }]
+  const patches = await planLineEdits(original, { expected_hash: await contentHash(original), edits })
+  const intended = patchedText(original, patches)
+  assert.deepEqual(reconcileLineEdits(original, intended, intended, patches), { reconciliation: "applied_exactly", requestedEdits: "verified" })
+
+  const formatted = "import { a, b } from './b'\n\nconst value = 2\nfunction run() {\n  return value\n}\n"
+  assert.deepEqual(reconcileLineEdits(original, intended, formatted, patches), { reconciliation: "applied_and_transformed", requestedEdits: "verified" })
+
+  const conflicted = "import { a, b } from './b'\n\nconst value = 99\nfunction run() {\n  return value\n}\n"
+  assert.deepEqual(reconcileLineEdits(original, intended, conflicted, patches), { reconciliation: "conflicted", requestedEdits: "conflicted" })
+})
+
+test("refreshed ranges use final line coordinates and merge adjacent or distant regions", async () => {
+  const original = "top\nold\nmiddle\nbottom\n"
+  const edits = [
+    { operation: "replace_text", line: 2, old_text: "old", new_text: "NEW" },
+    { operation: "insert_after", line: 4, content: ["tail"] }
+  ]
+  const patches = await planLineEdits(original, { expected_hash: await contentHash(original), edits })
+  const intended = patchedText(original, patches)
+  const finalText = "top\nNEW\ninserted-at-start\nmiddle\nbottom\nformatter\n"
+  const ranges = refreshedRangesForEdit(original, intended, finalText, patches)
+  assert.ok(ranges.length > 0)
+  assert.ok(ranges.every((range) => range.startLine >= 1 && range.endLine <= 6))
+  for (let i = 1; i < ranges.length; i++) assert.ok(ranges[i].startLine > ranges[i - 1].endLine)
+  assert.deepEqual(refreshedRangesForEdit(original, intended, finalText, patches), ranges)
 })
 
 test("a range that changes the line count does not shift the ranges after it", async () => {

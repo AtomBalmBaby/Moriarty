@@ -51,7 +51,7 @@ import { isProtectedPath } from "../tools/helpers"
 import { changedSpan, contentHash, LineEditError, lineEditFailure, patchedText, planLineEdits } from "../tools/line-edit"
 import { EditorDiagnostic, EditorLocation, EditorSink, FileOpsSink } from "../tools/more"
 import { claimWrites, coversWrites, type OperationAuthorization, type WriteOperation, type WriteRequest } from "../tools/operation-authorization"
-import { WorkspaceView } from "../tools/view"
+import { linesOf, WorkspaceView } from "../tools/view"
 import { CodeSearch, CommandOutcome, CommandSink, EditOutcome, EditSink, IndexChange, IndexRefreshOutcome } from "../tools/workspace"
 
 import { changesBetween, MAX_COMMAND_CHANGES, snapshotTree, TreeSnapshot } from "./command-snapshot"
@@ -82,7 +82,7 @@ export type EditCommandRunner = <T>(command: string, ...args: unknown[]) => Prom
 
 /** Settles one recorded edit operation; a settlement that loses to reconciliation is a no-op. */
 export interface EditOperationTicket {
-  settle(status: "succeeded" | "failed" | "reconciled_applied" | "reconciled_absent", detail: string): Promise<void>
+  settle(status: "succeeded" | "failed" | "reconciled_applied" | "reconciled_absent" | "diverged", detail: string): Promise<void>
 }
 
 /** Records a consequential edit before it is dispatched, and throws when the record cannot be written. */
@@ -547,7 +547,9 @@ export const editorEdits = (
    */
   const settleEdit = async (pending: PendingEdit | undefined, command: EditOutcome | undefined, checked: EditOutcome) => {
     if (!pending?.ticket) return
-    if (checked.ok && !checked.pending) await pending.ticket.settle("succeeded", checked.message)
+    if (checked.postSave === "conflicted" || checked.postSave === "unresolved" || checked.requestedEdits === "conflicted" || checked.requestedEdits === "unresolved") {
+      await pending.ticket.settle("diverged", checked.message)
+    } else if (checked.ok && !checked.pending) await pending.ticket.settle("succeeded", checked.message)
     else if (command?.ok && (await holdsPrecondition(pending))) await pending.ticket.settle("reconciled_absent", checked.message)
     else if (command && !command.ok && (await holdsPrecondition(pending))) await pending.ticket.settle("failed", command.message)
   }
@@ -576,7 +578,46 @@ export const editorEdits = (
       try {
         patches = await planLineEdits(document.getText(), request)
       } catch (error) {
-        if (error instanceof LineEditError) return { ok: false, message: error.message, error: error.detail }
+        if (error instanceof LineEditError) {
+          if (error.detail.code === "hash_mismatch") {
+            const text = document.getText()
+            const totalLines = text.length ? text.split(/\r\n|\r|\n/).length : 0
+            const lines = request.edits
+              ? (Array.isArray(request.edits) ? request.edits : []) as Array<Record<string, unknown>>
+              : []
+            const named = lines.flatMap((edit) => {
+              const line = typeof edit.line === "number" ? edit.line : typeof edit.start_line === "number" ? edit.start_line : undefined
+              return line === undefined ? [] : [{ startLine: Math.max(1, line - 3), endLine: Math.min(Math.max(1, totalLines), line + 3) }]
+            })
+            const refreshedRanges = named.length
+              ? named.sort((a, b) => a.startLine - b.startLine).reduce<typeof named>((merged, range) => {
+                  const last = merged[merged.length - 1]
+                  if (last && range.startLine <= last.endLine + 1) last.endLine = Math.max(last.endLine, range.endLine)
+                  else merged.push({ ...range })
+                  return merged
+                }, [])
+              : totalLines ? [{ startLine: 1, endLine: Math.min(totalLines, 7) }] : []
+            return {
+              ok: false,
+              message: error.message,
+              error: lineEditFailure(error.detail.code, error.detail.message, error.detail.current_hash, {
+                current_text: text,
+                total_lines: totalLines,
+                refreshed_ranges: refreshedRanges,
+                source_version: "unchanged",
+                mutation_occurred: false
+              })
+            }
+          }
+          return {
+            ok: false,
+            message: error.message,
+            error: lineEditFailure(error.detail.code, error.detail.message, error.detail.current_hash, {
+              total_lines: document.lineCount,
+              mutation_occurred: false
+            })
+          }
+        }
         throw error
       }
       if (modeFor(file) === "review" && !(await approve(
@@ -665,12 +706,20 @@ export const editorEdits = (
       }
       return checked
     },
-    async create(file, content, write) {
+    async create(file, content, write, invocationId) {
       const denied = blocked(file)
       if (denied) return denied
       const refused = outsideRefusal(outsideWrites("create", [file]), write)
       if (refused) return { ok: false, message: `Not created: ${refused}` }
-      if (modeFor(file) === "apply" && existsSync(file)) return { ok: false, message: "Not created: " + view.relative(file) + " already exists." }
+      if (modeFor(file) === "apply" && existsSync(file)) {
+        const saved = savedFileText(file)
+        return {
+          ok: false,
+          message: "Not created: " + view.relative(file) + " already exists.",
+          createStatus: "already_exists",
+          ...(saved !== undefined ? { contentHash: await contentHash(saved), contentSource: "disk" as const, persisted: true, finalText: saved, totalLines: linesOf(saved).length } : {})
+        }
+      }
       if (modeFor(file) === "apply") await safety.checkpoints?.capture([file])
       let pending: PendingEdit | undefined
       try {
@@ -687,7 +736,8 @@ export const editorEdits = (
               file,
               content,
               modeFor(file),
-              write
+              write,
+              invocationId
             )) ?? { ok: false, message: "Not created: the editor did not answer." }
           }),
           async () => { if (modeFor(file) === "apply") await safety.checkpoints?.markChanged([file]) }
@@ -697,9 +747,48 @@ export const editorEdits = (
           // The saved file is what the index sees, and the hash the model is given is read back from it.
           checked = await refreshed(view, safety, [{ path: file, kind: "write" }], checked)
           const saved = savedFileText(file)
-          if (saved !== undefined) checked = { ...checked, contentHash: await contentHash(saved), contentSource: "disk", persisted: true }
+          if (saved !== undefined) {
+            const finalHash = await contentHash(saved)
+            const intendedHash = await contentHash(content)
+            const transformed = saved !== content
+            checked = {
+              ...checked,
+              contentHash: finalHash,
+              contentSource: "disk",
+              persisted: true,
+              postSave: transformed ? "applied_and_transformed" : "applied_exactly",
+              requestedEdits: "verified",
+              intendedHash,
+              sourceVersion: "changed",
+              previousSourceVersion: "superseded",
+              transformationNotice: transformed ? "Save-time formatting or code actions transformed the created file." : undefined,
+              finalText: saved,
+              totalLines: linesOf(saved).length,
+              createStatus: transformed ? "created_and_transformed" : "created",
+              operationId: invocationId
+            }
+          } else {
+            checked = {
+              ...checked,
+              contentHash: undefined,
+              contentSource: undefined,
+              persisted: undefined,
+              postSave: "unresolved",
+              requestedEdits: "unresolved",
+              intendedHash: await contentHash(content),
+              sourceVersion: "changed",
+              previousSourceVersion: "superseded",
+              finalText: undefined,
+              createStatus: "unresolved",
+              operationId: invocationId
+            }
+          }
         }
-        await settleEdit(pending, outcome, checked)
+        if (pending?.ticket && checked.createStatus === "unresolved" && checked.ok) {
+          await pending.ticket.settle("succeeded", checked.message)
+        } else {
+          await settleEdit(pending, outcome, checked)
+        }
         return checked
       } finally {
         if (pending) editOperationsInFlight.delete(pending.id)

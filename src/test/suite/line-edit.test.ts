@@ -387,6 +387,56 @@ suite("Hash-verified native line edits", () => {
     assert.strictEqual(fs.readFileSync(file, "utf8"), clean, "nothing was saved")
   })
 
+  test("on-save formatting is success when the requested edit survives and includes final ranges", async function () {
+    this.timeout(20000)
+    const document = await vscode.workspace.openTextDocument(file)
+    await vscode.window.showTextDocument(document)
+    let applied = false
+    const listener = vscode.workspace.onWillSaveTextDocument((event) => {
+      if (event.document !== document || applied) return
+      applied = true
+      event.waitUntil(Promise.resolve([vscode.TextEdit.insert(new vscode.Position(0, 0), "formatted:\n")]))
+    })
+    try {
+      const result = await applyDocumentLineEdits(file, await request(document.getText(), [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }]))
+      assert.strictEqual(result.ok, true, result.message)
+      assert.strictEqual(result.postSave, "applied_and_transformed")
+      assert.strictEqual(result.requestedEdits, "verified")
+      assert.strictEqual(result.contentHash, await contentHash("formatted:\nfirst\nSECOND\nthird\nfourth\n"))
+      assert.strictEqual(document.getText(), "formatted:\nfirst\nSECOND\nthird\nfourth\n")
+      assert.ok(result.refreshedRanges?.some((range) => range.startLine <= 2 && range.endLine >= 2))
+      assert.strictEqual(result.previousHash, await contentHash("first\nsecond\nthird\nfourth\n"))
+      assert.strictEqual(result.finalText, "formatted:\nfirst\nSECOND\nthird\nfourth\n")
+    } finally {
+      listener.dispose()
+    }
+  })
+
+  test("on-save actions that contradict the requested edit are reported as conflicts", async function () {
+    this.timeout(20000)
+    const document = await vscode.workspace.openTextDocument(file)
+    await vscode.window.showTextDocument(document)
+    let applied = false
+    const listener = vscode.workspace.onWillSaveTextDocument((event) => {
+      if (event.document !== document || applied) return
+      applied = true
+      event.waitUntil(Promise.resolve([
+        vscode.TextEdit.replace(new vscode.Range(new vscode.Position(1, 0), new vscode.Position(1, 6)), "CONFLICT")
+      ]))
+    })
+    try {
+      const result = await applyDocumentLineEdits(file, await request(document.getText(), [{ operation: "replace", start_line: 2, end_line: 2, content: ["SECOND"] }]))
+      assert.strictEqual(result.ok, false)
+      assert.strictEqual(result.postSave, "conflicted")
+      assert.strictEqual(result.requestedEdits, "conflicted")
+      assert.strictEqual(result.error?.code, "application_failed")
+      assert.strictEqual(document.getText(), "first\nCONFLICT\nthird\nfourth\n")
+      assert.strictEqual(result.contentHash, await contentHash("first\nCONFLICT\nthird\nfourth\n"))
+    } finally {
+      listener.dispose()
+    }
+  })
+
   test("save failure is reported as save_failed and the edit stays unsaved", async function () {
     if (process.getuid?.() === 0) this.skip()
     const document = await vscode.workspace.openTextDocument(file)

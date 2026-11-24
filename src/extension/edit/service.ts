@@ -11,8 +11,9 @@ import { Base } from "../providers/base"
 import { describeProviderErrorPlain, isAbortError } from "../providers/errors"
 import { currentAccessHostKey } from "../tools/access-host"
 import { authorizedRootOf, normalizeAuthorizedRoots } from "../tools/authorized-paths"
-import { ContentSource, LineEditFailure, lineEditFailure, LineEditRequest } from "../tools/line-edit"
+import { contentHash, ContentSource, EditReconciliation, LineEditFailure, lineEditFailure, LineEditRequest, RefreshedRange, RequestedEditVerification } from "../tools/line-edit"
 import { claimWrites, WriteOperation } from "../tools/operation-authorization"
+import { linesOf } from "../tools/view"
 
 import { DiffLayout, layoutDiff, locateSnippet } from "./diff"
 import { applyDocumentLineEdits, EditorVisibility } from "./line-edit"
@@ -65,6 +66,18 @@ export interface ChatEditOutcome {
   persisted?: boolean
   message: string
   pending?: boolean
+  postSave?: EditReconciliation
+  requestedEdits?: RequestedEditVerification
+  previousHash?: string
+  intendedHash?: string
+  sourceVersion?: "changed" | "unchanged"
+  previousSourceVersion?: "superseded"
+  refreshedRanges?: RefreshedRange[]
+  transformationNotice?: string
+  totalLines?: number
+  finalText?: string
+  createStatus?: "created" | "created_and_transformed" | "already_exists" | "conflicted" | "unresolved"
+  operationId?: string
 }
 
 /** Both native editing tools use the existing chat edit command. */
@@ -155,6 +168,7 @@ const REVIEW_HINT = mac
 export class InlineEditService extends Base {
   private _run?: GenerationRun
   private _pending?: DiffRegion
+  private _createInvocations = new Map<string, ChatEditOutcome>()
   private readonly _emitter = new vscode.EventEmitter<void>()
   public readonly onDidChangePending = this._emitter.event
 
@@ -402,15 +416,30 @@ export class InlineEditService extends Base {
     file: string,
     content: string,
     mode: ChatEditMode = "apply",
-    write?: unknown
+    write?: unknown,
+    invocationId?: string
   ): Promise<ChatEditOutcome> {
+    if (invocationId) {
+      const prior = this._createInvocations.get(invocationId)
+      if (prior) return prior
+    }
     const target = vscode.Uri.file(file)
     const relative = vscode.workspace.asRelativePath(target)
     if (outsideWorkspace(target) && !approvedOutsideWrite(write, mode, "create", file)) {
       return { ok: false, message: `Not created: ${relative} is outside the workspace.` }
     }
     if (fs.existsSync(file)) {
-      return { ok: false, message: `Not created: ${relative} already exists. Read it, then use edit_lines to change it.` }
+      const persistedText = fs.readFileSync(file, "utf8").replace(/^\ufeff/, "")
+      return {
+        ok: false,
+        message: `Not created: ${relative} already exists. Read it, then use edit_lines to change it.`,
+        contentHash: await contentHash(persistedText),
+        contentSource: "disk",
+        persisted: true,
+        finalText: persistedText,
+        totalLines: linesOf(persistedText).length,
+        createStatus: "already_exists"
+      }
     }
     if (this.running || (this._pending && mode === "review")) {
       return {
@@ -423,13 +452,134 @@ export class InlineEditService extends Base {
       const edit = new vscode.WorkspaceEdit()
       edit.createFile(target, { ignoreIfExists: false, contents: Buffer.from(content, "utf8") })
       if (!(await vscode.workspace.applyEdit(edit))) {
-        return { ok: false, message: `Not created: the editor refused to create ${relative}.` }
+        const outcome: ChatEditOutcome = {
+          ok: false,
+          message: `Not created: the editor refused to create ${relative}.`,
+          createStatus: fs.existsSync(file) ? "already_exists" : "unresolved"
+        }
+        if (invocationId) this._createInvocations.set(invocationId, outcome)
+        return outcome
       }
       const document = await vscode.workspace.openTextDocument(target)
-      if (document.isDirty) await document.save()
+      const requestedHash = await contentHash(content)
+      let saved = false
+      try {
+        if (document.isDirty) saved = await document.save()
+        else saved = true
+      } catch (error) {
+        const outcome: ChatEditOutcome = {
+          ok: false,
+          message: `Created the editor document but save could not be confirmed: ${error instanceof Error ? error.message : String(error)}. Reconcile this invocation before creating again.`,
+          error: lineEditFailure("save_failed", "Creation reached the editor but save could not be confirmed."),
+          contentHash: await contentHash(document.getText()),
+          contentSource: "buffer",
+          persisted: false,
+          postSave: "unresolved",
+          requestedEdits: "unresolved",
+          previousHash: undefined,
+          intendedHash: requestedHash,
+          sourceVersion: "changed",
+          previousSourceVersion: "superseded",
+          finalText: document.getText(),
+          totalLines: document.lineCount,
+          createStatus: "unresolved",
+          operationId: invocationId
+        }
+        if (invocationId) this._createInvocations.set(invocationId, outcome)
+        return outcome
+      }
       await vscode.window.showTextDocument(document, { preview: true, preserveFocus: true })
+      if (!saved || document.isDirty) {
+        const outcome: ChatEditOutcome = {
+          ok: false,
+          message: "Created the editor document but VS Code did not confirm the save. Reconcile this invocation before creating again.",
+          error: lineEditFailure("save_failed", "Creation reached the editor but save could not be confirmed."),
+          contentHash: await contentHash(document.getText()),
+          contentSource: "buffer",
+          persisted: false,
+          postSave: "unresolved",
+          requestedEdits: "unresolved",
+          intendedHash: requestedHash,
+          sourceVersion: "changed",
+          previousSourceVersion: "superseded",
+          finalText: document.getText(),
+          totalLines: document.lineCount,
+          createStatus: "unresolved",
+          operationId: invocationId
+        }
+        if (invocationId) this._createInvocations.set(invocationId, outcome)
+        return outcome
+      }
+      let persistedText: string | undefined
+      try {
+        persistedText = fs.readFileSync(file, "utf8").replace(/^\ufeff/, "")
+      } catch {
+        persistedText = undefined
+      }
+      if (persistedText === undefined) {
+        const outcome: ChatEditOutcome = {
+          ok: false,
+          message: "Creation was applied, but the saved file could not be read back for verification.",
+          error: lineEditFailure("save_failed", "The created file could not be read back."),
+          contentHash: await contentHash(document.getText()),
+          contentSource: "buffer",
+          persisted: false,
+          postSave: "unresolved",
+          requestedEdits: "unresolved",
+          intendedHash: requestedHash,
+          sourceVersion: "changed",
+          previousSourceVersion: "superseded",
+          finalText: document.getText(),
+          totalLines: document.lineCount,
+          createStatus: "unresolved",
+          operationId: invocationId
+        }
+        if (invocationId) this._createInvocations.set(invocationId, outcome)
+        return outcome
+      }
+      if (persistedText !== document.getText()) {
+        const outcome: ChatEditOutcome = {
+          ok: false,
+          message: "Creation was applied, but the saved editor and disk snapshots differ.",
+          error: lineEditFailure("application_failed", "The created file has inconsistent editor and disk snapshots."),
+          contentHash: await contentHash(document.getText()),
+          contentSource: "disk",
+          persisted: false,
+          postSave: "unresolved",
+          requestedEdits: "unresolved",
+          intendedHash: requestedHash,
+          sourceVersion: "changed",
+          previousSourceVersion: "superseded",
+          finalText: document.getText(),
+          totalLines: document.lineCount,
+          createStatus: "unresolved",
+          operationId: invocationId
+        }
+        if (invocationId) this._createInvocations.set(invocationId, outcome)
+        return outcome
+      }
+      const finalHash = await contentHash(persistedText)
+      const transformed = persistedText !== content
+      const outcome: ChatEditOutcome = {
+        ok: true,
+        message: transformed ? `Created and saved ${relative}; save-time actions transformed the final file.` : `Created and saved ${relative}.`,
+        contentHash: finalHash,
+        contentSource: "disk",
+        persisted: true,
+        postSave: transformed ? "applied_and_transformed" : "applied_exactly",
+        requestedEdits: "verified",
+        intendedHash: requestedHash,
+        sourceVersion: "changed",
+        previousSourceVersion: "superseded",
+        transformationNotice: transformed ? "Save-time formatting or code actions transformed the created file." : undefined,
+        finalText: persistedText,
+        totalLines: linesOf(persistedText).length,
+        createStatus: transformed ? "created_and_transformed" : "created",
+        operationId: invocationId
+      }
       logger.info(`Chat created ${relative}`)
-      return { ok: true, message: `Created and saved ${relative}.` }
+      if (invocationId) this._createInvocations.set(invocationId, outcome)
+      return { ...outcome, message: transformed ? `Created and saved ${relative}; save-time actions transformed the final file.` : `Created and saved ${relative}.` }
     }
 
     const document = await vscode.workspace.openTextDocument(target.with({ scheme: "untitled" }))

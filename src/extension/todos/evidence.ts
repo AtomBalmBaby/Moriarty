@@ -227,7 +227,10 @@ const FROM_KEYS = ["from"]
 const TO_KEYS = ["to"]
 const RENAME_HASH_LINE = /^content_hash\((.+?)\): ([a-z0-9_]+:[a-f0-9]+)/gm
 
-const hashOf = (text: string): string | undefined => CONTENT_HASH.exec(text.slice(0, 400))?.[1]
+const hashOf = (text: string): string | undefined =>
+  CONTENT_HASH.exec(text.slice(0, 400))?.[1]
+    ?? text.match(/\b(?:final_hash|next_expected_hash): ([a-z0-9_]+:[a-f0-9]+)/i)?.[1]
+    ?? text.match(/"(?:content_hash|final_hash|next_expected_hash)"\s*:\s*"([a-z0-9_]+:[a-f0-9]+)"/i)?.[1]
 
 const totalLinesOf = (text: string): number | undefined => {
   const value = Number(TOTAL_LINES.exec(text.slice(0, 400))?.[1])
@@ -326,9 +329,32 @@ export const preserveEvidence = (output: string, integrity?: ToolResultIntegrity
  * unknown side effects never gets an invented fingerprint.
  */
 export const observedSourceReferences = (input: ObservedSourceInput): ObservedSourceReference[] => {
-  if (input.failed) return []
   let origin: ObservedVersion = input.origin?.origin ?? "disk"
   const editorVersion = input.origin?.editorVersion
+  if (input.failed) {
+    let json: Record<string, unknown> | undefined
+    try {
+      json = JSON.parse(input.output.trim().split("\n\n", 1)[0]) as Record<string, unknown>
+    } catch {
+      json = undefined
+    }
+    const persisted = json?.persisted === true
+    const hash = typeof json?.content_hash === "string"
+      ? json.content_hash
+      : typeof json?.final_hash === "string"
+        ? json.final_hash
+        : undefined
+    const file = firstValue(input.args, PATH_KEYS)
+    if (!persisted || !hash || !file) return []
+    return [{
+      path: file,
+      role: "modified",
+      contentHash: hash,
+      totalLines: json !== undefined && typeof json.total_lines === "number" ? json.total_lines : undefined,
+      observedVersion: origin,
+      ...(editorVersion === undefined ? {} : { editorVersion })
+    }]
+  }
   const withOrigin = (reference: EvidenceSource & { role: SourceRole }): ObservedSourceReference => ({
     ...reference,
     observedVersion: origin,
@@ -362,7 +388,30 @@ export const observedSourceReferences = (input: ObservedSourceInput): ObservedSo
   // An edit names the version it hashed, so the reference records that version rather than a guess.
   const outcome = role === "modified" ? jsonOutput(input.output) : undefined
   if (outcome?.content_source === "buffer") origin = "buffer"
-  return [reference(file, role, hashOf(input.output))]
+  const hash = hashOf(input.output)
+  const base = reference(file, role, hash)
+  if (role === "created") {
+    const total = base.totalLines
+    return [{ ...base, ...(total ? { startLine: 1, endLine: total, complete: true } : { complete: true }) }]
+  }
+  let ranges: Array<{ startLine: number, endLine: number }> = []
+  try {
+    const json = JSON.parse(input.output.trim().split("\n\n", 1)[0]) as { refreshed_ranges?: Array<{ start_line?: number, end_line?: number }> }
+    if (Array.isArray(json.refreshed_ranges)) {
+      ranges = json.refreshed_ranges.flatMap((range) =>
+        typeof range.start_line === "number" && typeof range.end_line === "number"
+          ? [{ startLine: range.start_line, endLine: range.end_line }]
+          : []
+      )
+    }
+  } catch {
+    ranges = []
+  }
+  if (ranges.length === 1) return [{ ...base, startLine: ranges[0].startLine, endLine: ranges[0].endLine, complete: true }]
+  if (ranges.length > 1) {
+    return [{ ...base, startLine: ranges[0].startLine, endLine: ranges[ranges.length - 1].endLine, complete: false }]
+  }
+  return [base]
 }
 export interface EvidenceAnchors {
   paths: string[]

@@ -1,6 +1,6 @@
 import { EndOfLine, Range, TextDocument, TextEditor, Uri, window, workspace } from "vscode"
 
-import { contentHash, ContentSource, LineEditError, lineEditFailure, LineEditFailureCode, LineEditRequest, LinePatch, patchedText, planLineEdits } from "../tools/line-edit"
+import { contentHash, ContentSource, LineEditError, lineEditFailure, LineEditFailureCode, LineEditRequest, LinePatch, patchedText, planLineEdits, reconcileLineEdits, refreshedRangesForEdit } from "../tools/line-edit"
 
 import type { ChatEditOutcome } from "./service"
 
@@ -63,9 +63,25 @@ export const applyDocumentLineEdits = async (file: string, request: LineEditRequ
     }
     if (!options.save) {
       const message = "Applied as one undoable editor transaction and left unsaved for review. The file on disk is unchanged, so a build from disk does not include this edit."
-      return { ok: true, contentHash: await contentHash(expected), contentSource: "buffer", persisted: false, message }
+      const finalHash = await contentHash(expected)
+      return {
+        ok: true,
+        contentHash: finalHash,
+        contentSource: "buffer",
+        persisted: false,
+        postSave: "applied_exactly",
+        requestedEdits: "verified",
+        previousHash: await contentHash(original),
+        intendedHash: finalHash,
+        sourceVersion: "changed",
+        previousSourceVersion: "superseded",
+        refreshedRanges: refreshedRangesForEdit(original, expected, expected, patches),
+        totalLines: document.lineCount,
+        finalText: expected,
+        message
+      }
     }
-    return await saveAndVerify(document, expected)
+    return await saveAndVerify(document, original, expected, patches)
   } catch (error) {
     if (error instanceof LineEditError) return { ok: false, message: error.message, error: error.detail }
     const message = error instanceof Error ? error.message : String(error)
@@ -105,12 +121,31 @@ const applyTransaction = async (editor: TextEditor, document: TextDocument, vers
   return failed("application_failed", "VS Code refused the line-edit transaction; no line edits were applied.")
 }
 
-/** Saves only this document, then reads the file back and checks it against the intended text. */
-const saveAndVerify = async (document: TextDocument, expected: string): Promise<ChatEditOutcome> => {
+/** Saves only this document, then reconciles the coherent saved editor/disk snapshot against the intended text. */
+const saveAndVerify = async (
+  document: TextDocument,
+  original: string,
+  expected: string,
+  patches: readonly LinePatch[]
+): Promise<ChatEditOutcome> => {
   const saveProblem = async (reason: string): Promise<ChatEditOutcome> => {
     const hash = await contentHash(document.getText())
     const message = `The line edits are applied in the editor buffer but are not confirmed on disk: ${reason} Reread the file before editing again.`
-    return { ok: false, message, error: lineEditFailure("save_failed", message, hash) }
+    return {
+      ok: false,
+      message,
+      error: lineEditFailure("save_failed", message, hash),
+      postSave: "unresolved",
+      requestedEdits: "unresolved",
+      previousHash: await contentHash(original),
+      intendedHash: await contentHash(expected),
+      sourceVersion: "changed",
+      previousSourceVersion: "superseded",
+      refreshedRanges: refreshedRangesForEdit(original, expected, document.getText(), patches),
+      totalLines: document.lineCount,
+      finalText: document.getText(),
+      persisted: false
+    }
   }
   try {
     const saved = await document.save()
@@ -128,14 +163,94 @@ const saveAndVerify = async (document: TextDocument, expected: string): Promise<
   const contentSource: ContentSource = persisted === undefined ? "buffer" : "disk"
   const text = persisted ?? document.getText()
   if (persisted !== undefined && persisted !== document.getText()) {
-    return await saveProblem("the file on disk differs from the saved editor buffer.")
+    const hash = await contentHash(document.getText())
+    const message = "The requested edit was saved, but the editor buffer and disk snapshot differ. The final state is unresolved; reread the file before editing again."
+    return {
+      ok: false,
+      message,
+      error: lineEditFailure("application_failed", message, hash),
+      postSave: "unresolved",
+      requestedEdits: "unresolved",
+      previousHash: await contentHash(original),
+      intendedHash: await contentHash(expected),
+      sourceVersion: "changed",
+      previousSourceVersion: "superseded",
+      refreshedRanges: refreshedRangesForEdit(original, expected, document.getText(), patches),
+      totalLines: document.lineCount,
+      finalText: document.getText(),
+      persisted: false
+    }
   }
-  if (text !== expected) {
-    const message = "The saved file differs from the intended edit (for example, format-on-save changed it). Reread it; do not retry automatically."
-    return { ok: false, message, error: lineEditFailure("application_failed", message, await contentHash(text)) }
+  const reconciliation = reconcileLineEdits(original, expected, text, patches)
+  const finalHash = await contentHash(text)
+  const intendedHash = await contentHash(expected)
+  const previousHash = await contentHash(original)
+  const ranges = refreshedRangesForEdit(original, expected, text, patches)
+  const totalLines = textLinesCount(text)
+  if (reconciliation.reconciliation === "conflicted") {
+    const message = "The save completed, but one or more requested mutations were removed, contradicted or replaced. No success is claimed; reread the authoritative final snapshot before editing."
+    return {
+      ok: false,
+      message,
+      error: lineEditFailure("application_failed", message, finalHash),
+      contentHash: finalHash,
+      contentSource,
+      persisted: true,
+      postSave: reconciliation.reconciliation,
+      requestedEdits: reconciliation.requestedEdits,
+      previousHash,
+      intendedHash,
+      sourceVersion: "changed",
+      previousSourceVersion: "superseded",
+      refreshedRanges: ranges,
+      transformationNotice: "Save-time processing produced a conflicting final state.",
+      totalLines,
+      finalText: text
+    }
   }
-  const message = contentSource === "disk"
-    ? "Applied as one undoable editor transaction and saved; the saved file was read back and matches."
-    : "Applied as one undoable editor transaction and saved. The file's encoding could not be read back, so the save was checked by the editor only."
-  return { ok: true, contentHash: await contentHash(text), contentSource, persisted: true, message }
+  if (reconciliation.reconciliation === "unresolved") {
+    const message = "The save completed, but the requested mutations cannot be conclusively verified. Reread the final snapshot before editing."
+    return {
+      ok: false,
+      message,
+      error: lineEditFailure("application_failed", message, finalHash),
+      contentHash: finalHash,
+      contentSource,
+      persisted: true,
+      postSave: "unresolved",
+      requestedEdits: "unresolved",
+      previousHash,
+      intendedHash,
+      sourceVersion: "changed",
+      previousSourceVersion: "superseded",
+      refreshedRanges: ranges,
+      totalLines,
+      finalText: text
+    }
+  }
+  const transformed = reconciliation.reconciliation === "applied_and_transformed"
+  const message = transformed
+    ? "Applied as one undoable editor transaction and saved. Save-time formatting or code actions transformed bytes, but every requested mutation was verified in the final saved snapshot."
+    : contentSource === "disk"
+      ? "Applied as one undoable editor transaction and saved; the saved file was read back and matches."
+      : "Applied as one undoable editor transaction and saved. The file's encoding could not be read back, so the save was checked by the editor only."
+  return {
+    ok: true,
+    contentHash: finalHash,
+    contentSource,
+    persisted: true,
+    postSave: reconciliation.reconciliation,
+    requestedEdits: reconciliation.requestedEdits,
+    previousHash,
+    intendedHash,
+    sourceVersion: "changed",
+    previousSourceVersion: "superseded",
+    refreshedRanges: ranges,
+    transformationNotice: transformed ? "Save-time formatting or code actions changed the saved content." : undefined,
+    totalLines,
+    finalText: text,
+    message
+  }
 }
+
+const textLinesCount = (text: string): number => text.length ? text.replace(/\r\n/g, "\n").replace(/\r$/, "").split("\n").length : 0

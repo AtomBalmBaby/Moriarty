@@ -22,7 +22,7 @@ import { planReplacement, Replacement } from "./edit"
 import { evidenceTools } from "./evidence"
 import { indexChangeNote } from "./helpers"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
-import { contentHash, ContentSource, LINE_EDIT_OPERATIONS, LineEditError, LineEditFailure, lineEditFailure, LineEditFailureCode, LineEditRequest } from "./line-edit"
+import { contentHash, ContentSource, EditReconciliation, LINE_EDIT_OPERATIONS, LineEditError, LineEditFailure, lineEditFailure, LineEditFailureCode, LineEditRequest, RefreshedRange, RequestedEditVerification } from "./line-edit"
 import { coerceArguments, JsonSchema, McpToolSpec } from "./mcp"
 import {
   deleteFile,
@@ -138,7 +138,7 @@ export interface EditSink {
   edit(file: string, replacement: Replacement, write?: OperationAuthorization): Promise<EditOutcome>
   editLines?(file: string, request: LineEditRequest, save: boolean, write?: OperationAuthorization): Promise<EditOutcome>
   /** Make or show a new file; resolves to what the model is told. */
-  create(file: string, content: string, write?: OperationAuthorization): Promise<EditOutcome>
+  create(file: string, content: string, write?: OperationAuthorization, invocationId?: string): Promise<EditOutcome>
 }
 
 /** One file the index should catch up with: an absolute file-system path, and what happened to it. */
@@ -154,6 +154,18 @@ export interface EditOutcome {
   contentSource?: ContentSource
   /** Whether the edit is saved to disk; `false` when it was left unsaved on purpose. */
   persisted?: boolean
+  postSave?: EditReconciliation
+  requestedEdits?: RequestedEditVerification
+  previousHash?: string
+  intendedHash?: string
+  sourceVersion?: "changed" | "unchanged"
+  previousSourceVersion?: "superseded"
+  refreshedRanges?: RefreshedRange[]
+  transformationNotice?: string
+  totalLines?: number
+  finalText?: string
+  createStatus?: "created" | "created_and_transformed" | "already_exists" | "conflicted" | "unresolved"
+  operationId?: string
   /** What the index refresh did for this change, when the tool refreshed it. */
   indexRefresh?: IndexRefreshOutcome
   message: string
@@ -699,11 +711,55 @@ const createFile = (view: WorkspaceView, sink: EditSink): Tool => ({
     if (content.length > MAX_NEW_FILE_CHARS) throw new ToolInputError("That file is too large to create in one go.")
     const absolute = view.resolveNew(file)
     const rel = view.relative(absolute)
-    const outcome = await sink.create(absolute, content, context?.write)
+    const outcome = await sink.create(absolute, content, context?.write, context?.diagnostic?.requestId)
     if (!outcome.ok) {
-      return { output: outcome.message, summary: `\`${rel}\` not created · ${outcome.message}`, failed: true }
+      const rich = outcome.createStatus || outcome.contentHash || outcome.finalText
+      if (!rich) return { output: outcome.message, summary: `\`${rel}\` not created · ${outcome.message}`, failed: true }
+      const text = outcome.finalText ?? ""
+      const ranges = outcome.createStatus === "unresolved" && text
+        ? [{ startLine: 1, endLine: linesOf(text).length }]
+        : []
+      const body = text ? linesOf(text).map((line, index) => `${index + 1}: ${line}`).join("\n") : ""
+      const rawOutput = [
+        `create_file: ${outcome.createStatus ?? "unresolved"}`,
+        `save: ${outcome.persisted ? "completed" : "unresolved"}`,
+        ...(outcome.contentHash ? [`final_hash: ${outcome.contentHash}`] : []),
+        ...(outcome.intendedHash ? [`intended_hash: ${outcome.intendedHash}`] : []),
+        "source_version: changed",
+        ...(outcome.operationId ? [`operation_id: ${outcome.operationId}`] : []),
+        ...(ranges.length ? [`refreshed_ranges:\n${rel}:${ranges[0].startLine}-${ranges[0].endLine}\n${body}`] : [])
+      ].join("\n")
+      return { output: rawOutput, summary: `\`${rel}\` not created · ${outcome.message}`, failed: true, rawOutput }
     }
     view.forgetFiles()
+    if (outcome.createStatus || outcome.finalText) {
+      const finalText = outcome.finalText ?? content
+      const totalLines = outcome.totalLines ?? linesOf(finalText).length
+      const body = linesOf(finalText).map((line, index) => `${index + 1}: ${line}`).join("\n")
+      const rawOutput = [
+        `create_file: ${outcome.createStatus ?? "created"}`,
+        `save: ${outcome.persisted ? "completed" : "pending"}`,
+        `post_save: ${outcome.postSave === "applied_and_transformed" ? "transformed" : "exact"}`,
+        `requested_edits: ${outcome.requestedEdits ?? "verified"}`,
+        ...(outcome.contentHash ? [`content_hash: ${outcome.contentHash}`, `final_hash: ${outcome.contentHash}`, `next_expected_hash: ${outcome.contentHash}`] : []),
+        ...(outcome.intendedHash ? [`intended_hash: ${outcome.intendedHash}`] : []),
+        "source_version: changed",
+        "previous_source_version: superseded",
+        `total_lines: ${totalLines}`,
+        ...(outcome.operationId ? [`operation_id: ${outcome.operationId}`] : []),
+        ...(outcome.transformationNotice ? [`transformation_notice: ${outcome.transformationNotice}`] : []),
+        "",
+        `${rel} (lines 1-${totalLines} of ${totalLines})`,
+        `content_hash: ${outcome.contentHash ?? ""}; total_lines: ${totalLines}`,
+        body
+      ].filter((line, index, array) => !(index === array.length - 1 && line === "")).join("\n")
+      return {
+        output: rawOutput,
+        summary: `${outcome.createStatus === "created_and_transformed" ? "created and transformed" : "created"} \`${rel}\` · ${plural(totalLines, "line")}${errorsNote(outcome)}`,
+        final: outcome.pending,
+        rawOutput
+      }
+    }
     const hash = outcome.contentHash ? `\ncontent_hash: ${outcome.contentHash}; total_lines: ${linesOf(content).length}` : ""
     return {
       output: outcome.message + hash + indexChangeNote(outcome),
@@ -727,6 +783,50 @@ const lineEditErrorResult = (error: LineEditFailure): ToolResult => ({
   summary: `edit_lines failed · ${error.message}`,
   failed: true
 })
+
+const numberedRangeText = (path: string, text: string, range: RefreshedRange): string => {
+  const lines = text ? text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n") : []
+  const start = Math.max(1, range.startLine)
+  const end = Math.min(lines.length, range.endLine)
+  if (!lines.length || end < start) return `${path}:${start}-${end}`
+  return `${path}:${start}-${end}\n` + lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n")
+}
+
+const lineEditOutcomeErrorResult = (view: WorkspaceView, absolute: string, outcome: EditOutcome): ToolResult => {
+  if (!outcome.error) return lineEditErrorResult(lineEditFailure("application_failed", outcome.message))
+  const error = {
+    ...outcome.error,
+    ...(outcome.finalText !== undefined ? { current_text: outcome.finalText } : {}),
+    ...(outcome.totalLines !== undefined ? { total_lines: outcome.totalLines } : {}),
+    ...(outcome.refreshedRanges ? { refreshed_ranges: outcome.refreshedRanges } : {}),
+    ...(outcome.postSave === "unresolved" ? { mutation_occurred: undefined } : { mutation_occurred: outcome.postSave === "conflicted" }),
+    source_version: "changed"
+  }
+  const rel = view.relative(absolute)
+  const recoveryText = outcome.finalText ?? outcome.error.current_text
+  const recoveryRanges = outcome.refreshedRanges ?? outcome.error.refreshed_ranges
+  const excerpts = recoveryText !== undefined
+    ? (recoveryRanges ?? []).map((range) => numberedRangeText(rel, recoveryText, range)).join("\n")
+    : ""
+  const output: Record<string, unknown> = {
+    ok: false,
+    error,
+    ...(outcome.error.current_hash ? { hash_algorithm: outcome.error.current_hash.split(":")[0] } : {}),
+    ...(outcome.contentHash ? { content_hash: outcome.contentHash, final_hash: outcome.contentHash, next_expected_hash: outcome.contentHash } : {}),
+    ...(!outcome.contentHash && outcome.error.current_hash ? { current_hash: outcome.error.current_hash } : {}),
+    ...(outcome.previousHash ? { previous_hash: outcome.previousHash } : {}),
+    ...(outcome.intendedHash ? { intended_hash: outcome.intendedHash } : {}),
+    ...(outcome.postSave ? { post_save: outcome.postSave === "applied_exactly" ? "exact" : outcome.postSave === "applied_and_transformed" ? "transformed" : outcome.postSave } : {}),
+    ...(outcome.requestedEdits ? { requested_edits: outcome.requestedEdits } : {}),
+    ...(outcome.refreshedRanges ? { refreshed_ranges: outcome.refreshedRanges } : {}),
+    ...(!outcome.refreshedRanges && outcome.error.refreshed_ranges ? { refreshed_ranges: outcome.error.refreshed_ranges } : {}),
+    ...(outcome.sourceVersion ? { source_version: outcome.sourceVersion } : {}),
+    ...(outcome.previousSourceVersion ? { previous_source_version: outcome.previousSourceVersion } : {}),
+    ...(excerpts ? { recovery_source: excerpts } : {})
+  }
+  const rawOutput = JSON.stringify(output)
+  return { output: rawOutput, summary: `edit_lines failed · ${outcome.error.message}`, failed: true, rawOutput }
+}
 
 const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]>, resolve: (args: ToolArguments, context?: ToolContext) => Promise<ResolvedTarget>): Tool => ({
   name: "edit_lines",
@@ -817,8 +917,53 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       { required_argument: "edits", recovery: "Read the file again if stale, then send edits as an array, for example [{\"operation\":\"replace\",\"start_line\":1,\"end_line\":1,\"content\":[\"new\"]}]." }
     ))
     const outcome = await apply(source.absolute, { expected_hash: hash, edits: operations }, save, context?.write ?? source.write)
-    if (!outcome.ok) return lineEditErrorResult(outcome.error ?? lineEditFailure("application_failed", outcome.message))
+    if (!outcome.ok) return lineEditOutcomeErrorResult(view, absolute, outcome)
     if (!outcome.contentHash) return lineEditErrorResult(lineEditFailure("application_failed", "The editor did not return the resulting document hash."))
+    if (outcome.postSave || outcome.finalText !== undefined) {
+      const rel = view.relative(absolute)
+      const ranges = outcome.refreshedRanges ?? []
+      const output: Record<string, unknown> = {
+        ok: true,
+        path: rel,
+        save: outcome.persisted === false ? "unsaved" : "completed",
+        post_save: outcome.postSave === "applied_and_transformed"
+          ? "transformed"
+          : outcome.postSave === "applied_exactly"
+            ? "exact"
+            : outcome.postSave,
+        requested_edits: outcome.requestedEdits ?? "verified",
+        previous_hash: outcome.previousHash,
+        intended_hash: outcome.intendedHash,
+        content_hash: outcome.contentHash,
+        final_hash: outcome.contentHash,
+        next_expected_hash: outcome.contentHash,
+        hash_algorithm: outcome.contentHash.split(":")[0],
+        content_source: outcome.contentSource,
+        persisted: outcome.persisted ?? false,
+        source_version: outcome.sourceVersion ?? "changed",
+        previous_source_version: outcome.previousSourceVersion ?? "superseded",
+        ...(outcome.transformationNotice ? { transformation_notice: outcome.transformationNotice } : {}),
+        ...(outcome.totalLines !== undefined ? { total_lines: outcome.totalLines } : {}),
+        refreshed_ranges: ranges.map((range) => ({
+          path: rel,
+          start_line: range.startLine,
+          end_line: range.endLine,
+          ...(range.uncertain ? { uncertain: true } : {})
+        })),
+        index_refresh: outcome.indexRefresh?.status === "failed" ? { status: "failed", reason: outcome.indexRefresh.reason } : undefined,
+        message: outcome.message + indexRefreshNote(outcome)
+      }
+      const excerpts = outcome.finalText !== undefined
+        ? ranges.map((range) => numberedRangeText(rel, outcome.finalText!, range)).join("\n")
+        : ""
+      const richOutput = excerpts ? { ...output, refreshed_source: excerpts } : output
+      const rawOutput = JSON.stringify(richOutput)
+      return {
+        output: rawOutput,
+        summary: `edited \`${rel}\` by lines${errorsNote(outcome)}`,
+        rawOutput
+      }
+    }
     return {
       output: JSON.stringify({ ok: true, path: view.relative(absolute), content_hash: outcome.contentHash, hash_algorithm: outcome.contentHash.split(":")[0], content_source: outcome.contentSource, persisted: outcome.persisted ?? false, index_refresh: outcome.indexRefresh?.status === "failed" ? { status: "failed", reason: outcome.indexRefresh.reason } : undefined, message: outcome.message + indexRefreshNote(outcome) }),
       summary: `edited \`${view.relative(absolute)}\` by lines${errorsNote(outcome)}`
@@ -1313,7 +1458,34 @@ export const workspaceTools = (
         return result
       }
       if (error instanceof LineEditError) {
-        const result = lineEditErrorResult(error.detail)
+        let detail = error.detail
+        if (detail.code === "hash_mismatch" && context?.source?.absolute) {
+          const text = await view.text(context.source.absolute)
+          if (text !== undefined) {
+            const lines = linesOf(text)
+            const requested = typeof call.args.edits === "string" ? [] : Array.isArray(call.args.edits) ? call.args.edits as Array<Record<string, unknown>> : []
+            const targets = requested.flatMap((edit) => {
+              const line = typeof edit.line === "number" ? edit.line : typeof edit.start_line === "number" ? edit.start_line : undefined
+              return line === undefined ? [] : [{ startLine: Math.max(1, line - 3), endLine: Math.min(Math.max(1, lines.length), line + 3) }]
+            })
+            const ranges = targets.length
+              ? targets.sort((a, b) => a.startLine - b.startLine).reduce<Array<{ startLine: number, endLine: number }>>((merged, range) => {
+                  const last = merged[merged.length - 1]
+                  if (last && range.startLine <= last.endLine + 1) last.endLine = Math.max(last.endLine, range.endLine)
+                  else merged.push({ ...range })
+                  return merged
+                }, [])
+              : lines.length ? [{ startLine: 1, endLine: Math.min(lines.length, 7) }] : []
+            detail = lineEditFailure(detail.code, detail.message, detail.current_hash, {
+              current_text: text,
+              total_lines: lines.length,
+              refreshed_ranges: ranges,
+              source_version: "unchanged",
+              mutation_occurred: false
+            })
+          }
+        }
+        const result = lineEditErrorResult(detail)
         diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
           toolName: call.name,
           implementationType: "native",
