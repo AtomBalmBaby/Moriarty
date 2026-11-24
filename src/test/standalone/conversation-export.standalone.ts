@@ -838,3 +838,19 @@ test("every retained activity appears once per reply, with none dropped or repea
   assert.ok(second > text.indexOf("Confirm the result."), "the second reply's activity follows the first reply")
   assert.ok(text.indexOf("Plan: list the tools first.", second) > second, "the second reply's reasoning follows its user message")
 })
+
+test("the export names the observation a step is an account of, and invents none", () => {
+  const id = "9c0b1e2a-3d4e-4f50-8a6b-7c8d9e0f1a2b"
+  const withId = exportOf([
+    user("x"),
+    assistant("y", {
+      toolSteps: [step({ id: "a", name: "query_evidence", args: { observation_id: id }, output: "the stored line", observationId: id })]
+    })
+  ])
+  assert.match(withId, new RegExp(`account of recorded observation ${id}`), "the real id reaches the export")
+  const without = exportOf([
+    user("x"),
+    assistant("y", { toolSteps: [step({ id: "b", name: "grep", output: "hit" })] })
+  ])
+  assert.ok(!without.includes("Observation "), `no id is invented for a step that has none: ${without}`)
+})

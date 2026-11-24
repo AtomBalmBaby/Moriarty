@@ -1013,3 +1013,37 @@ test("a command result keeps the stream references its sink named and invents no
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test("the hook hands back the observation it recorded, and a retrieval is not stored as evidence content again", async () => {
+  const root = makeWorkspace()
+  const databasePath = await prepareProjectTodoStorage(resolveProjectTodoStorage([{ scheme: "file", fsPath: root }]))
+  const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+  const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${root}`]), conversationId: "stage3-hook", writer: "stage3-hook" }
+  await repository.initialize()
+  await repository.getList(scope)
+  try {
+    const access = await repository.evidenceAccess(scope)
+    const tools = workspaceTools(root, [], { evidence: { access } })
+    const read = { name: "read_file", args: { path: "src/warmer.ts" } }
+    const produced = await tools.run(read)
+    const recorded = await recordToolResult({ repository, scope }, read, produced, { invocationId: "stage3-hook-read" })
+    assert.equal(recorded.id.length, 36, "the hook names the real observation it wrote")
+    const query = { name: "query_evidence", args: { observation_id: recorded.id, start_line: 1, end_line: 1 } }
+    const answer = await tools.run(query)
+    assert.equal(answer.observationId, recorded.id, "the retrieval names the record it answered from")
+    assert.equal(isRecordableToolResult(query, answer), false, "and its text is not kept as model-visible evidence content (§4.3)")
+    assert.equal((await repository.projectObservations(scope)).length, 1, "one observation: the read, not the retrieval")
+
+    const sent: ToolStepView[][] = []
+    const steps = new ToolSteps((list) => sent.push(list))
+    steps.start({ id: "0.0", name: "query_evidence", args: { observation_id: recorded.id } })
+    steps.finish({ id: "0.0", index: 0, mode: "native", name: "query_evidence", summary: "queried stored content", output: answer.output, observationId: answer.observationId, promptChars: 0 })
+    assert.equal(steps.steps[0].observationId, recorded.id, "the step view shows the real id")
+    steps.start({ id: "1.0", name: "grep", args: { pattern: "foo" } })
+    steps.finish({ id: "1.0", index: 1, mode: "native", name: "grep", summary: "searched for `foo`", output: "a:1", promptChars: 0 })
+    assert.equal(steps.steps[1].observationId, undefined, "and none is invented for a step that has none")
+  } finally {
+    repository.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

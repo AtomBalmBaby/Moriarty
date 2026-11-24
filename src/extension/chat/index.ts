@@ -82,6 +82,7 @@ import { currentAccessHostKey } from "../tools/access-host"
 import { createAccessPreflight } from "../tools/access-preflight"
 import { type ContextCapacity, type ContextDiagnostics, type ContextUsage, ContextUsageStore, FALLBACK_CONTEXT_TOKENS } from "../tools/budget"
 import { formatCountedTokens, formatFullRequestTrace, formatRequestBreakdown, type FullRequestPayload, type RequestBreakdown } from "../tools/context-breakdown"
+import { evidenceTools, storedResultAnswerer, withEvidenceTools } from "../tools/evidence"
 import { DEFAULT_MAX_STEPS, describeResultBudget, GENERATION_LIMIT_DEFAULTS, generationLimitsFrom, GenerationStopped, pause, ToolLoopUsage, toolModeFor, withTools } from "../tools/loop"
 import type { McpToolSpec } from "../tools/mcp"
 import { type ToolCall, toolDefinition } from "../tools/protocol"
@@ -543,6 +544,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       },
       () => undefined
     ).map((tool) => ({ name: tool.name, description: tool.description, server: "native", tool: tool.name })) : []
+      const reader = await this.evidenceAccessFor(this.activeTodoScope())
+      if (reader) nativeList = [...nativeList, ...evidenceTools(reader).map((tool) => ({ name: tool.name, description: tool.description, server: "native", tool: tool.name }))];
     nativeList = [...nativeList, ...todoInventory]
     const mcpList = this._mcp.tools.map((t) => ({
       name: t.tool,
@@ -2398,14 +2401,15 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onChanges: (changes: ReplyChanges) => (tracked = changes),
       onOutOfSteps: () => (outOfSteps = true),
       onToolResult: async (call: ToolCall, result: ToolResult) => {
-        // A declined command ran nothing, and todo tools record their own results.
-        if (!isRecordableToolResult(call, result)) return
+        // A declined command ran nothing, todo tools record their own results, and a retrieval is recorded by the
+        // service as one access event: its text is not stored again as model-visible evidence content (§4.3).
+        if (!isRecordableToolResult(call, result)) return undefined
         const repository = this._todoRepository
         const scope = repository ? this.activeTodoScope() : undefined
         if (!repository || !scope) {
           execution.markUnrecordedTool()
           logger.debug(`[Evidence] result of ${call.name} has no project store to record in`)
-          return
+          return undefined
         }
         const recorder: ToolResultRecorder = {
           repository,
@@ -2419,11 +2423,13 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
           // what its tools actually did, and nothing is invented to justify storing it.
           const active = await repository.getActiveIntentContext(scope)
           itemId = active?.task.id
-          await recordToolResult(recorder, call, result, { invocationId, executionId: execution.executionId, itemId })
+          const observation = await recordToolResult(recorder, call, result, { invocationId, executionId: execution.executionId, itemId })
+          return observation.id
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
           execution.markUnrecordedTool()
           await reportRecordFailure(recorder, call, invocationId, reason, itemId)
+          return undefined
         }
       }
     }
@@ -2465,9 +2471,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }
     const client = view
-      ? this.toolsClient(provider, view, inventoryHooks, intentAtStart?.goal, activeCheckpoints, onCatastrophic)
+      ? await this.toolsClient(provider, view, inventoryHooks, intentAtStart?.goal, activeCheckpoints, onCatastrophic)
       : todoOnly && todoScope
-        ? this.todoToolsClient(provider, todoScope, inventoryHooks)
+        ? await this.todoToolsClient(provider, todoScope, inventoryHooks)
         : resolveAgentInferenceProvider(provider)
     const reply = await this._generation.generate(
       client,
@@ -2601,7 +2607,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * servers know, editing files and running commands, each as the
    * settings say.
    */
-  private todoToolsClient(
+  private async todoToolsClient(
     provider: TwinnyProvider,
     scope: TodoWriteRequest,
     hooks: {
@@ -2611,7 +2617,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onTools(tools: WorkspaceTools): void
       onChanges(changes: ReplyChanges): void
       onOutOfSteps(): void
-      onToolResult(call: ToolCall, result: ToolResult): Promise<void>
+      onToolResult(call: ToolCall, result: ToolResult): Promise<string | undefined>
     }
   ) {
     this._steps.reset()
@@ -2621,16 +2627,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         logger.error(`Native TODO snapshot refresh failed: ${error}`)
       })
     }, this.todoToolOptions())
+    const reader = await this.evidenceAccessFor(scope)
+    const offered = reader ? withEvidenceTools(available, reader) : available
     // TODO tools are always offered: agent profile tool restrictions must not hide task tracking.
-    logger.debug(`[ToolTrace] outgoing=${available.tools.length} native TODO tools: ${available.tools.map((tool) => tool.name).join(", ")}`)
-    hooks.onTools(available)
+    logger.debug(`[ToolTrace] outgoing=${offered.tools.length} native TODO tools: ${offered.tools.map((tool) => tool.name).join(", ")}`)
+    hooks.onTools(offered)
     const maxResultChars = clampNumericSetting(
       this.config.get<number>("chatToolsMaxResultChars", DEFAULT_RESULT_CHARS),
       MIN_RESULT_CHARS,
       MAX_RESULT_CHARS,
       DEFAULT_RESULT_CHARS
     )
-    return withTools(resolveAgentInferenceProvider(provider), available, {
+    return withTools(resolveAgentInferenceProvider(provider), offered, {
       mode: toolModeFor(provider.provider),
       provider: provider.provider,
       maxSteps: this.agentStepsForReply(),
@@ -2655,6 +2663,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
+      reuseStoredResult: reader ? storedResultAnswerer(reader) : undefined,
       onStep: (step) => {
         this._steps.finish(step)
         logger.debug(`Chat TODO tools · ${step.summary}`)
@@ -2666,7 +2675,22 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     })
   }
 
-  private toolsClient(
+  /**
+   * Stage 2's read-only access service for this project, as the repository scopes it. Without a project row there
+   * is no window to offer, and an unavailable window must not fail a reply: `query_evidence` is simply not
+   * registered, so no message can recommend a tool that is not there.
+   */
+  private async evidenceAccessFor(scope: TodoWriteRequest | undefined) {
+    if (!this._todoRepository || !scope) return undefined
+    try {
+      return await this._todoRepository.evidenceAccess(scope)
+    } catch (error) {
+      logger.warn(`[Evidence] no read-only access service for this chat: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
+  }
+
+  private async toolsClient(
     provider: TwinnyProvider,
     view: WorkspaceView,
     hooks: {
@@ -2676,7 +2700,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onTools(tools: WorkspaceTools): void
       onChanges(changes: ReplyChanges): void
       onOutOfSteps(): void
-      onToolResult(call: ToolCall, result: ToolResult): Promise<void>
+      onToolResult(call: ToolCall, result: ToolResult): Promise<string | undefined>
     },
     intentGoal: string | undefined,
     checkpoints: SafeEditCheckpoints | undefined,
@@ -2737,6 +2761,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       conversationId: this._activeConversationId,
       writer: this._activeConversationId
     } : undefined
+    const reader = await this.evidenceAccessFor(todoScope)
     let available = workspaceTools(view, [], {
       workspaceSearch: this._workspaceSearch,
       fingerprintIndex: fingerprintIndexOf(this._workspaceSearch),
@@ -2744,6 +2769,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         .filter((document) => document.uri.scheme === "file")
         .map((document) => document.uri.fsPath),
       access: createAccessPreflight({ store: this._accessStore, view, approve: chatAccessApprover }),
+      evidence: reader ? { access: reader } : undefined,
       edits: editorEdits(view, editMode, approveChange, changes, safety, this.config.get<EditorVisibility>("chatToolsEditorVisibility", "background")),
       editor: editorKnowledge(view, editMode, approveChange, changes, safety),
       ...readFileSettings((key, fallback) => this.config.get(key, fallback)),
@@ -2883,6 +2909,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       onRequestCounted: (step, breakdown, promptTokens) => this.observeCounted(conversationId, step, breakdown, promptTokens),
       onToolStart: (start) => this._steps.start(start),
       onToolResult: hooks.onToolResult,
+      reuseStoredResult: reader ? storedResultAnswerer(reader) : undefined,
       shouldStop: () => false,
       onStep: (step) => {
         this._steps.finish(step)

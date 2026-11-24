@@ -38,6 +38,7 @@ import { createInferenceTrace, inferenceEvent } from "../inference/trace"
 import { displayArguments } from "./arguments"
 import { ContextCapacity, ContextDiagnostics, ContextPlan, fitFileResult, fitResult, planContext, stripResultIntegrity, TokenEstimator, trimmedResult, withResultIntegrity } from "./budget"
 import { buildBreakdown, FullRequestPayload, RequestBreakdown, RowChars } from "./context-breakdown"
+import type { StoredResultReader } from "./evidence"
 import { logToolFailure } from "./failure-log"
 import { instructionsSection } from "./instructions"
 import {
@@ -202,6 +203,8 @@ export interface ToolStep {
   output: string
   /** Structured completeness and provenance for the model-visible output. */
   integrity?: ToolResultIntegrity
+  /** The observation this result is an account of: the one the host recorded for it, or the one a retrieval answered from. Only when there is a real one. */
+  observationId?: string
   /** The tool refused or the call went wrong (a bad path, a failing command). */
   failed?: boolean
   /** Characters of conversation sent for the request that asked for this call. */
@@ -256,8 +259,15 @@ export interface ToolLoopOptions {
   /** Called before each call runs. */
   onToolStart?(start: ToolStart): void
   onStep?(step: ToolStep): void
-  /** Called after a tool has really run, before its result is sent back to the model. */
-  onToolResult?(call: ToolCall, result: ToolResult): void | Promise<void>
+  /** Called after a tool has really run, before its result is sent back to the model. Resolves to the observation id the host recorded for it, when it records one. */
+  onToolResult?(call: ToolCall, result: ToolResult): void | Promise<string | void>
+  /**
+   * Stage 3: a read-only repeat answered from what the store already holds for it. The call is not run when the
+   * record is still the one it would produce: same identity and arguments, same source version, same authorization
+   * scope. Nothing is answered from content that was never stored. Undefined from the reader means the call has to
+   * run, and a retrieval that cannot be answered is never presented as a result.
+   */
+  reuseStoredResult?: StoredResultReader
   /** Stop dispatching tools and inference after a controller has blocked mutations. */
   shouldStop?(): boolean
   /**
@@ -555,6 +565,8 @@ export interface ResultBudget {
   retained?: boolean
   /** Structured delivery state after this budget decision. */
   integrity?: ToolResultIntegrity
+  /** The observation this result is an account of, when there is a real one. Sizes and ids only, never content. */
+  observationId?: string
 }
 
 export const describeResultBudget = (entry: ResultBudget) =>
@@ -565,6 +577,7 @@ export const describeResultBudget = (entry: ResultBudget) =>
     `budgeted ${entry.budgeted}`,
     entry.remainingTokens === undefined ? undefined : `remaining ${entry.remainingTokens} tokens`,
     entry.retained === undefined ? undefined : entry.retained ? "retained in next request" : "not retained",
+    entry.observationId === undefined ? undefined : `observation ${entry.observationId}`,
     entry.integrity === undefined ? undefined : `delivery ${entry.integrity.status}`
   ]
     .filter(Boolean)
@@ -579,6 +592,8 @@ interface ResultSlot {
   integrity?: ToolResultIntegrity
   rawIntegrity?: ToolResultIntegrity
   rawOutput?: string
+  /** The observation this result is an account of, so a later repeat can be answered from it. */
+  observationId?: string
   trimmed: boolean
   /** Left out of the conversation for lack of room, with a notice in its place. */
   omitted?: boolean
@@ -621,7 +636,7 @@ class ToolLoop {
    * workspace last changed: one asked again gets a pointer to its result
    * rather than the same output twice.
    */
-  private readonly _answered = new Map<string, { summary: string; slot?: ResultSlot }>()
+  private readonly _answered = new Map<string, { summary: string; slot?: ResultSlot; observationId?: string }>()
   /** Calls not run because they repeated one already answered. */
   private _repeats = 0
   /** Last identical failed call signature, independent of successful read caching. */
@@ -1103,6 +1118,13 @@ class ToolLoop {
         // one left out for lack of room is refused, since running it again would give the same answer.
         const repeated = earlier && (!earlier.slot?.trimmed || earlier.slot.omitted) ? earlier : undefined
         if (repeated) this._repeats++
+        // A read whose result was trimmed is answered from what the store holds for it while the record is still
+        // the one this call would produce; when it no longer is, the tool runs as it always did. A repeat that was
+        // left out of the context stays a refusal: nothing is answered from content with no room.
+        const stored = key && earlier && !repeated && pending.call
+          ? await this._options.reuseStoredResult?.(pending.call, earlier.observationId)
+          : undefined
+        if (stored) this._repeats++
         const stopped = this._options.shouldStop?.() === true
         const ran: ToolResult = stopped
           ? { output: "This call was not run because execution stopped after a catastrophic edit regression.", summary: name + " not run after catastrophic regression", failed: true }
@@ -1118,15 +1140,16 @@ class ToolLoop {
               summary: `${repeated.summary} · repeated, left out for lack of room`,
               failed: true
             }
-          : repeated
-
-            ? {
-                output:
-                  `You already called ${name} with these same arguments in this reply, and nothing in the workspace has changed since, ` +
-                  "so it was not run again: its result is above. Use that, or try something different.",
-                summary: `${repeated.summary} · repeated, not run again`
-              }
-            : await this.runCall(pending.call, outer, { operationId, requestId, step: step + 1 })
+          : stored
+            ? stored
+            : repeated
+              ? {
+                  output:
+                    `You already called ${name} with these same arguments in this reply, and nothing in the workspace has changed since, ` +
+                    "so it was not run again: its result is above. Use that, or try something different.",
+                  summary: `${repeated.summary} · repeated, not run again`
+                }
+              : await this.runCall(pending.call, outer, { operationId, requestId, step: step + 1 })
         // A read that failed (a search that ran out of time, a language
         // server still starting) is worth trying again, so it is not kept.
         if (ran.failed && failureKey) {
@@ -1140,7 +1163,7 @@ class ToolLoop {
           this._lastFailedCall = undefined
           this._repeats = 0
         }
-        keys.push(repeated ? undefined : ran.failed ? undefined : key)
+        keys.push(repeated || stored ? undefined : ran.failed ? undefined : key)
         const left = (reply.toolCalls?.length ?? 0) - calls.length
         const note =
           left > 0 && i === calls.length - 1
@@ -1180,7 +1203,7 @@ class ToolLoop {
         }
         const result: ToolResult = {
           ...ran,
-          output: `${fitted.output}${note}`.trim() || "(no output)",
+          output: fitted.output,
           integrity: fitted.integrity,
           rawOutput: ran.rawOutput ?? ran.output,
           rawIntegrity: ran.integrity,
@@ -1190,7 +1213,17 @@ class ToolLoop {
               : `read file · partial · line ${fitted.integrity.truncation?.nextStartLine ?? fitted.integrity.selected?.startLine ?? 1} exceeds budget`
             : ran.summary
         }
-        if (pending.call && !repeated) await this._options.onToolResult?.(pending.call, result)
+        if (pending.call && !repeated && !stored) {
+          const recorded = await this._options.onToolResult?.(pending.call, result)
+          if (typeof recorded === "string" && result.observationId === undefined) result.observationId = recorded
+        }
+        /** §4.7: an envelope the model reads carries the real id; a complete plain result stays plain text. */
+        if (result.observationId && result.integrity && result.integrity.status !== "complete") {
+          const envelope = { ...result.integrity, observationId: result.observationId }
+          result.integrity = envelope
+          result.output = withResultIntegrity(result.output, envelope)
+        }
+        result.output = `${result.output}${note}`.trim() || "(no output)"
         if (ran.failed) {
           logToolFailure({
             name,
@@ -1212,7 +1245,8 @@ class ToolLoop {
           serialized: result.output.length,
           budgeted: result.output.length,
           reason: fitted.output.length < ran.output.length ? "per-result cap" : "kept whole",
-          integrity: result.integrity
+          integrity: result.integrity,
+          observationId: result.observationId
         })
 
         // A folder's instructions go ahead of the output, where a cut to
@@ -1248,6 +1282,7 @@ class ToolLoop {
           summary: result.summary,
           output: result.output,
           integrity: result.integrity,
+          observationId: result.observationId,
           failed: result.failed,
           promptChars
         })
@@ -1257,7 +1292,7 @@ class ToolLoop {
       }
       const slots = this.remember(calls, results, reply.text, found, step, reply.reasoning || undefined)
       keys.forEach((key, i) => {
-        if (key) this._answered.set(key, { summary: results[i].summary, slot: slots[i] })
+        if (key) this._answered.set(key, { summary: results[i].summary, slot: slots[i], ...(results[i].observationId ? { observationId: results[i].observationId } : {}) })
       })
       this._unreadable = calls.every((pending) => !pending.call) ? this._unreadable + 1 : 0
       const repeatLimit = this._lastFailedCall ? maxNoProgressSteps : MAX_REPEATED_CALLS
@@ -1628,6 +1663,7 @@ class ToolLoop {
       ...(result?.integrity ? { integrity: result.integrity } : {}),
       ...(result?.rawIntegrity ? { rawIntegrity: result.rawIntegrity } : {}),
       ...(result?.rawOutput ? { rawOutput: result.rawOutput } : {}),
+      ...(result?.observationId ? { observationId: result.observationId } : {}),
       trimmed: false,
       ...(preface ? { preface } : {})
     })

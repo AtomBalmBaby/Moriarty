@@ -16,6 +16,7 @@ import {
 import { type CapturedResult, type EvidenceStream, textCapture } from "../todos/evidence-store"
 import type { TodoRepository } from "../todos/repository"
 import type { TodoToolObservation, TodoToolObservationInput, TodoWriteRequest } from "../todos/types"
+import { QUERY_EVIDENCE_TOOL } from "../tools/evidence"
 import type { ToolCall } from "../tools/protocol"
 import type { ToolResult } from "../tools/workspace"
 
@@ -37,10 +38,13 @@ export interface ToolResultRecord {
 
 /**
  * A declined command ran nothing and carries no refusal detail, so it is not an observation, and any other
- * result stays recordable. A command refused before execution is still an attempt: the record keeps what was asked for and says that nothing ran
+ * result stays recordable. A command refused before execution is still an attempt: the record keeps what was asked for and says that nothing ran.
+ * A retrieval by `query_evidence` is not recorded as model-visible evidence content (§4.3): the service already
+ * records it as one access event with its arguments and outcome, and the content it serves is already stored,
+ * so storing it again would make an evidence-of-evidence chain.
  */
 export const isRecordableToolResult = (call: ToolCall, result: ToolResult): boolean =>
-  !call.name.startsWith("twinny_todo_") && !(call.name === "run_command" && result.execution === undefined && result.error?.executed !== false)
+  !call.name.startsWith("twinny_todo_") && call.name !== QUERY_EVIDENCE_TOOL && !(call.name === "run_command" && result.execution === undefined && result.error?.executed !== false)
 
 /**
  * A tool result as it reached the host: the bytes as they were produced, before any fitting. A failed

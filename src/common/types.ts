@@ -235,6 +235,8 @@ export interface ToolResultIntegrity {
   gaps?: ResultGap[]
   /** Retained coverage in order, when a result reaches the model in pieces. */
   coverage?: DeliveryCoverage[]
+  /** The observation this result is an account of (§4.1). Written only when there is a real one, and it conveys no permission (Rule 7). */
+  observationId?: string
 }
 
 /** One tool call as the chat shows it: collapsed to a line, open to what went in and came out. */
@@ -248,6 +250,8 @@ export interface ToolStepView {
   output?: string
   /** Structured lifecycle metadata for the observation the model received. */
   integrity?: ToolResultIntegrity
+  /** The recorded observation this step's result is an account of, when the host recorded one or a retrieval answered from one. */
+  observationId?: string
   /** Characters of the output that were cut before being kept; the full output was never stored. */
   outputOmitted?: number
   /** Characters of the arguments (all of them together) that were cut before being kept. */

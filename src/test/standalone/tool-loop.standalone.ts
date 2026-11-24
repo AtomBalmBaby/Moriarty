@@ -10,10 +10,12 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
 
+import { exportConversation } from "../../common/conversation-export"
 import { CARRY_ON_PROMPT, CONTINUE_PROMPT, isContinuationText, requestBehindContinuation } from "../../common/messaging/chat-continuation"
 import { shouldResumeQueuedChat } from "../../common/messaging/chat-stop"
-import { ChatCompletionMessage } from "../../common/types"
+import { ChatCompletionMessage, ToolStepView } from "../../common/types"
 import { recordToolResult } from "../../extension/chat/tool-evidence"
+import { ToolSteps } from "../../extension/chat/tool-steps"
 import { buildChatTurn } from "../../extension/chat/turn"
 import { ChatChunk, ChatRequest, InferenceClient, InferenceError, InferenceErrorKind, InferenceOptions, isCancelled, isInferenceError } from "../../extension/inference"
 import { abortable } from "../../extension/inference/stream"
@@ -28,6 +30,7 @@ import {
   TokenEstimator,
   trimmedResult
 } from "../../extension/tools/budget"
+import { storedResultAnswerer } from "../../extension/tools/evidence"
 import { describeMismatch, shapeOf } from "../../extension/tools/failure-log"
 import { contentHash, patchedText, planLineEdits } from "../../extension/tools/line-edit"
 import {
@@ -1801,6 +1804,101 @@ test("the whole 1374-line read is stored complete while the copy the model is gi
     const sent = requests[1].messages.filter((message) => message.role === "tool").map((message) => String(message.content))
     assert.ok(sent.length === 1 && sent[0].length < payload.storedBytes, `the model was given ${sent[0]?.length} characters of ${payload.storedBytes} stored bytes`)
     assert.ok(budgets.some((entry) => entry.name === "read_file" && entry.reason === "per-result cap"), "the cut is reported as delivery, not as storage")
+  } finally {
+    repository.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("the model-visible copy carries the real observation id through loop, budget, the step view and the export", async () => {
+  const body = Array.from({ length: 60 }, (_, i) => `const value${i} = "${"x".repeat(40)}"`).join("\n")
+  const root = workspace({ "a.ts": body })
+  const databasePath = await prepareProjectTodoStorage(resolveProjectTodoStorage([{ scheme: "file", fsPath: root }]))
+  const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+  const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${root}`]), conversationId: "stage3-carry", writer: "stage3-carry" }
+  await repository.initialize()
+  await repository.getList(scope)
+  const budgets: ResultBudget[] = []
+  const steps = new ToolSteps(() => undefined)
+  let recorded = ""
+  try {
+    const { client, requests } = scripted([{ calls: [read("1", "a.ts")] }, "Answered."])
+    await collect(withTools(client, workspaceTools(root), {
+      mode: "native",
+      contextWindow: () => 4096,
+      onToolResult: async (call, result) => {
+        const observation = await recordToolResult({ repository, scope }, call, result, { invocationId: "stage3-carry-1" })
+        recorded = observation.id
+        return observation.id
+      },
+      onBudget: (entry) => budgets.push(entry),
+      onToolStart: (start) => steps.start(start),
+      onStep: (step) => steps.finish(step)
+    }).chat(ask("Read a.ts.")))
+    assert.ok(recorded.length > 0, "the hook recorded the call and named it")
+    const toolMessage = requests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content))
+    assert.match(toolMessage[0], new RegExp(`\\[result_integrity\\].*"observationId":"${recorded}"`), `the partial delivery names the real id: ${toolMessage[0]}`)
+    assert.ok(budgets.some((entry) => entry.observationId === recorded), "the budget entry carries it")
+    assert.equal(steps.steps[0]?.observationId, recorded, "the step view shows it")
+    const exported = exportConversation([{ role: "assistant", content: "done", toolSteps: steps.steps } as ChatCompletionMessage], { exportedAt: new Date("2026-11-24T00:00:00.000Z") })
+    assert.match(exported, new RegExp(`observation ${recorded}`), "and the export names it")
+    const plain = exportConversation([{ role: "assistant", content: "done", toolSteps: [{ id: "0.0", name: "grep", summary: "searched", status: "done" } as ToolStepView] } as ChatCompletionMessage], { exportedAt: new Date("2026-11-24T00:00:00.000Z") })
+    assert.ok(!plain.includes("observation "), `a step with no recorded id invents none: ${plain}`)
+  } finally {
+    repository.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("repeated identical read-only calls reuse the stored content while validity holds, and run again once the source version changes", async () => {
+  const root = workspace({ "a.ts": "MARKER_A\nline 1 of a\nline 2 of a\n", "b.ts": "MARKER_B\nline 1 of b\n" })
+  const databasePath = await prepareProjectTodoStorage(resolveProjectTodoStorage([{ scheme: "file", fsPath: root }]))
+  const repository = new TodoRepository(databasePath, DEFAULT_EVIDENCE_STORAGE_LIMITS, () => [root])
+  const scope = { projectFingerprint: workspaceProjectFingerprint([`file://${root}`]), conversationId: "stage3-reuse", writer: "stage3-reuse" }
+  await repository.initialize()
+  await repository.getList(scope)
+  try {
+    const access = await repository.evidenceAccess(scope)
+    const tools = workspaceTools(root, [], { evidence: { access } })
+    const seen: ToolStep[] = []
+    const trims: number[] = []
+    let recordedCalls = 0
+    const ids: string[] = []
+    const { client } = scripted([
+      { calls: [read("1", "a.ts")] },
+      { calls: [read("2", "b.ts")] },
+      { calls: [read("3", "a.ts")] },
+      { calls: [read("4", "a.ts")] },
+      "Done."
+    ])
+    await collect(withTools(client, tools, {
+      mode: "native",
+      maxSteps: 20,
+      contextWindow: () => 4096,
+      reuseStoredResult: storedResultAnswerer(access),
+      onRequest: (_chars, step) => {
+        // The source changes before the last repeat, so the stored record is no longer the one this call would produce.
+        if (step === 3) fs.writeFileSync(path.join(root, "a.ts"), "MARKER_A\nline 1 of a\nline 2 of a\nthe source changed after the capture\n")
+      },
+      onToolResult: async (call, result) => {
+        recordedCalls += 1
+        const observation = await recordToolResult({ repository, scope }, call, result, { invocationId: `stage3-reuse-${recordedCalls}` })
+        ids.push(observation.id)
+        return observation.id
+      },
+      onTrim: (results) => trims.push(results),
+      onStep: (step) => seen.push(step)
+    }).chat({ model: "m", messages: [...longHistory(40), { role: "user", content: "Read a.ts, then b.ts, then a.ts twice more." }] }))
+    const ran = seen.filter((step) => !step.summary.includes("answered from stored evidence"))
+    assert.ok(trims.length > 0, `the first read's result had to be trimmed before the repeat: ${trims.join(", ")}`)
+    assert.equal(ran.length, 3, `three calls ran: ${seen.map((step) => step.summary).join(" | ")}`)
+    const reused = seen.find((step) => step.summary.includes("answered from stored evidence"))
+    assert.ok(reused !== undefined, `the trimmed repeat was answered from the store, not rerun: ${seen.map((step) => step.summary).join(" | ")}`)
+    assert.ok(String(reused?.output).includes("line 2 of a") || String(reused?.output).includes("retained"), `what it served is what was recorded: ${reused?.output}`)
+    assert.equal(reused?.observationId, ids[0], "and it names the record it answered from, not a new one")
+    assert.ok(seen[3] !== undefined && !seen[3].summary.includes("answered from stored evidence"), `once the source version changes, the call runs again: ${seen[3]?.summary}`)
+    const reads = await repository.projectObservations(scope, { toolName: "read_file" })
+    assert.equal(reads.length, 3, "three runs recorded, and the reuse recorded none")
   } finally {
     repository.close()
     fs.rmSync(root, { recursive: true, force: true })

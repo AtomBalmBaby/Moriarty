@@ -83,3 +83,24 @@ test("languages come from file names", () => {
     ["typescript", "tsx", "python", "docker", "yaml", "markdown", "text", "text"]
   )
 })
+/**
+ * The existing header parsers keep reading today's output, and an envelope that names the observation it is an
+ * account of does not change how today's headers parse.
+ */
+test("the header parsers still read a real tool's output when the envelope carries the observation id", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "twinny-out-envelope-"))
+  fs.writeFileSync(path.join(root, "a.ts"), "one\ntwo\nthree\n")
+  const real = await workspaceTools(root).run({ name: "read_file", args: { path: "a.ts" } })
+  const id = "9c0b1e2a-3d4e-4f50-8a6b-7c8d9e0f1a2b"
+  const withEnvelope = `${real.output}\n[result_integrity]{"status":"partial","observationId":"${id}"}`
+  const slice = parseReadFile(withEnvelope)
+  assert.ok(slice !== undefined, "the header still parses")
+  assert.equal(slice.path, "a.ts")
+  assert.equal(slice.code, "one\ntwo\nthree", "and the lines are the ones the tool printed")
+  const printed = withEnvelope.split("\n").find((line) => line.startsWith("[result_integrity]"))
+  assert.ok(printed !== undefined, "the envelope line is still one line on its own")
+  assert.equal((JSON.parse(printed!.slice("[result_integrity]".length)) as { observationId?: string }).observationId, id, "and a consumer reading it still finds the id")
+  const command = parseCommandRun("$ node --version\n(exit code 0)\nv22.11.0")
+  assert.ok(command !== undefined && command.status === "exit code 0", "a command run still parses the same way")
+  assert.equal(parseReadFile("b.ts (lines 1–2 of 2)\n1: x\n2: y")?.code, "x\ny", "and a plain two-line read is unchanged")
+})

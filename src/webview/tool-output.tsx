@@ -115,6 +115,9 @@ const Label = ({ children }: { children: React.ReactNode }) => (
   <div className={styles.detailLabel}>{children}</div>
 )
 
+/** The recorded observation this step is an account of, shown only when there is a real one to name. */
+const Observation = ({ observationId }: { observationId?: string }) => (observationId ? <div className={styles.note}>Observation {observationId}</div> : null)
+
 const Plain = ({ text }: { text: string }) => <pre className={styles.output}>{text}</pre>
 
 const Args = ({ args }: { args: Record<string, string> }) => {
@@ -158,6 +161,7 @@ export const ToolOutput = ({ step }: { step: ToolStepView }) => {
               {step.integrity.truncation?.nextCharStart ? `; continue at character ${step.integrity.truncation.nextCharStart}` : ""}.
             </div>
           )}
+          <Observation observationId={step.observationId} />
         </>
       )
     }
@@ -280,6 +284,7 @@ export const ToolOutput = ({ step }: { step: ToolStepView }) => {
           <Plain text={output} />
         </>
       )}
+      <Observation observationId={step.observationId} />
     </>
   )
 }

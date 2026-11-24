@@ -404,6 +404,9 @@ const renderTool = (step: ToolStepView): string => {
         ].filter((value): value is string => !!value).join(" "))
       )
     }
+    if (step.observationId) {
+      lines.push("", note(`This result is an account of recorded observation ${step.observationId}.`))
+    }
     if (step.outputOmitted) {
       lines.push(
         "",

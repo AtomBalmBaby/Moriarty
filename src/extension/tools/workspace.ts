@@ -12,12 +12,13 @@
 import type { CaptureMode, ToolResultIntegrity } from "../../common/types"
 import { diagnosticEvent } from "../diagnostics"
 import { TodoRepository } from "../todos/repository"
-import { TodoWriteRequest } from "../todos/types"
+import type { EvidenceAccess, TodoWriteRequest } from "../todos/types"
 
 import { AccessPreflight,accessTargetsOf } from "./access-preflight"
 import { argumentFailure, argumentObject, argumentReader, checkDeclaredArguments, jsonType, positiveNumberArgument, structuredErrorResult, textArgument, ToolArgumentError,type ToolArguments, type ToolErrorDetail } from "./arguments"
 import { formatResultIntegrity } from "./budget"
 import { planReplacement, Replacement } from "./edit"
+import { evidenceTools } from "./evidence"
 import { indexChangeNote } from "./helpers"
 import { FolderInstructions, folderInstructionsNote, InstructionFile, readRootInstructions } from "./instructions"
 import { contentHash, ContentSource, LINE_EDIT_OPERATIONS, LineEditError, LineEditFailure, lineEditFailure, LineEditFailureCode, LineEditRequest } from "./line-edit"
@@ -77,6 +78,8 @@ export interface ToolResult {
   }
   /** The bytes as they arrived on each stream, before any presentation view. Stage 10 fills these from the real command sink. */
   rawStreams?: { stdout?: Buffer; stderr?: Buffer; terminal?: Buffer }
+  /** The observation this result is an account of: the one the host recorded for this call, or the one a retrieval answered from. Written only when there is a real one. */
+  observationId?: string
   /** Structured fields the host records with this observation. Verification reads them; the model does not see them. */
   observation?: { arguments: Record<string, string> }
   /** Why the call was refused, when the tool can name the condition precisely. */
@@ -1100,6 +1103,8 @@ export interface ToolExtras {
   fingerprintIndex?: FingerprintCandidates
   /** Files open in the editor, whose buffer may not be what the index recorded. */
   openFiles?: () => string[]
+  /** Stage 2's read-only access service for this project, when the host holds one: it registers `query_evidence`. Without it the tool is not offered, so no message may recommend it. */
+  evidence?: { access: EvidenceAccess }
 }
 
 /**
@@ -1178,6 +1183,7 @@ export const workspaceTools = (
   }
   if (commands) tools.push(runCommand(commands))
   if (extras.todos) tools.push(...todoTools(extras.todos.repository, extras.todos.scope, extras.todos.onChanged, extras.todos.options))
+  if (extras.evidence) tools.push(...evidenceTools(extras.evidence.access))
   for (const spec of extras.mcp?.tools ?? []) tools.push(mcpTool(spec, extras.mcp!))
   const top = view.entries(view.root).map((e) => (e.dir ? `${e.name}/` : e.name))
   const reading = extras.instructions !== false

@@ -102,6 +102,7 @@ export class ToolSteps {
       summary: step.summary,
       output,
       integrity: step.integrity,
+      observationId: step.observationId,
       outputOmitted: outputOmitted || undefined,
       status,
       command: undefined,
