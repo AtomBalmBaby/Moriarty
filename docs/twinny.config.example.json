@@ -7,5 +7,34 @@
       "redactionMode": "presentation_only",
       "enabled": true
     }
+  },
+  "git": {
+    "workflow": {
+      "mode": "manual-approval",
+      "plainCommit": "commit-only"
+    },
+    "destination": {
+      "remote": "origin",
+      "branch": "current",
+      "setUpstream": true
+    },
+    "identity": {
+      "tagging": true,
+      "email": {
+        "env": "MORIARTY_GIT_EMAIL"
+      },
+      "human": {
+        "name": "Ada Human",
+        "email": "ada@example.com"
+      }
+    },
+    "auth": {
+      "mode": "inherit",
+      "env": {
+        "GIT_ASKPASS": { "env": "MORIARTY_GIT_ASKPASS" },
+        "GIT_SSH_COMMAND": { "env": "MORIARTY_GIT_SSH_COMMAND" },
+        "GIT_HTTP_EXTRA_HEADER": { "env": "MORIARTY_GIT_HTTP_EXTRA_HEADER" }
+      }
+    }
   }
 }

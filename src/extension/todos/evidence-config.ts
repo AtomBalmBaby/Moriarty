@@ -6,14 +6,18 @@
  *
  * A missing file uses the documented defaults. An unreadable, corrupt or invalid file is reported as
  * an actionable error: it is never overwritten, never silently fallen back on, and no database is
- * touched because of it. Keys outside `evidence.storage` are preserved as they are and reported.
+ * touched because of it. Keys outside `evidence.storage` are preserved as they are and reported,
+ * including a `git` section that its own module reads; sharing the parser changes nothing here.
+ *
+ * File location, JSON parsing and the changed-on-disk reload cache live in `project-config.ts` and are
+ * shared with the Git reader. The evidence section's defaults, validation and error wording are
+ * unchanged.
  */
-import fs from "node:fs/promises"
-import path from "node:path"
+import { isRecord } from "../../common/guards"
 
-import { PROJECT_TODO_DIRECTORY } from "./project-home"
+import { type ConfigProblem, createDocumentSource, type DocumentReading, otherKeysOf, readProjectConfigDocument } from "./project-config"
 
-export const PROJECT_CONFIG_NAME = "config.json"
+export { PROJECT_CONFIG_NAME } from "./project-config"
 
 /** Stage 1 keeps today's order; the favourite tier is Stage 6's, so the name says what was actually used. */
 export type PolicyEvictionOrder = "oldest_unfavourited_first" | "oldest_first"
@@ -48,10 +52,8 @@ export interface EffectivePolicy {
   otherKeys: string[]
 }
 
-export interface InvalidPolicy {
-  path: string
-  reason: string
-}
+/** The same problem shape every project config section reports. */
+export type InvalidPolicy = ConfigProblem
 
 export type PolicyReading =
   | { state: "effective"; reading: EffectivePolicy }
@@ -85,36 +87,21 @@ const validateStorage = (storage: Record<string, unknown>, file: string): Invali
   return { path: file, reason: `${problems.join("; ")}; the file was left as it is` }
 }
 
-/** Reads the file as it stands. A corrupt file is reported, not worked around. */
-export const readEvidenceStoragePolicy = async (projectHome: string): Promise<PolicyReading> => {
-  const file = path.join(projectHome, PROJECT_TODO_DIRECTORY, PROJECT_CONFIG_NAME)
-  let text: string
-  try {
-    text = await fs.readFile(file, "utf8")
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT")
-      return { state: "effective", reading: { path: file, source: "defaults", policy: { ...DEFAULT_EVIDENCE_STORAGE_POLICY }, otherKeys: [] } }
-    return { state: "invalid", path: file, reason: `could not be read: ${error instanceof Error ? error.message : String(error)}` }
-  }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text) as unknown
-  } catch (error) {
-    return { state: "invalid", path: file, reason: `is not JSON (${error instanceof Error ? error.message : String(error)}); correct it or remove it` }
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
-    return { state: "invalid", path: file, reason: `must hold a JSON object, not ${Array.isArray(parsed) ? "an array" : String(parsed)}` }
-  const document = parsed as Record<string, unknown>
-  const otherKeys = Object.keys(document).filter((key) => key !== "evidence")
-  const evidence = document.evidence
+/** What the evidence section of a shared document says, or the problem it has with it. */
+const evidenceReadingOf = (document: DocumentReading): PolicyReading => {
+  if (document.state === "invalid") return { state: "invalid", path: document.path, reason: document.reason }
+  const source = document.reading
+  const file = source.path
+  const otherKeys = otherKeysOf(source.document, "evidence")
+  const evidence = source.document.evidence
   if (evidence === undefined || evidence === null)
-    return { state: "effective", reading: { path: file, source: "config.json", policy: { ...DEFAULT_EVIDENCE_STORAGE_POLICY }, otherKeys } }
-  if (typeof evidence !== "object" || Array.isArray(evidence))
+    return { state: "effective", reading: { path: file, source: source.source, policy: { ...DEFAULT_EVIDENCE_STORAGE_POLICY }, otherKeys } }
+  if (!isRecord(evidence))
     return { state: "invalid", path: file, reason: `evidence must be an object, not ${Array.isArray(evidence) ? "an array" : String(evidence)}` }
   const storage = (evidence as Record<string, unknown>).storage
   if (storage === undefined || storage === null)
-    return { state: "effective", reading: { path: file, source: "config.json", policy: { ...DEFAULT_EVIDENCE_STORAGE_POLICY }, otherKeys } }
-  if (typeof storage !== "object" || Array.isArray(storage))
+    return { state: "effective", reading: { path: file, source: source.source, policy: { ...DEFAULT_EVIDENCE_STORAGE_POLICY }, otherKeys } }
+  if (!isRecord(storage))
     return { state: "invalid", path: file, reason: `evidence.storage must be an object, not ${Array.isArray(storage) ? "an array" : String(storage)}` }
   const given = storage as Record<string, unknown>
   const invalid = validateStorage(given, file)
@@ -124,7 +111,7 @@ export const readEvidenceStoragePolicy = async (projectHome: string): Promise<Po
     state: "effective",
     reading: {
       path: file,
-      source: "config.json",
+      source: source.source,
       policy: {
         maxProjectBytes: given.maxProjectBytes === undefined ? defaults.maxProjectBytes : given.maxProjectBytes as number,
         maxBlobBytes: given.maxBlobBytes === undefined ? defaults.maxBlobBytes : given.maxBlobBytes as number,
@@ -137,9 +124,14 @@ export const readEvidenceStoragePolicy = async (projectHome: string): Promise<Po
   }
 }
 
+/** Reads the file as it stands. A corrupt file is reported, not worked around. */
+export const readEvidenceStoragePolicy = async (projectHome: string): Promise<PolicyReading> =>
+  evidenceReadingOf(await readProjectConfigDocument(projectHome))
+
 /**
  * Safe reload: the file is read again only when it has changed on disk, so a new setting takes effect
  * at the next storage operation without a restart and without re-reading a file that did not change.
+ * The stamp cache is the shared one; what this source answers with is still evidence's own reading.
  */
 export interface PolicySource {
   effective(): Promise<PolicyReading>
@@ -148,24 +140,17 @@ export interface PolicySource {
 }
 
 export const createPolicySource = (projectHome: string): PolicySource => {
+  const documents = createDocumentSource(projectHome)
   let last: PolicyReading | undefined
-  let stamp = ""
+  let lastDocument: DocumentReading | undefined
   return {
     effective: async () => {
-      const file = path.join(projectHome, PROJECT_TODO_DIRECTORY, PROJECT_CONFIG_NAME)
-      let stampNow = "absent"
-      try {
-        const stat = await fs.stat(file)
-        if (stat.isDirectory()) return { state: "invalid", path: file, reason: "is a folder, not a config file; nothing was changed" }
-        stampNow = `${stat.size}:${stat.mtimeMs}`
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-          return { state: "invalid", path: file, reason: `could not be checked: ${error instanceof Error ? error.message : String(error)}` }
-      }
-      if (last && stamp === stampNow) return last
-      const reading = await readEvidenceStoragePolicy(projectHome)
+      const document = await documents.effective()
+      // A file that did not change answers with the same reading, exactly as before the parser was shared.
+      if (last && lastDocument === document) return last
+      const reading = evidenceReadingOf(document)
       last = reading
-      stamp = stampNow
+      lastDocument = document
       return reading
     },
     last: () => last

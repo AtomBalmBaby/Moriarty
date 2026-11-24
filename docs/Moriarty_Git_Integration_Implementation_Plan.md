@@ -123,7 +123,7 @@ Use this table in every stage update.
 | Stage | Title | Status | Date | Verification | Result | Notes |
 |---|---|---|---|---|---|---|
 | 0 | Repository audit and contracts | in progress | 2026-11-24 | design documents and repository audit | no code changed | This plan is design-only |
-| 1 | Project Git configuration and identity | not started | | | | |
+| 1 | Project Git configuration and identity | complete | 2026-11-24 | `npm run build-tests`; `node --test out/test/standalone/git-config.standalone.js` (16 cases); existing evidence suites re-run; `npm run lint` | 16/16 pass; evidence suites unchanged at 19/15/14/6; eslint clean; no schema change and no Git process run | Shared reader in `src/extension/todos/project-config.ts`; `git/config.ts`, `git/identity.ts`, `git/auth.ts` added. Defaults: manual-approval, tagging true, remote origin, branch current, auth inherit. Invalid values fail with an actionable line instead of falling back; credential values stay out of readings and diagnostics; the tagging opt-out is not exposed in settings or the GUI |
 | 2 | Git session baseline and ownership tracker | not started | | | | |
 | 3 | Repository/status/change native tools | not started | | | | |
 | 4 | Alternate-index staging and commit | not started | | | | |
@@ -141,6 +141,16 @@ Update this table only after the stage's acceptance gates pass. A stage's handof
 - unresolved risks;
 - next stage;
 - exact fresh-agent prompt.
+
+### Stage 1 handoff
+
+- Branch/HEAD: `integrated-git` at `6cbf2bf`; the working tree was clean before the stage started.
+- Changed files: `src/extension/todos/project-config.ts` (new shared file reader and stamp cache), `src/extension/todos/evidence-config.ts` (reads through the shared parser; its defaults, validation wording, `otherKeys` report and reload behavior are unchanged), `src/extension/git/config.ts`, `src/extension/git/identity.ts`, `src/extension/git/auth.ts` (new), `src/test/standalone/git-config.standalone.ts` (new), `docs/twinny.config.example.json` (the Git example added).
+- Tests run: the 11 named Stage 1 cases plus 5 added coverage cases, 16 total, all passing; existing evidence suites re-run unchanged (19, 15, 14, 6); `npm run build-tests` compiles and `npm run lint` is clean.
+- Database state: schema stays v21. No table was created or changed, no migration was proposed or applied, and `.twinny/project.sqlite` was never opened by Stage 1 code or tests; every test ran on a scratch project under `/tmp`.
+- Unresolved risks: the machine/user preference layer is validated as an input but no `package.json` setting exists yet (Stage 7 owns that); `managed` credentials are only a seam and report `managed credential provider not installed`; the child-process environment is assembled as data and has not been proven against a real Git process; explicit task restrictions are not read here.
+- Next stage: Stage 2, session baseline and ownership tracker. Stage 2 must use `createDocumentSource` or `createGitConfigSource` rather than re-reading `config.json`, because file parsing and the stamp cache now belong to `project-config.ts`.
+- Redacted credential diagnostic, as a test produced it: `mode=environment, GIT_TERMINAL_PROMPT=0, references=GIT_HTTP_EXTRA_HEADER` - the variable name is shown, the value is not.
 
 ## 2. Cross-stage contracts
 
