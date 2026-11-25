@@ -29,12 +29,12 @@ const GIT_TIMEOUT_MS = 15_000
 /** Past this many files a command changed, they are not listed: undo all would be a guess. */
 export const MAX_COMMAND_CHANGES = 200
 
-interface GitAnswer {
+export interface GitAnswer {
   stdout: Buffer
   ok: boolean
 }
 
-const git = (cwd: string, args: string[], env?: NodeJS.ProcessEnv) =>
+export const runGitInRepository = (cwd: string, args: string[], env?: NodeJS.ProcessEnv) =>
   new Promise<GitAnswer>((resolve) => {
     const child = execFile(
       "git",
@@ -45,9 +45,12 @@ const git = (cwd: string, args: string[], env?: NodeJS.ProcessEnv) =>
     child.stdin?.end()
   })
 
+/** Where a repository keeps its own files, as git itself answers for them. */
+export interface RepositoryLocation { top: string; gitDir: string }
+
 /** The working tree's top and its git directory, when `cwd` is in one. */
-const repositoryOf = async (cwd: string) => {
-  const answer = await git(cwd, ["rev-parse", "--show-toplevel", "--absolute-git-dir"])
+export const repositoryOf = async (cwd: string): Promise<RepositoryLocation | undefined> => {
+  const answer = await runGitInRepository(cwd, ["rev-parse", "--show-toplevel", "--absolute-git-dir"])
   if (!answer.ok) return undefined
   const [top, gitDir] = answer.stdout.toString("utf8").trim().split("\n")
   return top && gitDir ? { top, gitDir } : undefined
@@ -72,8 +75,8 @@ export const snapshotTree = async (cwd: string): Promise<TreeSnapshot | undefine
       // A repository with nothing staged yet has no index; git makes one.
     }
     const env = { GIT_INDEX_FILE: index }
-    if (!(await git(repository.top, ["add", "-A"], env)).ok) return undefined
-    const written = await git(repository.top, ["write-tree"], env)
+    if (!(await runGitInRepository(repository.top, ["add", "-A"], env)).ok) return undefined
+    const written = await runGitInRepository(repository.top, ["write-tree"], env)
     const tree = written.stdout.toString("utf8").trim()
     return written.ok && /^[0-9a-f]{40,64}$/.test(tree) ? { top: repository.top, tree } : undefined
   } finally {
@@ -90,7 +93,7 @@ export interface TreeChange {
 
 /** A file in `tree` as text, or undefined when it is binary or too large to keep. */
 const textAt = async (top: string, tree: string, relative: string): Promise<string | undefined> => {
-  const answer = await git(top, ["cat-file", "-p", `${tree}:${relative}`])
+  const answer = await runGitInRepository(top, ["cat-file", "-p", `${tree}:${relative}`])
   if (!answer.ok || answer.stdout.length > MAX_KEPT_FILE_BYTES || looksBinary(answer.stdout)) return undefined
   const text = answer.stdout.toString("utf8")
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
@@ -102,7 +105,7 @@ const textAt = async (top: string, tree: string, relative: string): Promise<stri
  */
 export const changesBetween = async (before: TreeSnapshot, after: TreeSnapshot): Promise<TreeChange[] | undefined> => {
   if (before.tree === after.tree) return []
-  const answer = await git(before.top, ["diff-tree", "-r", "--no-renames", "--name-status", "-z", before.tree, after.tree])
+  const answer = await runGitInRepository(before.top, ["diff-tree", "-r", "--no-renames", "--name-status", "-z", before.tree, after.tree])
   if (!answer.ok) return []
   const fields = answer.stdout.toString("utf8").split("\0").filter(Boolean)
   const entries: { status: string; relative: string }[] = []
