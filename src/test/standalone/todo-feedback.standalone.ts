@@ -5868,6 +5868,17 @@ test("project edit reconciliation settles an operation once and stays inside its
     assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "dispatched", "reconciled_applied", "stale decision"), false, "a stale decision cannot release a diverged operation")
     assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "diverged", "reconciled_applied", "The editor now holds the intended text."), true)
     assert.equal(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), undefined, "the editor matching the intended text releases the target")
+
+    await state.repository.beginEditOperation(state.scope, { id: "fresh-snapshot-recovery", itemId, target: "src/race.ts", mode: "apply", preDigest: pre, postDigest: post })
+    assert.equal(await state.repository.settleProjectEditOperation(other, "fresh-snapshot-recovery", "dispatched", "diverged", "matches neither text"), true)
+    assert.equal(await state.repository.settleProjectEditOperation(
+      other,
+      "fresh-snapshot-recovery",
+      "diverged",
+      "reconciled_absent",
+      "A newly verified authoritative snapshot superseded the earlier diverged mutation; it was not replayed."
+    ), true)
+    assert.equal(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), undefined, "a fresh verified snapshot releases an obsolete diverged ledger entry")
   } finally {
     removeAll(state.directory)
   }

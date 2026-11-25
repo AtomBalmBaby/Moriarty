@@ -2113,7 +2113,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }
     return async (operation) => {
-      await this.clearEditTargetBlockers(scope, operation.target)
+      await this.clearEditTargetBlockers(scope, operation.target, operation.preDigest)
       const active = await repository.getActiveIntentContext(scope)
       await repository.beginEditOperation(scope, { ...operation, itemId: active?.task.id, ownerId: this._editOwnerId })
       return {
@@ -2131,14 +2131,30 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * the editor first, so a settled operation releases the target. A blocker that is still running or diverged throws
    * a refusal that names the operation, its state, and the next action.
    */
-  private async clearEditTargetBlockers(scope: TodoWriteRequest, target: string): Promise<void> {
+  private async clearEditTargetBlockers(scope: TodoWriteRequest, target: string, freshDigest?: string): Promise<void> {
     const repository = this._todoRepository
     if (!repository) return
     const blockers = (await repository.listUnresolvedEditOperations(scope)).filter((operation) => operation.target === target)
     if (!blockers.length) return
     await this.reconcileEditOperations(target)
     const remaining = (await repository.listUnresolvedEditOperations(scope)).find((operation) => operation.target === target)
-    if (remaining) throw new Error(describeEditBlocker(remaining, scope.conversationId, this._editOwnerId))
+    if (remaining && remaining.status === "diverged" && freshDigest !== undefined && remaining.ownerId === this._editOwnerId) {
+      const settledStatus = freshDigest === remaining.postDigest
+        ? "reconciled_applied"
+        : "reconciled_absent"
+      const detail = freshDigest === remaining.postDigest
+        ? "A newly verified authoritative snapshot matches the earlier intended text; the earlier mutation was not replayed."
+        : "A newly verified authoritative snapshot superseded the earlier diverged mutation; external or replacement content is preserved and the mutation was not replayed."
+      await repository.settleProjectEditOperation(
+        scope,
+        remaining.id,
+        "diverged",
+        settledStatus,
+        detail
+      )
+    }
+    const remainingAfterFreshSnapshot = (await repository.listUnresolvedEditOperations(scope)).find((operation) => operation.target === target)
+    if (remainingAfterFreshSnapshot) throw new Error(describeEditBlocker(remainingAfterFreshSnapshot, scope.conversationId, this._editOwnerId))
   }
 
   /**

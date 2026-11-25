@@ -139,15 +139,23 @@ export const refreshedRangesForEdit = (
     if (patch.kind === "replace_text" && patch.line !== undefined) {
       ranges.push({ startLine: mappedLine(mapping, patch.line), endLine: mappedLine(mapping, patch.line) })
     } else if (patch.kind === "replace" && patch.startLine !== undefined && patch.endLine !== undefined) {
-      ranges.push({
-        startLine: mappedLine(mapping, patch.startLine),
-        endLine: mappedLine(mapping, patch.endLine)
-      })
+      if (patch.startLine === 1 && patch.endLine === textLines(original).length) {
+        ranges.push({ startLine: 1, endLine: totalLines })
+      } else {
+        ranges.push({
+          startLine: mappedLine(mapping, patch.startLine),
+          endLine: mappedLine(mapping, patch.endLine)
+        })
+      }
     } else if (patch.kind === "delete" && patch.startLine !== undefined) {
-      ranges.push({
-        startLine: mappedLine(mapping, patch.startLine),
-        endLine: mappedLine(mapping, patch.endLine ?? patch.startLine)
-      })
+      if (patch.startLine === 1 && patch.endLine === textLines(original).length) {
+        ranges.push({ startLine: 1, endLine: Math.max(1, totalLines) })
+      } else {
+        ranges.push({
+          startLine: mappedLine(mapping, patch.startLine),
+          endLine: mappedLine(mapping, patch.endLine ?? patch.startLine)
+        })
+      }
     } else if (patch.kind === "insert" && patch.line !== undefined) {
       ranges.push({ startLine: mappedLine(mapping, patch.line), endLine: mappedLine(mapping, patch.line) })
     }
@@ -174,7 +182,9 @@ const windowLines = (text: string, range: { startLine: number, endLine: number }
 
 const sequenceInWindow = (window: readonly string[], wanted: readonly string[]): boolean => {
   if (!wanted.length) return false
-  const normalized = window.map((line) => normalizedLine(line).replace(/\s+/g, ""))
+  const normalized = window
+    .map((line) => normalizedLine(line).replace(/\s+/g, ""))
+    .filter((line) => line.length > 0)
   const target = wanted.map((line) => normalizedLine(line).replace(/\s+/g, "")).filter((line) => line.length > 0)
   if (!target.length) return false
   for (let index = 0; index <= normalized.length - target.length; index++) {
@@ -183,7 +193,12 @@ const sequenceInWindow = (window: readonly string[], wanted: readonly string[]):
   return false
 }
 
-const patchSurvived = (patch: LinePatch, final: string, mapping: readonly (number | undefined)[]): boolean => {
+const sequenceInText = (text: string, wanted: readonly string[]): boolean => {
+  const window = textLines(text)
+  return sequenceInWindow(window, wanted)
+}
+
+const patchSurvived = (patch: LinePatch, original: string, final: string, mapping: readonly (number | undefined)[]): boolean => {
   const totalLines = textLines(final).length
   if (patch.kind === "replace_text") {
     if (patch.line === undefined) return false
@@ -201,9 +216,21 @@ const patchSurvived = (patch: LinePatch, final: string, mapping: readonly (numbe
   }
   if (patch.kind === "replace") {
     if (patch.startLine === undefined) return false
-    const line = mappedLine(mapping, patch.startLine)
-    const range = boundedRange(line, 3, totalLines)
-    return sequenceInWindow(windowLines(final, range), textLines(patch.intendedText ?? patch.text))
+    const wanted = textLines(patch.intendedText ?? patch.text)
+    if (!wanted.length) return false
+    const originalTotal = textLines(original).length
+    if (patch.startLine === 1 && patch.endLine === originalTotal) {
+      return sequenceInText(final, wanted)
+    }
+    const start = mappedLine(mapping, patch.startLine)
+    const end = patch.endLine === undefined ? start : mappedLine(mapping, patch.endLine)
+    const originalSize = textLines(patch.originalText ?? "").length
+    const finalSize = Math.max(originalSize, wanted.length)
+    const range = {
+      startLine: Math.max(1, Math.min(start, end) - 3),
+      endLine: Math.min(Math.max(1, totalLines), Math.max(start, end) + finalSize + 3)
+    }
+    return sequenceInWindow(windowLines(final, range), wanted)
   }
   if (patch.kind === "insert") {
     if (patch.line === undefined) return false
@@ -214,7 +241,12 @@ const patchSurvived = (patch: LinePatch, final: string, mapping: readonly (numbe
   if (patch.kind === "delete") {
     if (patch.startLine === undefined) return false
     const line = mappedLine(mapping, patch.startLine)
-    const range = boundedRange(line, 3, totalLines)
+    const end = patch.endLine === undefined ? line : mappedLine(mapping, patch.endLine)
+    const originalTotal = textLines(original).length
+    if (patch.startLine === 1 && patch.endLine === originalTotal) {
+      return textLines(final).every((entry) => normalizedLine(entry).length === 0)
+    }
+    const range = boundedRange(line, Math.max(3, Math.abs(end - line) + 3), totalLines)
     const removed = textLines(patch.originalText ?? "")
       .map(normalizedLine)
       .filter((entry) => entry.length)
@@ -236,7 +268,7 @@ export const reconcileLineEdits = (
   if (intended === final) return { reconciliation: "applied_exactly", requestedEdits: "verified" }
   if (!patches.length) return { reconciliation: "unresolved", requestedEdits: "unresolved" }
   const mapping = mappingFromLineDiff(original, final)
-  const verified = patches.every((patch) => patchSurvived(patch, final, mapping))
+  const verified = patches.every((patch) => patchSurvived(patch, original, final, mapping))
   if (verified) return { reconciliation: "applied_and_transformed", requestedEdits: "verified" }
   return { reconciliation: "conflicted", requestedEdits: "conflicted" }
 }
@@ -308,7 +340,11 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
     }
     const insertion = operation === "insert_before" || operation === "insert_after"
     const substring = operation === "replace_text"
-    const fields = substring ? ["line", "old_text", "new_text"] : insertion ? ["line"] : ["start_line", "end_line"]
+    const fields = substring
+      ? ["line", "old_text", "new_text"]
+      : insertion
+        ? ["line"]
+        : ["line", "start_line", "end_line"]
     const allowed = new Set(["operation", ...fields, ...(operation === "delete" || substring ? [] : ["content"])])
     const unexpected = Object.keys(edit).filter((key) => !allowed.has(key))
     if (unexpected.length) invalid(`Unexpected field${unexpected.length > 1 ? "s" : ""} for ${operation} operation: ${unexpected.join(", ")}. Allowed fields: ${[...allowed].join(", ")}.`)
@@ -371,22 +407,41 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
         intendedText: content
       }
     }
-    if (!integer(edit.start_line, 1, lines.length) || !integer(edit.end_line, edit.start_line, lines.length)) {
-      invalid(`Invalid inclusive range; expected lines 1 through ${lines.length}.`)
+    const hasLine = Object.prototype.hasOwnProperty.call(edit, "line")
+    const hasStart = Object.prototype.hasOwnProperty.call(edit, "start_line")
+    const hasEnd = Object.prototype.hasOwnProperty.call(edit, "end_line")
+    if (hasLine && (hasStart || hasEnd)) {
+      invalid("Ambiguous inclusive range: use line as shorthand for start_line=end_line, or use start_line and end_line, never combine line with either range field.")
     }
-    let start = starts[edit.start_line - 1]
-    const end = starts[edit.end_line] ?? text.length
+    let startLine: number
+    let endLine: number
+    if (hasLine) {
+      if (!integer(edit.line, 1, lines.length)) invalid(`Invalid line shorthand; expected 1 through ${lines.length}.`)
+      startLine = edit.line
+      endLine = edit.line
+    } else {
+      if (!hasStart || !hasEnd) {
+        invalid("Invalid inclusive range: replace and delete require start_line and end_line, or line as shorthand for both.")
+      }
+      if (!integer(edit.start_line, 1, lines.length) || !integer(edit.end_line, edit.start_line, lines.length)) {
+        invalid(`Invalid inclusive range; expected lines 1 through ${lines.length}.`)
+      }
+      startLine = edit.start_line
+      endLine = edit.end_line
+    }
+    let start = starts[startLine - 1]
+    const end = starts[endLine] ?? text.length
     if (operation === "delete") {
       // Removing an unterminated last line also removes its preceding separator.
-      if (edit.end_line === lines.length && !terminated && start > 0) start -= text.slice(0, start).endsWith("\r\n") ? 2 : 1
+      if (endLine === lines.length && !terminated && start > 0) start -= text.slice(0, start).endsWith("\r\n") ? 2 : 1
       const originalText = text.slice(start, end)
       return {
         start,
         end,
         text: "",
         kind: "delete",
-        startLine: edit.start_line,
-        endLine: edit.end_line,
+        startLine,
+        endLine,
         originalText
       }
     }
@@ -394,10 +449,10 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
     return {
       start,
       end,
-      text: intendedText + (edit.end_line < lines.length || terminated ? eol : ""),
+      text: intendedText + (endLine < lines.length || terminated ? eol : ""),
       kind: "replace",
-      startLine: edit.start_line,
-      endLine: edit.end_line,
+      startLine,
+      endLine,
       originalText: text.slice(start, end),
       intendedText
     }
