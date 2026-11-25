@@ -591,6 +591,10 @@ export class WorkspaceIntelligenceIndex implements vscode.Disposable {
 
   private handleFileChange(uri: vscode.Uri, source = "file-watcher"): void {
     if (!this.automaticSyncEnabled()) return
+    if (uri.scheme !== "file" || !this.isEligibleUri(uri)) {
+      this.workspaceIndexDebug(`[WorkspaceIndex] ignored non-file or excluded URI path=${uri.fsPath || uri.path} scheme=${uri.scheme}`)
+      return
+    }
     if (this.isInternalStorageArtifact(uri)) {
       this.workspaceIndexDebug(`[WorkspaceIndex] ignored internal storage file event path=${uri.fsPath || uri.path} type=change`)
       return

@@ -794,19 +794,38 @@ const numberedRangeText = (path: string, text: string, range: RefreshedRange): s
 
 const lineEditOutcomeErrorResult = (view: WorkspaceView, absolute: string, outcome: EditOutcome): ToolResult => {
   if (!outcome.error) return lineEditErrorResult(lineEditFailure("application_failed", outcome.message))
+  const sourceVersion = outcome.sourceVersion ?? outcome.error.source_version ?? "unchanged"
+  const mutationOccurred = outcome.error.mutation_occurred
+    ?? (outcome.postSave === "conflicted" ? true : outcome.postSave === "unresolved" ? undefined : false)
+  const rel = view.relative(absolute)
+  const refreshed = (outcome.refreshedRanges ?? outcome.error.refreshed_ranges ?? []).map((range) => {
+    const raw = range as RefreshedRange & { start_line?: number; end_line?: number }
+    return {
+      path: rel,
+      start_line: raw.start_line ?? raw.startLine,
+      end_line: raw.end_line ?? raw.endLine,
+      ...(raw.uncertain ? { uncertain: true } : {})
+    }
+  })
   const error = {
     ...outcome.error,
     ...(outcome.finalText !== undefined ? { current_text: outcome.finalText } : {}),
     ...(outcome.totalLines !== undefined ? { total_lines: outcome.totalLines } : {}),
-    ...(outcome.refreshedRanges ? { refreshed_ranges: outcome.refreshedRanges } : {}),
-    ...(outcome.postSave === "unresolved" ? { mutation_occurred: undefined } : { mutation_occurred: outcome.postSave === "conflicted" }),
-    source_version: "changed"
+    ...(refreshed.length ? { refreshed_ranges: refreshed } : {}),
+    ...(mutationOccurred === undefined ? { mutation_occurred: undefined } : { mutation_occurred: mutationOccurred }),
+    source_version: sourceVersion
   }
-  const rel = view.relative(absolute)
   const recoveryText = outcome.finalText ?? outcome.error.current_text
   const recoveryRanges = outcome.refreshedRanges ?? outcome.error.refreshed_ranges
   const excerpts = recoveryText !== undefined
-    ? (recoveryRanges ?? []).map((range) => numberedRangeText(rel, recoveryText, range)).join("\n")
+    ? (recoveryRanges ?? []).map((range) => {
+        const raw = range as RefreshedRange & { start_line?: number; end_line?: number }
+        return numberedRangeText(rel, recoveryText, {
+          startLine: raw.start_line ?? raw.startLine,
+          endLine: raw.end_line ?? raw.endLine,
+          uncertain: raw.uncertain
+        })
+      }).join("\n")
     : ""
   const output: Record<string, unknown> = {
     ok: false,
@@ -818,9 +837,8 @@ const lineEditOutcomeErrorResult = (view: WorkspaceView, absolute: string, outco
     ...(outcome.intendedHash ? { intended_hash: outcome.intendedHash } : {}),
     ...(outcome.postSave ? { post_save: outcome.postSave === "applied_exactly" ? "exact" : outcome.postSave === "applied_and_transformed" ? "transformed" : outcome.postSave } : {}),
     ...(outcome.requestedEdits ? { requested_edits: outcome.requestedEdits } : {}),
-    ...(outcome.refreshedRanges ? { refreshed_ranges: outcome.refreshedRanges } : {}),
-    ...(!outcome.refreshedRanges && outcome.error.refreshed_ranges ? { refreshed_ranges: outcome.error.refreshed_ranges } : {}),
-    ...(outcome.sourceVersion ? { source_version: outcome.sourceVersion } : {}),
+    ...(refreshed.length ? { refreshed_ranges: refreshed } : {}),
+    source_version: sourceVersion,
     ...(outcome.previousSourceVersion ? { previous_source_version: outcome.previousSourceVersion } : {}),
     ...(excerpts ? { recovery_source: excerpts } : {})
   }
@@ -833,7 +851,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
   description:
     "The standard way to change an existing source file. Edit complete source lines atomically, guarded by expected_hash from read_file (the fingerprint of the entire editor buffer). " +
     "All coordinates refer to the SAME original snapshot, not earlier edits, and ranges may be supplied in any order; they are applied from the bottom of the file upwards. Lines are 1-based; a terminal newline is not an extra line. " +
-    "replace/delete use inclusive start_line/end_line. insert_before accepts 1 through total_lines+1; insert_after accepts 1 through total_lines. " +
+    "replace/delete use inclusive start_line/end_line, or line as shorthand for both start_line and end_line (for example line=2 replaces/deletes only line 2). Combining line with start_line or end_line is ambiguous and refused. insert_before accepts 1 through total_lines+1; insert_after accepts 1 through total_lines. " +
     "For an empty document only insert_before line=1 or insert_after line=0 is valid. EOF insertion preserves the final-newline convention. " +
     "content is an array of complete lines without newline characters (use [''] for a blank line). " +
     "Use `replace_text` for small modifications within an existing line, especially long lines. Supply the whole-file `expected_hash`, the original 1-based line number, and the exact substring to replace. Do not reproduce the complete line. Its fields are line, old_text and new_text: old_text must occur exactly once on that line, matching is literal and case-sensitive with no fallback to another line, an empty new_text removes the match, and neither operand may hold a newline. A missing or ambiguous match refuses the whole batch before anything changes. " +
@@ -866,7 +884,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
         description: "Line operations in any order, all against the original snapshot. Each object's key is operation, set to replace, delete, insert_before, insert_after or replace_text; not type, op or action.",
         items: {
           type: "object",
-          description: "replace and delete use start_line and end_line (inclusive, 1-based). insert_before and insert_after use line. replace_text uses line plus the exact old_text and new_text, so a long line does not have to be retyped. replace and inserts require content, an array of complete lines.",
+          description: "replace and delete use start_line and end_line (inclusive, 1-based), or line as shorthand for both. Do not combine line with start_line or end_line. insert_before and insert_after use line. replace_text uses line plus the exact old_text and new_text, so a long line does not have to be retyped. replace and inserts require content, an array of complete lines.",
           required: ["operation"],
           properties: {
             operation: { type: "string", enum: LINE_EDIT_OPERATIONS, description: "The change to make; this key is required." },
@@ -882,7 +900,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
             const substring = operation === "replace_text"
             return {
               type: "object", additionalProperties: false,
-              required: ["operation", ...(substring ? ["line", "old_text", "new_text"] : insertion ? ["line"] : ["start_line", "end_line"]), ...(operation === "delete" || substring ? [] : ["content"])],
+              required: ["operation", ...(substring ? ["line", "old_text", "new_text"] : insertion ? ["line"] : []), ...(operation === "delete" || substring ? [] : ["content"])],
               properties: {
                 operation: { type: "string", enum: [operation] },
                 ...(substring ? {
@@ -890,10 +908,23 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
                   old_text: { type: "string", minLength: 1, pattern: "^[^\\r\\n]+$" },
                   new_text: { type: "string", pattern: "^[^\\r\\n]*$" }
                 } : insertion ? { line: { type: "integer", minimum: operation === "insert_after" ? 0 : 1 } } : {
+                  line: { type: "integer", minimum: 1, description: "Shorthand for start_line and end_line for one line." },
                   start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 1 }
                 }),
                 ...(operation === "delete" || substring ? {} : { content: { type: "array", minItems: 1, items: { type: "string", pattern: "^[^\\r\\n]*$" } } })
-              }
+              },
+              ...(substring || insertion ? {} : {
+                anyOf: [
+                  { required: ["line"] },
+                  { required: ["start_line", "end_line"] }
+                ],
+                not: {
+                  anyOf: [
+                    { required: ["line", "start_line"] },
+                    { required: ["line", "end_line"] }
+                  ]
+                }
+              })
             }
           })
         }
@@ -905,7 +936,12 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     const hash = normalizeFingerprint(a.raw("expected_hash"))
     if (!hash) return lineEditErrorResult(lineEditFailure("invalid_hash", "edit_lines needs expected_hash: the content fingerprint read_file gave for this file.", undefined, { required_argument: "expected_hash", recovery: "Read the file to get its fingerprint, then edit that." }))
     const source = context?.source ?? (await resolve(raw, context))
-    if (!source.ok) return lineEditErrorResult(lineEditFailure(source.detail.code, source.detail.message, source.detail.current_hash, { required_argument: source.detail.required_argument, candidates: source.detail.candidates, recovery: source.detail.recovery }))
+    if (!source.ok) return lineEditErrorResult(lineEditFailure(source.detail.code, source.detail.message, source.detail.current_hash, {
+      required_argument: source.detail.required_argument,
+      candidates: source.detail.candidates,
+      recovery: source.detail.recovery,
+      ...(source.detail.code === "hash_mismatch" ? { source_version: "unchanged", mutation_occurred: false } : {})
+    }))
     const absolute = source.absolute
     // A real boolean stays a boolean: false means do not save, and an absent field keeps the default.
     const save = a.sent("save") ? a.flag("save") : true
@@ -1459,6 +1495,13 @@ export const workspaceTools = (
       }
       if (error instanceof LineEditError) {
         let detail = error.detail
+        if (detail.code === "hash_mismatch") {
+          detail = {
+            ...detail,
+            source_version: "unchanged",
+            mutation_occurred: false
+          }
+        }
         if (detail.code === "hash_mismatch" && context?.source?.absolute) {
           const text = await view.text(context.source.absolute)
           if (text !== undefined) {

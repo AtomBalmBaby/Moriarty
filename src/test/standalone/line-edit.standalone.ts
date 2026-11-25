@@ -8,7 +8,7 @@ import { test } from "node:test"
 import { parseReadFile } from "../../common/tool-output"
 import { resolveAgentToolSelection } from "../../extension/agents/tool-selection"
 import { buildStreamingRequest } from "../../extension/inference/adapters/fluency"
-import { contentHash, LINE_EDIT_OPERATIONS, patchedText, planLineEdits, reconcileLineEdits, refreshedRangesForEdit } from "../../extension/tools/line-edit"
+import { contentHash, LINE_EDIT_OPERATIONS, lineEditFailure, patchedText, planLineEdits, reconcileLineEdits, refreshedRangesForEdit } from "../../extension/tools/line-edit"
 import { findToolCall, toolDefinition } from "../../extension/tools/protocol"
 import { EditSink, workspaceTools } from "../../extension/tools/workspace"
 
@@ -83,9 +83,11 @@ test("long JSX lines with repeated closing tags are returned intact and edited w
 const cases: [string, string, unknown[], string][] = [
   ["replace one line", "a\nb\nc\n", [{ operation: "replace", start_line: 2, end_line: 2, content: ["B"] }], "a\nB\nc\n"],
   ["replace multiple lines", "a\nb\nc\nd", [{ operation: "replace", start_line: 2, end_line: 3, content: ["B", "C", "extra"] }], "a\nB\nC\nextra\nd"],
+  ["replace line shorthand with multiple lines", "a\nb\nc", [{ operation: "replace", line: 2, content: ["B", "C", "extra"] }], "a\nB\nC\nextra\nc"],
   ["insert before", "a\nb", [{ operation: "insert_before", line: 2, content: ["new"] }], "a\nnew\nb"],
   ["insert after", "a\nb", [{ operation: "insert_after", line: 1, content: ["new"] }], "a\nnew\nb"],
   ["delete range", "a\nb\nc\nd\n", [{ operation: "delete", start_line: 2, end_line: 3 }], "a\nd\n"],
+  ["delete line shorthand", "a\nb\nc\n", [{ operation: "delete", line: 2 }], "a\nc\n"],
   ["delete unterminated EOF", "a\nb", [{ operation: "delete", start_line: 2, end_line: 2 }], "a"],
   ["delete all", "a\nb\n", [{ operation: "delete", start_line: 1, end_line: 2 }], ""],
   ["insert empty before", "", [{ operation: "insert_before", line: 1, content: ["new", "line"] }], "new\nline"],
@@ -118,6 +120,8 @@ const rejected: [string, unknown, string][] = [
   ["string coordinate", [{ operation: "delete", start_line: "1", end_line: 1 }], "invalid_range"],
   ["empty content", [{ operation: "replace", start_line: 1, end_line: 1, content: [] }], "invalid_range"],
   ["unknown fields", [{ operation: "insert_before", line: 1, start_line: 1, content: ["x"] }], "invalid_range"],
+  ["ambiguous replace line shorthand", [{ operation: "replace", line: 2, start_line: 2, end_line: 2, content: ["x"] }], "invalid_range"],
+  ["ambiguous delete line shorthand", [{ operation: "delete", line: 2, end_line: 2 }], "invalid_range"],
   ["non-string operation", [{ operation: ["replace"], start_line: 1, end_line: 1, content: ["x"] }], "invalid_range"],
   ["unknown operation", [{ operation: "append", line: 1, content: ["x"] }], "invalid_range"],
   ["empty batch", [], "invalid_argument_type"]
@@ -131,6 +135,17 @@ for (const [name, edits, code] of rejected) test("rejects " + name + " without m
   assert.equal(f.transactions(), 0)
 })
 
+test("large whole-file replacement is applied as one native transaction", async () => {
+  const source = Array.from({ length: 509 }, (_, index) => `old-${index + 1}`).join("\n") + "\n"
+  const replacement = Array.from({ length: 509 }, (_, index) => `new-${index + 1}`).join("\n") + "\n"
+  const f = fixture(source)
+  const result = await f.edit([{ operation: "replace", start_line: 1, end_line: 509, content: replacement.trimEnd().split("\n") }])
+  assert.equal(result.failed, undefined, result.output)
+  assert.equal(f.text(), replacement)
+  assert.equal(f.transactions(), 1)
+  assert.equal(JSON.parse(result.output).content_hash, await contentHash(replacement))
+})
+
 test("outdated hashes reject atomically and return the current hash", async () => {
   const f = fixture("old\n")
   const stale = hash(f.text())
@@ -139,7 +154,20 @@ test("outdated hashes reject atomically and return the current hash", async () =
   assert.equal(result.failed, true)
   assert.equal(JSON.parse(result.output).error.code, "hash_mismatch")
   assert.equal(JSON.parse(result.output).error.current_hash, await contentHash("dirty buffer\n"))
+  assert.equal(JSON.parse(result.output).error.source_version, "unchanged")
+  assert.equal(JSON.parse(result.output).error.mutation_occurred, false)
   assert.equal(f.text(), "dirty buffer\n")
+  assert.equal(f.transactions(), 0)
+})
+
+test("an external run-command-style modification is preserved by stale-hash rejection", async () => {
+  const f = fixture("original\n")
+  const stale = hash(f.text())
+  f.change("external modification\nunrelated\n")
+  const result = await f.edit([{ operation: "replace", line: 1, content: ["native replacement"] }], stale)
+  assert.equal(result.failed, true)
+  assert.equal(JSON.parse(result.output).error.code, "hash_mismatch")
+  assert.equal(f.text(), "external modification\nunrelated\n")
   assert.equal(f.transactions(), 0)
 })
 
@@ -424,6 +452,92 @@ test("save-time reconciliation distinguishes exact, transformed, and conflicting
   assert.deepEqual(reconcileLineEdits(original, intended, conflicted, patches), { reconciliation: "conflicted", requestedEdits: "conflicted" })
 })
 
+test("a large whole-file replacement survives save-time formatting and reports the final hash", async () => {
+  const original = Array.from({ length: 509 }, (_, index) => `line-${index + 1}`).join("\n") + "\n"
+  const replacement = Array.from({ length: 509 }, (_, index) => `replacement-${index + 1}`).join("\n") + "\n"
+  const patches = await planLineEdits(original, {
+    expected_hash: await contentHash(original),
+    edits: [{ operation: "replace", start_line: 1, end_line: 509, content: replacement.trimEnd().split("\n") }]
+  })
+  const intended = patchedText(original, patches)
+  assert.equal(intended, replacement)
+  const formatted = "// generated header\n" + replacement.trimEnd().split("\n").map((line, index) => index % 50 === 0 ? `  ${line}` : line).join("\n") + "\n"
+  assert.deepEqual(reconcileLineEdits(original, intended, formatted, patches), {
+    reconciliation: "applied_and_transformed",
+    requestedEdits: "verified"
+  })
+  assert.ok(formatted.includes("replacement-509"), "the authoritative transformed final snapshot remains complete")
+})
+
+test("genuinely contradicted whole-file mutations remain conflicted", async () => {
+  const original = "one\ntwo\nthree\n"
+  const patches = await planLineEdits(original, {
+    expected_hash: await contentHash(original),
+    edits: [{ operation: "replace", start_line: 1, end_line: 3, content: ["ONE", "TWO", "THREE"] }]
+  })
+  const intended = patchedText(original, patches)
+  const contradicted = "one\n// unrelated\nTWO\nthree\n"
+  assert.deepEqual(reconcileLineEdits(original, intended, contradicted, patches), {
+    reconciliation: "conflicted",
+    requestedEdits: "conflicted"
+  })
+})
+
+test("fresh external modifications are preserved and do not become false edit success", async () => {
+  const original = "a\nb\nc\n"
+  const patches = await planLineEdits(original, {
+    expected_hash: await contentHash(original),
+    edits: [{ operation: "replace", line: 2, content: ["B"] }]
+  })
+  const intended = patchedText(original, patches)
+  const externallyExtended = "external before\na\nB\nc\nexternal after\n"
+  assert.deepEqual(reconcileLineEdits(original, intended, externallyExtended, patches), {
+    reconciliation: "applied_and_transformed",
+    requestedEdits: "verified"
+  })
+  const externalContradiction = "external before\na\nOTHER\nc\nexternal after\n"
+  assert.deepEqual(reconcileLineEdits(original, intended, externalContradiction, patches), {
+    reconciliation: "conflicted",
+    requestedEdits: "conflicted"
+  })
+})
+
+test("a genuinely contradicted native sink reports the authoritative final hash and changed source evidence", async () => {
+  const f = fixture("a\nb\nc\n")
+  f.sink.editLines = async (_file, request) => {
+    await planLineEdits("a\nb\nc\n", request)
+    const finalText = "a\nOTHER\nc\n"
+    return {
+      ok: false,
+      message: "The save completed, but the requested mutation was contradicted.",
+      error: lineEditFailure("application_failed", "The requested mutation was contradicted.", await contentHash(finalText)),
+      contentHash: await contentHash(finalText),
+      contentSource: "disk",
+      persisted: true,
+      postSave: "conflicted",
+      requestedEdits: "conflicted",
+      previousHash: await contentHash("a\nb\nc\n"),
+      intendedHash: await contentHash("a\nB\nc\n"),
+      sourceVersion: "changed",
+      refreshedRanges: [{ startLine: 2, endLine: 2 }],
+      totalLines: 3,
+      finalText
+    }
+  }
+  const tools = workspaceTools(f.root, [], { edits: f.sink, git: false, instructions: false })
+  const result = await tools.run({
+    name: "edit_lines",
+    args: { path: "panel.tsx", expected_hash: await contentHash("a\nb\nc\n"), edits: [{ operation: "replace", line: 2, content: ["B"] }] }
+  })
+  assert.equal(result.failed, true)
+  const output = JSON.parse(result.output)
+  assert.equal(output.error.code, "application_failed")
+  assert.equal(output.error.mutation_occurred, true, result.output)
+  assert.equal(output.source_version, "changed")
+  assert.equal(output.final_hash, await contentHash("a\nOTHER\nc\n"))
+  assert.deepEqual(output.refreshed_ranges, [{ path: "panel.tsx", start_line: 2, end_line: 2 }])
+})
+
 test("refreshed ranges use final line coordinates and merge adjacent or distant regions", async () => {
   const original = "top\nold\nmiddle\nbottom\n"
   const edits = [
@@ -627,7 +741,8 @@ test("the edit_lines schema and instructions advertise replace_text with its own
   assert.ok(!substring.properties.content, "replace_text takes no content")
   assert.ok(items.properties.old_text && items.properties.new_text, "the fields are described for the model")
   const deletion = branchFor("delete")
-  assert.deepEqual(deletion.required, ["operation", "start_line", "end_line"])
+  assert.deepEqual(deletion.required, ["operation"])
+  assert.ok((deletion as unknown as { anyOf: unknown[] }).anyOf, "delete accepts range fields or line shorthand")
   assert.ok(!deletion.properties.content, "delete neither requires nor accepts content")
 })
 

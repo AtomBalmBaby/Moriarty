@@ -50,6 +50,25 @@ export const applyDocumentLineEdits = async (file: string, request: LineEditRequ
     const message = error instanceof Error ? error.message : String(error)
     return { ok: false, message, error: lineEditFailure("document_unavailable", message) }
   }
+  if (!document.isDirty) {
+    try {
+      const persisted = decodePersisted(await workspace.fs.readFile(document.uri))
+      if (persisted !== undefined && persisted !== document.getText()) {
+        const hash = await contentHash(persisted)
+        return failed(
+          "hash_mismatch",
+          "The file changed outside the editor after it was opened. Reread it; no line edits were applied.",
+          hash
+        )
+      }
+    } catch (error) {
+      if (error instanceof Error && "code" in error && (error as { code?: unknown }).code === "ENOENT") {
+        return failed("missing_target", "The target disappeared before the edit was applied. Reread the workspace.")
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      return failed("document_unavailable", `The authoritative disk snapshot could not be read before the edit: ${message}`)
+    }
+  }
   try {
     const editor = await revealEditor(document, options.visibility)
     const version = document.version
