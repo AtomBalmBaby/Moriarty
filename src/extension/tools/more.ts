@@ -9,29 +9,40 @@
  * is held to the same rules as everything else: a place outside the
  * workspace, or in a file `.gitignore` ignores, is named but never read.
  */
-import { execFile } from "child_process"
 import fs from "fs"
 import path from "path"
 
+import { GitRefusal, refuse } from "../git/baseline"
+import {
+  createGitExecutionService,
+  cutToLine,
+  GIT_OPERATIONS,
+  gitCallIsReadOnly,
+  GitInspectReading,
+  GitOperation,
+  GitServiceOptions,
+  GitStatusReading,
+  MAX_GIT_OUTPUT,
+  RUN_GIT_OPERATIONS,
+  toolCodeOfGitRefusal
+} from "../git/service"
+
 import type { AccessPreflight, AccessTarget } from "./access-preflight"
-import { argumentReader } from "./arguments"
+import { argumentFailure, type ArgumentReader, argumentReader, jsonType, type ToolArguments } from "./arguments"
 import {
   gitNamedPaths,
   globToRegExp,
   indexChangeNote,
   locateSymbol,
   readOnlyGitArgs,
-  tidyGitPath,
   withoutHiddenDiffs,
   withoutHiddenLines
 } from "./helpers"
 import type { OperationAuthorization } from "./operation-authorization"
 import { clip, linesOf, plural, ToolInputError, WorkspaceView } from "./view"
-import type { EditOutcome, Tool, WorkspaceSearchProvider } from "./workspace"
+import type { EditOutcome, Tool, ToolContext, ToolResult, WorkspaceSearchProvider } from "./workspace"
 
 const MAX_FOUND_FILES = 100
-const MAX_GIT_OUTPUT = 10_000
-const GIT_TIMEOUT_MS = 20_000
 const MAX_LOCATIONS = 50
 /** How many of a rename's files the tool lists with their hash. */
 const MAX_RENAME_HASH_LINES = 20
@@ -138,137 +149,102 @@ export const insideGitRepository = (root: string): boolean => {
 }
 
 /**
- * Settings a user's git configuration could turn another way, pinned so
- * the output is the same on every machine: no colour codes, and diff
- * headers that name each file as `a/path b/path`.
+ * The existing read-only `git` tool, extended on the same name. Legacy `args` answers exactly as it did -
+ * the same allowlist, the same path rules, the same capped output - while operation "status" and operation
+ * "inspect" run through the shared Git service. The two forms are mutually exclusive, and the read-only
+ * classification is per call: an operation that would change the repository is named here but not run,
+ * because commit, push and recovery belong to the stages that own staging and the transaction. One tool
+ * name stays in the inventory.
  */
-const GIT_PINNED = [
-  "--no-pager",
-  "-c", "color.ui=false",
-  "-c", "diff.noprefix=false",
-  "-c", "diff.mnemonicPrefix=false",
-  "-c", "core.quotepath=false"
-]
+export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"> = {}): Tool => {
+  const service = createGitExecutionService({ ...options, view })
 
-const runGit = (root: string, args: string[], signal?: AbortSignal) =>
-  new Promise<{ output: string; exitCode: number }>((resolve) => {
-    const child = execFile(
-      "git",
-      [...GIT_PINNED, ...args],
-      {
-        cwd: root,
-        timeout: GIT_TIMEOUT_MS,
-        maxBuffer: 20 * 1024 * 1024,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-        signal
-      },
-      (error, stdout, stderr) => {
-        const output = `${stdout}${stderr ? `${stdout ? "\n" : ""}${stderr}` : ""}`
-        const code = error ? (typeof error.code === "number" ? error.code : 1) : 0
-        resolve({ output, exitCode: code })
-      }
-    )
-    // Nothing is ever typed at it; a command that would wait for input gets none.
-    child.stdin?.end()
-  })
-
-/** `text` up to `max` characters, ending on a whole line where one is near. */
-const cutToLine = (text: string, max: number) => {
-  if (text.length <= max) return text
-  const newline = text.lastIndexOf("\n", max)
-  return text.slice(0, newline > max / 2 ? newline : max)
-}
-
-export const git = (view: WorkspaceView): Tool => {
-  /** The workspace root's path inside its repository, e.g. `packages/app/`; empty at the top. */
-  let prefix: Promise<string> | undefined
-  const repoPrefix = () =>
-    (prefix ??= runGit(view.root, ["rev-parse", "--show-prefix"]).then(({ output, exitCode }) =>
-      exitCode === 0 ? output.trim() : ""
-    ))
-  /**
-   * Whether a path from the workspace root is ignored, as the folder it
-   * is when it is one (`infra` under an `infra/` rule); a path that is
-   * not there is taken either way.
-   */
-  const ignoredHere = (relative: string) => {
-    if (!relative) return false
-    let isDirectory: boolean | undefined
-    try {
-      isDirectory = fs.statSync(path.join(view.root, relative)).isDirectory()
-    } catch {
-      isDirectory = undefined
+  /** A refusal as §14 shapes it: what was asked for, that nothing ran, and what the call can do instead. */
+  const refused = (refusal: GitRefusal, operation: string): ToolResult => {
+    const shared = toolCodeOfGitRefusal(refusal.code)
+    return {
+      output: JSON.stringify({ ok: false, error: { code: refusal.code, executed: refusal.executed, message: refusal.summary, recovery: refusal.output } }),
+      summary: `git \`${operation}\` · ${refusal.summary}`,
+      failed: true,
+      ...(shared === undefined ? {} : { error: argumentFailure(shared, `${shared}: ${refusal.summary}`, { recovery: refusal.output }) })
     }
-    return isDirectory === undefined
-      ? view.ignored(relative) || view.ignored(relative, true)
-      : view.ignored(relative, isDirectory)
   }
-  /**
-   * Whether a path as the repository names it is one the tools may not
-   * show: ignored, or in a part of the repository outside the workspace
-   * folder (a sibling package, when one package is what is open).
-   */
-  const hiddenIn = (inRepo: string, at: string) =>
-    inRepo.startsWith(at) ? ignoredHere(inRepo.slice(at.length)) : at !== ""
-  /**
-   * The same for a path given from the workspace root, where git runs.
-   * Pathspec magic (`:/`, `:(top)`) addresses the repository's top, so it
-   * is refused with the rest.
-   */
-  const hiddenHere = (relative: string) =>
-    relative.startsWith(":") || /^\.\.(\/|$)/.test(path.posix.normalize(relative.replace(/\\/g, "/"))) || path.isAbsolute(relative) || ignoredHere(relative)
 
-  /**
-   * Why a word before `--` that is not an option may not go to git, if
-   * it may not: a path outside the workspace (git compares two paths
-   * anywhere on the machine when one is outside the repository), a hidden
-   * file named as itself, or an object id that is a file's contents,
-   * which `show` and `diff` would print whatever .gitignore says.
-   */
-  const refuseBareArguments = async (args: string[], signal?: AbortSignal): Promise<string | undefined> => {
-    const [subcommand, ...rest] = args
-    const split = rest.indexOf("--")
-    for (const arg of split === -1 ? rest : rest.slice(0, split)) {
-      if (arg.startsWith("-") || /^[^:]*:/.test(arg)) continue
-      const tidied = tidyGitPath(arg)
-      if (path.isAbsolute(arg) || /^\.\.(\/|$)/.test(tidied)) return `${arg} is outside the workspace and cannot be read.`
-      if (tidied && fs.existsSync(path.join(view.root, tidied)) && ignoredHere(tidied)) {
-        return `${arg} is outside the workspace or ignored by .gitignore and cannot be read.`
-      }
-      if (subcommand === "show" || subcommand === "diff") {
-        const { output, exitCode } = await runGit(view.root, ["cat-file", "-t", arg], signal)
-        if (exitCode === 0 && output.trim() === "blob") {
-          return `${arg} is a file's contents by id, which git here does not show; name the file instead, e.g. show HEAD:path/to/file.`
-        }
+  const summaryOf = (reading: GitStatusReading | GitInspectReading): string => {
+    if (reading.kind === "git_status")
+      return `git \`status\` · ${plural(reading.staged.length, "staged file", "staged files")}, ${plural(reading.unstaged.length, "unstaged file", "unstaged files")}, ${plural(reading.untracked.length, "untracked file")}` + (reading.leftOut ? `; ${plural(reading.leftOut, "file")} left out` : "")
+    return `git \`inspect\` · ${plural(reading.changes.length, "path")}` + (reading.clipped ? `, ${reading.clipped} characters kept for the recorded raw output` : "") + (reading.leftOut ? `; ${plural(reading.leftOut, "file")} left out` : "")
+  }
+
+  /** The structured reading as the model sees it: compact, with the whole bounded text left to the recorded raw output. */
+  const shaped = (reading: GitStatusReading | GitInspectReading, raw: ToolArguments): ToolResult => {
+    const fields = reading as GitInspectReading & { retained?: string }
+    const { retained, kind, ...visible } = fields
+    const observationId = options.observations?.({ name: "git", args: raw })
+    return {
+      output: JSON.stringify({ kind, ...(observationId === undefined ? {} : { observationId }), ...visible }),
+      summary: summaryOf(reading),
+      ...(retained === undefined ? {} : { rawOutput: retained })
+    }
+  }
+
+  const typed = async (a: ArgumentReader, raw: ToolArguments, operation: string, context?: ToolContext): Promise<ToolResult> => {
+    if (a.sent("args"))
+      return refused(refuse("git_argument_conflict", "git refused: args and operation cannot be sent together", "Send one or the other: `args` for a read-only command line, `operation` for status or inspect."), operation)
+    const wanted = operation.trim()
+    if (!GIT_OPERATIONS.includes(wanted as GitOperation))
+      return refused(refuse("git_argument_conflict", `git refused: operation "${wanted}" is not one this tool answers for`, `Ask for ${GIT_OPERATIONS.join(", ")}, or send args instead.`), operation)
+    if (!RUN_GIT_OPERATIONS.includes(wanted as GitOperation))
+      return refused(refuse("git_operation_not_supported", `git refused: ${wanted} is not run by this stage`, "This stage reads only. Commit, push and recovery belong to the stages that own the alternate index and the transaction; nothing here runs them."), operation)
+    const given = a.structure("paths")
+    const paths: string[] = []
+    if (given !== undefined) {
+      if (!Array.isArray(given))
+        return refused(refuse("git_argument_conflict", "git refused: paths must be a list of paths", `paths came as ${jsonType(given)}; send an array such as ["src/a.ts"].`), operation)
+      for (const entry of given) {
+        if (typeof entry !== "string")
+          return refused(refuse("git_argument_conflict", "git refused: paths must name each path as text", `paths holds ${jsonType(entry)}; each entry must be a path as text.`), operation)
+        paths.push(entry)
       }
     }
-    return undefined
+    const named = a.text("repository")
+    const reading = wanted === "status" ? await service.status(named, context?.signal) : await service.inspect(paths, named, context?.signal)
+    if ("code" in reading) return refused(reading, wanted)
+    return shaped(reading, raw)
   }
 
   return {
     name: "git",
     readOnly: true,
+    readOnlyFor: gitCallIsReadOnly,
     description:
-      "Run a read-only git command in the workspace: status, diff, log, show, blame, branch (listing), shortlog, ls-files, rev-parse. No approval needed; nothing is changed.",
-    guidance: "Use git to see what changed (git diff, git status) or the history of a file (git log -p -- path) before you edit.",
-    parameters: [{ name: "args", description: "The git command without `git`, e.g. `diff --stat` or `log -5 --oneline -- src/a.ts`." }],
+      "Run a read-only git command in the workspace, or ask for one of the typed operations: status and inspect. No approval needed; nothing is changed.",
+    guidance: "Use git to see what changed (git diff, git status) or the history of a file (git log -p -- path) before you edit. For repository state, and for who owns a change, ask operation status or operation inspect.",
+    parameters: [
+      { name: "args", description: "The git command without `git`, e.g. `diff --stat` or `log -5 --oneline -- src/a.ts`.", optional: true },
+      { name: "operation", description: "A typed operation instead of args: status for repository state, inspect for the selected paths and what the host can say about each.", optional: true },
+      { name: "repository", description: "A repository to read when it is not the workspace folder itself; it must be inside the workspace or granted.", optional: true },
+      { name: "paths", description: "The paths an operation answers for; every change this workspace may show when left out.", optional: true, type: "array" }
+    ],
     async run(raw, context) {
       const a = argumentReader("git", raw)
+      const operation = a.text("operation")
+      if (operation !== undefined && operation.trim() !== "") return typed(a, raw, operation, context)
       const args = a.text("args")
       const line = args?.trim()
-      if (!line) throw new ToolInputError("git needs arguments, e.g. status.")
+      if (!line) throw new ToolInputError("git needs arguments such as status, or an operation such as status or inspect.")
       const parsed = readOnlyGitArgs(line)
       if (typeof parsed === "string") throw new ToolInputError(`${parsed}.`)
-      const at = await repoPrefix()
+      const at = await service.prefix(view.root)
       // What .gitignore keeps from read_file, git does not hand over either.
-      const named = gitNamedPaths(parsed).find((p) => (p.inRepo ? hiddenIn(p.path, at) : hiddenHere(p.path)))
+      const named = gitNamedPaths(parsed).find((p) => (p.inRepo ? service.hiddenIn(p.path, at) : service.hiddenHere(p.path)))
       if (named) throw new ToolInputError(`${named.path} is outside the workspace or ignored by .gitignore and cannot be read.`)
-      const refusal = await refuseBareArguments(parsed, context?.signal)
+      const refusal = await service.refuseBareArguments(parsed, context?.signal)
       if (refusal) throw new ToolInputError(refusal)
-      const { output: stdout, exitCode } = await runGit(view.root, parsed, context?.signal)
+      const { output: stdout, exitCode } = await service.runGit(view.root, parsed, context?.signal)
       // ls-files names what git tracks, ignored or not; the hidden ones are left out.
-      const listed = parsed[0] === "ls-files" ? withoutHiddenLines(stdout, hiddenHere) : { text: stdout, dropped: 0 }
-      const diffs = withoutHiddenDiffs(listed.text, (file) => hiddenIn(file, at))
+      const listed = parsed[0] === "ls-files" ? withoutHiddenLines(stdout, service.hiddenHere) : { text: stdout, dropped: 0 }
+      const diffs = withoutHiddenDiffs(listed.text, (file) => service.hiddenIn(file, at))
       const text = diffs.text
       const dropped = diffs.dropped + listed.dropped
       const shown =

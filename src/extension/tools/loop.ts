@@ -1311,7 +1311,8 @@ class ToolLoop {
 
   /** A read-only call by its name and arguments, so the same one asked twice is known; undefined for any other call. */
   private answerKey(call: ToolCall): string | undefined {
-    if (!this._workspace.tools.find((tool) => tool.name === call.name)?.readOnly) return undefined
+    const spec = this._workspace.tools.find((listed) => listed.name === call.name)
+    if (!spec || !(spec.readOnlyFor ? spec.readOnlyFor(call.args) : spec.readOnly)) return undefined
     const args = Object.entries(call.args)
       .map(([name, value]) => [name, typeof value === "string" ? value.trim() : JSON.stringify(value)])
       .filter(([, value]) => value && value !== "null")

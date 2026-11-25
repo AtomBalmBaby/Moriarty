@@ -388,6 +388,12 @@ export interface ToolSpec {
    */
   readOnly?: boolean
   /**
+   * Whether this particular call only reads. A tool whose read-only nature depends on what the call
+   * asks for (the `git` tool, where a typed operation can change the repository) answers here; `readOnly`
+   * stays the default for every other tool and every other call.
+   */
+  readOnlyFor?: (args: ToolArguments) => boolean
+  /**
    * The arguments' JSON schema as the tool's maker wrote it (an MCP
    * server's), sent as it is to providers with native tool-calling;
    * `parameters` still names them for the text protocol.

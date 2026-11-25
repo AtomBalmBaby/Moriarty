@@ -11,6 +11,7 @@
  */
 import type { CaptureMode, ToolResultIntegrity } from "../../common/types"
 import { diagnosticEvent } from "../diagnostics"
+import type { GitServiceOptions } from "../git/service"
 import type { SourceEvent } from "../todos/dependency-index"
 import { TodoRepository } from "../todos/repository"
 import type { EvidenceAccess, TodoWriteRequest } from "../todos/types"
@@ -1287,6 +1288,8 @@ export interface ToolExtras {
   openFiles?: () => string[]
   /** Stage 2's read-only access service for this project, when the host holds one: it registers `query_evidence`. Without it the tool is not offered, so no message may recommend it. */
   evidence?: { access: EvidenceAccess }
+  /** Stage 3's Git service options, when the host has the stores and the conversation this call belongs to. */
+  gitOptions?: Omit<GitServiceOptions, "view">
 }
 
 /**
@@ -1353,7 +1356,7 @@ export const workspaceTools = (
     grep(view),
     findSymbol(view),
     ...(editor ? [goToDefinition(view, editor), findReferences(view, editor), diagnostics(view, editor)] : []),
-    ...(extras.git !== false && insideGitRepository(view.root) ? [git(view)] : [])
+    ...(extras.git !== false && insideGitRepository(view.root) ? [git(view, { ...(extras.gitOptions ?? {}), access: extras.access })] : [])
   ]
   if (edits && extras.legacyEditFile) tools.push(editFile(view, edits))
   if (edits) tools.push(createFile(view, edits))
@@ -1407,10 +1410,12 @@ export const workspaceTools = (
     try {
       const args = argumentObject(call.args, call.name)
       checkDeclaredArguments(call.name, tool.parameters, args)
+      /** Whether this call reads, as the tool says when the call itself decides (a typed git operation). */
+      const reads = tool.readOnlyFor ? tool.readOnlyFor(args) : tool.readOnly
       /** The file this call is about: the one it named, or the one its content fingerprint names. */
       let source: ResolvedSource | undefined
       if (tool.hashAddressable && !textArgument(call.name, "path", args)) {
-        const resolved = await resolveSourceTarget(resolverOptions, { tool: call.name, args, kind: tool.readOnly ? "read" : "write", operation: mutationOperationOf(call.name), signal: context?.signal })
+        const resolved = await resolveSourceTarget(resolverOptions, { tool: call.name, args, kind: reads ? "read" : "write", operation: mutationOperationOf(call.name), signal: context?.signal })
         if (!resolved.ok) return structuredErrorResult(resolved.detail, call.name)
         source = resolved
       }
@@ -1436,11 +1441,11 @@ export const workspaceTools = (
         write = source.write
       }
       const run = () => {
-        if (!tool.readOnly && context?.signal?.aborted) throw new ToolInputError("The execution stopped before this tool could run.")
+        if (!reads && context?.signal?.aborted) throw new ToolInputError("The execution stopped before this tool could run.")
         // The write approval comes only from this call's authorization, never from the caller's context.
         return tool.run(args, { ...context, write, source })
       }
-      const result = withFolderInstructions(call, await (tool.readOnly ? run() : serializeMutation(run)))
+      const result = withFolderInstructions(call, await (reads ? run() : serializeMutation(run)))
       diagnosticEvent("toolcalls", "tool.native.execution.finish", context?.diagnostic ?? {}, {
         toolName: call.name,
         implementationType: "native",

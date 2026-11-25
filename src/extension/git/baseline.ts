@@ -29,7 +29,7 @@ import { describeGitConfig, GitConfigReading, GitConfigSource } from "./config"
 /** What git's own porcelain code says about one side of a path, as a plain word. */
 export type GitChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "type_change" | "unreadable" | "untracked" | "clean" | "unknown"
 
-const STATUS_OF_CODE: Record<string, GitChangeStatus> = {
+export const STATUS_OF_CODE: Record<string, GitChangeStatus> = {
   A: "added",
   M: "modified",
   D: "deleted",
@@ -124,13 +124,13 @@ const entryOf = async (top: string, code: string, relative: string, side: "stage
 }
 
 /** One porcelain v1 record: `XY path`, with the source path following for a rename or a copy. */
-const parsePorcelain = (stdout: Buffer): { code: string; path: string; from?: string }[] => {
+export const parsePorcelain = (stdout: Buffer): { code: string; path: string; from?: string }[] => {
   const fields = stdout.toString("utf8").split("\0").filter(Boolean)
   const entries: { code: string; path: string; from?: string }[] = []
   for (let i = 0; i < fields.length; i++) {
     const field = fields[i]
     const code = field.slice(0, 2)
-    const named = field.slice(2).replace(/^ +/, "")
+    const named = field.slice(3)
     if (!code || !named) continue
     const detected = code.charAt(0) === "R" || code.charAt(1) === "R" || code.charAt(0) === "C" || code.charAt(1) === "C"
     const entry: { code: string; path: string; from?: string } = { code, path: named }

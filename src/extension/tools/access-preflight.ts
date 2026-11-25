@@ -9,6 +9,8 @@
 import fs from "fs"
 import path from "path"
 
+import { gitCallIsReadOnly } from "../git/service"
+
 import { AccessClass, AccessGrant, AccessStore, canonicalPath, GrantLifetime, isFilesystemRoot, isWithin, makeGrant } from "./access-grants"
 import { OperationAuthorization, WriteOperation } from "./operation-authorization"
 import type { WorkspaceView } from "./view"
@@ -76,6 +78,12 @@ export const accessTargetsOf = (tool: string, args: Record<string, unknown>): Ac
       return pick("write", "path")
     case "move_file":
       return [...pick("write", "from", "move"), ...pick("write", "to", "move").map((target) => ({ ...target, creates: true }))]
+    case "git":
+      // The repository a git call may reach. What the call does to it is decided per call, not by how the
+      // tool was registered: a read asks read access, an operation that changes the repository asks write,
+      // so a grant taken for `status` cannot carry a later mutating call. No write operation is named here;
+      // the stage that stages and commits names its own.
+      return pick(gitCallIsReadOnly(args) ? "read" : "write", "repository")
     default:
       return []
   }
