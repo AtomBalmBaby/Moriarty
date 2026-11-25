@@ -14,7 +14,11 @@
  *
  * Paths keep the workspace's rules: what `.gitignore` hides, what the team's rules block, and what lies
  * outside the open folder is not shown; a path the call names outright is refused rather than quietly
- * dropped. A repository the workspace folder does not belong to is reached only through the existing access
+ * dropped. A named path is read both ways - as the open folder names it and as the repository names it -
+ * and answered for whichever reading this workspace may show, so the same visible file is never refused
+ * for being named from the open folder; only what is genuinely outside, ignored or kept is refused.
+ * A rename carries the pair git named it, and a `-z` numstat record counts that pair for the name the
+ * path became: the name it came from is reported only when this workspace may show that name as well.
  * preflight, and without a grant the call is refused. Credentials stay as references: a reading names the
  * mode and the variable names, never what they hold, and a read needs no credential at all — no value
  * enters an argument, an output or a recorded result.
@@ -154,6 +158,8 @@ export interface GitInspectedChange {
   status: GitChangeStatus
   ownership: OwnershipClass
   confidence: OwnershipConfidence
+  /** For a rename, the name git says the path came from. Carried only when this workspace may show that name as well. */
+  from?: string
   added?: number
   removed?: number
   digest?: string
@@ -204,6 +210,8 @@ export interface GitExecutionService {
   prefix(top: string): Promise<string>
   hiddenHere(relative: string): boolean
   hiddenIn(relative: string, at: string): boolean
+  /** A path the call named, read both ways: as the open folder names it, and as the repository names it from its top. The reading this workspace may show is the one answered for; undefined when neither is. */
+  nameOf(relative: string, at: string): string | undefined
   /** Why a word before `--` that is not an option may not go to git, if it may not. */
   refuseBareArguments(args: string[], signal?: AbortSignal): Promise<string | undefined>
   /** One read-only git process: argument arrays, no shell, nothing typed at it. */
@@ -219,21 +227,41 @@ export const cutToLine = (text: string, max: number): string => {
   return text.slice(0, newline > max / 2 ? newline : max)
 }
 
-/** A record from `git diff --numstat -z`: `added\tremoved\tpath`, with `-` where the content is not text. */
+/** A record from `git diff --numstat -z`: `added\tremoved\tpath`, with `-` where the content is not text. For a rename or a copy git writes the counts with an empty path field and names the pair as two fields of its own - the name it came from, then the name it became - so those counts belong to the name the path became, not to an empty one. */
 interface NumstatEntry { path: string; added?: number; removed?: number }
 
+const counted = (word: string): number | undefined => {
+  const number = Number(word)
+  return Number.isFinite(number) ? number : undefined
+}
+
 const parseNumstat = (stdout: Buffer): NumstatEntry[] => {
+  const fields = stdout.toString("utf8").split("\0")
   const entries: NumstatEntry[] = []
-  for (const field of stdout.toString("utf8").split("\0")) {
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]
     if (!field) continue
     const parts = field.split("\t")
     const named = parts.pop()
-    if (!named) continue
+    if (!named) {
+      // The pair follows as its own two fields, in git's order. Read them here so they are not taken as records of their own.
+      const came = fields[i + 1]
+      const became = fields[i + 2]
+      if (!came || !became) continue
+      i += 2
+      const entry: NumstatEntry = { path: tidyGitPath(became) }
+      const added = counted(parts[0])
+      const removed = counted(parts[1])
+      if (added !== undefined) entry.added = added
+      if (removed !== undefined) entry.removed = removed
+      entries.push(entry)
+      continue
+    }
     const entry: NumstatEntry = { path: tidyGitPath(named) }
-    const added = Number(parts[0])
-    const removed = Number(parts[1])
-    if (Number.isFinite(added)) entry.added = added
-    if (Number.isFinite(removed)) entry.removed = removed
+    const added = counted(parts[0])
+    const removed = counted(parts[1])
+    if (added !== undefined) entry.added = added
+    if (removed !== undefined) entry.removed = removed
     entries.push(entry)
   }
   return entries
@@ -288,6 +316,14 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
   /** The same for a path given from the workspace root, where git runs. Pathspec magic is refused with the rest. */
   const hiddenHere = (relative: string): boolean =>
     relative.startsWith(":") || /^\.\.(\/|$)/.test(path.posix.normalize(relative.replace(/\\/g, "/"))) || path.isAbsolute(relative) || ignoredHere(relative)
+
+  /** A path the call named, as either reading names it. What this workspace may show is what the call can be answered for; a name that lies outside the open folder, or that the workspace's rules keep, is refused with the reason the call gave it. */
+  const nameOf = (relative: string, at: string): string | undefined => {
+    const given = tidyGitPath(relative)
+    if (!given || given.startsWith(":") || path.isAbsolute(given) || /^\.\.(\/|$)/.test(given)) return undefined
+    for (const reading of [given, at ? `${at}${given}` : given]) if (!hiddenIn(reading, at)) return reading
+    return undefined
+  }
 
   /** Why a path the call named outright cannot be shown, said so the call can act on it. */
   const whyHidden = (relative: string): string => {
@@ -440,10 +476,11 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
     for (const given of paths) {
       const relative = tidyGitPath(given)
       if (!relative) continue
-      // A path the call named is refused when it may not be shown, not quietly left out of the answer.
-      if (hiddenHere(relative) || hiddenIn(relative, at))
+      // A path the call named is refused when it may not be shown, not quietly left out of the answer. It is read both ways, so the same file is answered for whether it was named from the open folder or from the repository's top.
+      const inRepo = nameOf(relative, at)
+      if (inRepo === undefined)
         return refuse("git_path_not_visible", `Inspection refused: ${relative} cannot be shown`, `${whyHidden(relative)} and cannot be read. Name a path this workspace may show.`)
-      selected.push(relative)
+      selected.push(inRepo)
     }
     const read = await runGit(repository.top, ["status", "--porcelain=v1", "-z"], signal)
     if (!read.ok) return refuse("git_read_failed", "Inspection refused: git could not read the repository", `git status --porcelain=v1 -z failed in ${repository.top}. Nothing was changed.`)
@@ -458,29 +495,33 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
         : "no baseline was captured for this conversation, so nothing here can say who changed a path"
       : undefined
 
-    const seen = new Map<string, string>()
+    const seen = new Map<string, { code: string; from?: string }>()
     let leftOut = 0
-    for (const entry of entries) {
-      if (hiddenIn(entry.path, at)) { leftOut++; continue }
-      if (selected.length && !selected.includes(entry.path)) continue
-      seen.set(entry.path, entry.code)
+    for (const record of entries) {
+      if (hiddenIn(record.path, at)) { leftOut++; continue }
+      if (selected.length && !selected.includes(record.path)) continue
+      const pair = record.from === undefined ? undefined : tidyGitPath(record.from)
+      const found: { code: string; from?: string } = { code: record.code, ...(pair !== undefined && pair !== record.path && !hiddenIn(pair, at) ? { from: pair } : {}) }
+      seen.set(record.path, found)
+      // A rename's other name is not a record of its own in porcelain: the record names the path it became. When the call named the name it came from, git's own record says what it was, so that name is answered as the pair rather than as clean.
+      if (pair !== undefined && selected.includes(pair) && !hiddenIn(pair, at)) seen.set(pair, { code: record.code })
     }
-    for (const relative of selected) if (!seen.has(relative)) seen.set(relative, "  ")
+    for (const relative of selected) if (!seen.has(relative)) seen.set(relative, { code: "  " })
 
-    const pathsOf = (side: (code: string) => boolean): string[] => [...seen.keys()].filter((relative) => side(seen.get(relative)!))
-    const stagedPaths = pathsOf((code) => code !== "??" && code.charAt(0) !== " ")
-    const unstagedPaths = pathsOf((code) => code === "??" || code.charAt(1) !== " ")
+    const pathsOf = (side: (record: { code: string; from?: string }) => boolean): string[] => [...seen.keys()].filter((relative) => side(seen.get(relative)!))
+    const stagedPaths = pathsOf((record) => record.code !== "??" && record.code.charAt(0) !== " ")
+    const unstagedPaths = pathsOf((record) => record.code === "??" || record.code.charAt(1) !== " ")
     const staged = await sideOf(repository.top, true, stagedPaths, signal)
     const unstaged = await sideOf(repository.top, false, unstagedPaths, signal)
     const counts = new Map<string, NumstatEntry>([...staged.entries, ...unstaged.entries].map((entry) => [entry.path, entry]))
 
     const changes: GitInspectedChange[] = await Promise.all([...seen.keys()].sort((a, b) => a.localeCompare(b)).map(async (relative) => {
-      const code = seen.get(relative)!
-      const entry = counts.get(relative)
+      const record = seen.get(relative)!
+      const countedFor = counts.get(relative)
       const owned = known?.change(relative)
-      const side: "staged" | "unstaged" | "untracked" | "clean" = code === "??" ? "untracked" : code.charAt(0) !== " " ? "staged" : code.charAt(1) !== " " ? "unstaged" : "clean"
-      // The status is the character for the side the path is reported on, as git gave it.
-      const mark = side === "untracked" ? "?" : side === "clean" ? " " : side === "staged" ? code.charAt(0) : code.charAt(1)
+      const side: "staged" | "unstaged" | "untracked" | "clean" = record.code === "??" ? "untracked" : record.code.charAt(0) !== " " ? "staged" : record.code.charAt(1) !== " " ? "unstaged" : "clean"
+      // The status is the character for the side the path is reported on, as git gave it; for a pair, the character that detected it.
+      const mark = record.code === "??" ? "?" : side === "clean" ? " " : side === "staged" ? record.code.charAt(0) : record.code.charAt(1)
       const answer: GitInspectedChange = {
         path: relative,
         side,
@@ -488,8 +529,10 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
         ownership: owned?.ownership ?? "unknown",
         confidence: owned?.confidence ?? "uncertain"
       }
-      if (entry?.added !== undefined) answer.added = entry.added
-      if (entry?.removed !== undefined) answer.removed = entry.removed
+      // The name the pair came from is carried only when this workspace may show it; a name the workspace's rules keep is never put into the reading.
+      if (record.from !== undefined) answer.from = record.from
+      if (countedFor?.added !== undefined) answer.added = countedFor.added
+      if (countedFor?.removed !== undefined) answer.removed = countedFor.removed
       const digest = await digestOf(repository.top, relative)
       if (digest !== undefined) answer.digest = digest
       return answer
@@ -518,5 +561,5 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
     return reading
   }
 
-  return { resolveRepository, prefix: prefixOf, hiddenHere, hiddenIn, refuseBareArguments, runGit, status, inspect }
+  return { resolveRepository, prefix: prefixOf, hiddenHere, hiddenIn, nameOf, refuseBareArguments, runGit, status, inspect }
 }

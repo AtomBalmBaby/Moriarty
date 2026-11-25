@@ -125,7 +125,7 @@ Use this table in every stage update.
 | 0 | Repository audit and contracts | in progress | 2026-11-24 | design documents and repository audit | no code changed | This plan is design-only |
 | 1 | Project Git configuration and identity | complete | 2026-11-24 | `npm run build-tests`; `node --test out/test/standalone/git-config.standalone.js` (16 cases); existing evidence suites re-run; `npm run lint` | 16/16 pass; evidence suites unchanged at 19/15/14/6; eslint clean; no schema change and no Git process run | Shared reader in `src/extension/todos/project-config.ts`; `git/config.ts`, `git/identity.ts`, `git/auth.ts` added. Defaults: manual-approval, tagging true, remote origin, branch current, auth inherit. Invalid values fail with an actionable line instead of falling back; credential values stay out of readings and diagnostics; the tagging opt-out is not exposed in settings or the GUI |
 | 2 | Git session baseline and ownership tracker | complete | 2026-11-25 | `npm run build-tests`; `node --test out/test/standalone/git-baseline.standalone.js` (14 cases); `command-snapshot.standalone.js` (4) and `git-config.standalone.js` (16) re-run; `npm run lint` | 14/14 pass; the reused suites unchanged at 4 and 16; eslint clean; no schema change and no staging, commit, push or branch change | `git/baseline.ts` reads the chat-start state through `status --porcelain=v1 -z`, `rev-parse` and `symbolic-ref` plus the existing `snapshotTree`, once per conversation and kept as it was; `git/ownership.ts` accepts the five host sources only and refuses any claim that is not host-derived |
-| 3 | Repository/status/change native tools | in review - two criteria fail (audit) | 2026-11-25 | `npm run build-tests`; `node --test out/test/standalone/git-tool-dispatch.standalone.js` (14 cases); `more-tools.standalone.js` (17), `git-baseline.standalone.js` (14), `git-config.standalone.js` (16), `line-edit.standalone.js` (100), `access-preflight.standalone.js` (23) re-run; `npm run lint`; `npm run build`; `npx tsc -p . --noEmit`; `git diff --check` | exit 0 everywhere except the Stage 3 suite: exit 1, 12 pass / 2 fail; all other suites unchanged at their previous counts; eslint, tsc and `git diff --check` clean; nothing staged, committed, pushed or branch-changed and no project database opened | `git/service.ts` runs the two typed reads behind the same `git` tool name: `status --porcelain=v1 -z`, `rev-parse`, `symbolic-ref` and bounded `diff --numstat -z` with the patch for the paths named, as argument arrays with no shell. The legacy `args` path is unchanged, its allowlist, path rules and output cap read through the service, and read-only is answered per call |
+| 3 | Repository/status/change native tools | complete | 2026-11-25 | `npm run build-tests`; `node --test out/test/standalone/git-tool-dispatch.standalone.js` (14 cases); `more-tools.standalone.js` (17), `git-baseline.standalone.js` (14), `git-config.standalone.js` (16), `line-edit.standalone.js` (101), `access-preflight.standalone.js` (23), `command-snapshot.standalone.js` (4) re-run; `npm run lint`; `npm run build`; `npx tsc -p . --noEmit`; `git diff --check` | every command exit 0: the Stage 3 suite 14/14 with the two cases that were red now green, and the reused suites unchanged at 17, 14, 16, 23, 4 (line-edit at its current 101); eslint, tsc and `git diff --check` clean; nothing staged, committed, pushed or branch-changed and no project database opened | `git/service.ts` runs the two typed reads behind the same `git` tool name: `status --porcelain=v1 -z`, `rev-parse`, `symbolic-ref` and bounded `diff --numstat -z` with the patch for the paths named, as argument arrays with no shell. The legacy `args` path is unchanged, its allowlist, path rules and output cap read through the service, and read-only is answered per call. The two audit failures were corrected in that file only: a named path is read both ways (as the open folder names it, and as the repository names it from its top) and answered for whichever reading this workspace may show; rename pairs are carried, and a `-z` pair record's counts belong to the name the path became. No assertion was weakened or removed |
 | 4 | Alternate-index staging and commit | not started | | | | |
 | 5 | Push and ambiguous operation recovery | not started | | | | |
 | 6 | Database/evidence/source-validity integration | not started | | | | |
@@ -218,6 +218,61 @@ Ownership and evidence: inspection reads Stage 2's contracts through `STATUS_OF_
 Wired for tests only, not for production: `ToolExtras.gitOptions` reaches the tool through `workspaceTools`, but no production call site supplies the conversation, the stores or the observation lookup, so live conversation ownership tracking does not work yet - Stage 7 owns that wiring. No claim of live ownership tracking is made here.
 
 Verdict: **NO-GO**. The authorization mismatch was real and is now closed by a narrow correction; two criteria remain unmet - the path naming above, and rename pairs (`from` declared but never carried, a selected rename source answered as `clean`, and `-z` pair counts dropped). Both belong to `src/extension/git/service.ts`, which cannot be edited from this host while the operation named above is unsettled, so the suite is left red for those two cases rather than the assertions being softened. Stage 3 cannot be accepted as complete and Stage 4 must not start until these are settled in the window holding that pending operation.
+
+**Superseded 2026-11-25 by the Stage 3 close below:** the two criteria in this verdict are met, and Stage 3 is complete. This paragraph stands as the audit as it was recorded at the time.
+
+That block is now closed: the native editing lockout was recovered and live-verified by `003d7d5` (the P0 repair), so `src/extension/git/service.ts` could be edited from this host on 2026-11-25. Nothing was reset, stashed, settled or cleared by hand, and no earlier part of this audit is re-opened here.
+
+### Stage 3 close (2026-11-25) - both criteria met, stage complete
+
+Branch `integrated-git` at `003d7d5`. The only change for this close is `src/extension/git/service.ts`; no test, fixture or assertion was touched, and the two failing regression tests were used as the acceptance criteria exactly as they stand.
+
+Criterion 1 - workspace-relative against repository-relative path handling. A name the call gives is now read both ways: as the open folder names it, and as the same path under the prefix, as the repository names it (`nameOf`, answering through the existing `hiddenIn`). The reading is given for whichever reading this workspace may show; what is genuinely outside, ignored by `.gitignore` or kept by the team's rules is still refused with the reason the call named, before anything runs, and the refusal shape (`code`, `executed: false`, message, recovery) is unchanged. Workspace authorization is untouched: the repository a call reaches is still decided by the existing access preflight, and pathspec magic and an absolute or `..` name are still refused outright.
+
+Live through the real dispatcher on a scratch repository with the open folder at `packages/api` inside the repository top:
+
+- `paths: ["kept.ts"]` answers `[{"path":"packages/api/kept.ts","side":"unstaged","status":"modified",…}]`, and the counts match git's own record for that path (`2\t1\tpackages/api/kept.ts`);
+- naming the same file as the repository names it answers identically;
+- `../packages/web/sibling.ts` is still refused (outside the workspace), an ignored name is still refused by the `.gitignore` rule, and a name the team's rules keep is still refused - each with `executed: false`;
+- `status` reports the open folder's own change as the repository names it and counts what it keeps out with `leftOut`; nothing kept from the agent is named.
+
+Criterion 2 - rename source/destination reporting and `git diff --numstat -z`. `GitInspectedChange.from` is carried for the name the path became, as porcelain's pair record names it, and only when this workspace may show that name as well; a name the workspace's rules keep is never put into the reading. A rename source named outright is answered with git's own status instead of `clean`. `parseNumstat` now reads the `-z` pair record - counts, an empty path field, then the name it came from and the name it became as their own fields - instead of skipping it, so those counts are attributed to the name the path became.
+
+Live on a scratch repository holding a pure staged rename:
+
+- git's own record `0\t0\t` + `read as.ts` + `became.ts` answers as `{"path":"became.ts","side":"staged","status":"renamed","from":"read as.ts","added":0,"removed":0}`;
+- the name it came from answers `renamed`, not clean;
+- a rename whose other name is kept from the agent carries no pair name (`from` left out) and names no kept path anywhere in the reading.
+
+Gates, each run on its own with its real exit code:
+
+| Command | Exit code | Result |
+|---|---|---|
+| `npm run build-tests` | 0 | compiles clean |
+| `node --test out/test/standalone/git-tool-dispatch.standalone.js` | 0 | 14/14; the two cases named above are green |
+| `node --test out/test/standalone/more-tools.standalone.js` | 0 | 17/17, unchanged |
+| `node --test out/test/standalone/git-baseline.standalone.js` | 0 | 14/14, unchanged |
+| `npm run lint` | 0 | clean |
+| `npm run build` | 0 | clean |
+| `git diff --check` | 0 | no whitespace findings |
+
+Re-run unchanged: `git-config` 16/16, `line-edit` 101/101 (the reconciliation cases included), `access-preflight` 23/23, `command-snapshot` 4/4; `npx tsc -p . --noEmit` 0 findings.
+
+Read-only and the mutation boundary, checked live: the inventory holds exactly one native `git` tool, registered read-only with `readOnlyFor`; `status`, `inspect` and legacy `args` answer read-only, while `commit`, `prepare_commit` and `push` answer not-read-only and are refused with `git_operation_not_supported` before anything runs; the access preflight asks write for each of those three for its own call, a grant taken for a read does not carry them (read never covers write), an ungranted outside repository is refused before any process runs, and every read left the real index, the porcelain record and HEAD as they were. Every consumer that decides read or write - `workspace.ts`, `loop.ts`, `access-preflight.ts`, the tool inventory and the source resolver through the preflight - answers per call.
+
+Database state: schema stays v21. No table was created or changed, no migration was proposed or applied, and `.twinny/project.sqlite` was never opened by Stage 3 code, tests or this close; every case runs on a scratch repository and its own scratch project home under `/tmp`, which holds nothing but `config.json`.
+
+Remaining limitations (unchanged from the audit, recorded here as accepted):
+
+- Nothing in production passes `gitOptions`: no call site supplies the conversation, the baseline/ownership stores or the observation lookup, so live conversation ownership tracking does not work yet. Stage 7 owns that wiring, including attaching the baseline capture at `chat/index.ts` `completion()`.
+- `paths` in an inspection reading reports each name as the repository names it, which is what `status` already does; a file named from the open folder is answered for that name. The view's ignore rules are read from the open folder down, so a `.gitignore` rule written above the open folder is not this workspace's rule - behaviour unchanged by this close, recorded as a limitation.
+- Rename counts depend on what git measured for the paths named: with both names in the call git prints the pair record (0/0 for a pure rename), while a read restricted to one side prints that side's own counts. The reading answers with what git printed, never with an inferred pair.
+- `recover` is listed as read-only because Stage 5 needs a classification for it now; Stage 5 must decide what it actually does.
+- Native Git policies still do not constrain Git run through `run_command`; the documented temporary bypass stands, and the managed run-command redesign must reuse this service's execution boundary.
+
+Stage 3 is complete. Next stage: Stage 4, alternate-index staging and commit, reading through this service's `resolveRepository`, `runGit`, `hiddenHere`/`hiddenIn`/`nameOf`, the hidden-path rules and the ownership index, keeping the same refusal shape (`code`, `executed: false`, message, recovery) and the same single tool name, and carrying a staged rename's pair into its own staging decision. Stage 4 must not inherit read-only authorization: a commit call asks for write access for its own call, as the close above measured. Exact fresh-agent prompt: the one in section 6 of this plan, unchanged.
+
+Git state for this close: nothing was staged, committed, pushed, reset or branch-changed. The development repository's working tree holds this stage's changed source file plus this plan update, and no Git write command was run anywhere.
 
 ## 2. Cross-stage contracts
 
