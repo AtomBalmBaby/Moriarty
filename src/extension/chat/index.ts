@@ -148,7 +148,12 @@ const hostEditOwnerId = randomUUID()
 const describeEditBlocker = (operation: UnresolvedEditOperation, conversationId: string, ownerId: string): string => {
   const owner = operation.conversationId === conversationId ? "this conversation" : "another conversation of this project"
   if (operation.ownerId !== ownerId) {
-    return `${operation.target} has unresolved edit ${operation.id} from ${owner} (${operation.status}), which was started by another VS Code window or an earlier session. It is not retried or settled here, so it blocks edits to this target until that window settles it. Reread the target before editing it again.`
+    const liveness = operation.ownerLiveness === "live"
+      ? "the owner is reporting a live heartbeat"
+      : operation.ownerLiveness === "abandoned"
+        ? "the owner reported a terminated host"
+        : "the owner liveness is uncertain"
+    return `${operation.target} has unresolved edit ${operation.id} from ${owner} (${operation.status}), started by another VS Code window or an earlier session; ${liveness}. It is not taken over or retried here. Use Twinny: Recover unresolved edit operations for verified reconciliation or an explicit supersession decision. Reread the target before editing it again.`
   }
   if (isEditOperationInFlight(operation.id)) {
     return `${operation.target} has edit ${operation.id} from ${owner} still running. Wait for it to settle before editing this target.`
@@ -375,6 +380,7 @@ export class Chat extends Base {
   /** The host evidence preflight for this turn's explicit evidence-first request, injected into every request of the turn. */
   private _evidencePreflight: string | undefined
   private _editRecoveryNotes: string[] = []
+  private _editOwnerHeartbeat?: ReturnType<typeof setInterval>
   /** Request ID of this turn's accepted-evidence preflight, recorded as a host observation once a task is active. */
   private _evidencePreflightCheck: string | undefined
   /** Open operations (planning, replies, reviews, continuations); Stop stays available while any is open. */
@@ -502,6 +508,10 @@ export class Chat extends Base {
     )
     this._context = new ChatContextBuilder(extensionContext, bridge, new TemplateProvider(templateDir), search)
     this._stopSubscription = generations.onDidStop(() => this._steps.cancelWaiting())
+    this._editOwnerHeartbeat = setInterval(() => {
+      const scope = this.activeTodoScope()
+      if (scope) void this._todoRepository?.heartbeatEditOwner(scope, this._editOwnerId, this._activeConversationId)
+    }, 30 * 1000)
 
 this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   logger.debug("twinny-tool-inventory requested");
@@ -714,6 +724,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
   public dispose() {
     this.abortAll()
+    if (this._editOwnerHeartbeat) clearInterval(this._editOwnerHeartbeat)
     super.dispose()
     this._stopSubscription.dispose()
     this._steps.cancelWaiting()
@@ -2113,7 +2124,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }
     return async (operation) => {
-      await this.clearEditTargetBlockers(scope, operation.target, operation.preDigest)
+      await this.clearEditTargetBlockers(scope, operation.target)
       const active = await repository.getActiveIntentContext(scope)
       await repository.beginEditOperation(scope, { ...operation, itemId: active?.task.id, ownerId: this._editOwnerId })
       return {
@@ -2131,30 +2142,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
    * the editor first, so a settled operation releases the target. A blocker that is still running or diverged throws
    * a refusal that names the operation, its state, and the next action.
    */
-  private async clearEditTargetBlockers(scope: TodoWriteRequest, target: string, freshDigest?: string): Promise<void> {
+  private async clearEditTargetBlockers(scope: TodoWriteRequest, target: string): Promise<void> {
     const repository = this._todoRepository
     if (!repository) return
     const blockers = (await repository.listUnresolvedEditOperations(scope)).filter((operation) => operation.target === target)
     if (!blockers.length) return
+    const liveForeign = blockers.find((operation) =>
+      operation.ownerId !== this._editOwnerId && operation.ownerLiveness === "live"
+    )
+    if (liveForeign) throw new Error(describeEditBlocker(liveForeign, scope.conversationId, this._editOwnerId))
     await this.reconcileEditOperations(target)
     const remaining = (await repository.listUnresolvedEditOperations(scope)).find((operation) => operation.target === target)
-    if (remaining && remaining.status === "diverged" && freshDigest !== undefined && remaining.ownerId === this._editOwnerId) {
-      const settledStatus = freshDigest === remaining.postDigest
-        ? "reconciled_applied"
-        : "reconciled_absent"
-      const detail = freshDigest === remaining.postDigest
-        ? "A newly verified authoritative snapshot matches the earlier intended text; the earlier mutation was not replayed."
-        : "A newly verified authoritative snapshot superseded the earlier diverged mutation; external or replacement content is preserved and the mutation was not replayed."
-      await repository.settleProjectEditOperation(
-        scope,
-        remaining.id,
-        "diverged",
-        settledStatus,
-        detail
-      )
-    }
-    const remainingAfterFreshSnapshot = (await repository.listUnresolvedEditOperations(scope)).find((operation) => operation.target === target)
-    if (remainingAfterFreshSnapshot) throw new Error(describeEditBlocker(remainingAfterFreshSnapshot, scope.conversationId, this._editOwnerId))
+    if (remaining) throw new Error(describeEditBlocker(remaining, scope.conversationId, this._editOwnerId))
   }
 
   /**
@@ -2178,8 +2177,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       // A live sink still owns its edit and settles it itself, including any rollback it performs after the editor answers.
       if (owned && isEditOperationInFlight(operation.id)) continue
       const outcome = await this.decideEditOutcome(operation, path.join(root, operation.target))
-      if (!owned && outcome.status !== "reconciled_applied") {
-        logger.info("Edit operation " + operation.id + " on " + operation.target + " belongs to another extension host and is not settled here.")
+      if (!owned && outcome.status !== "reconciled_applied" && operation.ownerLiveness !== "abandoned") {
+        logger.info("Edit operation " + operation.id + " on " + operation.target + " is owned by a live or uncertain host and is not settled here.")
         continue
       }
       const settled = await repository.settleProjectEditOperation(scope, operation.id, operation.status, outcome.status, outcome.detail)
@@ -2199,12 +2198,26 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
 
   private async decideEditOutcome(operation: UnresolvedEditOperation, file: string): Promise<{ status: Exclude<EditOperationStatus, "dispatched" | "succeeded" | "failed">; detail: string }> {
     try {
-      const text = await this.editorTextOrAbsent(file)
-      if (text === undefined && operation.preDigest === ABSENT_DIGEST) {
-        return { status: "reconciled_absent", detail: "The file does not exist and no edit is running." }
+      const editorText = await this.editorTextOrAbsent(file)
+      let diskText: string | undefined
+      try {
+        const bytes = await workspace.fs.readFile(Uri.file(file))
+        diskText = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r\n/g, "\n")
+      } catch (error) {
+        if (error instanceof Error && "code" in error && (error as { code?: unknown }).code === "ENOENT") diskText = undefined
+        else return { status: "diverged", detail: "The authoritative disk snapshot could not be read safely." }
       }
-      if (text === undefined) return { status: "diverged", detail: "The target no longer exists." }
-      const current = editDigest(text)
+      if (diskText === undefined) {
+        if (editorText !== undefined) return { status: "diverged", detail: "The editor and authoritative disk snapshot disagree because the file is missing on disk." }
+        if (operation.preDigest === ABSENT_DIGEST) {
+        return { status: "reconciled_absent", detail: "The file does not exist and no edit is running." }
+        }
+        return { status: "diverged", detail: "The target no longer exists on disk." }
+      }
+      if (editorText !== undefined && editorText.replace(/\r\n/g, "\n") !== diskText) {
+        return { status: "diverged", detail: "The editor buffer matches neither the original nor the intended text." }
+      }
+      const current = editDigest(diskText)
       if (current === operation.postDigest) return { status: "reconciled_applied", detail: "The editor buffer holds the intended text." }
       if (current === operation.preDigest) return { status: "reconciled_absent", detail: "The editor buffer holds the original text and no edit is running." }
       return { status: "diverged", detail: "The editor buffer matches neither the original nor the intended text." }

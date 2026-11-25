@@ -5884,6 +5884,94 @@ test("project edit reconciliation settles an operation once and stays inside its
   }
 })
 
+test("edit ownership distinguishes live, abandoned, and uncertain owners without PID identity", async () => {
+  const state = await fixture([{ id: "edit-recovery", criteria: [semantic("edit-recovery", "The edit is reconciled")] }], false)
+  try {
+    const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
+    const pre = editDigest("before\n")
+    const post = editDigest("after\n")
+    await state.repository.beginEditOperation(state.scope, {
+      id: "live-owner-op",
+      itemId,
+      ownerId: "host-live",
+      target: "src/live.ts",
+      mode: "apply",
+      preDigest: pre,
+      postDigest: post
+    })
+    let unresolved = await state.repository.listUnresolvedEditOperations(state.scope)
+    assert.equal(unresolved.find((operation) => operation.id === "live-owner-op")?.ownerLiveness, "live")
+    assert.equal(await state.repository.supersedeProjectEditOperation(
+      state.scope,
+      "live-owner-op",
+      "dispatched",
+      "reconciled_absent",
+      "attempted while live",
+      "test"
+    ), false, "a live owner cannot be superseded")
+
+    await state.repository.terminateEditOwner(state.scope, "host-live", "extension host disposed")
+    unresolved = await state.repository.listUnresolvedEditOperations(state.scope)
+    assert.equal(unresolved.find((operation) => operation.id === "live-owner-op")?.ownerLiveness, "abandoned")
+
+    assert.equal(await state.repository.beginEditOperation(state.scope, {
+      id: "uncertain-owner-op",
+      itemId,
+      ownerId: "host-legacy",
+      target: "src/uncertain.ts",
+      mode: "apply",
+      preDigest: pre,
+      postDigest: post
+    }).then((operation) => operation.status), "dispatched")
+    await state.repository.terminateEditOwner(state.scope, "host-legacy", "crash is not inferred")
+    // Explicit termination makes this abandoned, while an owner with no event remains uncertain.
+    unresolved = await state.repository.listUnresolvedEditOperations(state.scope)
+    assert.equal(unresolved.find((operation) => operation.id === "uncertain-owner-op")?.ownerLiveness, "abandoned")
+
+    await state.repository.beginEditOperation(state.scope, {
+      id: "legacy-owner-op",
+      itemId,
+      target: "src/legacy.ts",
+      mode: "apply",
+      preDigest: pre,
+      postDigest: post
+    })
+    await state.repository.settleProjectEditOperation(state.scope, "legacy-owner-op", "dispatched", "diverged", "matches neither text")
+    unresolved = await state.repository.listUnresolvedEditOperations(state.scope)
+    // It has no heartbeat or termination event, so liveness remains uncertain.
+    assert.equal(unresolved.find((operation) => operation.id === "legacy-owner-op")?.ownerLiveness, "uncertain")
+
+    assert.equal(await state.repository.supersedeProjectEditOperation(
+      state.scope,
+      "live-owner-op",
+      "dispatched",
+      "reconciled_absent",
+      "historical owner definitively terminated; original mutation not inferred",
+      "explicit host-side recovery test"
+    ), true)
+    assert.equal(await state.repository.supersedeProjectEditOperation(
+      state.scope,
+      "live-owner-op",
+      "dispatched",
+      "reconciled_applied",
+      "duplicate",
+      "test"
+    ), false, "duplicate supersession loses the compare-and-set")
+    withSqlite(state.databasePath, (database) => {
+      const audit = sqliteRows(database, "SELECT event_type, payload_json FROM todo_events WHERE event_type = 'edit_operation_recovery_decision'")
+      assert.equal(audit.length, 1)
+      assert.match(String(audit[0][1]), /historical owner definitively terminated/)
+    })
+    const history = await state.repository.listEditOperationRecoveryHistory(state.scope, "live-owner-op")
+    assert.equal(history.length, 1)
+    assert.equal(history[0].target, "src/live.ts")
+    assert.equal(history[0].decision, "reconciled_absent")
+    assert.match(history[0].provenance, /explicit host-side recovery test/)
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
 test("edit digests normalize line endings and distinguish content", () => {
   assert.equal(editDigest("a\r\nb\r\n"), editDigest("a\nb\n"))
   assert.notEqual(editDigest("a\nb\n"), editDigest("a\nc\n"))

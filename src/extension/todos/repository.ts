@@ -37,6 +37,7 @@ import {
   type CreateTodoInput,
   type EditOperationInput,
   type EditOperationRecord,
+  type EditOperationRecoveryAudit,
   type EditOperationStatus,
   type EvidenceAccess,
   type EvidenceAccessScope,
@@ -352,6 +353,53 @@ const toEditOperationRecord = (row: EditOperationRow): EditOperationRecord => ({
   createdAt: row.createdAt,
   updatedAt: row.updatedAt
 })
+
+const EDIT_OWNER_HEARTBEAT_MS = 2 * 60 * 1000
+
+type EditOwnerEventRow = {
+  eventType: string
+  payloadJson: string
+  createdAt: string
+}
+
+const editOwnerEvents = (database: Database, listId: string, ownerId: string): Array<{ event: "heartbeat" | "terminated"; sessionId?: string; at: number }> =>
+  rows<EditOwnerEventRow>(database,
+    "SELECT event_type AS eventType, payload_json AS payloadJson, created_at AS createdAt FROM todo_events WHERE list_id = ? AND event_type IN ('edit_owner_heartbeat','edit_owner_terminated') ORDER BY created_at DESC",
+    [listId])
+    .flatMap((row) => {
+      try {
+        const payload = JSON.parse(row.payloadJson) as { ownerId?: unknown; sessionId?: unknown }
+        if (payload.ownerId !== ownerId) return []
+        const at = Date.parse(row.createdAt)
+        if (!Number.isFinite(at)) return []
+        return [{
+          event: row.eventType === "edit_owner_terminated" ? "terminated" as const : "heartbeat" as const,
+          sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
+          at
+        }]
+      } catch {
+        return []
+      }
+    })
+
+const editOwnerLiveness = (database: Database, listId: string, ownerId: string | undefined): {
+  ownerLiveness: "live" | "abandoned" | "uncertain"
+  ownerHeartbeatAt?: string
+  ownerSessionId?: string
+} => {
+  if (!ownerId) return { ownerLiveness: "uncertain" }
+  const events = editOwnerEvents(database, listId, ownerId)
+  const terminated = events.find((event) => event.event === "terminated")
+  const heartbeat = events.find((event) => event.event === "heartbeat")
+  if (terminated && (!heartbeat || terminated.at >= heartbeat.at)) {
+    return { ownerLiveness: "abandoned", ownerHeartbeatAt: new Date(terminated.at).toISOString(), ownerSessionId: terminated.sessionId }
+  }
+  if (!heartbeat) return { ownerLiveness: "uncertain" }
+  if (Date.now() - heartbeat.at <= EDIT_OWNER_HEARTBEAT_MS) {
+    return { ownerLiveness: "live", ownerHeartbeatAt: new Date(heartbeat.at).toISOString(), ownerSessionId: heartbeat.sessionId }
+  }
+  return { ownerLiveness: "uncertain", ownerHeartbeatAt: new Date(heartbeat.at).toISOString(), ownerSessionId: heartbeat.sessionId }
+}
 
 const ensureList = (database: Database, request: TodoListRequest): ListRow => {
   const fingerprint = request.projectFingerprint.trim()
@@ -1584,7 +1632,32 @@ export class TodoRepository {
       const record: EditOperationRecord = { ...input, status: "dispatched", detail: "", createdAt: timestamp, updatedAt: timestamp }
       execute(database, "INSERT INTO todo_edit_operations(id, list_id, item_id, owner_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [record.id, list.id, record.itemId ?? null, record.ownerId ?? null, record.target, record.mode, record.preDigest, record.postDigest, record.status, record.detail, record.createdAt, record.updatedAt])
+      if (input.ownerId) {
+        execute(database,
+          "INSERT INTO todo_events(id, list_id, item_id, list_revision, event_type, actor, request_id, payload_json, created_at) VALUES (?, ?, NULL, ?, 'edit_owner_heartbeat', 'system', ?, ?, ?)",
+          [randomUUID(), list.id, list.revision, "edit-owner-" + input.ownerId, JSON.stringify({ ownerId: input.ownerId, sessionId: request.conversationId }), now()])
+      }
       return record
+    })
+  }
+
+  heartbeatEditOwner(request: TodoWriteRequest, ownerId: string, sessionId?: string): Promise<void> {
+    assertWriter(request)
+    return this.sqlite.write((database) => {
+      const list = ensureList(database, request)
+      execute(database,
+        "INSERT INTO todo_events(id, list_id, item_id, list_revision, event_type, actor, request_id, payload_json, created_at) VALUES (?, ?, NULL, ?, 'edit_owner_heartbeat', 'system', ?, ?, ?)",
+        [randomUUID(), list.id, list.revision, "edit-owner-" + ownerId, JSON.stringify({ ownerId, sessionId: sessionId ?? request.conversationId }), now()])
+    })
+  }
+
+  terminateEditOwner(request: TodoWriteRequest, ownerId: string, reason: string): Promise<void> {
+    assertWriter(request)
+    return this.sqlite.write((database) => {
+      const list = ensureList(database, request)
+      execute(database,
+        "INSERT INTO todo_events(id, list_id, item_id, list_revision, event_type, actor, request_id, payload_json, created_at) VALUES (?, ?, NULL, ?, 'edit_owner_terminated', 'system', ?, ?, ?)",
+        [randomUUID(), list.id, list.revision, "edit-owner-" + ownerId, JSON.stringify({ ownerId, sessionId: request.conversationId, reason: reason.slice(0, 500) }), now()])
     })
   }
 
@@ -1635,7 +1708,16 @@ export class TodoRepository {
       if (!project) return []
       return rows<EditOperationRow & { conversationId: string | null }>(database,
         "SELECT e.id AS id, e.item_id AS itemId, e.owner_id AS ownerId, e.target AS target, e.mode AS mode, e.pre_digest AS preDigest, e.post_digest AS postDigest, e.status AS status, e.detail AS detail, e.created_at AS createdAt, e.updated_at AS updatedAt, l.conversation_id AS conversationId FROM todo_edit_operations e JOIN todo_lists l ON l.id = e.list_id WHERE l.project_id = ? AND e.status IN ('dispatched','diverged') ORDER BY e.created_at, e.id", [project.id])
-        .map((row) => ({ ...toEditOperationRecord(row), status: row.status as "dispatched" | "diverged", conversationId: row.conversationId }))
+        .map((row) => {
+          const list = rows<{ id: string }>(database, "SELECT id FROM todo_lists WHERE project_id = ? AND id = (SELECT list_id FROM todo_edit_operations WHERE id = ?)", [project.id, row.id])[0]
+          const liveness = editOwnerLiveness(database, list?.id ?? "", row.ownerId ?? undefined)
+          return {
+            ...toEditOperationRecord(row),
+            status: row.status as "dispatched" | "diverged",
+            conversationId: row.conversationId,
+            ...liveness
+          }
+        })
     })
   }
 
@@ -1649,6 +1731,90 @@ export class TodoRepository {
       if (!project) return false
       return execute(database, "UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND status = ? AND list_id IN (SELECT id FROM todo_lists WHERE project_id = ?)",
         [status, detail.slice(0, 500), Date.now(), operationId, expected, project.id]).changes === 1
+    })
+  }
+
+  /**
+   * Explicitly removes unresolved blocking authority after a host-side or user recovery decision.
+   * The operation row is never deleted or rewritten: this terminal status is paired with an audit event
+   * that says exactly why it was superseded and does not claim the original mutation occurred.
+   */
+  supersedeProjectEditOperation(
+    request: TodoListRequest,
+    operationId: string,
+    expected: "dispatched" | "diverged",
+    decision: "reconciled_absent" | "reconciled_applied",
+    reason: string,
+    provenance: string
+  ): Promise<boolean> {
+    return this.sqlite.write((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return false
+      const operation = rows<{ listId: string; ownerId: string | null; target: string; status: EditOperationStatus }>(database,
+        "SELECT e.list_id AS listId, e.owner_id AS ownerId, e.target AS target, e.status AS status FROM todo_edit_operations e JOIN todo_lists l ON l.id = e.list_id WHERE e.id = ? AND l.project_id = ?",
+        [operationId, project.id])[0]
+      if (!operation || operation.status !== expected) return false
+      if (editOwnerLiveness(database, operation.listId, operation.ownerId ?? undefined).ownerLiveness === "live") return false
+      const updated = execute(database,
+        "UPDATE todo_edit_operations SET status = ?, detail = ?, updated_at = ? WHERE id = ? AND status = ?",
+        [decision, reason.slice(0, 500), Date.now(), operationId, expected]).changes === 1
+      if (!updated) return false
+      execute(database,
+        "INSERT INTO todo_events(id, list_id, item_id, list_revision, event_type, actor, request_id, payload_json, created_at) VALUES (?, ?, NULL, (SELECT revision FROM todo_lists WHERE id = ?), 'edit_operation_recovery_decision', 'system', ?, ?, ?)",
+        [randomUUID(), operation.listId, operation.listId, "recovery-" + operationId, JSON.stringify({
+          operationId,
+          target: operation.target,
+          previousStatus: expected,
+          decision,
+          reason: reason.slice(0, 500),
+          provenance: provenance.slice(0, 500)
+        }), now()])
+      return true
+    })
+  }
+
+  listEditOperationRecoveryHistory(request: TodoListRequest, operationId?: string): Promise<EditOperationRecoveryAudit[]> {
+    return this.sqlite.read((database) => {
+      const project = rows<ProjectRow>(database, "SELECT id, fingerprint FROM todo_projects WHERE fingerprint = ?", [request.projectFingerprint.trim()])[0]
+      if (!project) return []
+      return rows<{ id: string; payloadJson: string; createdAt: string }>(database,
+        `SELECT ev.id AS id, ev.payload_json AS payloadJson, ev.created_at AS createdAt
+         FROM todo_events ev
+         JOIN todo_lists l ON l.id = ev.list_id
+         WHERE l.project_id = ? AND ev.event_type = 'edit_operation_recovery_decision'
+         ORDER BY ev.created_at DESC, ev.id`,
+        [project.id])
+        .flatMap((row) => {
+          try {
+            const payload = JSON.parse(row.payloadJson) as {
+              operationId?: unknown
+              target?: unknown
+              previousStatus?: unknown
+              decision?: unknown
+              reason?: unknown
+              provenance?: unknown
+            }
+            if (operationId && payload.operationId !== operationId) return []
+            if (typeof payload.operationId !== "string" ||
+                typeof payload.target !== "string" ||
+                (payload.previousStatus !== "dispatched" && payload.previousStatus !== "diverged") ||
+                (payload.decision !== "reconciled_absent" && payload.decision !== "reconciled_applied") ||
+                typeof payload.reason !== "string" ||
+                typeof payload.provenance !== "string") return []
+            return [{
+              id: row.id,
+              operationId: payload.operationId,
+              target: payload.target,
+              previousStatus: payload.previousStatus,
+              decision: payload.decision,
+              reason: payload.reason,
+              provenance: payload.provenance,
+              createdAt: row.createdAt
+            }]
+          } catch {
+            return []
+          }
+        })
     })
   }
 

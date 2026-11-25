@@ -80,6 +80,7 @@
     "onCommand:twinny.showShortcuts",
     "onCommand:twinny.forgetAlwaysRunCommands",
     "onCommand:twinny.revokeFileAccess",
+    "onCommand:twinny.recoverEditOperations",
     "onCommand:twinny.openPanelChat",
     "onCommand:twinny.openChat",
     "onCommand:twinny.openTeamPlugins",
@@ -364,6 +365,10 @@
       {
         "command": "twinny.revokeFileAccess",
         "title": "Twinny - Review and revoke always-allowed file and destructive approvals"
+      },
+      {
+        "command": "twinny.recoverEditOperations",
+        "title": "Twinny - Recover unresolved edit operations"
       },
       {
         "command": "twinny.newConversation",

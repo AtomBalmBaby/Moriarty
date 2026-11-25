@@ -452,6 +452,28 @@ test("save-time reconciliation distinguishes exact, transformed, and conflicting
   assert.deepEqual(reconcileLineEdits(original, intended, conflicted, patches), { reconciliation: "conflicted", requestedEdits: "conflicted" })
 })
 
+test("unequal-line-count ranges reconcile only when all patches survive", async () => {
+  const original = "header\nold-a\nold-b\nold-c\nfooter\n"
+  const patches = await planLineEdits(original, {
+    expected_hash: await contentHash(original),
+    edits: [
+      { operation: "replace", start_line: 2, end_line: 4, content: ["new-a", "new-b", "new-c", "new-d"] },
+      { operation: "replace", start_line: 5, end_line: 5, content: ["new-footer"] }
+    ]
+  })
+  const intended = patchedText(original, patches)
+  assert.equal(intended, "header\nnew-a\nnew-b\nnew-c\nnew-d\nnew-footer\n")
+  assert.deepEqual(reconcileLineEdits(original, intended, intended, patches), {
+    reconciliation: "applied_exactly",
+    requestedEdits: "verified"
+  })
+  const partial = "header\nnew-a\nexternal\nnew-c\nnew-d\nnew-footer\n"
+  assert.deepEqual(reconcileLineEdits(original, intended, partial, patches), {
+    reconciliation: "conflicted",
+    requestedEdits: "conflicted"
+  })
+})
+
 test("a large whole-file replacement survives save-time formatting and reports the final hash", async () => {
   const original = Array.from({ length: 509 }, (_, index) => `line-${index + 1}`).join("\n") + "\n"
   const replacement = Array.from({ length: 509 }, (_, index) => `replacement-${index + 1}`).join("\n") + "\n"

@@ -382,6 +382,20 @@ export interface EditOperationRecord extends EditOperationInput {
 export interface UnresolvedEditOperation extends EditOperationRecord {
   status: "dispatched" | "diverged"
   conversationId: string | null
+  ownerLiveness: "live" | "abandoned" | "uncertain"
+  ownerHeartbeatAt?: string
+  ownerSessionId?: string
+}
+
+export interface EditOperationRecoveryAudit {
+  id: string
+  operationId: string
+  target: string
+  previousStatus: "dispatched" | "diverged"
+  decision: "reconciled_absent" | "reconciled_applied"
+  reason: string
+  provenance: string
+  createdAt: string
 }
 
 /**

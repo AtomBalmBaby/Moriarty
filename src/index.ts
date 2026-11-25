@@ -36,6 +36,7 @@ import { CompletionProvider } from "./extension/completion/provider"
 import { setContext } from "./extension/context"
 import { InlineEditCodeActionProvider } from "./extension/edit/code-actions"
 import { InlineEditCodeLensProvider } from "./extension/edit/code-lens"
+import { EditOperationRecoveryHost } from "./extension/edit/operation-recovery"
 import {
   ChatEditMode,
   FileEditProposal,
@@ -68,6 +69,7 @@ import { terminalHistory } from "./extension/terminal"
 import { runDescribedCommand } from "./extension/terminal/command"
 import { fixTerminalError } from "./extension/terminal/fix"
 import { currentProjectTodoStorage } from "./extension/todos/project-storage"
+import { DEFAULT_EVIDENCE_STORAGE_LIMITS, PROJECT_FINGERPRINT, TodoRepository } from "./extension/todos/repository"
 import { closeTodoDatabases, prepareProjectTodoStorage } from "./extension/todos/sqlite"
 import { ContentHashAlgorithm, isContentHashAlgorithm, setContentHashAlgorithmProvider } from "./extension/tools/fingerprint"
 import { delayExecution } from "./extension/utils"
@@ -626,6 +628,25 @@ export async function activate(context: ExtensionContext) {
       const destructive = (await chat?.revokeDestructiveProjectApprovals()) ?? 0
       if (destructive) window.showInformationMessage(`Twinny revoked ${destructive === 1 ? "one project destructive approval" : `${destructive} project destructive approvals`}.`)
       if (revoked) window.showInformationMessage(`Twinny revoked ${revoked === 1 ? "one always-allowed grant" : `${revoked} always-allowed grants`}.`)
+    }),
+    commands.registerCommand(TWINNY_COMMAND_NAME.recoverEditOperations, async () => {
+      const root = workspace.workspaceFolders?.[0]?.uri.fsPath
+      if (!root) {
+        window.showWarningMessage("Twinny cannot recover edit operations without an open workspace.")
+        return
+      }
+      const repository = new TodoRepository(
+        async () => prepareProjectTodoStorage(currentProjectTodoStorage()),
+        DEFAULT_EVIDENCE_STORAGE_LIMITS,
+        () => [root]
+      )
+      await repository.initialize()
+      const scope = { projectFingerprint: PROJECT_FINGERPRINT, conversationId: "host-recovery-" + uuidv4(), writer: "host-recovery" }
+      try {
+        await new EditOperationRecoveryHost(repository, root).show(scope)
+      } finally {
+        repository.close()
+      }
     }),
     commands.registerCommand(TWINNY_COMMAND_NAME.openPanelChat, () => {
       commands.executeCommand("workbench.action.closeSidebar")
