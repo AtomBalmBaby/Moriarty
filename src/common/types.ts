@@ -519,6 +519,8 @@ export interface TwinnyProvider {
     | "high"
     | "xhigh"
     | "max"
+  /** Explicit Auto means omit reasoning_effort even if endpoint discovery suggests a default. */
+  reasoningEffortAuto?: boolean
   provider: string
   repositoryLevel?: boolean
   type: string

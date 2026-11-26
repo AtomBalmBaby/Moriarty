@@ -201,13 +201,13 @@ export const supportsReasoningEffort = (providerName: string): boolean =>
   providerName === API_PROVIDERS.OpenAI ||
   providerName === API_PROVIDERS.ChatGPTPlan ||
   providerName === API_PROVIDERS.Ollama ||
-  providerName === API_PROVIDERS.OpenAICompatible ||
   providerName === API_PROVIDERS.Deepseek ||
   providerName === API_PROVIDERS.Groq ||
   providerName === API_PROVIDERS.LiteLLM ||
   providerName === API_PROVIDERS.LMStudio ||
   providerName === API_PROVIDERS.OpenRouter ||
-  providerName === API_PROVIDERS.OpenWebUI
+  providerName === API_PROVIDERS.OpenWebUI ||
+  isOpenAICompatibleProvider(providerName)
 
 export const normalizeReasoningEffort = (
   providerName: string,
@@ -345,6 +345,10 @@ export const normalizeProvider = (input: TwinnyProvider): TwinnyProvider => {
       providerName,
       input.reasoningEffort
     )
+    if (input.reasoningEffortAuto === true) {
+      normalized.reasoningEffortAuto = true
+      normalized.reasoningEffort = undefined
+    }
   }
 
   return normalized

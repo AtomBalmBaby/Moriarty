@@ -113,6 +113,21 @@ suite("Provider validation", () => {
       )
     })
 
+    test("serializes explicit Auto separately from an omitted preference", () => {
+      const result = normalizeProvider({
+        ...ollamaChat,
+        provider: API_PROVIDERS.OpenAICompatible,
+        reasoningEffort: undefined,
+        reasoningEffortAuto: true
+      })
+      assert.strictEqual(result.reasoningEffort, undefined)
+      assert.strictEqual(result.reasoningEffortAuto, true)
+      assert.strictEqual(
+        normalizeProvider(JSON.parse(JSON.stringify(result))).reasoningEffortAuto,
+        true
+      )
+    })
+
     test("normalizes provider-specific and unsupported reasoning values", () => {
       assert.strictEqual(
         normalizeReasoningEffort(API_PROVIDERS.OpenAICompatible, "high"),

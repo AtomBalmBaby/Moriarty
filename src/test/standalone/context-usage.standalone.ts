@@ -24,6 +24,7 @@ import {
   knownContextCapacity,
   parseContextSetting,
   resolveFallback,
+  serverProbeOf,
   setContextClock
 } from "../../extension/inference/context-window"
 import { ChatChunk } from "../../extension/inference/types"
@@ -370,6 +371,36 @@ test("llama.cpp: the per-slot context is confirmed with its slot count, whatever
         [8_192, "runtime", true, 4]
       )
       assert.deepStrictEqual(server.hits, ["GET /props"], "a single-model server is asked once, without the model name")
+    } finally {
+      server.close()
+    }
+  }))
+
+test("equivalent OpenAI-compatible presets discover Strata context and reasoning from /props", () =>
+  discovery(async () => {
+    const server = await fakeServer({
+      "/props": () => ({
+        default_generation_settings: { n_ctx: 524288 },
+        chat_template: "supports low, medium and xhigh reasoning_effort"
+      }),
+      "/v1/models": () => ({ data: [{ id: "m" }] })
+    })
+    try {
+      for (const kind of ["openai-compatible", "llamacpp"]) {
+        const capacity = await contextCapacityOf(
+          provider(kind, { ...at(server.port), modelName: "m" }),
+          auto
+        )
+        assert.deepStrictEqual(
+          [capacity.tokens, capacity.source, capacity.confirmed],
+          [524288, "runtime", true],
+          kind
+        )
+      }
+      const probe = await serverProbeOf(provider("openai-compatible", { ...at(server.port), modelName: "m" }))
+      assert.ok(probe.reasoningEfforts?.includes("medium"))
+      assert.ok(probe.reasoningEfforts?.includes("xhigh"))
+      assert.ok(server.hits.includes("GET /props"), "both presets reach endpoint metadata")
     } finally {
       server.close()
     }

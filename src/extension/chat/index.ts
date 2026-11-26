@@ -34,7 +34,7 @@ import {
 import { formatCount, logger, redact } from "../../common/logger"
 import { isContinuationText, isResumableReply, requestBehindContinuation } from "../../common/messaging/chat-continuation"
 import type { ChatContinuation, ComposerTurn, ContextWindowStatus, PromptCompileRequest, PromptCompileResult, ToolInventoryItem } from "../../common/messaging/protocol"
-import { normalizeReasoningEffort } from "../../common/provider-validation"
+import { isOpenAICompatibleProvider, normalizeReasoningEffort } from "../../common/provider-validation"
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
 import { kebabToSentence } from "../../common/text"
@@ -62,7 +62,8 @@ import { isCancelled, isRetryableProviderFailure, readReply, readText, resolveAg
 import {
   contextCapacityOf,
   forgetContextWindows,
-  knownContextCapacity
+  knownContextCapacity,
+  serverProbeOf
 } from "../inference/context-window"
 import { ExtensionBridge } from "../messaging/bridge"
 import { PromptInstructionResolver } from "../prompts/instructions"
@@ -868,6 +869,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             const reply = await readReply(resolveInferenceProvider(provider).chat({
               model: provider.modelName,
               messages,
+              reasoningEffort: await this.reasoningEffortFor(provider),
               ...(responseFormat ? { responseFormat: "json" as const } : {})
             }, { signal, trace }))
             return { text: reply.content, reasoningChars: reply.reasoningChars, finishReason: reply.finishReason }
@@ -1216,7 +1218,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         resolveInferenceProvider(provider).chat(
           {
             model: provider.modelName,
-            messages: [{ role: USER, content: prompt }]
+            messages: [{ role: USER, content: prompt }],
+            reasoningEffort: await this.reasoningEffortFor(provider)
           },
           { signal: run.signal }
         )
@@ -1256,7 +1259,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             messages: composerSuggestionMessages(draft, recent),
             maxTokens: SUGGESTION_MAX_TOKENS,
             temperature: 0,
-            think: false
+            think: false,
+            reasoningEffort: await this.reasoningEffortFor(provider)
           },
           { signal: run.signal }
         )
@@ -1569,12 +1573,18 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
-  private reasoningEffortFor(provider: TwinnyProvider): ChatRequest["reasoningEffort"] {
+  private async reasoningEffortFor(provider: TwinnyProvider): Promise<ChatRequest["reasoningEffort"]> {
+    if (provider.reasoningEffortAuto === true) return undefined
     const selected = normalizeReasoningEffort(
       provider.provider,
       provider.reasoningEffort
     )
     if (selected) return selected
+    if (isOpenAICompatibleProvider(provider.provider)) {
+      const probe = await serverProbeOf(provider)
+      if (probe.reasoningEfforts?.includes("medium")) return "medium"
+      return undefined
+    }
     // Preserve the native OpenAI tool-loop default; Auto omits the field for
     // ordinary chat and all other provider types unless configured explicitly.
     return provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined
@@ -1715,7 +1725,8 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
             messages: [
               { role: SYSTEM, content: system },
               { role: USER, content: user }
-            ] as ChatCompletionMessage[]
+            ] as ChatCompletionMessage[],
+            reasoningEffort: await this.reasoningEffortFor(activeProvider)
           }, { signal: controller.signal, trace: { operationId: `feedback-${purpose}-${randomUUID()}`, operationKind: "feedback", requestId: `request-${randomUUID()}`, provider: activeProvider.provider } })), timedOut, stopped])
         } catch (error) {
           throw new TodoEvaluationProviderError(redact(isCancelled(error) ? "Feedback evaluation was cancelled" : describeProviderError(error, activeProvider)))
@@ -2714,7 +2725,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       maxNoProgressSteps: this.clampedNoProgressSteps(),
       ...this.generationOptions(),
       maxResultChars,
-      reasoningEffort: this.reasoningEffortFor(provider),
+      reasoningEffort: await this.reasoningEffortFor(provider),
       contextWindow: () => this.contextCapacity(provider),
       onContext: (entry) => this.observeContext(provider, conversationId, entry),
       stepLines: false,
@@ -2958,7 +2969,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       maxNoProgressSteps: this.clampedNoProgressSteps(),
       ...this.generationOptions(),
       maxResultChars,
-      reasoningEffort: this.reasoningEffortFor(provider),
+      reasoningEffort: await this.reasoningEffortFor(provider),
       contextWindow: () => this.contextCapacity(provider),
       onContext: (entry) => this.observeContext(provider, conversationId, entry),
       stepLines: false,

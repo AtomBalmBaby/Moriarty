@@ -16,7 +16,7 @@
 import { API_PROVIDERS } from "../../common/constants"
 import { deadline } from "../../common/deadline"
 import { logger } from "../../common/logger"
-import { getProviderOrigin } from "../../common/provider-validation"
+import { getProviderOrigin, isOpenAICompatibleProvider } from "../../common/provider-validation"
 import { TwinnyProvider } from "../../common/types"
 import { ConfirmedCapacity, ContextCapacity, FALLBACK_CONTEXT_TOKENS, SUPPORTED_CONTEXT_TOKENS } from "../tools/budget"
 
@@ -35,6 +35,7 @@ export interface ServerProbe {
   confirmed: ConfirmedCapacity[]
   advertised?: number
   slots?: number
+  reasoningEfforts?: Array<"none" | "low" | "medium" | "high" | "xhigh">
 }
 
 export type ContextSetting =
@@ -58,10 +59,10 @@ const known = new Map<string, Known>()
 
 const keyOf = (provider: TwinnyProvider) =>
   [
-    provider.provider,
     provider.apiProtocol ?? "",
     provider.apiHostname ?? "",
     provider.apiPort ?? "",
+    provider.apiPath ?? "",
     provider.modelName
   ].join("|")
 
@@ -111,8 +112,66 @@ const positive = (value: unknown): number | undefined =>
     ? value
     : undefined
 
+const positiveAt = (record: Record<string, unknown> | undefined, keys: string[]): number | undefined => {
+  if (!record) return undefined
+  for (const key of keys) {
+    const value = positive(record[key])
+    if (value !== undefined) return value
+  }
+  for (const nested of Object.values(record)) {
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const value = positiveAt(nested as Record<string, unknown>, keys)
+      if (value !== undefined) return value
+    }
+  }
+  return undefined
+}
+
 const sized = (source: ConfirmedCapacity["source"], tokens: number | undefined): ConfirmedCapacity[] =>
   tokens === undefined ? [] : [{ source, tokens }]
+
+type ReasoningEffort = NonNullable<ServerProbe["reasoningEfforts"]>[number]
+
+const addReasoningEffort = (efforts: ReasoningEffort[], value: string) => {
+  const normalized = value.trim().toLowerCase()
+  const effort: ReasoningEffort | undefined =
+    normalized === "none" || normalized === "off" ? "none"
+      : normalized === "low" ? "low"
+        : normalized === "medium" ? "medium"
+          : normalized === "high" ? "high"
+            : normalized === "xhigh" || normalized === "extra_high" || normalized === "extra high" ? "xhigh"
+              : undefined
+  if (effort && !efforts.includes(effort)) efforts.push(effort)
+}
+
+const reasoningEffortsOf = (value: unknown): ReasoningEffort[] => {
+  const efforts: ReasoningEffort[] = []
+  const visit = (entry: unknown) => {
+    if (typeof entry === "string") {
+      for (const match of entry.matchAll(/\b(none|off|low|medium|high|xhigh|extra[_ -]?high)\b/gi)) {
+        addReasoningEffort(efforts, match[1])
+      }
+      return
+    }
+    if (Array.isArray(entry)) {
+      entry.forEach(visit)
+      return
+    }
+    if (!entry || typeof entry !== "object") return
+    for (const [key, nested] of Object.entries(entry)) {
+      const normalizedKey = key.toLowerCase()
+      if (
+        normalizedKey.includes("reasoning") ||
+        normalizedKey.includes("reason") ||
+        normalizedKey.includes("thinking") ||
+        normalizedKey.includes("chat_template")
+      ) visit(nested)
+      else if (typeof nested === "object") visit(nested)
+    }
+  }
+  visit(value)
+  return efforts
+}
 
 /** `llama3` and `llama3:latest` are one model to Ollama. */
 const sameOllamaModel = (a: string, b: string) => {
@@ -167,7 +226,8 @@ const fromLlamaCpp = async (provider: TwinnyProvider): Promise<ServerProbe> => {
   }
   return {
     confirmed: sized("runtime", positive(props?.default_generation_settings?.n_ctx)),
-    slots: positive(props?.total_slots)
+    slots: positive(props?.total_slots),
+    ...(reasoningEffortsOf(props).length ? { reasoningEfforts: reasoningEffortsOf(props) } : {})
   }
 }
 
@@ -200,17 +260,34 @@ const fromListing = async (provider: TwinnyProvider): Promise<ServerProbe> => {
  * are advertised only. The standard list carries neither, and that is fine.
  */
 const fromModelList = async (provider: TwinnyProvider): Promise<ServerProbe> => {
-  const listing = (await ask(provider, `${originOf(provider)}/v1/models`)) as
+  const origin = originOf(provider)
+  let props = (await ask(provider, `${origin}/props`)) as unknown
+  let propsContext =
+    positiveAt(props as Record<string, unknown> | undefined, ["n_ctx", "context_length", "context_window", "max_context_length"])
+  if (propsContext === undefined && provider.modelName) {
+    props = await ask(provider, `${origin}/props?model=${encodeURIComponent(provider.modelName)}&autoload=false`) as unknown
+    propsContext =
+      positiveAt(props as Record<string, unknown> | undefined, ["n_ctx", "context_length", "context_window", "max_context_length"])
+  }
+  const listing = (await ask(provider, `${origin}/v1/models`)) as
     | { data?: Record<string, unknown>[] }
     | undefined
   const model = listing?.data?.find((entry) => entry.id === provider.modelName)
+  const loadedContext =
+    positiveAt(model, ["loaded_context_length", "n_ctx"]) ??
+    propsContext
+  const configuredContext =
+    positiveAt(model, ["max_model_len"])
+  const advertised =
+    positiveAt(model, ["context_length", "context_window", "max_context_length"])
+  const reasoningEfforts = reasoningEffortsOf(props)
   return {
     confirmed: [
-      ...sized("runtime", positive(model?.loaded_context_length)),
-      ...sized("configured", positive(model?.max_model_len))
+      ...sized("runtime", loadedContext),
+      ...sized("configured", configuredContext)
     ],
-    advertised:
-      positive(model?.context_length) ?? positive(model?.context_window) ?? positive(model?.max_context_length)
+    ...(advertised !== undefined ? { advertised } : {}),
+    ...(reasoningEfforts.length ? { reasoningEfforts } : {})
   }
 }
 
@@ -219,19 +296,17 @@ const probeOf = (provider: TwinnyProvider): Promise<ServerProbe | undefined> => 
   switch (provider.provider) {
     case API_PROVIDERS.Ollama:
       return fromOllama(provider)
-    case API_PROVIDERS.LlamaCpp:
-      return fromLlamaCpp(provider)
     case API_PROVIDERS.LMStudio:
       return fromLmStudio(provider)
     case API_PROVIDERS.TwinnyRemote:
       return fromListing(provider)
-    case API_PROVIDERS.OpenAICompatible:
-    case API_PROVIDERS.LiteLLM:
-    case API_PROVIDERS.OpenWebUI:
-    case API_PROVIDERS.Oobabooga:
-    case API_PROVIDERS.Qvac:
-      return fromModelList(provider)
     default:
+      if (provider.provider === API_PROVIDERS.LlamaCpp) {
+        return fromLlamaCpp(provider)
+      }
+      if (isOpenAICompatibleProvider(provider.provider)) {
+        return fromModelList(provider)
+      }
       return Promise.resolve(undefined)
   }
 }
@@ -342,6 +417,9 @@ export const knownContextCapacity = (provider: TwinnyProvider, options: ContextO
     ? resolveCapacity(cached.probe, parseContextSetting(options.setting), resolveFallback(options.fallback))
     : undefined
 }
+
+export const knownServerProbeOf = (provider: TwinnyProvider): ServerProbe | undefined =>
+  known.get(keyOf(provider))?.probe
 
 /** For configuration changes and tests: forget every answer. */
 export const forgetContextWindows = () => known.clear()

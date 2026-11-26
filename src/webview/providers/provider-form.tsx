@@ -613,7 +613,8 @@ export const ProviderForm = ({ initial, onClose, onSaved }: ProviderFormProps) =
               onChange={(e) =>
                 update({
                   reasoningEffort:
-                    (valueOf(e) || undefined) as TwinnyProvider["reasoningEffort"]
+                    (valueOf(e) || undefined) as TwinnyProvider["reasoningEffort"],
+                  reasoningEffortAuto: valueOf(e) ? undefined : true
                 })
               }
             >

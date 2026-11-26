@@ -1966,14 +1966,15 @@ export const Chat = (props: ChatProps): JSX.Element => {
                     className={styles.reasoningEffort}
                     aria-label="Reasoning effort"
                     title="Reasoning effort"
-                    value={chatProvider.reasoningEffort || ""}
+                    value={chatProvider.reasoningEffortAuto ? "" : chatProvider.reasoningEffort || ""}
                     onChange={(event: unknown) => {
                       const value = (event as React.ChangeEvent<HTMLSelectElement>).target.value
                       void updateProvider({
                         ...chatProvider,
                         reasoningEffort: value
                           ? (value as TwinnyProvider["reasoningEffort"])
-                          : undefined
+                          : undefined,
+                        reasoningEffortAuto: value ? undefined : true
                       })
                     }}
                   >
