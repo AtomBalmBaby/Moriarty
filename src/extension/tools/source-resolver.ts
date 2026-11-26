@@ -214,7 +214,7 @@ export const resolveSourceTarget = async (options: SourceResolverOptions, reques
       })
     if (hash) {
       if (!(await sameFingerprint(text)))
-        return refuse(request.tool, "hash_mismatch", `${options.view.relative(absolute)} is not the content this call was sent with; nothing was changed.`, {
+        return refuse(request.tool, "stale_hash", `${options.view.relative(absolute)} is not the content this call was sent with; nothing was changed.`, {
           required_argument: "path",
           recovery: "Read the file again to get its current fingerprint, then edit that.",
           current_hash: await fingerprintContent(text)
@@ -282,7 +282,7 @@ export const resolveSourceTarget = async (options: SourceResolverOptions, reques
   // The content is checked once more, straight before it is used: what was proved above may have changed.
   const text = await options.view.text(absolute)
   if (text === undefined || !(await sameFingerprint(text)))
-    return refuse(request.tool, "hash_mismatch", `${relative} changed while this call was resolving it; nothing was changed.`, {
+    return refuse(request.tool, "stale_hash", `${relative} changed while this call was resolving it; nothing was changed.`, {
       required_argument: "path",
       recovery: "Read it again to get its current fingerprint."
     })

@@ -3132,7 +3132,7 @@ suite("Read-file acceptance, production controller", function () {
       })
     })
 
-    test("an unsettled edit from another window blocks this window and is not replayed", async () => {
+    test("an unsettled edit from another window is not replayed but a later valid edit dispatches", async () => {
       await withWorkspace(async (workspace) => {
         let attempts = 0
         const lostBeforeRun = (async () => {
@@ -3150,17 +3150,21 @@ suite("Read-file acceptance, production controller", function () {
         assert.equal(attempts, 1)
         assert.deepEqual(await statusesOf(workspace), ["dispatched"], "the unanswered edit stays recorded")
 
+        const windowBApply = (async (command: string, ...args: unknown[]) => {
+          attempts++
+          return await vscode.commands.executeCommand(command, ...args)
+        }) as EditCommandRunner
         const windowB = await runTurn(workspace, {
           conversationId: "edit-foreign-lost-b",
           planReply: editPlan("foreign-lost-b-plan"),
-          replies: [editCall, "Window B is blocked."],
-          editCommands: lostBeforeRun,
+          replies: [editCall, "Window B applied the independent edit."],
+          editCommands: windowBApply,
           editOwnerId: "window-b"
         })
-        assert.equal(attempts, 1, "window B never replays another window's unsettled edit")
-        assert.deepEqual(await statusesOf(workspace), ["dispatched"], "the foreign edit is not settled as absent")
-        assert.ok(JSON.stringify(windowB.agent.requests).includes("started by another VS Code window"), "window B is told why the target is blocked")
-        assert.equal(occurrences(await bufferOf(workspace), editReplace), 0, "the file is unchanged")
+        assert.equal(attempts, 2, "window B dispatches its own edit instead of replaying or inheriting the old record")
+        assert.deepEqual((await statusesOf(workspace)).sort(), ["dispatched", "succeeded"], "the historical record remains while the fresh record settles")
+        assert.equal(JSON.stringify(windowB.agent.requests).includes("started by another VS Code window"), false)
+        assert.equal(occurrences(await bufferOf(workspace), editReplace), 1, "the later edit changes the file exactly once")
       })
     })
 
@@ -3396,7 +3400,7 @@ suite("Read-file acceptance, production controller", function () {
       })
     })
 
-    test("an edit whose target matches neither its original nor intended text is diverged, preserved, and not retried", async () => {
+    test("an edit whose target matches neither its original nor intended text is diverged, preserved, and not authoritative", async () => {
       await withWorkspace(async (workspace) => {
         const counts = { runs: 0 }
         const editCommands = losingFirstAnswer(counts)
@@ -3434,12 +3438,12 @@ suite("Read-file acceptance, production controller", function () {
         const retried = await runTurn(workspace, {
           conversationId: "edit-diverged",
           planReply: editPlan("edit-diverged-plan"),
-          replies: [retriedCall, "The target is still blocked."],
+          replies: [retriedCall, "The corrected edit succeeded."],
           editCommands
         })
-        assert.equal(counts.runs, 1, "a later proposal for the diverged target is refused before dispatch")
-        assert.ok(JSON.stringify(retried.agent.requests).includes("has unresolved edit"), "the refusal names the unresolved edit")
-        assert.equal(await bufferOf(workspace), third, "the refused proposal leaves the text untouched")
+        assert.equal(counts.runs, 2, "a later valid proposal dispatches despite the historical diverged record")
+        assert.equal(JSON.stringify(retried.agent.requests).includes("has unresolved edit"), false)
+        assert.equal(await bufferOf(workspace), "export const third = false\n", "the corrected edit changes the preserved text")
       })
     })
 
@@ -3510,7 +3514,7 @@ suite("Read-file acceptance, production controller", function () {
       })
     })
 
-    test("an untracked edit is refused with the blocker's state while another conversation's diverged edit holds its target", async () => {
+    test("an untracked edit is allowed despite another conversation's diverged edit evidence", async () => {
       await withWorkspace(async (workspace) => {
         const counts = { runs: 0 }
         const editCommands = losingFirstAnswer(counts)
@@ -3529,17 +3533,16 @@ suite("Read-file acceptance, production controller", function () {
         unsaved.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), third)
         assert.equal(await vscode.workspace.applyEdit(unsaved), true)
 
-        const refused = await runTurn(workspace, {
+        const untracked = await runTurn(workspace, {
           conversationId: "edit-untracked",
           planReply: JSON.stringify({ track: false, plan: null }),
-          replies: [await replaceLineCall(editTarget, await bufferOf(workspace), "export const third", "export const fourth"), "The edit was refused."],
+          replies: [await replaceLineCall(editTarget, await bufferOf(workspace), "export const third", "export const fourth"), "The untracked edit succeeded."],
           editCommands
         })
-        assert.equal(counts.runs, 1, "the untracked edit never reaches the editor")
-        assert.equal(await bufferOf(workspace), third, "the target is unchanged")
-        assert.deepEqual(await statusesOf(workspace), ["diverged"], "the diverged edit keeps holding the target")
-        assert.ok(JSON.stringify(refused.agent.requests).includes("another conversation of this project"), "the refusal names the owning conversation")
-        assert.ok(JSON.stringify(refused.agent.requests).includes("The edit was not retried"), "the refusal states the edit was not retried")
+        assert.equal(counts.runs, 2, "the untracked edit reaches the editor")
+        assert.equal(await bufferOf(workspace), "export const fourth = true\n", "the target is changed by the valid untracked edit")
+        assert.deepEqual(await statusesOf(workspace), ["diverged"], "the old diverged evidence remains auditable")
+        assert.equal(JSON.stringify(untracked.agent.requests).includes("another conversation of this project"), false)
       })
     })
 

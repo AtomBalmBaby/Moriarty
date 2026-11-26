@@ -126,7 +126,7 @@ test("a complete tool result is stored before display fitting and the delivered 
 test("a failed call records its typed arguments, status, timing and structured error, and nothing claims it executed", async () => {
   await withProject("stage1-refused-attempt-", async (project) => {
     const call: ToolCall = { name: "edit_lines", args: { path: "src/a.ts", expected_hash: "xxh64:0000000000000000" } }
-    const refused: ToolErrorDetail = { code: "hash_mismatch", message: "the file is not the version the call named", executed: false, current_hash: "xxh64:1111111111111111" }
+    const refused: ToolErrorDetail = { code: "stale_hash", message: "the file is not the version the call named", executed: false, current_hash: "xxh64:1111111111111111" }
     const result = { output: "the call was refused before anything ran", summary: "refused", failed: true, error: refused }
     assert.equal(isRecordableToolResult(call, result), true, "an attempt is recordable even though nothing executed")
     const input = toolObservationInput({ repository: project.repository, scope: project.scope }, call, result, "refused-edit")

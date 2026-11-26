@@ -23,7 +23,7 @@ const fixture = (files: Record<string, string>) => {
   return { root, view: new WorkspaceView(root) }
 }
 
-test("normal path resolution stays available and stale hashes remain hash_mismatch", async () => {
+test("normal path resolution stays available and stale hashes return stale_hash", async () => {
   const { root, view } = fixture({ "a.ts": "same\n" })
   const hash = await fingerprintContent("same\n")
   const exact = await resolveSourceTarget({ view }, {
@@ -42,7 +42,7 @@ test("normal path resolution stays available and stale hashes remain hash_mismat
     operation: "edit"
   })
   assert.equal(stale.ok, false)
-  if (!stale.ok) assert.equal(stale.detail.code, "hash_mismatch")
+  if (!stale.ok) assert.equal(stale.detail.code, "stale_hash")
   fs.rmSync(root, { recursive: true, force: true })
 })
 

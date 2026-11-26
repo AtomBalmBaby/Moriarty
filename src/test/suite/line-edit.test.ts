@@ -381,7 +381,7 @@ suite("Hash-verified native line edits", () => {
     const dirty = document.getText()
     const result = await applyDocumentLineEdits(file, await request(clean, [{ operation: "delete", start_line: 2, end_line: 2 }]))
     assert.strictEqual(result.ok, false)
-    assert.strictEqual(result.error?.code, "hash_mismatch")
+    assert.strictEqual(result.error?.code, "stale_hash")
     assert.strictEqual(result.error?.current_hash, await contentHash(dirty))
     assert.strictEqual(document.getText(), dirty, "the user's change is kept and no edit was made")
     assert.strictEqual(fs.readFileSync(file, "utf8"), clean, "nothing was saved")
@@ -473,7 +473,7 @@ suite("Hash-verified native line edits", () => {
     const listener = vscode.workspace.onDidChangeTextDocument((event) => { if (event.document === document && event.contentChanges.length) events++ })
     try {
       for (const [expected, edits, code] of [
-        [await contentHash("outdated"), [{ operation: "delete", start_line: 1, end_line: 1 }], "hash_mismatch"],
+        [await contentHash("outdated"), [{ operation: "delete", start_line: 1, end_line: 1 }], "stale_hash"],
         [await contentHash(original), [{ operation: "delete", start_line: 1, end_line: 1 }, { operation: "delete", start_line: 99, end_line: 99 }], "invalid_range"],
         [await contentHash(original), [{ operation: "delete", start_line: 1, end_line: 2 }, { operation: "delete", start_line: 2, end_line: 3 }], "overlapping_edits"]
       ] as const) {
@@ -499,7 +499,7 @@ suite("Hash-verified native line edits", () => {
       const result = await applyDocumentLineEdits(file, await request(original, [{ operation: "delete", start_line: 2, end_line: 2 }]))
       if (changed) await changed
       assert.strictEqual(result.ok, false, "a concurrent version change must not be overwritten")
-      assert.strictEqual(result.error?.code, "hash_mismatch")
+      assert.strictEqual(result.error?.code, "stale_hash")
       assert.ok(document.getText().includes("second"))
       assert.ok(document.getText().includes("user: "))
       assert.strictEqual(fs.readFileSync(file, "utf8"), original, "nothing was saved")
@@ -736,7 +736,7 @@ suite("Hash-verified native line edits", () => {
     const { calls, saw, refreshIndex } = refreshSpy(order)
     const result = await refreshSinkFor(ledger, refreshIndex).editLines!(file, { expected_hash: await contentHash("not this document"), edits: [{ operation: "replace", start_line: 1, end_line: 2, content: ["x"] }] }, true)
     assert.strictEqual(result.ok, false)
-    assert.strictEqual(result.error?.code, "hash_mismatch")
+    assert.strictEqual(result.error?.code, "stale_hash")
     assert.strictEqual(result.error?.current_hash, await contentHash(original))
     assert.deepStrictEqual(order, [], "the edit was refused before it was recorded")
     assert.deepStrictEqual(recorded, [])
@@ -756,7 +756,7 @@ suite("Hash-verified native line edits", () => {
     assert.ok(first.ok, first.message)
     const second = await sink.editLines!(file, { expected_hash: hash, edits: [{ operation: "delete", start_line: 3, end_line: 3 }] }, true)
     assert.strictEqual(second.ok, false)
-    assert.strictEqual(second.error?.code, "hash_mismatch")
+    assert.strictEqual(second.error?.code, "stale_hash")
     assert.deepStrictEqual(calls, [[{ path: file, kind: "write" }]], "only the edit that reached the file was refreshed")
     assert.deepStrictEqual(saw, ["first\nSECOND\nthird\nfourth\n"])
     assert.strictEqual(fs.readFileSync(file, "utf8"), "first\nSECOND\nthird\nfourth\n", "the second edit changed nothing")
@@ -849,7 +849,7 @@ suite("Hash-verified native line edits", () => {
     const result = await tools.run({ name: "edit_lines", args: { path: "source.txt", expected_hash: await contentHash(original), edits: [{ operation: "delete", start_line: 2, end_line: 2 }] } })
     assert.strictEqual(result.failed, true)
     const error = JSON.parse(result.output).error
-    assert.strictEqual(error.code, "hash_mismatch")
+    assert.strictEqual(error.code, "stale_hash")
     assert.strictEqual(error.current_hash, await contentHash(document.getText()))
     assert.strictEqual(document.getText(), "user: " + original)
   })
@@ -968,7 +968,7 @@ suite("Hash-verified native line edits", () => {
       edits: [{ operation: "replace", start_line: 1, end_line: 2, content: ["x"] }, { operation: "delete", start_line: 3, end_line: 4 }]
     })
     assert.strictEqual(result.ok, false, result.message)
-    assert.strictEqual(result.error?.code, "hash_mismatch")
+    assert.strictEqual(result.error?.code, "stale_hash")
     assert.strictEqual(result.error?.current_hash, await contentHash(original))
     assert.strictEqual(document.getText(), original, "the buffer is as it was")
     assert.strictEqual(fs.readFileSync(file, "utf8"), original, "nothing was saved")

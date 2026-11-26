@@ -147,24 +147,6 @@ const mcpAllowed = (team: TeamAgentPolicy | undefined) => team?.commands !== "of
  */
 const hostEditOwnerId = randomUUID()
 
-/** Names an unresolved edit that refuses another edit to its target, with the state and the next action. */
-const describeEditBlocker = (operation: UnresolvedEditOperation, conversationId: string, ownerId: string): string => {
-  const owner = operation.conversationId === conversationId ? "this conversation" : "another conversation of this project"
-  if (operation.ownerId !== ownerId) {
-    const liveness = operation.ownerLiveness === "live"
-      ? "the owner is reporting a live heartbeat"
-      : operation.ownerLiveness === "abandoned"
-        ? "the owner reported a terminated host"
-        : "the owner liveness is uncertain"
-    return `${operation.target} has unresolved edit ${operation.id} from ${owner} (${operation.status}), started by another VS Code window or an earlier session; ${liveness}. It is not taken over or retried here. Use Twinny: Recover unresolved edit operations for verified reconciliation or an explicit supersession decision. Reread the target before editing it again.`
-  }
-  if (isEditOperationInFlight(operation.id)) {
-    return `${operation.target} has edit ${operation.id} from ${owner} still running. Wait for it to settle before editing this target.`
-  }
-  const detail = operation.detail ? " " + operation.detail : ""
-  return `${operation.target} has unresolved edit ${operation.id} from ${owner} (${operation.status}).${detail} The edit was not retried. Reread the target before editing it again.`
-}
-
 /** How long an agent reply waits for the team's policy to be re-read. */
 const POLICY_REFRESH_WAIT_MS = 1500
 const PROVIDER_RESUME_DELAY_MS = 1000
@@ -2136,9 +2118,9 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
   }
 
   /**
-   * Records each edit before the editor is asked for it, with the active task when there is one. An unsettled edit on
-   * the same target in this project is reconciled first and refuses the new edit only while it remains unresolved.
-   * Without a conversation scope and a TODO store, the edit is refused rather than run unrecorded.
+   * Records each edit before the editor is asked for it, with the active task when there is one. Historical operation
+   * states are evidence only and never gate a new edit. Without a conversation scope and a TODO store, the edit is
+   * refused rather than run unrecorded.
    */
   private editOperationLedger(scope: TodoWriteRequest | undefined): EditOperationLedger {
     const repository = this._todoRepository
@@ -2148,7 +2130,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       }
     }
     return async (operation) => {
-      await this.clearEditTargetBlockers(scope, operation.target)
       const active = await repository.getActiveIntentContext(scope)
       await repository.beginEditOperation(scope, { ...operation, itemId: active?.task.id, ownerId: this._editOwnerId })
       return {
@@ -2159,25 +2140,6 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
         }
       }
     }
-  }
-
-  /**
-   * Refuses an edit while an unsettled operation in this project holds its target. The blockers are reconciled against
-   * the editor first, so a settled operation releases the target. A blocker that is still running or diverged throws
-   * a refusal that names the operation, its state, and the next action.
-   */
-  private async clearEditTargetBlockers(scope: TodoWriteRequest, target: string): Promise<void> {
-    const repository = this._todoRepository
-    if (!repository) return
-    const blockers = (await repository.listUnresolvedEditOperations(scope)).filter((operation) => operation.target === target)
-    if (!blockers.length) return
-    const liveForeign = blockers.find((operation) =>
-      operation.ownerId !== this._editOwnerId && operation.ownerLiveness === "live"
-    )
-    if (liveForeign) throw new Error(describeEditBlocker(liveForeign, scope.conversationId, this._editOwnerId))
-    await this.reconcileEditOperations(target)
-    const remaining = (await repository.listUnresolvedEditOperations(scope)).find((operation) => operation.target === target)
-    if (remaining) throw new Error(describeEditBlocker(remaining, scope.conversationId, this._editOwnerId))
   }
 
   /**

@@ -108,7 +108,7 @@ export class EditOperationRecoveryHost {
   async show(scope: TodoListRequest): Promise<void> {
     const operations = await this.list(scope)
     if (!operations.length) {
-      await vscode.window.showInformationMessage("Twinny: no unresolved edit operations block this project.")
+      await vscode.window.showInformationMessage("Twinny: no unresolved edit operations are recorded.")
       return
     }
     const picked = await vscode.window.showQuickPick(operations.map((operation) => {

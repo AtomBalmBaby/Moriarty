@@ -857,11 +857,11 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
     "content is an array of complete lines without newline characters (use [''] for a blank line). " +
     "Use `replace_text` for small modifications within an existing line, especially long lines. Supply the whole-file `expected_hash`, the original 1-based line number, and the exact substring to replace. Do not reproduce the complete line. Its fields are line, old_text and new_text: old_text must occur exactly once on that line, matching is literal and case-sensitive with no fallback to another line, an empty new_text removes the match, and neither operand may hold a newline. A missing or ambiguous match refuses the whole batch before anything changes. " +
     "Overlaps, same-boundary insertions and insertions touching a replaced/deleted boundary are rejected. " +
-    "Hash mismatch leaves everything unchanged and returns current_hash; reread, never retry blindly. " +
+    "A stale_hash leaves everything unchanged and returns current_hash; reread, never retry blindly. " +
     "Uses existing edit permissions; review/protected files require approval. Edits apply to the editor buffer, so the user's unsaved changes in the file are kept (and saved with it when save is true). The document is shown in an editor so diagnostics are checked: in background mode (the default) it is used in place if already open, otherwise shown as a preview tab without taking focus; in visible mode it is shown in a persistent tab that takes focus. By default (save true) the complete document is saved and read back: persisted is true, content_source is disk, and content_hash is the saved file's fingerprint, the expected_hash for the next edit to the same file. save false is only for when the task instructions ask for it and the editor mode is visible; otherwise it is refused with permission_denied and nothing changes. A save false edit is left unsaved for review: persisted is false, the file on disk is unchanged, and a build from disk does not include it. If saving fails the error code is save_failed: the edit stays in the unsaved editor buffer, the file on disk may not have it, and current_hash is the buffer's fingerprint.",
   guidance:
     "To change existing source: read_file for its numbered lines and content_hash, then call edit_lines with that expected_hash and the line operations. " +
-    "Use the content_hash it returns for the next edit to the same file. Reread only after a hash_mismatch, or when the lines you need were not in the last read. " +
+    "Use the content_hash it returns for the next edit to the same file. Reread only after a stale_hash, or when the lines you need were not in the last read. " +
     "Use `replace_text` for small modifications within an existing line, especially long lines. Supply the whole-file `expected_hash`, the original 1-based line number, and the exact substring to replace. Do not reproduce the complete line. " +
     "A file can also be named by the fingerprint read_file gave for it: with no path, expected_hash resolves the one current file it matches. When more than one file matches, nothing is chosen and the call is refused with ambiguous_hash.",
     // A fingerprint read_file gave can name the file on its own, when it matches exactly one.
@@ -941,7 +941,7 @@ const editLines = (view: WorkspaceView, apply: NonNullable<EditSink["editLines"]
       required_argument: source.detail.required_argument,
       candidates: source.detail.candidates,
       recovery: source.detail.recovery,
-      ...(source.detail.code === "hash_mismatch" ? { source_version: "unchanged", mutation_occurred: false } : {})
+      ...(source.detail.code === "stale_hash" || source.detail.code === "hash_mismatch" ? { source_version: "unchanged", mutation_occurred: false } : {})
     }))
     const absolute = source.absolute
     // A real boolean stays a boolean: false means do not save, and an absent field keeps the default.
@@ -1500,14 +1500,14 @@ export const workspaceTools = (
       }
       if (error instanceof LineEditError) {
         let detail = error.detail
-        if (detail.code === "hash_mismatch") {
+        if (detail.code === "stale_hash" || detail.code === "hash_mismatch") {
           detail = {
             ...detail,
             source_version: "unchanged",
             mutation_occurred: false
           }
         }
-        if (detail.code === "hash_mismatch" && context?.source?.absolute) {
+        if ((detail.code === "stale_hash" || detail.code === "hash_mismatch") && context?.source?.absolute) {
           const text = await view.text(context.source.absolute)
           if (text !== undefined) {
             const lines = linesOf(text)

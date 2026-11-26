@@ -579,7 +579,7 @@ export const editorEdits = (
         patches = await planLineEdits(document.getText(), request)
       } catch (error) {
         if (error instanceof LineEditError) {
-          if (error.detail.code === "hash_mismatch") {
+          if (error.detail.code === "stale_hash" || error.detail.code === "hash_mismatch") {
             const text = document.getText()
             const totalLines = text.length ? text.split(/\r\n|\r|\n/).length : 0
             const lines = request.edits

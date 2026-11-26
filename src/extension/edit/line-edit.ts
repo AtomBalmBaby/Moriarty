@@ -56,7 +56,7 @@ export const applyDocumentLineEdits = async (file: string, request: LineEditRequ
       if (persisted !== undefined && persisted !== document.getText()) {
         const hash = await contentHash(persisted)
         return failed(
-          "hash_mismatch",
+          "stale_hash",
           "The file changed outside the editor after it was opened. Reread it; no line edits were applied.",
           hash
         )
@@ -128,14 +128,14 @@ export const revealEditor = async (document: TextDocument, visibility: EditorVis
  */
 const applyTransaction = async (editor: TextEditor, document: TextDocument, version: number, original: string, patches: LinePatch[]): Promise<ChatEditOutcome | undefined> => {
   if (document.isClosed || document.version !== version) {
-    return failed("hash_mismatch", "The document changed after the edit was prepared; no line edits were applied. Reread it.", await contentHash(document.getText()))
+    return failed("stale_hash", "The document changed after the edit was prepared; no line edits were applied. Reread it.", await contentHash(document.getText()))
   }
   const applied = await editor.edit((builder) => {
     for (const patch of patches) builder.replace(new Range(document.positionAt(patch.start), document.positionAt(patch.end)), patch.text)
   }, { undoStopBefore: true, undoStopAfter: true })
   if (applied) return undefined
   if (document.getText() !== original) {
-    return failed("hash_mismatch", "The document changed during the transaction; no line edits were applied. Reread it.", await contentHash(document.getText()))
+    return failed("stale_hash", "The document changed during the transaction; no line edits were applied. Reread it.", await contentHash(document.getText()))
   }
   return failed("application_failed", "VS Code refused the line-edit transaction; no line edits were applied.")
 }

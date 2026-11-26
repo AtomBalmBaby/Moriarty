@@ -5,7 +5,7 @@ import { linesOf } from "./view"
 
 export const contentHash = fingerprintContent
 
-export type LineEditFailureCode = "hash_mismatch" | "invalid_range" | "overlapping_edits" | "document_unavailable" | "permission_denied" | "application_failed" | "save_failed" | "missing_target" | "invalid_hash" | "hash_not_found" | "ambiguous_hash" | "hash_unproven" | "malformed_arguments" | "missing_argument" | "invalid_argument_type"
+export type LineEditFailureCode = "stale_hash" | "hash_mismatch" | "invalid_range" | "overlapping_edits" | "document_unavailable" | "permission_denied" | "application_failed" | "save_failed" | "missing_target" | "invalid_hash" | "hash_not_found" | "ambiguous_hash" | "hash_unproven" | "malformed_arguments" | "missing_argument" | "invalid_argument_type"
 
 /** `disk` when the saved file's bytes were read back and match; `buffer` when the text was not read from disk (left unsaved, or the bytes cannot be compared). */
 export type ContentSource = "disk" | "buffer"
@@ -314,7 +314,7 @@ export const planLineEdits = async (text: string, request: LineEditRequest, eol 
   const matches = await verifyContentFingerprint(text, request.expected_hash)
   if (!matches) {
     const hash = await contentHash(text)
-    throw new LineEditError(lineEditFailure("hash_mismatch", "The document changed. Reread it before editing; no changes were applied.", hash))
+    throw new LineEditError(lineEditFailure("stale_hash", "The file changed. Reread it and use the current expected_hash; no changes were applied.", hash))
   }
   if (!Array.isArray(request.edits) || !request.edits.length) {
     throw new LineEditError(lineEditFailure(

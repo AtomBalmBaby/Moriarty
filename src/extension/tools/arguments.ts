@@ -26,6 +26,7 @@ export type ToolErrorCode =
   | "ambiguous_hash"
   | "hash_unproven"
   | "hash_mismatch"
+  | "stale_hash"
   | "permission_denied"
   | "invalid_argument_type"
   | "malformed_arguments"

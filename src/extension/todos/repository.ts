@@ -1615,8 +1615,8 @@ export class TodoRepository {
   }
 
   /**
-   * Records an editor mutation before it is dispatched. The unresolved-target check and the insert run in one write
-   * transaction, so two dispatches cannot both claim the same target.
+   * Records an editor mutation before it is dispatched. Historical operations are evidence only and never
+   * authorize or prohibit this insert.
    */
   beginEditOperation(request: TodoWriteRequest, input: EditOperationInput): Promise<EditOperationRecord> {
     assertWriter(request)
@@ -1626,8 +1626,6 @@ export class TodoRepository {
         const intentTask = rows<{ task_id: string }>(database, "SELECT task_id FROM todo_intent_tasks WHERE item_id = ? AND list_id = ? AND active = 1", [input.itemId, list.id])[0]
         if (!intentTask) throw new Error("Edit operations are limited to active Intent tasks")
       }
-      const unresolved = unresolvedEditTarget(database, list.project_id, input.target)
-      if (unresolved) throw new TodoConflictError(`Edit target ${input.target} has an unresolved operation ${unresolved.id}`)
       const timestamp = Date.now()
       const record: EditOperationRecord = { ...input, status: "dispatched", detail: "", createdAt: timestamp, updatedAt: timestamp }
       execute(database, "INSERT INTO todo_edit_operations(id, list_id, item_id, owner_id, target, mode, pre_digest, post_digest, status, detail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1676,8 +1674,8 @@ export class TodoRepository {
   }
 
   /**
-   * Reports a dispatched edit on the target in any conversation of this project. Edits without an active Intent task
-   * cannot be recorded, so the controller uses this to refuse them while an earlier dispatch is still unsettled.
+   * Reports unresolved edit evidence on the target in any conversation of this project. This lookup is audit-only;
+   * it does not authorize or prohibit a future edit.
    */
   findUnresolvedEditTarget(request: TodoListRequest, target: string): Promise<{ operationId: string; conversationId: string | null } | undefined> {
     return this.sqlite.read((database) => {
@@ -1735,7 +1733,7 @@ export class TodoRepository {
   }
 
   /**
-   * Explicitly removes unresolved blocking authority after a host-side or user recovery decision.
+   * Explicitly records a supersession decision after host-side or user recovery.
    * The operation row is never deleted or rewritten: this terminal status is paired with an audit event
    * that says exactly why it was superseded and does not claim the original mutation occurred.
    */

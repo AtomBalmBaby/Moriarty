@@ -5780,7 +5780,7 @@ test("the command_exit_status execution field accepts the two typed values and r
   assert.match(validateIntentTaskPlan(withExecution("after_activation", "historical")).diagnostic ?? "", /cannot be both historical and after_activation/)
 })
 
-test("an unresolved edit target blocks other conversations in the same project, but not other projects", async () => {
+test("historical edit operations do not block other conversations or projects", async () => {
   const state = await fixture([{ id: "edit-task", criteria: [semantic("edit-task", "The edit is applied")] }], false)
   try {
     const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
@@ -5793,20 +5793,63 @@ test("an unresolved edit target blocks other conversations in the same project, 
     const otherItemId = (await state.repository.getActiveIntentContext(otherConversation))!.task.id
     const blocked = { id: "edit-other", itemId: otherItemId, target: "src/shared.ts", mode: "apply" as const, preDigest: pre, postDigest: post }
     assert.deepEqual(await state.repository.findUnresolvedEditTarget(otherConversation, "src/shared.ts"), { operationId: "edit-owner", conversationId: "feedback-chat" })
-    await assert.rejects(state.repository.beginEditOperation(otherConversation, blocked), TodoConflictError, "another conversation cannot duplicate an unresolved edit in the same project")
-    assert.deepEqual((await state.repository.listDispatchedEditOperations(otherConversation)), [], "a refused edit is never recorded")
+    assert.equal((await state.repository.beginEditOperation(otherConversation, blocked)).status, "dispatched")
+    assert.deepEqual((await state.repository.listDispatchedEditOperations(otherConversation)).map((record) => record.id), ["edit-other"], "the second conversation records its own independent operation")
 
     const foreignProject = { projectFingerprint: workspaceProjectFingerprint(["file:///another-project"]), conversationId: "foreign-chat", writer: "foreign-chat" }
     await state.repository.synchronizeIntentPlan(foreignProject, plan([{ id: "foreign-task", criteria: [semantic("foreign-task", "The foreign edit is applied")] }], "Foreign goal"), { prompt: "Foreign goal" })
     const foreignItemId = (await state.repository.getActiveIntentContext(foreignProject))!.task.id
-    assert.equal(await state.repository.findUnresolvedEditTarget(foreignProject, "src/shared.ts"), undefined, "an unresolved edit does not block another project")
+    assert.equal(await state.repository.findUnresolvedEditTarget(foreignProject, "src/shared.ts"), undefined, "another project has no foreign audit row")
     assert.equal((await state.repository.beginEditOperation(foreignProject, { id: "edit-foreign", itemId: foreignItemId, target: "src/shared.ts", mode: "apply", preDigest: pre, postDigest: post })).status, "dispatched")
   } finally {
     removeAll(state.directory)
   }
 })
 
-test("edit operations are recorded before dispatch, settle once, and block only unresolved targets", async () => {
+test("hundreds of dispatched and diverged ledger records do not affect a valid edit", async () => {
+  const state = await fixture([{ id: "edit-task", criteria: [semantic("edit-task", "The edit is applied")] }], false)
+  try {
+    const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
+    const pre = editDigest("one\ntwo\n")
+    const post = editDigest("two\n")
+    for (let index = 0; index < 300; index++) {
+      const id = `old-edit-${index}`
+      const record = await state.repository.beginEditOperation(state.scope, {
+        id,
+        itemId,
+        target: "src/shared.ts",
+        mode: "apply",
+        preDigest: pre,
+        postDigest: post
+      })
+      assert.equal(record.status, "dispatched")
+      if (index % 2 === 0) {
+        assert.equal(await state.repository.settleProjectEditOperation(
+          state.scope,
+          id,
+          "dispatched",
+          "diverged",
+          "historical scratch operation"
+        ), true)
+      }
+    }
+    const fresh = await state.repository.beginEditOperation(state.scope, {
+      id: "fresh-after-hundreds",
+      itemId,
+      target: "src/shared.ts",
+      mode: "apply",
+      preDigest: pre,
+      postDigest: post
+    })
+    assert.equal(fresh.status, "dispatched")
+    assert.equal(await state.repository.settleEditOperation(state.scope, "fresh-after-hundreds", "succeeded", "valid scratch edit"), true)
+    assert.equal((await state.repository.listUnresolvedEditOperations(state.scope)).length, 300)
+  } finally {
+    removeAll(state.directory)
+  }
+})
+
+test("edit operations are recorded before dispatch and settle once without target locks", async () => {
   const state = await fixture([{ id: "edit-task", criteria: [semantic("edit-task", "The edit is applied")] }], false)
   try {
     const itemId = (await state.repository.getActiveIntentContext(state.scope))!.task.id
@@ -5815,24 +5858,24 @@ test("edit operations are recorded before dispatch, settle once, and block only 
     const operation = (id: string, target: string) => ({ id, itemId, target, mode: "apply" as const, preDigest: pre, postDigest: post })
 
     assert.equal((await state.repository.beginEditOperation(state.scope, operation("edit-1", "src/a.ts"))).status, "dispatched")
-    await assert.rejects(state.repository.beginEditOperation(state.scope, operation("edit-2", "src/a.ts")), TodoConflictError, "a second edit to an unresolved target is refused")
+    assert.equal((await state.repository.beginEditOperation(state.scope, operation("edit-2", "src/a.ts"))).status, "dispatched", "a second edit to the same target is recorded independently")
     await state.repository.beginEditOperation(state.scope, operation("edit-3", "src/b.ts"))
     await assert.rejects(state.repository.beginEditOperation(state.scope, { ...operation("edit-5", "src/c.ts"), itemId: "not-active" }), /limited to active Intent tasks/)
 
     assert.equal(await state.repository.settleEditOperation(state.scope, "edit-1", "succeeded", "applied"), true)
     assert.equal(await state.repository.settleEditOperation(state.scope, "edit-1", "failed", "late"), false, "a late settlement cannot overwrite a decided outcome")
     assert.equal(await state.repository.settleEditOperation(state.scope, "missing", "failed", ""), false)
-    assert.deepEqual((await state.repository.listDispatchedEditOperations(state.scope)).map((record) => record.id), ["edit-3"])
+    assert.deepEqual((await state.repository.listDispatchedEditOperations(state.scope)).map((record) => record.id), ["edit-2", "edit-3"], "unsettled operations remain independently auditable")
     await state.repository.beginEditOperation(state.scope, operation("edit-4", "src/a.ts"))
 
     const reopened = new TodoRepository(state.databasePath)
     await reopened.initialize()
-    assert.deepEqual((await reopened.listDispatchedEditOperations(state.scope)).map((record) => record.id), ["edit-3", "edit-4"], "unsettled operations survive reopen")
+    assert.deepEqual((await reopened.listDispatchedEditOperations(state.scope)).map((record) => record.id), ["edit-2", "edit-3", "edit-4"], "unsettled operations survive reopen")
     assert.equal(await reopened.settleEditOperation(state.scope, "edit-3", "reconciled_absent", "The editor buffer holds the original text."), true)
     assert.equal(await reopened.settleEditOperation(state.scope, "edit-3", "succeeded", "late"), false, "reconciliation decides the outcome once")
 
     withSqlite(state.databasePath, (database) => {
-      assert.deepEqual(sqliteRows(database, "SELECT id, status FROM todo_edit_operations ORDER BY id"), [["edit-1", "succeeded"], ["edit-3", "reconciled_absent"], ["edit-4", "dispatched"]])
+      assert.deepEqual(sqliteRows(database, "SELECT id, status FROM todo_edit_operations ORDER BY id"), [["edit-1", "succeeded"], ["edit-2", "dispatched"], ["edit-3", "reconciled_absent"], ["edit-4", "dispatched"]])
     })
   } finally {
     removeAll(state.directory)
@@ -5859,12 +5902,12 @@ test("project edit reconciliation settles an operation once and stays inside its
       state.repository.settleProjectEditOperation(state.scope, "reconcile-op", "dispatched", "reconciled_absent", "second reconciler")
     ])
     assert.equal(raced.filter(Boolean).length, 1, "exactly one reconciler wins the compare-and-set")
-    assert.deepEqual(await state.repository.listUnresolvedEditOperations(other), [], "a settled operation no longer blocks the project")
+    assert.deepEqual(await state.repository.listUnresolvedEditOperations(other), [], "a settled operation leaves no unresolved audit row")
     assert.equal(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), undefined)
 
     await state.repository.beginEditOperation(state.scope, { id: "reconcile-divergent", itemId, target: "src/race.ts", mode: "apply", preDigest: pre, postDigest: post })
     assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "dispatched", "diverged", "matches neither text"), true)
-    assert.deepEqual(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), { operationId: "reconcile-divergent", conversationId: state.scope.conversationId }, "a diverged operation keeps its target blocked")
+    assert.deepEqual(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), { operationId: "reconcile-divergent", conversationId: state.scope.conversationId }, "a diverged operation remains available as audit evidence")
     assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "dispatched", "reconciled_applied", "stale decision"), false, "a stale decision cannot release a diverged operation")
     assert.equal(await state.repository.settleProjectEditOperation(other, "reconcile-divergent", "diverged", "reconciled_applied", "The editor now holds the intended text."), true)
     assert.equal(await state.repository.findUnresolvedEditTarget(other, "src/race.ts"), undefined, "the editor matching the intended text releases the target")
