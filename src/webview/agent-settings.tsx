@@ -493,6 +493,7 @@ interface AgentSettingsProps {
   /** What the connected team's policy allows, if it sets agent rules. */
   team?: TeamAgentPolicy
   autoRun: boolean
+  autoRunAvailable: boolean
   setAutoRun: (on: boolean) => void
   onClose: () => void
   agentSelection: AgentSelection
@@ -505,7 +506,7 @@ interface AgentSettingsProps {
  * back to their settings; a rule the team sets shows, and cannot be
  * loosened here.
  */
-export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelection }: AgentSettingsProps) => {
+export const AgentSettings = ({ team, autoRun, autoRunAvailable, setAutoRun, onClose, agentSelection }: AgentSettingsProps) => {
   const { t } = useTranslation()
   const panel = useRef<HTMLDivElement>(null)
   const [edits, setEdits] = useSetting<string>("chatToolsEdits", "apply")
@@ -659,6 +660,20 @@ export const AgentSettings = ({ team, autoRun, setAutoRun, onClose, agentSelecti
           { value: "off", label: t("agent-settings-commands-off"), title: t("agent-settings-commands-off-title") }
         ]}
       />
+      {autoRunAvailable && (
+        <label className={styles.row}>
+          <span className={styles.label} title="Run approved commands without asking on later tool steps.">
+            {t("auto-run")}
+          </span>
+          <input
+            type="checkbox"
+            checked={autoRun}
+            disabled={team?.commands === "off" || !!team?.commands}
+            title={team?.commands ? "Controlled by the connected team's command policy." : t("auto-run-on-title")}
+            onChange={(event) => setAutoRun(event.target.checked)}
+          />
+        </label>
+      )}
       {!commandsOff && (
         <Choices
           label={t("agent-settings-run-in")}

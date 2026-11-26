@@ -8,7 +8,10 @@
  * reasoning together and answers in seconds, so a request with tools, or
  * a conversation that already holds tool calls, comes here.
  */
-import { getProviderOrigin } from "../../../common/provider-validation"
+import {
+  getProviderOrigin,
+  normalizeReasoningEffort
+} from "../../../common/provider-validation"
 import { TwinnyProvider } from "../../../common/types"
 import { diagnosticEvent } from "../../diagnostics"
 import { createInferenceTrace, startInferenceAttempt } from "../trace"
@@ -51,6 +54,10 @@ export async function* responsesChat(
   options?: InferenceOptions
 ): AsyncGenerator<ChatChunk> {
   const { instructions, input } = toResponsesInput(request.messages)
+  const reasoningEffort = normalizeReasoningEffort(
+    config.provider,
+    request.reasoningEffort ?? config.reasoningEffort
+  )
   const body = {
     model: request.model || config.modelName,
     input,
@@ -67,8 +74,8 @@ export async function* responsesChat(
           }))
         }
       : {}),
-    ...(request.reasoningEffort
-      ? { reasoning: { effort: request.reasoningEffort } }
+    ...(reasoningEffort
+      ? { reasoning: { effort: reasoningEffort } }
       : {}),
     ...(request.maxTokens !== undefined && request.maxTokens > 0
       ? { max_output_tokens: request.maxTokens }

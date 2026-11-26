@@ -28,6 +28,7 @@ import {
   normalizeProvider,
   PROVIDER_TYPES,
   ProviderField,
+  supportsReasoningEffort,
   supportsType,
   validateProvider
 } from "../../common/provider-validation"
@@ -601,7 +602,7 @@ export const ProviderForm = ({ initial, onClose, onSaved }: ProviderFormProps) =
               : undefined
       )}
 
-      {isChatGPTPlan && (
+      {(isChatGPTPlan || ((draft.type === "chat" || draft.type === "intent") && supportsReasoningEffort(draft.provider))) && (
         <>
           {field(
             "reasoningEffort",
@@ -616,14 +617,18 @@ export const ProviderForm = ({ initial, onClose, onSaved }: ProviderFormProps) =
                 })
               }
             >
-              <VSCodeOption value="">Model default</VSCodeOption>
-              <VSCodeOption value="none">None (fastest)</VSCodeOption>
-              <VSCodeOption value="minimal">Minimal</VSCodeOption>
+              <VSCodeOption value="">Auto</VSCodeOption>
+              {(isChatGPTPlan || draft.provider === API_PROVIDERS.OpenAI || draft.provider === API_PROVIDERS.Ollama) && (
+                <VSCodeOption value="none">Off</VSCodeOption>
+              )}
+              {isChatGPTPlan && <VSCodeOption value="minimal">Minimal</VSCodeOption>}
               <VSCodeOption value="low">Low</VSCodeOption>
               <VSCodeOption value="medium">Medium</VSCodeOption>
-              <VSCodeOption value="high">High</VSCodeOption>
-              <VSCodeOption value="xhigh">Extra high</VSCodeOption>
-              <VSCodeOption value="max">Maximum</VSCodeOption>
+              <VSCodeOption value="high">
+                {draft.provider === API_PROVIDERS.OpenAICompatible ? "High / xhigh" : "High"}
+              </VSCodeOption>
+              <VSCodeOption value="xhigh">Extra high / xhigh</VSCodeOption>
+              {isChatGPTPlan && <VSCodeOption value="max">Maximum</VSCodeOption>}
             </VSCodeDropdown>,
             draft.type === "fim"
               ? "Lower effort usually reduces inline-completion latency. Supported values depend on the selected model."

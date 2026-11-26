@@ -187,7 +187,7 @@ export const getEndpointDefaults = (
 const trim = (value: unknown) =>
   typeof value === "string" ? value.trim() : ""
 
-const REASONING_EFFORTS = [
+export const REASONING_EFFORTS = [
   "none",
   "minimal",
   "low",
@@ -197,14 +197,50 @@ const REASONING_EFFORTS = [
   "max"
 ] as const
 
-const reasoningEffort = (
+export const supportsReasoningEffort = (providerName: string): boolean =>
+  providerName === API_PROVIDERS.OpenAI ||
+  providerName === API_PROVIDERS.ChatGPTPlan ||
+  providerName === API_PROVIDERS.Ollama ||
+  providerName === API_PROVIDERS.OpenAICompatible ||
+  providerName === API_PROVIDERS.Deepseek ||
+  providerName === API_PROVIDERS.Groq ||
+  providerName === API_PROVIDERS.LiteLLM ||
+  providerName === API_PROVIDERS.LMStudio ||
+  providerName === API_PROVIDERS.OpenRouter ||
+  providerName === API_PROVIDERS.OpenWebUI
+
+export const normalizeReasoningEffort = (
+  providerName: string,
   value: unknown
-): TwinnyProvider["reasoningEffort"] =>
-  REASONING_EFFORTS.includes(
-    trim(value) as (typeof REASONING_EFFORTS)[number]
-  )
-    ? (trim(value) as TwinnyProvider["reasoningEffort"])
+): TwinnyProvider["reasoningEffort"] => {
+  const effort = trim(value)
+  if (!REASONING_EFFORTS.includes(effort as (typeof REASONING_EFFORTS)[number])) {
+    return undefined
+  }
+
+  if (providerName === API_PROVIDERS.ChatGPTPlan) {
+    return effort as TwinnyProvider["reasoningEffort"]
+  }
+  if (providerName === API_PROVIDERS.OpenAI) {
+    return effort === "max"
+      ? "xhigh"
+      : effort as TwinnyProvider["reasoningEffort"]
+  }
+  if (providerName === API_PROVIDERS.Ollama) {
+    return ["none", "low", "medium", "high", "xhigh"].includes(effort)
+      ? effort as TwinnyProvider["reasoningEffort"]
+      : undefined
+  }
+  if (providerName === API_PROVIDERS.OpenAICompatible) {
+    if (effort === "high") return "xhigh"
+    return ["low", "medium", "xhigh"].includes(effort)
+      ? effort as TwinnyProvider["reasoningEffort"]
+      : undefined
+  }
+  return ["low", "medium", "high", "xhigh", "none"].includes(effort)
+    ? effort as TwinnyProvider["reasoningEffort"]
     : undefined
+}
 
 /** Junk stays NaN rather than vanishing, so validation can point at it. */
 const parsePort = (value: unknown): number | undefined => {
@@ -302,7 +338,13 @@ export const normalizeProvider = (input: TwinnyProvider): TwinnyProvider => {
     normalized.apiKey = ""
     normalized.apiProtocol = "https"
     normalized.fimTemplate = undefined
-    normalized.reasoningEffort = reasoningEffort(input.reasoningEffort)
+  }
+
+  if (supportsReasoningEffort(providerName)) {
+    normalized.reasoningEffort = normalizeReasoningEffort(
+      providerName,
+      input.reasoningEffort
+    )
   }
 
   return normalized

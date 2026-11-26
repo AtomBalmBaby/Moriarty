@@ -4,7 +4,7 @@ import { Virtuoso, VirtuosoHandle } from "react-virtuoso"
 import Placeholder from "@tiptap/extension-placeholder"
 import { Editor, EditorContent, JSONContent, useEditor } from "@tiptap/react"
 import StarterKit from "@tiptap/starter-kit"
-import { VSCodeButton, VSCodePanelView } from "@vscode/webview-ui-toolkit/react"
+import { VSCodeButton, VSCodeDropdown, VSCodeOption, VSCodePanelView } from "@vscode/webview-ui-toolkit/react"
 import * as cheerio from "cheerio"
 import cx from "classnames"
 import { Markdown as TiptapMarkdown } from "tiptap-markdown"
@@ -12,13 +12,14 @@ import { v4 as uuidv4 } from "uuid"
 
 import type { AgentProfileSummary, AgentSelection } from "../common/agents"
 import { AGENT_GLYPHS, agentGlyphState, nextAgentSelection, withAgentSelection } from "../common/agents"
-import { ASSISTANT, EVENT_NAME, TODO_EVENT_NAME, USER } from "../common/constants"
+import { API_PROVIDERS, ASSISTANT, EVENT_NAME, TODO_EVENT_NAME, USER } from "../common/constants"
 import { exportEntireChat } from "../common/conversation-export"
 import { PROMPT_COMPILER_ENABLED_KEY } from "../common/feedback-settings"
 import { isStaleTodoSnapshot } from "../common/guards"
 import { CARRY_ON_PROMPT, CONTINUE_PROMPT } from "../common/messaging/chat-continuation"
 import { shouldResumeQueuedChat } from "../common/messaging/chat-stop"
 import type { EntireChatAction, PromptCompileResult } from "../common/messaging/protocol"
+import { isChatGPTPlanProvider, supportsReasoningEffort } from "../common/provider-validation"
 import { buildChatRows, type ChatRow } from "../common/reply-parts"
 import { attachLateSteps } from "../common/reply-steps"
 import { messageText } from "../common/text"
@@ -30,8 +31,8 @@ import {
   ReplyChangesView,
   TodoFeedbackStatus,
   TodoListSnapshot,
-  ToolStepView
-} from "../common/types"
+  ToolStepView,
+  TwinnyProvider} from "../common/types"
 
 import { useAgentMode } from "./hooks/useAgentMode"
 import { useAutoRun } from "./hooks/useAutoRun"
@@ -167,7 +168,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const [messages, setMessages] = useState<ChatCompletionMessage[]>([])
   // Nothing can answer without a chat provider, so the composer is off
   // until one is set; the empty transcript says where to set it.
-  const { chatProvider, ready: providersReady } = useProviders()
+  const { chatProvider, ready: providersReady, updateProvider } = useProviders()
   const contextWindow = useContextWindow(chatProvider, messages.length)
   const chatDisabled = providersReady && !chatProvider
   const [completion, setCompletion] = useState<ChatCompletionMessage | null>()
@@ -222,7 +223,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
   const agentMenuItemsRef = useRef<Array<HTMLButtonElement | null>>([])
   const agentModeRef = useRef(agentMode)
   agentModeRef.current = agentMode
-  const { autoRun, autoRunAvailable, toggleAutoRun, setAutoRun } = useAutoRun(teamAgentRules)
+  const { autoRun, autoRunAvailable, setAutoRun } = useAutoRun(teamAgentRules)
   const [agentSettingsOpen, setAgentSettingsOpen] = useState(false)
   const [promptCompilerEnabled, setPromptCompilerEnabled] = useState(false)
   const promptCompilerEnabledRef = useRef(false)
@@ -1750,7 +1751,7 @@ export const Chat = (props: ChatProps): JSX.Element => {
         <div className={cx(styles.composer, { [styles.agentBusy]: agentMode && (isLoading || generatingRef.current) })}>
           {showShortcuts && <Shortcuts />}
           {agentSettingsOpen && (
-            <AgentSettings team={teamAgentRules} autoRun={autoRun} setAutoRun={setAutoRun} onClose={closeAgentSettings} agentSelection={agentSelection} />
+            <AgentSettings team={teamAgentRules} autoRun={autoRun} autoRunAvailable={autoRunAvailable} setAutoRun={setAutoRun} onClose={closeAgentSettings} agentSelection={agentSelection} />
           )}
           {!!queued.length && (
             <ol className={styles.queue} aria-label={t("queued-title")}>
@@ -1960,19 +1961,41 @@ export const Chat = (props: ChatProps): JSX.Element => {
                   <span className={styles.switchKey}>{t("agent-mode-key")}</span>
                 </div>
                 {(agentPickerError || agentPreferenceError) && <span id="agent-picker-status" className={styles.agentPickerError} role="status" title={agentPickerError || agentPreferenceError}>{agentPickerError || agentPreferenceError}</span>}
-                {autoRunAvailable && (
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={autoRun}
-                    disabled={chatDisabled || !agentMode}
-                    className={cx(styles.agentToggle, { [styles.agentToggleOn]: autoRun })}
-                    onClick={toggleAutoRun}
-                    title={t(autoRun ? "auto-run-on-title" : "auto-run-off-title")}
+                {chatProvider && supportsReasoningEffort(chatProvider.provider) && (
+                  <VSCodeDropdown
+                    className={styles.reasoningEffort}
+                    aria-label="Reasoning effort"
+                    title="Reasoning effort"
+                    value={chatProvider.reasoningEffort || ""}
+                    onChange={(event: unknown) => {
+                      const value = (event as React.ChangeEvent<HTMLSelectElement>).target.value
+                      void updateProvider({
+                        ...chatProvider,
+                        reasoningEffort: value
+                          ? (value as TwinnyProvider["reasoningEffort"])
+                          : undefined
+                      })
+                    }}
                   >
-                    <span className="codicon codicon-terminal" aria-hidden="true" />
-                    <span className={styles.switchLabel}>{t("auto-run")}</span>
-                  </button>
+                    <VSCodeOption value="">Auto</VSCodeOption>
+                    {(isChatGPTPlanProvider(chatProvider.provider) ||
+                      chatProvider.provider === API_PROVIDERS.OpenAI ||
+                      chatProvider.provider === API_PROVIDERS.Ollama) && (
+                      <VSCodeOption value="none">Off</VSCodeOption>
+                    )}
+                    {isChatGPTPlanProvider(chatProvider.provider) && (
+                      <VSCodeOption value="minimal">Minimal</VSCodeOption>
+                    )}
+                    <VSCodeOption value="low">Low</VSCodeOption>
+                    <VSCodeOption value="medium">Medium</VSCodeOption>
+                    <VSCodeOption value="high">
+                      {chatProvider.provider === API_PROVIDERS.OpenAICompatible ? "High / xhigh" : "High"}
+                    </VSCodeOption>
+                    <VSCodeOption value="xhigh">Extra high / xhigh</VSCodeOption>
+                    {isChatGPTPlanProvider(chatProvider.provider) && (
+                      <VSCodeOption value="max">Maximum</VSCodeOption>
+                    )}
+                  </VSCodeDropdown>
                 )}
 
               </div>

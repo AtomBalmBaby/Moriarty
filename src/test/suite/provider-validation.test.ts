@@ -7,6 +7,7 @@ import {
   hasConfigurableEndpoint,
   isProviderLike,
   normalizeProvider,
+  normalizeReasoningEffort,
   summarizeProvider,
   supportsType,
   usesEndpoint,
@@ -97,6 +98,42 @@ suite("Provider validation", () => {
       })
       assert.strictEqual(result.fimTemplate, undefined)
       assert.strictEqual(result.repositoryLevel, undefined)
+    })
+
+    test("serializes and restores Medium for an OpenAI-compatible provider", () => {
+      const result = normalizeProvider({
+        ...ollamaChat,
+        provider: API_PROVIDERS.OpenAICompatible,
+        reasoningEffort: "medium"
+      })
+      assert.strictEqual(result.reasoningEffort, "medium")
+      assert.strictEqual(
+        normalizeProvider(JSON.parse(JSON.stringify(result))).reasoningEffort,
+        "medium"
+      )
+    })
+
+    test("normalizes provider-specific and unsupported reasoning values", () => {
+      assert.strictEqual(
+        normalizeReasoningEffort(API_PROVIDERS.OpenAICompatible, "high"),
+        "xhigh"
+      )
+      assert.strictEqual(
+        normalizeReasoningEffort(API_PROVIDERS.OpenAI, "none"),
+        "none"
+      )
+      assert.strictEqual(
+        normalizeReasoningEffort(API_PROVIDERS.Ollama, "none"),
+        "none"
+      )
+      assert.strictEqual(
+        normalizeReasoningEffort(API_PROVIDERS.Qvac, "medium"),
+        undefined
+      )
+      assert.strictEqual(
+        normalizeReasoningEffort(API_PROVIDERS.Ollama, "minimal"),
+        undefined
+      )
     })
 
     test("falls back to chat for an unknown type", () => {

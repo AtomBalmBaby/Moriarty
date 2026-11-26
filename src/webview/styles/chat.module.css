@@ -606,6 +606,13 @@
   overflow: visible;
 }
 
+.reasoningEffort {
+  width: 108px;
+  max-width: 108px;
+  flex-shrink: 0;
+  font-size: var(--tw-fs-xs);
+}
+
 @container (max-width: 380px) {
   .switchKey {
     display: none;

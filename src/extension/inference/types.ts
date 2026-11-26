@@ -141,12 +141,10 @@ export interface ChatRequest {
    */
   think?: boolean
   /**
-   * How long a reasoning model may think before answering, on OpenAI.
-   * Its chat route streams nothing while it thinks, so a tool loop asks
-   * for `low` to keep each step to seconds. Models that do not reason
-   * refuse the parameter.
+   * How long a reasoning model may think before answering. Provider adapters
+   * normalize or omit this for their supported request dialect.
    */
-  reasoningEffort?: "low" | "medium" | "high"
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
   /**
    * `json` asks the server for a JSON object (structured output) where the
    * provider supports it. Servers that refuse it get the plain request.

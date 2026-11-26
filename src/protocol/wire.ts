@@ -329,7 +329,7 @@ const parseTools = (value: unknown): ChatRequest["tools"] => {
   return tools.length ? tools : undefined
 }
 
-const REASONING_EFFORTS = ["low", "medium", "high"]
+const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 export const parseFimRequest = (input: unknown): FimRequest => {
   const body = requireRecord(input)

@@ -34,6 +34,7 @@ import {
 import { formatCount, logger, redact } from "../../common/logger"
 import { isContinuationText, isResumableReply, requestBehindContinuation } from "../../common/messaging/chat-continuation"
 import type { ChatContinuation, ComposerTurn, ContextWindowStatus, PromptCompileRequest, PromptCompileResult, ToolInventoryItem } from "../../common/messaging/protocol"
+import { normalizeReasoningEffort } from "../../common/provider-validation"
 import type { TeamAgentPolicy } from "../../common/team"
 import { currentTeamPolicy, currentTeamState } from "../../common/team-policy"
 import { kebabToSentence } from "../../common/text"
@@ -56,6 +57,7 @@ import type { EditorVisibility } from "../edit/line-edit"
 import type { ChatEditMode } from "../edit/service"
 import { WorkspaceSearch } from "../embeddings/search"
 import { GenerationRun, GenerationTracker } from "../generations"
+import type { ChatRequest } from "../inference"
 import { isCancelled, isRetryableProviderFailure, readReply, readText, resolveAgentInferenceProvider, resolveInferenceProvider } from "../inference"
 import {
   contextCapacityOf,
@@ -1567,6 +1569,17 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
     }
   }
 
+  private reasoningEffortFor(provider: TwinnyProvider): ChatRequest["reasoningEffort"] {
+    const selected = normalizeReasoningEffort(
+      provider.provider,
+      provider.reasoningEffort
+    )
+    if (selected) return selected
+    // Preserve the native OpenAI tool-loop default; Auto omits the field for
+    // ordinary chat and all other provider types unless configured explicitly.
+    return provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined
+  }
+
   private async recordRuntimeInventory(scope: TodoWriteRequest, itemId: string, tools: WorkspaceTools): Promise<void> {
     const names = tools.tools.map((tool) => tool.name).sort()
     const signature = names.join("\n")
@@ -2701,7 +2714,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       maxNoProgressSteps: this.clampedNoProgressSteps(),
       ...this.generationOptions(),
       maxResultChars,
-      reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
+      reasoningEffort: this.reasoningEffortFor(provider),
       contextWindow: () => this.contextCapacity(provider),
       onContext: (entry) => this.observeContext(provider, conversationId, entry),
       stepLines: false,
@@ -2945,9 +2958,7 @@ this._bridge.handle(EVENT_NAME.twinnyToolInventory, async () => {
       maxNoProgressSteps: this.clampedNoProgressSteps(),
       ...this.generationOptions(),
       maxResultChars,
-      // OpenAI's reasoning models think silently on the chat route; at their
-      // default effort one tool step can take minutes.
-      reasoningEffort: provider.provider === API_PROVIDERS.OpenAI ? "low" : undefined,
+      reasoningEffort: this.reasoningEffortFor(provider),
       contextWindow: () => this.contextCapacity(provider),
       onContext: (entry) => this.observeContext(provider, conversationId, entry),
       stepLines: false,

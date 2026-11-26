@@ -14,7 +14,9 @@ import {
 import { API_PROVIDERS } from "../../../common/constants"
 import {
   getProviderOrigin,
-  isOpenAICompatibleProvider
+  isOpenAICompatibleProvider,
+  normalizeReasoningEffort,
+  supportsReasoningEffort
 } from "../../../common/provider-validation"
 import { TwinnyProvider } from "../../../common/types"
 import { diagnosticEvent } from "../../diagnostics"
@@ -223,46 +225,54 @@ const supportsJsonObjectMode = (provider: TwinnyProvider) =>
   (isOpenAICompatibleProvider(provider.provider) &&
     provider.provider !== API_PROVIDERS.Qvac)
 
-/**
- * Only real API parameters: OpenAI rejects unknown ones such as an `id`.
- * `think: false` is sent as OpenAI's own `reasoning_effort: "none"`, which
- * Ollama's OpenAI-style route honours (it ignores a `think` field there,
- * checked against 0.33). Only Ollama gets it for now: OpenAI refuses
- * `none` for models that do not reason, and other servers vary.
- */
+/** Only real, provider-supported API parameters. */
 const requestParameters = (
   provider: TwinnyProvider,
-  request: ChatParameters
-) => ({
-  ...(request.maxTokens !== undefined ? { max_tokens: request.maxTokens } : {}),
-  ...(request.temperature !== undefined
-    ? { temperature: request.temperature }
-    : {}),
-  ...(request.think === false && provider.provider === API_PROVIDERS.Ollama
-    ? { reasoning_effort: "none" as const }
-    : {}),
-  ...(request.reasoningEffort && provider.provider === API_PROVIDERS.OpenAI
-    ? { reasoning_effort: request.reasoningEffort }
-    : {}),
-  ...(request.responseFormat === "json" && supportsJsonObjectMode(provider)
-    ? { response_format: { type: "json_object" as const } }
-    : {}),
-  ...(request.tools?.length
-    ? {
-        tools: request.tools.map((tool) => ({
-          type: "function" as const,
-          function: {
-            name: tool.name,
-            description: tool.description,
-            parameters:
-              provider.provider === API_PROVIDERS.LlamaCpp
-                ? llamaCppSchema(tool.parameters)
-                : tool.parameters
-          }
-        }))
-      }
-    : {})
-})
+  request: ChatParameters,
+  omitReasoningEffort = false
+) => {
+  let reasoningEffort: TwinnyProvider["reasoningEffort"] | undefined
+  if (
+    !omitReasoningEffort &&
+    !refusedReasoningEffort.has(serverKey(provider)) &&
+    supportsReasoningEffort(provider.provider)
+  ) {
+    if (request.think === false && provider.provider === API_PROVIDERS.Ollama) {
+      reasoningEffort = "none"
+    } else {
+      reasoningEffort = normalizeReasoningEffort(
+        provider.provider,
+        request.reasoningEffort ?? provider.reasoningEffort
+      )
+    }
+  }
+
+  return {
+    ...(request.maxTokens !== undefined ? { max_tokens: request.maxTokens } : {}),
+    ...(request.temperature !== undefined
+      ? { temperature: request.temperature }
+      : {}),
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    ...(request.responseFormat === "json" && supportsJsonObjectMode(provider)
+      ? { response_format: { type: "json_object" as const } }
+      : {}),
+    ...(request.tools?.length
+      ? {
+          tools: request.tools.map((tool) => ({
+            type: "function" as const,
+            function: {
+              name: tool.name,
+              description: tool.description,
+              parameters:
+                provider.provider === API_PROVIDERS.LlamaCpp
+                  ? llamaCppSchema(tool.parameters)
+                  : tool.parameters
+            }
+          }))
+        }
+      : {})
+  }
+}
 
 type ToolCallDelta = {
   index?: number
@@ -330,6 +340,17 @@ const serverKey = (provider: TwinnyProvider) =>
 
 /** Servers that turned `stream_options` down; it is not sent to them again. */
 const refusedStreamOptions = new Set<string>()
+/** Servers that rejected `reasoning_effort`; it is not sent to them again. */
+const refusedReasoningEffort = new Set<string>()
+
+const rejectedReasoningEffort = (error: unknown) => {
+  const text = error instanceof Error ? error.message : String(error)
+  if (/reasoning_effort|reasoning effort|unsupported.*reasoning|unknown.*reasoning|invalid.*reasoning/i.test(text)) {
+    return true
+  }
+  const status = (error as { status?: number })?.status
+  return status === 400 || status === 422
+}
 
 /**
  * OpenAI-style servers count a streamed request's tokens only when asked
@@ -573,7 +594,8 @@ const withCacheBreakpoints = (messages: ChatMessage[]): ChatMessage[] => {
 export const buildStreamingRequest = (
   provider: TwinnyProvider,
   messages: ChatMessage[],
-  parameters: ChatParameters = {}
+  parameters: ChatParameters = {},
+  omitReasoningEffort = false
 ): CompletionStreaming<LLMProvider> => {
   const flat = ensureContentForCompatibility(
     parsableToolArguments(flattenTextContent(messages))
@@ -595,14 +617,15 @@ export const buildStreamingRequest = (
     ...(asksForUsage(provider)
       ? { stream_options: { include_usage: true } }
       : {}),
-    ...requestParameters(provider, parameters)
+    ...requestParameters(provider, parameters, omitReasoningEffort)
   } as CompletionStreaming<LLMProvider>
 }
 
 export const buildBlockingRequest = (
   provider: TwinnyProvider,
   messages: ChatMessage[],
-  parameters: ChatParameters = {}
+  parameters: ChatParameters = {},
+  omitReasoningEffort = false
 ): CompletionNonStreaming<LLMProvider> => {
   const prepared = withReasoningHistory(
     provider,
@@ -623,7 +646,7 @@ export const buildBlockingRequest = (
     model: provider.modelName,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     provider: getFluencyProvider(provider) as any,
-    ...requestParameters(provider, parameters)
+    ...requestParameters(provider, parameters, omitReasoningEffort)
   }
 }
 
@@ -689,62 +712,99 @@ export async function* fluencyChat(
         attempt.finish("cancelled", error)
         throw error
       }
-      // A strict server that does not know `stream_options` says so by
-      // name; it is asked again without, and not asked for counts again.
-      const asked = "stream_options" in body
-      if (
-        !asked ||
-        !/stream_options|include_usage/i.test(
-          error instanceof Error ? error.message : String(error)
-        )
-      ) {
-        attempt.finish(options?.signal?.aborted ? "cancelled" : "failed", error)
-        throw error
-      }
-      attempt.finish("retrying-compatibility", error)
-      refusedStreamOptions.add(serverKey(config))
-      attemptNumber++
-      inferenceEvent("provider_attempt.retry_decision", {
-        operation_id: trace.operationId,
-        request_id: trace.requestId,
-        failed_attempt_id: attempt.attemptId,
-        next_attempt_number: attemptNumber,
-        reason: "stream-options-unsupported",
-        retry_bounded: true
-      })
-      if (options?.signal?.aborted) {
-        throw new DOMException("The request was cancelled.", "AbortError")
-      }
-      attempt = startSdkAttempt(
-        trace,
-        config,
-        request,
-        attemptNumber,
-        options?.signal
-      )
-      try {
-        parts = await client.chat.completions.create(
-          buildStreamingRequest(config, messages, request)
-        )
+      const askedReasoningEffort = "reasoning_effort" in body
+      const rejection = rejectedReasoningEffort(error)
+      if (askedReasoningEffort && rejection) {
+        attempt.finish("retrying-compatibility", error)
+        refusedReasoningEffort.add(serverKey(config))
+        attemptNumber++
+        inferenceEvent("provider_attempt.retry_decision", {
+          operation_id: trace.operationId,
+          request_id: trace.requestId,
+          failed_attempt_id: attempt.attemptId,
+          next_attempt_number: attemptNumber,
+          reason: "reasoning-effort-unsupported",
+          retry_bounded: true
+        })
         if (options?.signal?.aborted) {
-          inferenceEvent(
-            "provider_attempt.late_response",
-            {
-              operation_id: trace.operationId,
-              request_id: trace.requestId,
-              attempt_id: attempt.attemptId,
-              reason: "cancelled-before-sdk-response"
-            },
-            "warn"
-          )
-          return
+          throw new DOMException("The request was cancelled.", "AbortError")
         }
-      } catch (retryError) {
-        attempt.finish(
-          options?.signal?.aborted ? "cancelled" : "failed",
-          retryError
+        attempt = startSdkAttempt(
+          trace,
+          config,
+          request,
+          attemptNumber,
+          options?.signal
         )
-        throw retryError
+        try {
+          parts = await client.chat.completions.create(
+            buildStreamingRequest(config, messages, request, true)
+          )
+        } catch (retryError) {
+          attempt.finish(
+            options?.signal?.aborted ? "cancelled" : "failed",
+            retryError
+          )
+          throw retryError
+        }
+      } else {
+        // A strict server that does not know `stream_options` says so by
+        // name; it is asked again without, and not asked for counts again.
+        const asked = "stream_options" in body
+        if (
+          !asked ||
+          !/stream_options|include_usage/i.test(
+            error instanceof Error ? error.message : String(error)
+          )
+        ) {
+          attempt.finish(options?.signal?.aborted ? "cancelled" : "failed", error)
+          throw error
+        }
+        attempt.finish("retrying-compatibility", error)
+        refusedStreamOptions.add(serverKey(config))
+        attemptNumber++
+        inferenceEvent("provider_attempt.retry_decision", {
+          operation_id: trace.operationId,
+          request_id: trace.requestId,
+          failed_attempt_id: attempt.attemptId,
+          next_attempt_number: attemptNumber,
+          reason: "stream-options-unsupported",
+          retry_bounded: true
+        })
+        if (options?.signal?.aborted) {
+          throw new DOMException("The request was cancelled.", "AbortError")
+        }
+        attempt = startSdkAttempt(
+          trace,
+          config,
+          request,
+          attemptNumber,
+          options?.signal
+        )
+        try {
+          parts = await client.chat.completions.create(
+            buildStreamingRequest(config, messages, request)
+          )
+          if (options?.signal?.aborted) {
+            inferenceEvent(
+              "provider_attempt.late_response",
+              {
+                operation_id: trace.operationId,
+                request_id: trace.requestId,
+                attempt_id: attempt.attemptId,
+                reason: "cancelled-before-sdk-response"
+              },
+              "warn"
+            )
+            return
+          }
+        } catch (retryError) {
+          attempt.finish(
+            options?.signal?.aborted ? "cancelled" : "failed",
+            retryError
+          )
+          throw retryError
+        }
       }
     }
     if (options?.signal?.aborted) {
@@ -858,7 +918,8 @@ export async function* fluencyChat(
   if (options?.signal?.aborted) {
     throw new DOMException("The request was cancelled.", "AbortError")
   }
-  const attempt = startSdkAttempt(trace, config, request, 1, options?.signal)
+  let attemptNumber = 1
+  let attempt = startSdkAttempt(trace, config, request, attemptNumber, options?.signal)
   let result: Awaited<ReturnType<typeof client.chat.completions.create>>
   try {
     result = await client.chat.completions.create(body)
@@ -878,8 +939,43 @@ export async function* fluencyChat(
     }
     attempt.finish("completed")
   } catch (error) {
-    attempt.finish(options?.signal?.aborted ? "cancelled" : "failed", error)
-    throw error
+    const rejection = rejectedReasoningEffort(error)
+    if (
+      options?.signal?.aborted ||
+      !("reasoning_effort" in body) ||
+      !rejection
+    ) {
+      attempt.finish(options?.signal?.aborted ? "cancelled" : "failed", error)
+      throw error
+    }
+    attempt.finish("retrying-compatibility", error)
+    refusedReasoningEffort.add(serverKey(config))
+    attemptNumber++
+    inferenceEvent("provider_attempt.retry_decision", {
+      operation_id: trace.operationId,
+      request_id: trace.requestId,
+      failed_attempt_id: attempt.attemptId,
+      next_attempt_number: attemptNumber,
+      reason: "reasoning-effort-unsupported",
+      retry_bounded: true
+    })
+    if (options?.signal?.aborted) {
+      throw new DOMException("The request was cancelled.", "AbortError")
+    }
+    attempt = startSdkAttempt(trace, config, request, attemptNumber, options?.signal)
+    try {
+      result = await client.chat.completions.create(
+        buildBlockingRequest(config, messages, request, true)
+      )
+      if (options?.signal?.aborted) {
+        attempt.finish("cancelled")
+        throw new DOMException("The request was cancelled.", "AbortError")
+      }
+      attempt.finish("completed")
+    } catch (retryError) {
+      attempt.finish(options?.signal?.aborted ? "cancelled" : "failed", retryError)
+      throw retryError
+    }
   }
   const message = result.choices[0]?.message
   const content = message?.content

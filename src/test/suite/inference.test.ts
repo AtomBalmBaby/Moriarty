@@ -826,6 +826,82 @@ suite("Inference layer", function () {
       assert.strictEqual(chunks[chunks.length - 1].finishReason, "length")
     })
 
+    test("Strata OpenAI-compatible chat sends selected Medium at the top level", async () => {
+      const server = await serve(openAiChatServer(["ok"]))
+      const config = {
+        ...fimConfig(API_PROVIDERS.OpenAICompatible, server.port, "/v1", {
+          type: "chat",
+          reasoningEffort: "medium"
+        }),
+        type: "chat" as const
+      }
+      for await (const _ of resolveInferenceProvider(config).chat({
+        model: "qwen3.8-flash-next-iq2_xs",
+        messages: [{ role: "user", content: "hi" }]
+      })) void _
+      assert.strictEqual(server.received[0].path, "/v1/chat/completions")
+      assert.strictEqual(server.received[0].body.reasoning_effort, "medium")
+    })
+
+    test("Auto omits reasoning_effort instead of changing the server default", async () => {
+      const server = await serve(openAiChatServer(["ok"]))
+      const config = {
+        ...fimConfig(API_PROVIDERS.OpenAICompatible, server.port, "/v1", {
+          type: "chat"
+        }),
+        type: "chat" as const
+      }
+      for await (const _ of resolveInferenceProvider(config).chat({
+        model: "qwen3.8-flash-next-iq2_xs",
+        messages: [{ role: "user", content: "hi" }]
+      })) void _
+      assert.strictEqual(server.received[0].body.reasoning_effort, undefined)
+    })
+
+    test("native OpenAI chat keeps explicit reasoning effort forwarding", async () => {
+      const server = await serve(openAiChatServer(["ok"]))
+      const config = {
+        ...fimConfig(API_PROVIDERS.OpenAI, server.port, "/v1", {
+          type: "chat",
+          reasoningEffort: "high"
+        }),
+        type: "chat" as const
+      }
+      for await (const _ of resolveInferenceProvider(config).chat({
+        model: "gpt-test",
+        messages: [{ role: "user", content: "hi" }]
+      })) void _
+      assert.strictEqual(server.received[0].body.reasoning_effort, "high")
+    })
+
+    test("unsupported reasoning_effort is retried once without the field", async () => {
+      const server = await serve(startServer((request, response) => {
+        if (request.body.reasoning_effort) {
+          response.writeHead(400, { "Content-Type": "application/json" })
+          response.end(JSON.stringify({ error: { message: "Unsupported reasoning_effort" } }))
+          return
+        }
+        response.writeHead(200, { "Content-Type": "text/event-stream" })
+        response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] })}\n\n`)
+        response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`)
+        response.end("data: [DONE]\n\n")
+      }))
+      const config = {
+        ...fimConfig(API_PROVIDERS.OpenAICompatible, server.port, "/v1", {
+          type: "chat",
+          reasoningEffort: "medium"
+        }),
+        type: "chat" as const
+      }
+      for await (const _ of resolveInferenceProvider(config).chat({
+        model: "qwen3",
+        messages: [{ role: "user", content: "hi" }]
+      })) void _
+      assert.strictEqual(server.received.length, 2)
+      assert.strictEqual(server.received[0].body.reasoning_effort, "medium")
+      assert.strictEqual(server.received[1].body.reasoning_effort, undefined)
+    })
+
     test("think:false is not sent to other OpenAI-compatible servers", async () => {
       const server = await serve(openAiChatServer(["ok"]))
       const config = { ...fimConfig(API_PROVIDERS.LlamaCpp, server.port, "/v1"), type: "chat" as const }
@@ -1052,7 +1128,10 @@ suite("Inference layer", function () {
         }
       } as unknown as InferenceClient
 
-      const wrapped = withTools(client, workspace, { mode: "native" })
+      const wrapped = withTools(client, workspace, {
+        mode: "native",
+        reasoningEffort: "medium"
+      })
       const chunks: ChatChunk[] = []
       for await (const chunk of wrapped.chat({
         model: "gpt-oss-20b",
@@ -1062,6 +1141,7 @@ suite("Inference layer", function () {
       }
 
       assert.ok(seen.length >= 2)
+      assert.ok(seen.every((request) => request.reasoningEffort === "medium"))
       const nextRequest = seen[1]
       const assistantMessage = nextRequest.messages.find((message) => message.role === "assistant") as ChatCompletionMessage
       assert.ok(assistantMessage)
