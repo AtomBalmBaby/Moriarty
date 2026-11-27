@@ -1420,7 +1420,7 @@ export const workspaceTools = (
         source = resolved
       }
       if (extras.access && !source?.write) {
-        const outcome = await extras.access.authorize(accessTargetsOf(call.name, args), call.name, context?.signal)
+        const outcome = await extras.access.authorize(accessTargetsOf(call.name, args, view.root), call.name, context?.signal)
         if (!outcome.ok) {
           const refused = structuredErrorResult(
             argumentFailure("permission_denied", outcome.message, { required_argument: "path" }),

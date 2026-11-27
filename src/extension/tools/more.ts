@@ -17,15 +17,18 @@ import {
   createGitExecutionService,
   cutToLine,
   GIT_OPERATIONS,
+  GitCallInfo,
   gitCallIsReadOnly,
   GitInspectReading,
   GitOperation,
   GitServiceOptions,
+  GitStagingCall,
   GitStatusReading,
   MAX_GIT_OUTPUT,
   RUN_GIT_OPERATIONS,
   toolCodeOfGitRefusal
 } from "../git/service"
+import { GitCommitReading, GitPreparedReading, GitRecoveredReading, GitRunRefusal } from "../git/transaction"
 
 import type { AccessPreflight, AccessTarget } from "./access-preflight"
 import { argumentFailure, type ArgumentReader, argumentReader, jsonType, type ToolArguments } from "./arguments"
@@ -160,7 +163,7 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
   const service = createGitExecutionService({ ...options, view })
 
   /** A refusal as §14 shapes it: what was asked for, that nothing ran, and what the call can do instead. */
-  const refused = (refusal: GitRefusal, operation: string): ToolResult => {
+  const refused = (refusal: GitRefusal | GitRunRefusal, operation: string): ToolResult => {
     const shared = toolCodeOfGitRefusal(refusal.code)
     return {
       output: JSON.stringify({ ok: false, error: { code: refusal.code, executed: refusal.executed, message: refusal.summary, recovery: refusal.output } }),
@@ -187,6 +190,27 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
       ...(retained === undefined ? {} : { rawOutput: retained })
     }
   }
+  /** The reading a Stage 4 operation answers with, in the shape §7.3 gives it. */
+  const shapedStage4 = (reading: GitPreparedReading | GitCommitReading | GitRecoveredReading, raw: ToolArguments, operation: string): ToolResult => {
+    const observationId = options.observations?.({ name: "git", args: raw })
+    const summary = reading.kind === "git_commit_prepared"
+      ? `git \`${operation}\` · ${plural(reading.selectedFiles.length, "file", "files")} staged in the private copy`
+      : reading.kind === "git_commit"
+        ? `git \`${operation}\` · ${reading.state}${reading.duplicate ? ", answered from the state it already had" : ""}`
+        : `git \`${operation}\` · ${reading.state}`
+    const { kind, ...rest } = reading
+    return {
+      output: JSON.stringify({ kind, ...(observationId === undefined ? {} : { observationId }), ...rest }),
+      summary
+    }
+  }
+
+  /** What the host knows about this call: the invocation and execution it belongs to. Nothing here is taken from what a model claimed. */
+  const callInfo = (context?: ToolContext): GitCallInfo => ({
+    ...(context?.diagnostic?.requestId === undefined ? {} : { invocationId: context.diagnostic.requestId }),
+    ...(context?.diagnostic?.operationId === undefined ? {} : { executionId: context.diagnostic.operationId })
+  })
+
 
   const typed = async (a: ArgumentReader, raw: ToolArguments, operation: string, context?: ToolContext): Promise<ToolResult> => {
     if (a.sent("args"))
@@ -195,7 +219,7 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
     if (!GIT_OPERATIONS.includes(wanted as GitOperation))
       return refused(refuse("git_argument_conflict", `git refused: operation "${wanted}" is not one this tool answers for`, `Ask for ${GIT_OPERATIONS.join(", ")}, or send args instead.`), operation)
     if (!RUN_GIT_OPERATIONS.includes(wanted as GitOperation))
-      return refused(refuse("git_operation_not_supported", `git refused: ${wanted} is not run by this stage`, "This stage reads only. Commit, push and recovery belong to the stages that own the alternate index and the transaction; nothing here runs them."), operation)
+      return refused(refuse("git_operation_not_supported", `git refused: ${wanted} is not run by this stage`, "This stage reads, stages, commits and recovers; push belongs to the stage that owns a destination. Nothing here pushes."), operation)
     const given = a.structure("paths")
     const paths: string[] = []
     if (given !== undefined) {
@@ -208,6 +232,38 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
       }
     }
     const named = a.text("repository")
+    const message = a.text("message")
+    if (wanted === "prepare_commit") {
+      const givenHunks = a.structure("hunks")
+      const hunks: { path: string; patch: string }[] = []
+      if (givenHunks !== undefined) {
+        if (!Array.isArray(givenHunks))
+          return refused(refuse("git_argument_conflict", "git refused: hunks must be a list of path and patch", `hunks came as ${jsonType(givenHunks)}; send an array of { path, patch }.`), operation)
+        for (const entry of givenHunks) {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry))
+            return refused(refuse("git_argument_conflict", "git refused: each hunk must name a path and carry its patch", `a hunk came as ${jsonType(entry)}.`), operation)
+          const hunk = entry as Record<string, unknown>
+          if (typeof hunk.path !== "string" || typeof hunk.patch !== "string")
+            return refused(refuse("git_argument_conflict", "git refused: each hunk needs a path and its patch as text", `a hunk has ${jsonType(hunk.path)} and ${jsonType(hunk.patch)}.`), operation)
+          hunks.push({ path: hunk.path, patch: hunk.patch })
+        }
+      }
+      if (paths.length === 0 && hunks.length === 0)
+        return refused(refuse("git_no_paths_selected", "Staging refused: no path was named", "Name the exact paths this commit should record; a prepare_commit call never takes the whole tree."), operation)
+      const call: GitStagingCall = { ...(named === undefined ? {} : { repository: named }), paths, ...(hunks.length === 0 ? {} : { hunks }), ...(message === undefined ? {} : { message }) }
+      const prepared = await service.prepareCommit(call, context?.write, callInfo(context), context?.signal)
+      if ("code" in prepared) return refused(prepared, wanted)
+      return shapedStage4(prepared, raw, wanted)
+    }
+    if (wanted === "commit" || wanted === "recover") {
+      const preparedId = a.text("operationId")
+      if (!preparedId)
+        return refused(refuse("git_commit_not_prepared", `git refused: ${wanted} needs the operation id a prepare_commit call gave`, "Answer for an operation this stage prepared; nothing here commits on its own."), operation)
+      const settled = wanted === "commit" ? await service.commit(preparedId, context?.write, callInfo(context), context?.signal) : await service.recover(preparedId, callInfo(context), context?.signal)
+      if ("code" in settled) return refused(settled, wanted)
+      return shapedStage4(settled, raw, wanted)
+    }
+
     const reading = wanted === "status" ? await service.status(named, context?.signal) : await service.inspect(paths, named, context?.signal)
     if ("code" in reading) return refused(reading, wanted)
     return shaped(reading, raw)
@@ -218,13 +274,16 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
     readOnly: true,
     readOnlyFor: gitCallIsReadOnly,
     description:
-      "Run a read-only git command in the workspace, or ask for one of the typed operations: status and inspect. No approval needed; nothing is changed.",
+      "Run a read-only git command in the workspace, or ask for one of the typed operations: status, inspect, prepare_commit, commit and recover. A read needs no approval; staging and committing are approved per call.",
     guidance: "Use git to see what changed (git diff, git status) or the history of a file (git log -p -- path) before you edit. For repository state, and for who owns a change, ask operation status or operation inspect.",
     parameters: [
       { name: "args", description: "The git command without `git`, e.g. `diff --stat` or `log -5 --oneline -- src/a.ts`.", optional: true },
       { name: "operation", description: "A typed operation instead of args: status for repository state, inspect for the selected paths and what the host can say about each.", optional: true },
       { name: "repository", description: "A repository to read when it is not the workspace folder itself; it must be inside the workspace or granted.", optional: true },
-      { name: "paths", description: "The paths an operation answers for; every change this workspace may show when left out.", optional: true, type: "array" }
+      { name: "paths", description: "The paths an operation answers for; every change this workspace may show when left out, and the exact scope a prepare_commit call stages.", optional: true, type: "array" },
+      { name: "hunks", description: "For prepare_commit: the exact hunks to stage, each as { path, patch }, only where the host proved this session made the change.", optional: true, type: "array" },
+      { name: "message", description: "For prepare_commit: the message the commit will carry.", optional: true },
+      { name: "operationId", description: "For commit and recover: the operation id a prepare_commit call gave.", optional: true }
     ],
     async run(raw, context) {
       const a = argumentReader("git", raw)

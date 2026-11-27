@@ -277,7 +277,7 @@ test("git tools join the real tool dispatcher", async () => {
     assert.equal(statusOf(counted).observationId, "observation-dispatch-1", "the observation the host recorded for this call")
     const plain = toolsFor(root, { configSource: source, baselines, conversationId: "conversation-dispatch" })
     assert.ok(statusOf(await plain.run({ name: "git", args: { operation: "status" } })).observationId === undefined, "no id is invented when nothing was recorded")
-    const later = refusalOf(await tools.run({ name: "git", args: { operation: "commit" } }))
+    const later = refusalOf(await tools.run({ name: "git", args: { operation: "push" } }))
     assert.equal(later.error.code, "git_operation_not_supported")
     assert.equal(later.error.executed, false, "nothing ran and no transaction was opened")
     const both = refusalOf(await tools.run({ name: "git", args: { operation: "status", args: "diff --stat" } }))
@@ -576,11 +576,21 @@ test("a git call is refused before anything runs when it names an operation this
   await withRepository({ "a.ts": "one\n" }, async ({ root }) => {
     const tools = toolsFor(root, { configSource: createGitConfigSource(home) })
     const before = stateOf(root)
-    for (const operation of ["prepare_commit", "commit", "push", "recover"]) {
-      const refused = refusalOf(await tools.run({ name: "git", args: { operation, paths: ["a.ts"] } }))
-      assert.equal(refused.error.code, "git_operation_not_supported", `${operation} is named but not run here`)
-      assert.equal(refused.error.executed, false, `and ${operation} ran nothing`)
-    }
+    // Push is the stage that owns a destination; it is still named and refused before anything runs.
+    const pushed = refusalOf(await tools.run({ name: "git", args: { operation: "push", paths: ["a.ts"] } }))
+    assert.equal(pushed.error.code, "git_operation_not_supported", "push is named but not run here")
+    assert.equal(pushed.error.executed, false, "and it ran nothing")
+    // The operations this stage does run are gated by the authorization the call carries: an unauthorized one runs nothing.
+    const staging = refusalOf(await tools.run({ name: "git", args: { operation: "prepare_commit", paths: ["a.ts"] } }))
+    assert.equal(staging.error.code, "git_commit_not_authorized", JSON.stringify(staging))
+    assert.equal(staging.error.executed, false, "and nothing was staged")
+    const approved = toolsFor(root, { configSource: createGitConfigSource(home), policy: { approved: true } })
+    const unapproved = refusalOf(await tools.run({ name: "git", args: { operation: "commit", operationId: "operation-nothing-prepared" } }))
+    assert.equal(unapproved.error.code, "git_approval_required", "a preset that needs an approval refuses before the record is read")
+    assert.equal(unapproved.error.executed, false)
+    const committed = refusalOf(await approved.run({ name: "git", args: { operation: "commit", operationId: "operation-nothing-prepared" } }))
+    assert.equal(committed.error.code, "git_commit_not_prepared", "and a commit answers for a prepared operation only")
+    assert.equal(committed.error.executed, false)
     const after = stateOf(root)
     assert.equal(after.index.equals(before.index), true, "the real index was never touched")
     assert.equal(after.status, before.status, "nothing was staged")

@@ -13,10 +13,15 @@
  * `git config user.name` and `user.email`, then an explicit trusted host instruction. Names are trimmed
  * and de-duplicated case-insensitively; one trailer per human identity, and Moriarty is never added as a
  * co-author of a commit it already authors.
+ * Stage 4 turns those identities into one commit's attribution (§9 of the design): who is named as author,
+ * who as committer, and which human appears once as a co-author. What decides it is the ownership the host
+ * proved for the paths in the commit scope, plus the tagging policy - never a model name, and never the fact
+ * that Moriarty ran the command.
  */
 import { ConfigValue, resolveConfigValue } from "../todos/project-config"
 
 import { GitConfigLayer, GitHumanConfig, GitProjectConfig } from "./config"
+import type { OwnershipClass, OwnershipConfidence } from "./ownership"
 
 /** The permanent logical identity. Nothing here replaces it with an account or a model name. */
 export const MORIARTY_IDENTITY_NAME = "Moriarty"
@@ -192,3 +197,136 @@ export const describeGitIdentity = (answer: GitIdentityAnswer): string => {
   if (resolution.problems.length > 0) parts.push(`reported: ${resolution.problems.join("; ")}`)
   return parts.join(", ")
 }
+
+/** One commit's attribution, as the matrix §9 decides it. `null` means git's own configured identity is used. */
+export interface CommitAttribution {
+  tagging: boolean
+  author: GitIdentity | null
+  committer: GitIdentity | null
+  coAuthors: GitIdentity[]
+  /** Which layer decided each one, said so a reading can show where it came from. */
+  basis: string
+}
+
+/** What the commit scope holds, as the ownership index can say about it. Host facts only, never a claim. */
+export interface CommitScopeReading { path: string; ownership: OwnershipClass; confidence: OwnershipConfidence }
+
+export interface CommitAttributionInput {
+  config: GitProjectConfig
+  /** Which layer decided `identity.email`, so the answer can name it. */
+  origin?: GitConfigLayer
+  gitConfig?: Record<string, string>
+  /** An explicit trusted host instruction: the only thing that can name an author for this commit. */
+  hostInstruction?: { name?: string; email?: string }
+  environment?: Record<string, string | undefined>
+  /** Whether the host proved this session made a change inside this scope. */
+  agentWork: boolean
+  scope: readonly CommitScopeReading[]
+}
+
+export type GitAttributionRefusalCode =
+  "git_identity_missing_email" | "git_identity_not_configured" | "git_authorship_not_proven" | "git_mixed_ownership" | "git_hunk_selection_required"
+
+export interface GitAttributionRefusal { code: GitAttributionRefusalCode; executed: false; summary: string; output: string }
+
+export type GitAttributionAnswer =
+  | { state: "resolved"; attribution: CommitAttribution }
+  | { state: "refused"; refusal: GitAttributionRefusal }
+
+/** The normal configured identity, as git itself would use it. Not a Moriarty name, and not a model name. */
+const configuredIdentity = (gitConfig?: Record<string, string>): GitIdentity | undefined => {
+  if (gitConfig === undefined) return undefined
+  const name = trimName(gitConfig["user.name"])
+  const email = trimAddress(gitConfig["user.email"])
+  return name === undefined || email === undefined ? undefined : { name, email }
+}
+
+/**
+ * Resolves the attribution one commit would carry, row by row through the matrix §9. A model name, a provider
+ * or the fact that this stage executed the commit never decides an author: what can is a host-proved owner of
+ * the change, the project's own human config, `git config user.name`/`user.email`, or an explicit host
+ * instruction. A mixed scope is not guessed around - it needs a split or an explicit authorship.
+ */
+export const resolveCommitAttribution = (input: CommitAttributionInput): GitAttributionAnswer => {
+  const answer = resolveGitIdentity({
+    config: input.config,
+    ...(input.origin === undefined ? {} : { origin: input.origin }),
+    ...(input.gitConfig === undefined ? {} : { gitConfig: input.gitConfig }),
+    ...(input.hostInstruction === undefined ? {} : { hostInstruction: input.hostInstruction }),
+    ...(input.environment === undefined ? {} : { environment: input.environment })
+  })
+  if (answer.state === "refused") return { state: "refused", refusal: answer.refusal }
+  const resolution = answer.resolution
+  const normal = configuredIdentity(input.gitConfig)
+
+  // §9.5: the opt-out names Moriarty nowhere and adds no trailer, so the commit is signed with the normal identity.
+  if (!resolution.tagging) {
+    if (normal === undefined)
+      return { state: "refused", refusal: { code: "git_identity_not_configured", executed: false, summary: "Commit refused: no normal Git identity is configured", output: "With git.identity.tagging off the commit uses `git config user.name` and `user.email`; neither is set here. Nothing was committed." } }
+    return {
+      state: "resolved",
+      attribution: { tagging: false, author: normal, committer: normal, coAuthors: [], basis: `tagging off: author and committer from git config (${normal.name})` }
+    }
+  }
+
+  const moriarty = resolution.moriarty
+  if (moriarty === undefined)
+    return { state: "refused", refusal: { code: "git_identity_missing_email", executed: false, summary: "Commit refused: Moriarty Git email is missing", output: `Set git.identity.email in .twinny/config.json or configure ${MORIARTY_EMAIL_ENVIRONMENT_VARIABLE}.` } }
+
+  const mixed = input.scope.filter((entry) => entry.ownership === "mixed" || entry.confidence === "uncertain")
+  const explicit = input.hostInstruction !== undefined && resolution.human !== undefined
+  if (mixed.length > 0 && !explicit)
+    return {
+      state: "refused",
+      refusal: {
+        code: "git_mixed_ownership",
+        executed: false,
+        summary: "Commit refused: ownership is mixed",
+        output: `${mixed.map((entry) => entry.path).join(", ")} holds more than one owner's work (${mixed.map((entry) => `${entry.ownership}/${entry.confidence}`).join(", ")}). Select hunks or state an explicit authorship; nothing here guesses one.`
+      }
+    }
+
+  // A split of verified agent hunks is still this session's own work, so Moriarty authors it.
+  if (input.agentWork) {
+    const human = resolution.human
+    return {
+      state: "resolved",
+      attribution: {
+        tagging: true,
+        author: moriarty,
+        committer: moriarty,
+        coAuthors: human === undefined ? [] : [human],
+        basis: `tagging on, agent work the host proved (${input.scope.map((entry) => `${entry.path}=${entry.ownership}/${entry.confidence}`).join(", ") || "nothing named"}); author and committer Moriarty from ${resolution.sources.moriartyEmail}; co-author ${human === undefined ? "none" : `${human.name} from ${resolution.sources.human}`}`
+      }
+    }
+  }
+
+  // §9.3: committing work this session did not make preserves the person the host can name, and never labels
+  // Moriarty as author merely because it executed the commit.
+  const author = explicit ? resolution.human : (resolution.human ?? normal)
+  if (author === undefined)
+    return {
+      state: "refused",
+      refusal: {
+        code: "git_authorship_not_proven",
+        executed: false,
+        summary: "Commit refused: the author of the existing work cannot be proven",
+        output: "The scope holds no change the host proved as this session's, and no human identity is named by the project config, git config or a host instruction. State an explicit authorship; nothing here invents one."
+      }
+    }
+  return {
+    state: "resolved",
+    attribution: {
+      tagging: true,
+      author,
+      committer: moriarty,
+      // No co-author is added just because Moriarty executed the commit.
+      coAuthors: explicit ? [author] : [],
+      basis: `tagging on, existing work not this session's: author ${author.name} from ${explicit ? "host instruction" : resolution.sources.human}, committer Moriarty from ${resolution.sources.moriartyEmail}`
+    }
+  }
+}
+
+/** The line a diagnostic may print for one commit's attribution. */
+export const describeCommitAttribution = (attribution: CommitAttribution): string =>
+  `author=${attribution.author === null ? "git config" : `${attribution.author.name} <${attribution.author.email}>`}, committer=${attribution.committer === null ? "git config" : `${attribution.committer.name} <${attribution.committer.email}>`}, co-authors=${attribution.coAuthors.length === 0 ? "none" : attribution.coAuthors.map((identity) => identity.name).join(", ")}; ${attribution.basis}`
