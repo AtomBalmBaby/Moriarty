@@ -11,6 +11,7 @@
    * verified patches applied to that copy, an ordinary commit, and recovery that reads repository state. The
    * real index file is hashed as it sits on disk and never written by staging, `git add -A` is never run, and
    * a call naming an operation this stage does not run is refused before anything runs.
+   * Stage 5 sends the commit this stage already made to the destination the effective config names, with no force option, and settles an answer that was lost by reading what the ref holds
  *
    * Paths keep the workspace's rules: what `.gitignore` hides, what the team's rules block, and what lies
    * outside the open folder is not shown; a path the call names outright is refused rather than quietly
@@ -36,21 +37,24 @@ import { isWithin } from "../tools/access-grants"
 import type { AccessPreflight } from "../tools/access-preflight"
 import type { ToolArguments, ToolErrorCode } from "../tools/arguments"
 import { tidyGitPath, withoutHiddenDiffs } from "../tools/helpers"
-import { AuthorizedRequest, claimGitRequests, GitCommitRequest, GitPrepareRequest } from "../tools/operation-authorization"
+import { AuthorizedRequest, claimGitRequests, GitCommitRequest, GitPrepareRequest, pushRequestFromCall } from "../tools/operation-authorization"
 import type { WorkspaceView } from "../tools/view"
 
 import { resolveGitCredentials } from "./auth"
 import { ABSENT_INDEX_DIGEST, contentDigest, GitBaselineStore, GitChangeStatus, GitRefusal, parsePorcelain, refuse, STATUS_OF_CODE } from "./baseline"
-import { DEFAULT_GIT_PROJECT_CONFIG, type EffectiveGitConfig, type GitConfigSource, type GitPlainCommitMode, type GitWorkflowMode } from "./config"
+import { DEFAULT_GIT_PROJECT_CONFIG, type EffectiveGitConfig, type GitConfigSource, type GitPlainCommitMode, type GitWorkflowMode, sanitizeRemoteForDisplay } from "./config"
 import { coAuthorTrailers, CommitAttribution, CommitScopeReading, describeCommitAttribution, MORIARTY_IDENTITY_NAME, resolveCommitAttribution } from "./identity"
 import type { GitOwnershipIndex, GitOwnershipStore, OwnershipClass, OwnershipConfidence } from "./ownership"
-import { COMMIT_TRANSITIONS, createGitTransactionStore, GitCommitCandidate, GitCommitReading, GitPreparedReading, GitRecoveredReading, GitRunRefusal, GitTransactionState, GitTransactionStore, operationIdOf, ranRefusal, reconcileCommit, StagedEntry } from "./transaction"
+import { COMMIT_TRANSITIONS, createGitTransactionStore, GitCommitCandidate, GitCommitReading, GitOperationRecord, GitPreparedReading, GitPushReading, GitPushRecord, GitRecoveredReading, GitRunRefusal, GitTransactionState, GitTransactionStore, operationIdOf, PUSH_TRANSITIONS, pushFingerprint, PushReconciliation, ranRefusal, reconcileCommit, reconcilePush, StagedEntry } from "./transaction"
+
 
 /** A read stays capped the way the read-only tool always capped it. */
 export const MAX_GIT_OUTPUT = 10_000
 /** How much of an inspected diff the model-visible result shows; the whole bounded text stays as raw output for the observation. */
 const MAX_INSPECT_DIFF_CHARS = 2_000
 const GIT_TIMEOUT_MS = 20_000
+/** How long one send may run before its answer counts as lost. A lost answer is settled by reading what the ref holds, not by its exit. */
+const GIT_PUSH_TIMEOUT_MS = 20_000
 
 /** Settings a user's git configuration could turn another way, pinned so the output is the same on every machine. */
 const GIT_PINNED = [
@@ -65,6 +69,8 @@ const GIT_PINNED = [
 export interface GitRunAnswer extends GitAnswer {
   output: string
   exitCode: number
+  /** Whether the process was killed before it could answer; such a call is settled from state, never from this. */
+  lost?: boolean
 }
 
 /** Stage 4's conditions. Every one is a refusal that ran nothing; the ones that ran something say so with
@@ -103,6 +109,15 @@ export type GitRefusalCode =
   | "git_commit_not_prepared"
   | "git_selected_path_clean"
   | "git_commit_no_message"
+  | "git_push_not_authorized"
+  | "git_force_not_allowed"
+  | "git_destination_not_authorized"
+  | "git_push_no_branch"
+  | "git_push_no_commit"
+  | "git_push_commit_changed"
+  | "git_push_branch_not_on_remote"
+  | "git_push_interrupted"
+  | "git_auth_environment_missing"
 /** Which shared tool code a Git condition reports under, so existing consumers read the same class; undefined when only the Git condition can be named.
  */
 export const toolCodeOfGitRefusal = (code: string): ToolErrorCode | undefined => {
@@ -111,18 +126,18 @@ export const toolCodeOfGitRefusal = (code: string): ToolErrorCode | undefined =>
   if (code === "git_argument_conflict" || code === "git_operation_not_supported") return "invalid_argument_type"
   // Stage 4: an authorization the call did not carry, an approval the preset still wants, or a task
   // restriction that outranks the preset - all refusals on the permission class, and none of them runs.
-  if (code === "git_commit_not_authorized" || code === "git_approval_required" || code === "git_task_restriction") return "permission_denied"
-  if (code === "git_no_paths_selected" || code === "git_commit_not_prepared" || code === "git_selected_path_clean" || code === "git_commit_no_message") return "invalid_argument_type"
+  if (code === "git_commit_not_authorized" || code === "git_push_not_authorized" || code === "git_force_not_allowed" || code === "git_destination_not_authorized" || code === "git_approval_required" || code === "git_task_restriction") return "permission_denied"
+  if (code === "git_no_paths_selected" || code === "git_commit_not_prepared" || code === "git_selected_path_clean" || code === "git_commit_no_message" || code === "git_push_no_branch" || code === "git_push_no_commit" || code === "git_push_commit_changed" || code === "git_auth_environment_missing") return "invalid_argument_type"
   return undefined
 }
 
 /** The typed operations the same `git` tool answers for. Stage 3 runs the ones that read; Stage 4 stages,
- * commits and recovers. Push is the stage that owns a destination, and it is still named and refused here. */
+ * commits and recovers; Stage 5 sends to a destination and settles an answer that was lost by reading what the ref holds. */
 export type GitOperation = "status" | "inspect" | "prepare_commit" | "commit" | "push" | "recover"
 
 export const GIT_OPERATIONS: readonly GitOperation[] = ["status", "inspect", "prepare_commit", "commit", "push", "recover"]
 /** The operations this stage runs; the rest are named and refused before anything runs. */
-export const RUN_GIT_OPERATIONS: readonly GitOperation[] = ["status", "inspect", "prepare_commit", "commit", "recover"]
+export const RUN_GIT_OPERATIONS: readonly GitOperation[] = ["status", "inspect", "prepare_commit", "commit", "push", "recover"]
 
 export const READ_ONLY_GIT_OPERATIONS: readonly GitOperation[] = ["status", "inspect", "recover"]
 
@@ -137,6 +152,11 @@ export interface GitToolArguments {
   hunks?: { path: string; patch: string }[]
   message?: string
   operationId?: string
+  /** Stage 5: the destination as the effective config names it. A call cannot choose a remote or a branch of its own. */
+  remote?: string
+  branch?: string
+  setUpstream?: boolean
+  commitSha?: string
 }
 
 /** What a Stage 4 call resolves to, with every path already named by the call itself. */
@@ -152,11 +172,26 @@ export interface GitStagingCall {
   allowEmpty?: boolean
 }
 
+/** What a Stage 5 send resolves to. The destination is what the effective config named, with a host-derived restriction above it. */
+export interface GitPushCall {
+  repository?: string
+  /** As the call named them; empty when it named none, which is what the authorization was issued for. */
+  remote?: string
+  branch?: string
+  operationId?: string
+  commitSha?: string
+  setUpstream?: boolean
+  /** Force is not a thing this stage can do, so a call that asks for it is refused before anything runs. */
+  force?: boolean
+  /** A second send only runs when the read shows nothing landed and a fast-forward is still possible. */
+  retry?: boolean
+}
+
 /** What the host knows about this call: the invocation it belongs to, never what a model claimed. */
 export interface GitCallInfo { invocationId?: string; executionId?: string; taskId?: string }
 
 /** Host-derived policy for the call. A restriction is read as it was given; nothing here grants anything. */
-export interface GitCallPolicy { restrictions?: { noCommit?: boolean }; approved?: boolean; /** A whole-file choice the host stated outright for this call, not one this stage worked out. */ explicitChoice?: boolean }
+export interface GitCallPolicy { restrictions?: { noCommit?: boolean; noPush?: boolean }; approved?: boolean; /** A whole-file choice the host stated outright for this call, not one this stage worked out. */ explicitChoice?: boolean; /** A host-derived destination, above what the project file names. */ destination?: { remote?: string; branch?: string } }
 
 /** The authorization issued for one call's requests. Only what operation-authorization issued is accepted. */
 export type GitAuthorizationSource = (requests: readonly AuthorizedRequest[]) => unknown
@@ -283,6 +318,8 @@ export interface GitServiceOptions {
   projectKey?: string
   /** An explicit trusted host instruction, used only when the file names no human. Never read from a prompt. */
   hostInstruction?: { name?: string; email?: string }
+  /** How long one send may run before its answer counts as lost. A lost answer is settled by reading, not by its exit. */
+  pushTimeoutMs?: number
 }
 
 /** The one place a Git call runs. */
@@ -298,13 +335,17 @@ export interface GitExecutionService {
   /** Why a word before `--` that is not an option may not go to git, if it may not. */
   refuseBareArguments(args: string[], signal?: AbortSignal): Promise<string | undefined>
   /** One git process: argument arrays, no shell, nothing typed at it. A read needs no credential and no private index; a Stage 4 run gets both as the child environment, and what a credential holds never comes back out of the process. */
-  runGit(top: string, args: string[], signal?: AbortSignal, childEnv?: Record<string, string>): Promise<GitRunAnswer>
+  runGit(top: string, args: string[], signal?: AbortSignal, childEnv?: Record<string, string>, timeoutMs?: number): Promise<GitRunAnswer>
   status(named: string | undefined, signal?: AbortSignal): Promise<GitStatusReading | GitRefusal>
   inspect(paths: string[], named: string | undefined, signal?: AbortSignal): Promise<GitInspectReading | GitRefusal>
   /** Stages exact paths into a private copy of the index. The real index is read, never written. */
   prepareCommit(call: GitStagingCall, authorization: unknown, info?: GitCallInfo, signal?: AbortSignal): Promise<GitPreparedReading | GitRunRefusal>
   /** Runs one prepared commit, after rechecking what was prepared. */
   commit(operationId: string, authorization: unknown, info?: GitCallInfo, signal?: AbortSignal): Promise<GitCommitReading | GitRunRefusal>
+  /** Stage 5: sends one commit to the destination the effective config names, with no force option, and settles a lost answer from what the ref holds. */
+  push(call: GitPushCall, authorization: unknown, info?: GitCallInfo, signal?: AbortSignal): Promise<GitPushReading | GitRunRefusal>
+  /** The ref a remote holds for a destination branch, as it was read. A failed read is named as a failed read. */
+  remoteRef(top: string, remote: string, branch: string, signal?: AbortSignal): Promise<{ ok: boolean; sha: string | null; read: string }>
   /** Reads what an interrupted operation came to, from repository state, and never runs anything itself. */
   recover(operationId: string, info?: GitCallInfo, signal?: AbortSignal): Promise<GitRecoveredReading | GitRefusal>
   /** Ends a prepared operation without committing it, and removes its private scratch files. */
@@ -363,6 +404,11 @@ const ADD_ALL_EQUIVALENTS = new Set([".", "*", "**", "./*", ""])
 
 /** Git's own empty tree, the base an unborn repository has no commit for. */
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+/** The arguments one send runs with. There is no force option in this list, and upstream is only set when the project configured it. */
+export const pushArgsFor = (record: GitPushRecord, gitConfig: Record<string, string> = {}, refspec?: string): string[] => {
+  const configArgs = Object.entries(gitConfig).flatMap(([key, value]) => ["-c", `${key}=${value}`])
+  return [...configArgs, "push", ...(record.setUpstream ? ["--set-upstream"] : []), "--", record.remote, refspec ?? `${record.commitSha}:refs/heads/${record.branch}`]
+}
 
 /** How this stage decided to take one path into the commit scope: the working copy, a verified patch, or a removal by name. */
 interface StageDecision {
@@ -389,14 +435,14 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
   const view = options.view
   const prefixes = new Map<string, Promise<string>>()
 
-  const runGit = async (top: string, args: string[], signal?: AbortSignal, childEnv?: Record<string, string>): Promise<GitRunAnswer> =>
+  const runGit = async (top: string, args: string[], signal?: AbortSignal, childEnv?: Record<string, string>, timeoutMs?: number): Promise<GitRunAnswer> =>
     new Promise<GitRunAnswer>((resolveAnswer) => {
       const child = execFile(
         "git",
         [...GIT_PINNED, ...args],
         {
           cwd: top,
-          timeout: GIT_TIMEOUT_MS,
+          timeout: timeoutMs ?? GIT_TIMEOUT_MS,
           maxBuffer: 20 * 1024 * 1024,
           encoding: "buffer",
           // A read keeps the environment this tool always had, with prompts off. A Stage 4 run adds the private index, the identities for that one commit and the resolved credentials: a value lives in the child process only.
@@ -407,7 +453,8 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
           const out = String(stdout ?? "")
           const err = String(stderr ?? "")
           const code = error ? (typeof error.code === "number" ? error.code : 1) : 0
-          resolveAnswer({ stdout: Buffer.from(out, "utf8"), ok: !error, exitCode: code, output: `${out}${err ? `${out ? "\n" : ""}${err}` : ""}` })
+          const lost = error !== null && ((error as { killed?: boolean }).killed === true || (error as { code?: unknown }).code === "ETIMEDOUT")
+          resolveAnswer({ stdout: Buffer.from(out, "utf8"), ok: !error, exitCode: code, lost, output: `${out}${err ? `${out ? "\n" : ""}${err}` : ""}` })
         }
       )
       child.stdin?.end()
@@ -527,7 +574,7 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
     return {
       config: { mode, plainCommit: config.workflow.plainCommit },
       auth: { mode: config.auth.mode, references: Object.keys(config.auth.env).map((name) => name) },
-      capabilities: { ...permissions, basis: `git.workflow.mode=${mode}; the preset's permission only, and this stage runs neither commit nor push` }
+      capabilities: { ...permissions, basis: `git.workflow.mode=${mode}; the preset's permission only, and a permission is not an approval` }
     }
   }
 
@@ -1068,6 +1115,211 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
 
   /** What recovery proved, whichever side of the reconciliation it came from. */
   const proofOf = (outcome: { provedBy?: string; reason?: string }): string => outcome.provedBy ?? outcome.reason ?? ""
+  /** The ref a remote holds for a destination branch, as it was read. A failed read is named as a failed read, never as a result. */
+  const remoteRef = async (top: string, remote: string, branch: string, signal?: AbortSignal): Promise<{ ok: boolean; sha: string | null; read: string }> => {
+    const read = await runGit(top, ["ls-remote", "--", remote, `refs/heads/${branch}`], signal, undefined, options.pushTimeoutMs ?? GIT_PUSH_TIMEOUT_MS)
+    if (!read.ok) return { ok: false, sha: null, read: `git ls-remote ${sanitizeRemoteForDisplay(remote)} failed in ${top} (exit ${read.exitCode})` }
+    const shown = redactForDisplay(read.output.split("\n").map((line) => line.trim()).filter((line) => line !== "")[0] ?? "", [])
+    const sha = (shown.split(/\s+/)[0] ?? "").trim()
+    return { ok: true, sha: sha === "" ? null : sha, read: `the ref ${branch} on ${sanitizeRemoteForDisplay(remote)} reads as ${sha === "" ? "nothing there" : sha}` }
+  }
+
+  /** Whether the ref a remote holds contains this commit. Only what can be read from here can be checked; anything else stays unproven. */
+  const remoteHoldsCommit = async (top: string, commitSha: string, remoteSha: string | null, signal?: AbortSignal): Promise<boolean | undefined> => {
+    if (remoteSha === null) return undefined
+    const known = await runGit(top, ["cat-file", "-e", remoteSha], signal)
+    if (!known.ok) return undefined
+    return (await runGit(top, ["merge-base", "--is-ancestor", commitSha, remoteSha], signal)).ok
+  }
+
+  /** Whether this commit could still fast-forward onto what the remote holds. Nothing here rewrites history to make that true. */
+  const canFastForward = async (top: string, remoteSha: string | null, commitSha: string, signal?: AbortSignal): Promise<boolean> => {
+    if (remoteSha === null) return false
+    const known = await runGit(top, ["cat-file", "-e", remoteSha], signal)
+    if (!known.ok) return false
+    return (await runGit(top, ["merge-base", "--is-ancestor", remoteSha, commitSha], signal)).ok
+  }
+
+  /** A send answer as it may be shown: no credential value, and a URL printed without one. */
+  const redactForDisplay = (text: string, values: readonly string[]): string => {
+    const shield = new SecretShield()
+    let kept = text
+    for (const value of values) if (value !== "") kept = kept.split(value).join("[credential withheld]")
+    return shield.redact(kept)
+  }
+
+  /** What a send may be approved for: the same preset read for push, with the task restriction above it. */
+  const pushPermission = async (): Promise<CommitPermission | GitRefusal> => {
+    if (!options.configSource) {
+      const mode = DEFAULT_GIT_PROJECT_CONFIG.workflow.mode
+      return { mode, capability: GIT_CAPABILITIES_OF_MODE[mode].push, basis: "no project file was read for this project, so the documented defaults apply", effective: { path: "(defaults)", source: "defaults", config: DEFAULT_GIT_PROJECT_CONFIG, reportedKeys: [], origins: {} } }
+    }
+    const reading = await options.configSource.effective()
+    if (reading.state === "invalid") return refuse("git_read_failed", `Send refused: ${reading.path}: ${reading.reason}`, "An invalid file reports itself and is left as it is; nothing was sent.")
+    const mode = reading.reading.config.workflow.mode
+    const capability = GIT_CAPABILITIES_OF_MODE[mode].push
+    return { mode, capability, basis: `git.workflow.mode=${mode} permits push as ${capability}; the permission is not an authorisation and never permits force`, effective: reading.reading }
+  }
+
+  /** A send reading, in the shape §7.4 gives it. */
+  const pushReading = (record: GitPushRecord, permission: CommitPermission, inspected: string, extra: Record<string, unknown> = {}): GitPushReading => ({
+    kind: "git_push",
+    succeeded: true,
+    operationId: record.id,
+    state: record.state,
+    remote: sanitizeRemoteForDisplay(record.remote),
+    branch: record.branch,
+    commitSha: record.commitSha,
+    expectedRemoteSha: record.expectedRemoteSha,
+    actualRemoteSha: record.actualRemoteSha ?? null,
+    setUpstream: record.setUpstream,
+    inspected,
+    basis: permission.basis,
+    ...extra
+  })
+  /** A send reading from whatever the store gave back for this operation. */
+  const pushReadingOf = (record: GitOperationRecord, permission: CommitPermission, inspected: string, extra: Record<string, unknown> = {}): GitPushReading | GitRefusal => {
+    const here = transactions.pushRecord(record.id)
+    if (here === undefined) return refuse("git_transaction_unknown", `Send refused: ${record.id} is not a push record here`, "Nothing was sent.")
+    return pushReading(here, permission, inspected, extra)
+  }
+
+  /** One send, with no force option anywhere in it. Its answer is settled from what the ref holds, not from its exit. */
+  const sendPush = async (record: GitPushRecord, permission: CommitPermission, info?: GitCallInfo, signal?: AbortSignal): Promise<GitPushReading | GitRunRefusal> => {
+    const credentials = await resolveGitCredentials({ auth: permission.effective.config.auth })
+    if ("code" in credentials) return refuse(credentials.code, `Send refused: ${credentials.summary}`, credentials.output)
+    const secrets = Object.entries(credentials.environment).filter(([name]) => credentials.report.references.includes(name)).map(([, value]) => value)
+    const moved = transactions.transition(record.id, "running", record.invocationId, `sent by call ${info?.executionId ?? "unnamed"}`)
+    if ("code" in moved) return moved
+    // A raw commit has no branch to track, so upstream is only added when this commit is the tip of that branch.
+    const tip = await runGit(record.repositoryTop, ["rev-parse", "--verify", "--quiet", record.branch], signal)
+    const tracksBranch = record.setUpstream && tip.ok && tip.output.trim() === record.commitSha
+    const refspec = tracksBranch ? `${record.branch}:refs/heads/${record.branch}` : `${record.commitSha}:refs/heads/${record.branch}`
+    const answer = await runGit(record.repositoryTop, pushArgsFor(record, credentials.gitConfig, refspec), signal, credentials.environment, options.pushTimeoutMs ?? GIT_PUSH_TIMEOUT_MS)
+    const now = await remoteRef(record.repositoryTop, record.remote, record.branch, signal)
+    const shown = redactForDisplay(answer.output, secrets)
+    // A send git itself refused as non-fast-forward is reported as rejected; this stage does not rebase, reset or force around it.
+    const rejectedByGit = !answer.lost && !answer.ok && /\[rejected\]|non-fast-forward/.test(shown)
+    const outcome: PushReconciliation = rejectedByGit ? { state: "rejected", remoteSha: now.sha, provedBy: `the send was refused as non-fast-forward; the ref holds ${now.sha ?? "nothing there"}, which does not hold this commit` } : reconcilePush(record, now.sha, await remoteHoldsCommit(record.repositoryTop, record.commitSha, now.sha, signal))
+    const said = answer.lost
+      ? `the send was killed at the ${options.pushTimeoutMs ?? GIT_PUSH_TIMEOUT_MS} ms limit and no answer came back, so nothing here is read from its exit`
+      : `the send answered with exit ${answer.exitCode}: ${shown.trim() === "" ? "nothing it could say" : shown.trim()}`
+    const upstream = record.setUpstream ? (tracksBranch ? "upstream set as the project configured it" : "upstream not added: a raw commit has no branch to track") : "upstream left as the project configured it"
+    const settled = transactions.transition(record.id, outcome.state, record.invocationId, `${proofOf(outcome)}; ${said}`)
+    if ("code" in settled) return settled
+    return pushReadingOf(settled, permission, `the commit sent is ${record.commitSha} (${refspec}); ${upstream}; ${now.read}; ${said}`, { sent: answer.ok && !answer.lost })
+  }
+
+  /** Stage 5's send. A second call for an operation that already ended answers as a status check, and a lost answer is settled by reading the ref before anything runs again. */
+  const push = async (call: GitPushCall, authorization: unknown, info?: GitCallInfo, signal?: AbortSignal): Promise<GitPushReading | GitRunRefusal> => {
+    if (call.force === true)
+      return refuse("git_force_not_allowed", "Send refused: force is not something this stage can do", "Nothing was sent. A send here only fast-forwards; force, force-with-lease and rewriting history are refused.")
+
+    const permission = await pushPermission()
+    if ("code" in permission) return permission
+    if (options.policy?.restrictions?.noPush)
+      return refuse("git_task_restriction", "Send refused: this task does not allow a push", "The task's restriction is above the workflow preset. Nothing was sent.")
+    if (permission.capability === "approval-required" && !options.policy?.approved)
+      return refuse("git_approval_required", "Send refused: this workflow needs an approval for the send", `${permission.basis}. This call was not approved.`)
+
+    const repository = await resolveRepository(call.repository, signal)
+    if ("code" in repository) return repository
+
+    // The destination is what the effective config names, with a host-derived restriction above it. A call cannot choose a remote or a branch.
+    const destination = permission.effective.config.destination
+    const policyDestination = options.policy?.destination
+    const remote = (policyDestination?.remote ?? destination.remote ?? "").trim()
+    if (remote === "") return refuse("git_destination_not_authorized", "Send refused: no destination remote is configured", "Nothing was sent. Set git.destination.remote, or name the remote the host granted.")
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/.test(remote))
+      return refuse("git_destination_not_authorized", `Send refused: ${sanitizeRemoteForDisplay(remote)} carries a login in its URL`, "Nothing was sent. A remote here names a place, not a credential; use a credential helper or an environment reference.")
+    const configuredBranch = (policyDestination?.branch ?? destination.branch ?? "current").trim()
+    const namedRemote = (call.remote ?? "").trim()
+    if (namedRemote !== "" && namedRemote !== remote)
+      return refuse("git_destination_not_authorized", `Send refused: ${sanitizeRemoteForDisplay(namedRemote)} is not the destination this project names`, `The effective destination is ${sanitizeRemoteForDisplay(remote)}. A call cannot choose a remote; only host-derived policy sits above it.`)
+    const namedBranch = (call.branch ?? "").trim()
+    if (namedBranch !== "" && configuredBranch !== "current" && namedBranch !== configuredBranch)
+      return refuse("git_destination_not_authorized", `Send refused: ${namedBranch} is not the branch this project names`, `The effective destination is ${sanitizeRemoteForDisplay(remote)}/${configuredBranch}. A call cannot choose a branch.`)
+    const here = await runGit(repository.top, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal)
+    const branch = configuredBranch === "current" ? (here.ok ? here.output.trim() : "") : configuredBranch
+    if (branch === "") return refuse("git_push_no_branch", "Send refused: there is no branch to publish to", "A detached HEAD has no name here, and nothing was sent. Name the destination branch in the project config.")
+    const setUpstream = destination.setUpstream
+    if (call.setUpstream !== undefined && call.setUpstream !== setUpstream)
+      return refuse("git_destination_not_authorized", "Send refused: upstream is only set as the project configured it", `The effective config says ${setUpstream}. Nothing was sent.`)
+
+    // The commit is what this stage already made; a send never makes one. A call may name an operation recorded as a push, and that is answered for from state, not sent again.
+    const preparedId = (call.operationId ?? "").trim()
+    const committed = preparedId === "" ? undefined : transactions.commitRecord(preparedId)
+    const recorded = preparedId === "" ? undefined : transactions.pushRecord(preparedId)
+    if (preparedId !== "" && committed === undefined && recorded === undefined)
+      return refuse("git_commit_not_prepared", `Send refused: ${preparedId} is not an operation this stage prepared`, "Nothing was sent. Commit first, then publish the record that commit made.")
+    if (committed !== undefined && committed.repositoryTop !== repository.top)
+      return refuse("git_commit_not_prepared", `Send refused: ${committed.id} belongs to another repository`, "Nothing was sent.")
+    if (committed !== undefined && committed.state !== "succeeded")
+      return refuse("git_commit_not_prepared", `Send refused: ${committed.id} has not committed`, `Its state is ${committed.state}. Nothing was committed, so there was nothing to send.`)
+    const headRead = await runGit(repository.top, ["rev-parse", "--verify", "--quiet", "HEAD"], signal)
+    const sha = committed !== undefined ? (committed.commitSha ?? "") : (recorded !== undefined ? recorded.commitSha : (headRead.ok ? headRead.output.trim() : ""))
+    if (sha === "") return refuse("git_push_no_commit", "Send refused: there is nothing committed to publish", "A repository with no commit has nothing to send. Nothing was sent.")
+    const namedSha = (call.commitSha ?? "").trim()
+    if (namedSha !== "" && namedSha !== sha)
+      return refuse("git_push_commit_changed", `Send refused: ${namedSha} is not what this operation published`, `The commit this repository holds is ${sha}. Nothing was sent; read the state before anything else is claimed.`)
+
+    const approvedFor = path.resolve(view.root)
+    const request = pushRequestFromCall({ operationId: preparedId, remote: namedRemote, branch: namedBranch }, approvedFor)
+    if (approvedFor !== repository.top)
+      return refuse("git_push_not_authorized", `Send refused: the approval covers ${approvedFor}, not the repository this call runs on`, `Nothing was sent. Grant ${repository.top}, or run this call in it.`)
+    if (!claimGitRequests(authorization, [request], options.hostKey ?? ""))
+      return refuse("git_push_not_authorized", "Send refused: no authorisation covers this call", "The approval must name the repository and the destination exactly as this call named them. A grant taken for a read, or for another call, does not carry a send. Nothing was sent.")
+
+    const projectKey = options.projectKey ?? ""
+    const invocation = info?.invocationId ?? ""
+    const fingerprint = pushFingerprint({ projectKey, repositoryTop: repository.top, remote, branch, commitSha: sha })
+    const byCall = invocation === "" ? undefined : transactions.byInvocation(invocation)
+    const known = recorded ?? (byCall !== undefined && byCall.kind === "push" ? byCall : transactions.byPushFingerprint(fingerprint))
+    if (known !== undefined) {
+      const now = await remoteRef(repository.top, remote, branch, signal)
+      if (GIT_TERMINAL_STATES.includes(known.state))
+        return pushReadingOf(known, permission, `${now.read}; answered from the state this operation already had`, { duplicate: true })
+      // Reading the ref before anything runs again settles what it proves; only an explicit authorized retry sends, and only when the read shows nothing landed and a fast-forward is still possible.
+      const outcome = reconcilePush(known, now.sha, await remoteHoldsCommit(repository.top, sha, now.sha, signal))
+      if (call.retry && outcome.state === "failed" && (await canFastForward(repository.top, now.sha, sha, signal))) return sendPush(known, permission, info, signal)
+      const target = PUSH_TRANSITIONS[known.state].includes(outcome.state) ? outcome.state : "uncertain"
+      const settled = transactions.transition(known.id, target, known.invocationId, `${proofOf(outcome)}; read before anything was sent again`)
+      if ("code" in settled) return settled
+      return pushReadingOf(settled, permission, `${now.read}; ${proofOf(outcome)}`, { duplicate: true, actualRemoteSha: now.sha })
+    }
+
+    const capture = options.conversationId === undefined ? undefined : options.baselines?.capturedFor(options.conversationId)
+    const before = await remoteRef(repository.top, remote, branch, signal)
+    const record = transactions.preparePush({
+      id: operationIdOf(undefined),
+      invocationId: invocation,
+      kind: "push",
+      projectKey,
+      repositoryTop: repository.top,
+      ...(options.conversationId === undefined ? {} : { conversationId: options.conversationId }),
+      ...(info?.taskId === undefined ? {} : { taskId: info.taskId }),
+      ...(info?.executionId === undefined ? {} : { executionId: info.executionId }),
+      ...(options.hostKey === undefined ? {} : { hostKey: options.hostKey }),
+      ...(capture?.model === undefined ? {} : { model: capture.model }),
+      headBefore: committed !== undefined ? committed.headBefore : (headRead.ok ? headRead.output.trim() : null),
+      branchBefore: branch,
+      commitSha: sha,
+      remote,
+      branch,
+      setUpstream,
+      force: false,
+      expectedRemoteSha: before.sha
+    })
+    const authorized = transactions.transition(record.id, "authorized", record.invocationId, `authorized by call ${info?.executionId ?? "unnamed"}`)
+    if ("code" in authorized) return authorized
+
+    if (before.ok && before.sha === sha)
+      return pushReadingOf(authorized, permission, `${before.read}; nothing was sent because the ref already held this commit`)
+    if (before.ok && before.sha === null)
+      return refuse("git_push_branch_not_on_remote", `Send refused: ${sanitizeRemoteForDisplay(remote)} has no branch named ${branch}`, "Nothing was sent. This stage only sends to a branch the remote already has; creating one is a separate, explicit permission.")
+    if (signal?.aborted) return ranRefusal("git_push_interrupted", "Send stopped: this call was interrupted", "Nothing was sent; read what the ref holds before anything else is claimed.")
+    return sendPush(record, permission, info, signal)
+ }
 
   /** Run one prepared commit. A second call for an operation that already settled answers as a status check. */
   const commit = async (operationId: string, authorization: unknown, info?: GitCallInfo, signal?: AbortSignal): Promise<GitCommitReading | GitRunRefusal> => {
@@ -1079,7 +1331,7 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
     if (permission.capability === "approval-required" && !options.policy?.approved)
       return refuse("git_approval_required", "Commit refused: this workflow needs an approval for the commit", `${permission.basis} This call was not approved. The prepared operation is left as it was.`)
 
-    const record = transactions.get(operationId)
+    const record = transactions.commitRecord(operationId)
     if (record === undefined)
       return refuse("git_commit_not_prepared", `Commit refused: ${operationId} is not an operation this stage prepared`, "Prepare a scope first, then commit by the operation id the preparation gave.")
 
@@ -1144,8 +1396,10 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
 
     const prepared = transactions.transition(record.id, "authorized", record.invocationId, info?.executionId === undefined ? undefined : `authorized by call ${info.executionId}`)
     if ("code" in prepared) return prepared
-    const running = transactions.transition(prepared.id, "running", prepared.invocationId)
-    if ("code" in running) return running
+    const moved = transactions.transition(prepared.id, "running", prepared.invocationId)
+    if ("code" in moved) return moved
+    const running = transactions.commitRecord(moved.id)
+    if (running === undefined) return refuse("git_transaction_unknown", `Commit refused: ${prepared.id} is not a commit record here`, "Nothing was committed.")
 
     const message = messageWithTrailers(running.message, coAuthorTrailers(running.attribution.coAuthors, running.attribution.author?.name === MORIARTY_IDENTITY_NAME, running.attribution.tagging))
     const env = { GIT_INDEX_FILE: running.scratchIndex, ...(await runEnvFor(running.attribution)) }
@@ -1158,6 +1412,8 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
       return { kind: "git_commit", succeeded: true, operationId: failed.id, state: "failed", basis: "nothing was committed: the prepared tree could not be written as a commit" }
     }
     const sha = written.stdout.toString("utf8").trim()
+    // The commit this operation made, recorded so a later send publishes exactly this one.
+    transactions.setCommitSha(running.id, sha, running.invocationId)
     // The ref moves by compare-and-set, so a HEAD that changed after preparation is not overwritten.
     const updated = await runGit(repository.top, ["update-ref", branch === null ? "HEAD" : `refs/heads/${branch}`, sha, running.headBefore ?? ""], signal, env)
     fs.unlinkSync(running.scratchIndex)
@@ -1196,6 +1452,20 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
     if (record === undefined) return refuse("git_commit_not_prepared", `Recovery refused: ${operationId} is not an operation this stage prepared`, "Nothing was read for an operation that does not exist.")
     const repository = await resolveRepository(record.repositoryTop, signal)
     if ("code" in repository) return repository
+    if (record.kind === "push") {
+      // A send is settled from the ref it was sent to. The exit of a process that never answered says nothing here.
+      const now = await remoteRef(repository.top, record.remote, record.branch, signal)
+      const outcome = reconcilePush(record, now.sha, await remoteHoldsCommit(repository.top, record.commitSha, now.sha, signal))
+      const inspected = `the commit this operation published is ${record.commitSha}; ${now.read}; read for call ${info?.executionId ?? "unnamed"}`
+      const where = { remote: sanitizeRemoteForDisplay(record.remote), branch: record.branch }
+      if (GIT_TERMINAL_STATES.includes(record.state))
+        return { kind: "git_recovered", succeeded: true, operationId: record.id, state: record.state, inspected: `${inspected}; answered from the state it already had`, destination: where, remoteSha: now.sha, ...(record.outcome === undefined ? {} : { reason: record.outcome }) }
+      if (record.state === "prepared")
+        return { kind: "git_recovered", succeeded: true, operationId: record.id, state: "prepared", inspected, destination: where, remoteSha: now.sha, reason: proofOf(outcome) }
+      const settled = transactions.transition(record.id, outcome.state, record.invocationId, proofOf(outcome))
+      if ("code" in settled) return settled
+      return { kind: "git_recovered", succeeded: true, operationId: settled.id, state: settled.state, inspected, destination: where, remoteSha: now.sha, reason: proofOf(outcome) }
+    }
     const headRead = await runGit(repository.top, ["rev-parse", "--verify", "--quiet", "HEAD"], signal)
     const head = headRead.ok ? headRead.stdout.toString("utf8").trim() : null
     const candidates = await logCandidates(repository.top, signal)
@@ -1221,7 +1491,7 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
 
   /** End a prepared operation without committing it, and remove its private scratch copy. */
   const cancelCommit = async (operationId: string, reason: string, info?: GitCallInfo, signal?: AbortSignal): Promise<GitRecoveredReading | GitRefusal> => {
-    const record = transactions.get(operationId)
+    const record = transactions.commitRecord(operationId)
     if (record === undefined) return refuse("git_commit_not_prepared", `Cancel refused: ${operationId} is not an operation this stage prepared`, "Nothing was removed; there is no prepared operation to cancel.")
     if (signal?.aborted) return refuse("git_commit_interrupted", "Cancel refused: this call was interrupted", "Nothing was removed; the operation is left as it stands.")
     if (!COMMIT_TRANSITIONS[record.state].includes("refused"))
@@ -1236,5 +1506,5 @@ export const createGitExecutionService = (options: GitServiceOptions): GitExecut
     return { kind: "git_recovered", succeeded: true, operationId: settled.id, state: settled.state, inspected: `the private index copy ${record.scratchIndex} was removed; nothing was committed; read for call ${info?.executionId ?? "unnamed"}`, reason: `cancelled: ${reason}` }
   }
 
-  return { resolveRepository, prefix: prefixOf, hiddenHere, hiddenIn, nameOf, refuseBareArguments, runGit, status, inspect, prepareCommit, commit, recover, cancelCommit }
+  return { resolveRepository, prefix: prefixOf, hiddenHere, hiddenIn, nameOf, refuseBareArguments, runGit, status, inspect, prepareCommit, commit, push, remoteRef, recover, cancelCommit }
 }

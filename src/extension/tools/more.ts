@@ -21,6 +21,7 @@ import {
   gitCallIsReadOnly,
   GitInspectReading,
   GitOperation,
+  GitPushCall,
   GitServiceOptions,
   GitStagingCall,
   GitStatusReading,
@@ -28,7 +29,7 @@ import {
   RUN_GIT_OPERATIONS,
   toolCodeOfGitRefusal
 } from "../git/service"
-import { GitCommitReading, GitPreparedReading, GitRecoveredReading, GitRunRefusal } from "../git/transaction"
+import { GitCommitReading, GitPreparedReading, GitPushReading, GitRecoveredReading, GitRunRefusal } from "../git/transaction"
 
 import type { AccessPreflight, AccessTarget } from "./access-preflight"
 import { argumentFailure, type ArgumentReader, argumentReader, jsonType, type ToolArguments } from "./arguments"
@@ -191,12 +192,14 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
     }
   }
   /** The reading a Stage 4 operation answers with, in the shape §7.3 gives it. */
-  const shapedStage4 = (reading: GitPreparedReading | GitCommitReading | GitRecoveredReading, raw: ToolArguments, operation: string): ToolResult => {
+  const shapedStage4 = (reading: GitPreparedReading | GitCommitReading | GitPushReading | GitRecoveredReading, raw: ToolArguments, operation: string): ToolResult => {
     const observationId = options.observations?.({ name: "git", args: raw })
     const summary = reading.kind === "git_commit_prepared"
       ? `git \`${operation}\` · ${plural(reading.selectedFiles.length, "file", "files")} staged in the private copy`
       : reading.kind === "git_commit"
         ? `git \`${operation}\` · ${reading.state}${reading.duplicate ? ", answered from the state it already had" : ""}`
+      : reading.kind === "git_push"
+        ? `git \`${operation}\` · ${reading.state} on ${reading.remote}/${reading.branch}${reading.duplicate ? ", answered from the state it already had" : ""}`
         : `git \`${operation}\` · ${reading.state}`
     const { kind, ...rest } = reading
     return {
@@ -264,6 +267,23 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
       return shapedStage4(settled, raw, wanted)
     }
 
+    if (wanted === "push") {
+      // A send publishes the commit this stage already made; it names no paths and never makes a commit.
+      if (paths.length > 0)
+        return refused(refuse("git_argument_conflict", "git refused: a send names no paths", "A send publishes what was committed, to the destination the effective config names. Name the operation id, not paths."), operation)
+      const call: GitPushCall = { ...(named === undefined ? {} : { repository: named }) }
+      const remote = a.text("remote")
+      const branchName = a.text("branch")
+      const published = a.text("commitSha")
+      if (remote !== undefined) call.remote = remote
+      if (branchName !== undefined) call.branch = branchName
+      if (published !== undefined) call.commitSha = published
+      if (a.sent("setUpstream")) call.setUpstream = a.flag("setUpstream")
+      if (a.sent("force") && a.flag("force")) call.force = true
+      const sent = await service.push(call, context?.write, callInfo(context), context?.signal)
+      if ("code" in sent) return refused(sent, wanted)
+      return shapedStage4(sent, raw, wanted)
+    }
     const reading = wanted === "status" ? await service.status(named, context?.signal) : await service.inspect(paths, named, context?.signal)
     if ("code" in reading) return refused(reading, wanted)
     return shaped(reading, raw)
@@ -274,16 +294,20 @@ export const git = (view: WorkspaceView, options: Omit<GitServiceOptions, "view"
     readOnly: true,
     readOnlyFor: gitCallIsReadOnly,
     description:
-      "Run a read-only git command in the workspace, or ask for one of the typed operations: status, inspect, prepare_commit, commit and recover. A read needs no approval; staging and committing are approved per call.",
+      "Run a read-only git command in the workspace, or ask for one of the typed operations: status, inspect, prepare_commit, commit, push and recover. A read needs no approval; staging, committing and sending are approved per call, and a send never forces or rewrites history.",
     guidance: "Use git to see what changed (git diff, git status) or the history of a file (git log -p -- path) before you edit. For repository state, and for who owns a change, ask operation status or operation inspect.",
     parameters: [
       { name: "args", description: "The git command without `git`, e.g. `diff --stat` or `log -5 --oneline -- src/a.ts`.", optional: true },
-      { name: "operation", description: "A typed operation instead of args: status for repository state, inspect for the selected paths and what the host can say about each.", optional: true },
+      { name: "operation", description: "A typed operation instead of args: status for repository state, inspect for the selected paths and what the host can say about each, prepare_commit and commit for a scope, push to send one already made, recover for an answer that was lost.", optional: true },
       { name: "repository", description: "A repository to read when it is not the workspace folder itself; it must be inside the workspace or granted.", optional: true },
       { name: "paths", description: "The paths an operation answers for; every change this workspace may show when left out, and the exact scope a prepare_commit call stages.", optional: true, type: "array" },
       { name: "hunks", description: "For prepare_commit: the exact hunks to stage, each as { path, patch }, only where the host proved this session made the change.", optional: true, type: "array" },
       { name: "message", description: "For prepare_commit: the message the commit will carry.", optional: true },
-      { name: "operationId", description: "For commit and recover: the operation id a prepare_commit call gave.", optional: true }
+      { name: "operationId", description: "For commit, push and recover: the operation id a prepare_commit call gave.", optional: true },
+      { name: "remote", description: "For push: only as the effective config names it. A call cannot choose a remote, and force is refused.", optional: true },
+      { name: "branch", description: "For push: only as the effective config names it, or the branch HEAD is on when it says current.", optional: true },
+      { name: "setUpstream", description: "For push: upstream is set only as the project configured it.", optional: true, type: "boolean" },
+      { name: "commitSha", description: "For push: the commit this stage published, checked against what the operation recorded.", optional: true }
     ],
     async run(raw, context) {
       const a = argumentReader("git", raw)

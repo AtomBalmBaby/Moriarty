@@ -11,6 +11,7 @@
  * carries a commit call: what an authorization covers is a write request or one of these typed requests.
  * A commit authorization is tied to the host, the call and the operation id it was issued for, and it is
  * spent by that operation.
+ * Stage 5 adds the push request: it is a separate approval, tied to the destination the call was approved for, and it never covers force.
  */
 import path from "path"
 
@@ -27,7 +28,9 @@ export interface WriteRequest {
 /** A typed Git request (§13 of the design) as Stage 4 names it: where, and what it is spent on. Never a credential. */
 export interface GitPrepareRequest { kind: "prepare_commit"; absolute: string; paths: readonly string[] }
 export interface GitCommitRequest { kind: "commit"; absolute: string; operationId: string }
-export type GitOperationRequest = GitPrepareRequest | GitCommitRequest
+/** Stage 5's push request, in its own shape. A commit approval never covers a push, and a push approval never covers force: what the call left unnamed stays empty here rather than being guessed later. */
+export interface GitPushRequest { kind: "push"; absolute: string; operationId?: string; remote: string; branch: string; force: false }
+export type GitOperationRequest = GitPrepareRequest | GitCommitRequest | GitPushRequest
 
 /** Either kind of request one call can be approved for. */
 export type AuthorizedRequest = WriteRequest | GitOperationRequest
@@ -56,7 +59,14 @@ export const gitRequestsForCall = (args: Record<string, unknown>, absolute: stri
     const operationId = typeof args.operationId === "string" ? args.operationId.trim() : ""
     return operationId === "" ? [] : [{ kind: "commit", absolute, operationId }]
   }
+  if (operation === "push") return [pushRequestFromCall(args, absolute)]
   return []
+}
+/** A push request as the call named it. The destination is what the effective config decides at execution time, so a part the call did not name stays empty here instead of being guessed. */
+export const pushRequestFromCall = (args: Record<string, unknown>, absolute: string): GitPushRequest => {
+  const named = (value: unknown): string => (typeof value === "string" ? value.trim() : "")
+  const operationId = named(args.operationId)
+  return { kind: "push", absolute, ...(operationId === "" ? {} : { operationId }), remote: named(args.remote), branch: named(args.branch), force: false }
 }
 
 
@@ -98,6 +108,14 @@ const matches = (approved: Approved, given: AuthorizedRequest): boolean => {
     if (approvedRequest.kind !== givenRequest.kind) return false
     if (approvedRequest.kind === "prepare_commit")
       return samePaths((approvedRequest as GitPrepareRequest).paths, (givenRequest as GitPrepareRequest).paths)
+    if (approvedRequest.kind === "push") {
+      // Force is never part of what a push approval can cover, and the destination has to be the one that was approved.
+      const approvedPush = approvedRequest as GitPushRequest
+      const givenPush = givenRequest as GitPushRequest
+      if (approvedPush.force !== false || givenPush.force !== false) return false
+      if (approvedPush.remote !== givenPush.remote || approvedPush.branch !== givenPush.branch) return false
+      return approvedPush.operationId === givenPush.operationId
+    }
     return (approvedRequest as GitCommitRequest).operationId === (givenRequest as GitCommitRequest).operationId
   }
   return (approved.request as WriteRequest).operation === (given as WriteRequest).operation

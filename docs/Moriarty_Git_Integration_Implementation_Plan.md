@@ -274,6 +274,24 @@ Stage 3 is complete. Next stage: Stage 4, alternate-index staging and commit, re
 
 Git state for this close: nothing was staged, committed, pushed, reset or branch-changed. The development repository's working tree holds this stage's changed source file plus this plan update, and no Git write command was run anywhere.
 
+### Stage 5 close (2026-07-30) - push and recovery, gates green
+
+Branch `integrated-git` at `ab6e59a`. This stage's work is in the working tree: `src/extension/git/service.ts`, `src/extension/git/transaction.ts`, `src/extension/tools/operation-authorization.ts`, `src/extension/tools/more.ts`, and the new `src/test/standalone/git-push-recovery.standalone.ts`.
+
+A push record holds the commit it published, the destination as the effective config named it, whether upstream was configured, `force: false`, and what the ref held before and after. No credential is stored, and a URL holding one is printed through `sanitizeRemoteForDisplay`. A push is approved by its own request: a grant taken for a commit call, or for a read, does not carry it, and the destination approved is the one reached.
+
+Recovery reads local and remote state before anything runs again, and settles from what the ref shows - equal to this commit, holding this commit and moved on, changed away from what was expected, or unchanged, which proves nothing landed. What cannot be read stays uncertain and decides no send. A call whose process never answered is settled by reading, not by its exit status, and only an explicit authorized retry sends, and only when the read shows nothing landed and a fast-forward is still possible. Non-fast-forward is reported as rejected with nothing rewritten; creating a branch the remote does not have is refused as a separate permission.
+
+Gates: `npm run build-tests` clean; 12/12 in `git-push-recovery.standalone.ts`; `npm run lint` clean; `git diff --check` clean. Re-run unchanged except where Stage 5 legitimately changes behaviour: `git-tool-dispatch` 14/14, `git-transaction` 14/14, `git-index-staging` 11/11, `git-attribution` 9/9, `access-preflight` 23/23, whole standalone run 1346/1346.
+
+Two assertions moved with the stage, both keeping the same guard. The access case now names the typed push request alongside write access, because a push is its own approval; the case that named an operation Stage 3 did not run answers that a send needs its own approval and authorization - nothing ran, no commit was made, and the index and branch stayed as they were. The reading's basis now says a permission is not an approval.
+
+Every case runs on its own scratch repository and local bare remote under `/tmp` and is cleaned up at the end; no hosting service was reached and no live credential was used. The fixture hooks only count receives, refuse one receive, or hold the remote past the send's limit, so a send that never reached the remote shows as nothing sent. One case shows the value the process echoed withheld in the reading (`saw [credential withheld]`), with no value in the reading, summary or recorded line.
+
+Unresolved: production wiring still passes no conversation, host key, project key or approval, so live authorization is exercised only through the tool's own preflight until Stage 7 attaches it; `recover` for a push reads the remote, which may reach the network - bounded by the send's limit and answered as unprovable when the ref cannot be read. Schema stays at v21; nothing here opens or changes a database.
+
+Next stage: Stage 6, the v22 migration and repository reading these records through this service's shapes. Exact fresh-agent prompt: the one in section 8 of this plan, unchanged.
+
 ## 2. Cross-stage contracts
 
 ### 2.1 Project configuration

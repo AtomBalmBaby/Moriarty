@@ -132,7 +132,7 @@ test("git status reports repository state", async () => {
     assert.deepEqual(clean.capabilities, {
       commit: "approval-required",
       push: "approval-required",
-      basis: "git.workflow.mode=manual-approval; the preset's permission only, and this stage runs neither commit nor push"
+      basis: "git.workflow.mode=manual-approval; the preset's permission only, and a permission is not an approval"
     }, "the reading says where the permission came from, and does not claim more")
     assert.equal(clean.auth?.mode, "inherit")
 
@@ -278,7 +278,7 @@ test("git tools join the real tool dispatcher", async () => {
     const plain = toolsFor(root, { configSource: source, baselines, conversationId: "conversation-dispatch" })
     assert.ok(statusOf(await plain.run({ name: "git", args: { operation: "status" } })).observationId === undefined, "no id is invented when nothing was recorded")
     const later = refusalOf(await tools.run({ name: "git", args: { operation: "push" } }))
-    assert.equal(later.error.code, "git_operation_not_supported")
+    assert.equal(later.error.code, "git_approval_required", "Stage 5 runs a send, but this call was not approved")
     assert.equal(later.error.executed, false, "nothing ran and no transaction was opened")
     const both = refusalOf(await tools.run({ name: "git", args: { operation: "status", args: "diff --stat" } }))
     assert.equal(both.error.code, "git_argument_conflict")
@@ -417,7 +417,7 @@ test("the access preflight decides git access for the call, not for the tool", a
   assert.deepEqual(accessTargetsOf("git", { operation: "inspect", repository: outside }), [{ path: outside, access: "read" }], "and so does an inspection")
   assert.deepEqual(accessTargetsOf("git", { args: "status -u", repository: outside }), [{ path: outside, access: "read" }], "legacy args always ask read")
   assert.deepEqual(accessTargetsOf("git", { operation: "commit", repository: outside }), [{ path: outside, access: "write" }], "a mutating operation asks for what it does, not for how the tool was registered")
-  assert.deepEqual(accessTargetsOf("git", { operation: "push", repository: outside }), [{ path: outside, access: "write" }])
+  assert.deepEqual(accessTargetsOf("git", { operation: "push", repository: outside }), [{ path: outside, access: "write", git: { kind: "push", absolute: outside, remote: "", branch: "", force: false } }], "a push asks for write access and names its own typed request, which covers no force")
   const store = new AccessStore(undefined, HOST)
   const view = new WorkspaceView(inside, [], undefined, [], [], () => store.grants().map((grant) => ({ root: grant.root, real: grant.real, scope: grant.scope })))
   const tools = toolsFor(view, { configSource: createGitConfigSource(home), access: createAccessPreflight({ store, view, approve: async (prompt) => prompt.access === "read" ? { target: "exact", lifetime: "session" } : "deny" }) })
@@ -571,20 +571,26 @@ test("the inspection answers for a path as the open folder names it", async () =
 })
 
 
-test("a git call is refused before anything runs when it names an operation this stage does not run", async () => {
+test("a git call is refused before anything runs when nothing covers what it does", async () => {
   const home = projectHome("git-dispatch-prepare-")
   await withRepository({ "a.ts": "one\n" }, async ({ root }) => {
     const tools = toolsFor(root, { configSource: createGitConfigSource(home) })
     const before = stateOf(root)
-    // Push is the stage that owns a destination; it is still named and refused before anything runs.
-    const pushed = refusalOf(await tools.run({ name: "git", args: { operation: "push", paths: ["a.ts"] } }))
-    assert.equal(pushed.error.code, "git_operation_not_supported", "push is named but not run here")
-    assert.equal(pushed.error.executed, false, "and it ran nothing")
-    // The operations this stage does run are gated by the authorization the call carries: an unauthorized one runs nothing.
+    // Stage 5 runs a send, and a send names no paths: the call is refused before anything runs.
+    const conflict = refusalOf(await tools.run({ name: "git", args: { operation: "push", paths: ["a.ts"] } }))
+    assert.equal(conflict.error.code, "git_argument_conflict", "a send that names paths answers as a conflict")
+    assert.equal(conflict.error.executed, false, "and it ran nothing")
+    const unauthorized = refusalOf(await tools.run({ name: "git", args: { operation: "push" } }))
+    assert.equal(unauthorized.error.code, "git_approval_required", "a send is refused until an approval covers it")
+    assert.equal(unauthorized.error.executed, false)
+    // The operations Stage 4 owns are still refused for an authorization the call did not carry.
     const staging = refusalOf(await tools.run({ name: "git", args: { operation: "prepare_commit", paths: ["a.ts"] } }))
     assert.equal(staging.error.code, "git_commit_not_authorized", JSON.stringify(staging))
     assert.equal(staging.error.executed, false, "and nothing was staged")
     const approved = toolsFor(root, { configSource: createGitConfigSource(home), policy: { approved: true } })
+    const ungranted = refusalOf(await approved.run({ name: "git", args: { operation: "push" } }))
+    assert.equal(ungranted.error.code, "git_push_not_authorized", "and an approval without the push request covers no send")
+    assert.equal(ungranted.error.executed, false)
     const unapproved = refusalOf(await tools.run({ name: "git", args: { operation: "commit", operationId: "operation-nothing-prepared" } }))
     assert.equal(unapproved.error.code, "git_approval_required", "a preset that needs an approval refuses before the record is read")
     assert.equal(unapproved.error.executed, false)
